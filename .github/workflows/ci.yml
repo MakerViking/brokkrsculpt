@@ -1,0 +1,71 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  check:
+    name: Format, lint and test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install toolchain
+        run: rustup component add rustfmt clippy
+
+      # winit and iced load X11 and Wayland at run time but still need the
+      # development headers to build.
+      - name: Install system libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libx11-dev libxkbcommon-dev libwayland-dev libxcursor-dev \
+            libxrandr-dev libxi-dev libgl1-mesa-dev
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Format
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets
+
+      - name: Test
+        run: cargo test --workspace
+
+      # brokkr-core must stay free of UI, windowing and GPU dependencies. That
+      # is what keeps the shell choice reversible: swapping Iced for something
+      # else has to touch brokkr-app only. Checked rather than trusted, because
+      # a stray `use` in a hurry is exactly how this rots.
+      - name: Engine has no UI dependencies
+        run: |
+          tree=$(cargo tree -p brokkr-core -e normal --prefix none --no-dedupe)
+          if echo "$tree" | grep -qiE '^(iced|winit|wgpu|egui|tauri|raw-window-handle)\b'; then
+            echo "brokkr-core picked up a UI or GPU dependency:"
+            echo "$tree" | grep -iE '^(iced|winit|wgpu|egui|tauri|raw-window-handle)\b'
+            exit 1
+          fi
+          echo "brokkr-core is clean"
+
+  budget:
+    name: Performance budget
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: Swatinem/rust-cache@v2
+
+      # The budgets are treated as tests, not aspirations. Local margins are
+      # large (brush edit p95 is roughly 60 times under budget, remesh roughly
+      # 8 times), so a slower shared runner should still pass comfortably. If
+      # this turns out to be noisy, raise the budgets in the harness with a
+      # note rather than dropping the gate.
+      - name: Sculpt budget
+        run: cargo bench -p brokkr-core
