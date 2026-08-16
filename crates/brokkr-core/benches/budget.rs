@@ -198,11 +198,7 @@ fn expand(coords: &mut Vec<BrickCoord>) {
         for dz in -1..=1 {
             for dy in -1..=1 {
                 for dx in -1..=1 {
-                    set.insert(BrickCoord::new(
-                        coord.0.x + dx,
-                        coord.0.y + dy,
-                        coord.0.z + dz,
-                    ));
+                    set.insert(BrickCoord::new(coord.0.x + dx, coord.0.y + dy, coord.0.z + dz));
                 }
             }
         }

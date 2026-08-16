@@ -2,10 +2,23 @@
 
 [package]
 name = "brokkr-app"
+description = "BrokkrSculpt: a voxel and SDF based 3D sculpting application."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 
+[[bin]]
+name = "brokkrsculpt"
+path = "src/main.rs"
+
 [dependencies]
+brokkr-core.workspace = true
+brokkr-gpu.workspace = true
+bytemuck.workspace = true
+env_logger.workspace = true
+glam.workspace = true
+iced = { workspace = true, features = ["advanced", "wgpu", "debug"] }
+log.workspace = true
+wgpu.workspace = true

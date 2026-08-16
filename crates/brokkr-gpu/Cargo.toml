@@ -2,6 +2,7 @@
 
 [package]
 name = "brokkr-gpu"
+description = "wgpu device resources, buffer pools and the sculpt render pipeline for BrokkrSculpt."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -9,3 +10,14 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+brokkr-core.workspace = true
+bytemuck.workspace = true
+glam.workspace = true
+log.workspace = true
+rustc-hash.workspace = true
+wgpu.workspace = true
+
+[dev-dependencies]
+brokkr-core.workspace = true
+glam.workspace = true
+pollster.workspace = true

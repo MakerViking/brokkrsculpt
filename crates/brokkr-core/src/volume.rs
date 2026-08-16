@@ -197,6 +197,25 @@ impl Volume {
         self.dirty.insert(coord);
     }
 
+    /// Mark every brick that can carry geometry: those with data, plus their
+    /// neighbours, because a brick with no voxels of its own still owns the
+    /// quads on its low faces.
+    ///
+    /// This is a load time operation, used after seeding or opening a model.
+    /// It is proportional to the whole volume and so must never run per frame.
+    pub fn mark_everything_dirty(&mut self) {
+        let stored: Vec<BrickCoord> = self.bricks.keys().copied().collect();
+        for coord in stored {
+            for dz in -1..=1 {
+                for dy in -1..=1 {
+                    for dx in -1..=1 {
+                        self.dirty.insert(BrickCoord(coord.0 + IVec3::new(dx, dy, dz)));
+                    }
+                }
+            }
+        }
+    }
+
     #[inline]
     pub fn dirty_count(&self) -> usize {
         self.dirty.len()

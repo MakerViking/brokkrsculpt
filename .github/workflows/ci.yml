@@ -22,13 +22,15 @@ jobs:
         run: rustup component add rustfmt clippy
 
       # winit and iced load X11 and Wayland at run time but still need the
-      # development headers to build.
+      # development headers to build. mesa-vulkan-drivers brings lavapipe, the
+      # software Vulkan device the offscreen render test runs on: without it
+      # that test skips itself and stops guarding anything.
       - name: Install system libraries
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             libx11-dev libxkbcommon-dev libwayland-dev libxcursor-dev \
-            libxrandr-dev libxi-dev libgl1-mesa-dev
+            libxrandr-dev libxi-dev libgl1-mesa-dev mesa-vulkan-drivers
 
       - uses: Swatinem/rust-cache@v2
 
@@ -40,6 +42,18 @@ jobs:
 
       - name: Test
         run: cargo test --workspace
+
+      # The offscreen test is the end to end run: it renders the sculpt to a
+      # texture and checks the pixels. It skips when no adapter is present, so
+      # confirm one was actually found rather than trusting a green tick.
+      - name: Confirm the offscreen render test really ran
+        run: |
+          output=$(cargo test -p brokkr-gpu --test offscreen -- --nocapture 2>&1)
+          echo "$output"
+          if echo "$output" | grep -q "skipping the offscreen render test"; then
+            echo "No Vulkan adapter was available, so the end to end test did not run."
+            exit 1
+          fi
 
       # brokkr-core must stay free of UI, windowing and GPU dependencies. That
       # is what keeps the shell choice reversible: swapping Iced for something
