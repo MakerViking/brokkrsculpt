@@ -1,0 +1,44 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
+[workspace]
+resolver = "3"
+members = ["crates/brokkr-core", "crates/brokkr-gpu", "crates/brokkr-app"]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2024"
+license = "AGPL-3.0-or-later"
+repository = "https://github.com/MakerViking/brokkrsculpt"
+rust-version = "1.90"
+
+[workspace.dependencies]
+brokkr-core = { path = "crates/brokkr-core" }
+brokkr-gpu = { path = "crates/brokkr-gpu" }
+
+bytemuck = { version = "1", features = ["derive"] }
+fast-surface-nets = "0.2"
+glam = { version = "0.33", features = ["bytemuck"] }
+iced = "0.14"
+iced_wgpu = "0.14"
+log = "0.4"
+env_logger = "0.11"
+pollster = "0.4"
+rayon = "1"
+rustc-hash = "2"
+# Pinned to 27 because iced_wgpu 0.14 depends on wgpu ^27. The shader widget
+# hands us a real wgpu::Device and RenderPass, so a different major version
+# here would be a different, incompatible type. Bump both together or not at
+# all.
+wgpu = "27"
+
+# Debug builds of a wgpu application are unusably slow without this. Our own
+# crates keep opt-level 1 so backtraces stay readable, dependencies get full
+# optimisation because we are not debugging them.
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3
+
+[profile.bench]
+debug = true

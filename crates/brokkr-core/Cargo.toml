@@ -1,0 +1,26 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
+[package]
+name = "brokkr-core"
+description = "Sparse brick volume, brushes and meshing for BrokkrSculpt. No UI or windowing dependencies."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+# Nothing in this crate may depend on a UI, windowing or GPU crate. That is
+# what keeps the Iced choice reversible: swapping the shell touches brokkr-app
+# only. CI enforces this with a dependency check.
+[dependencies]
+bytemuck.workspace = true
+fast-surface-nets.workspace = true
+glam.workspace = true
+rustc-hash.workspace = true
+
+[dev-dependencies]
+glam.workspace = true
+
+[[bench]]
+name = "budget"
+harness = false
