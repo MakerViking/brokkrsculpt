@@ -235,7 +235,7 @@ fn patterned_sculpting_keeps_the_surface_closed() {
     // engine clamps it up to MIN_SCALE_VOXELS, and this test is what proves
     // the clamp is doing its job: without it, one edge comes back shared by
     // four triangles and the export validator would refuse the model.
-    const SCALE_UNDER_TEST: f32 = 0.01;
+    const REQUESTED_SCALE: f32 = 0.01;
     // A pattern is the one thing that varies *within* a stamp rather than
     // between stamps, so if anything could put a discontinuity across a brick
     // boundary it is this. Full depth, and a feature size of a couple of
@@ -252,7 +252,7 @@ fn patterned_sculpting_keeps_the_surface_closed() {
             kind: BrushKind::Draw,
             radius: 9.0,
             strength: 0.6,
-            pattern: Pattern { kind, scale_mm: SCALE_UNDER_TEST, depth: 1.0 },
+            pattern: Pattern { kind, scale_mm: REQUESTED_SCALE, depth: 1.0 },
             ..Brush::default()
         };
         // Right on brick corners, which is the worst case for tiling.
