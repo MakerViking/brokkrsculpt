@@ -12,7 +12,7 @@
 
 use std::sync::Arc;
 
-use brokkr_core::{BrushKind, FalloffCurve, Symmetry};
+use brokkr_core::{BrushKind, FalloffCurve, MirrorAxis};
 use iced::widget::{button, checkbox, column, container, pick_list, row, slider, stack, text};
 use iced::{Alignment, Element, Length};
 
@@ -181,10 +181,7 @@ impl Brokkr {
                 radius,
                 strength,
                 falloff,
-                checkbox(self.symmetry == Symmetry::X)
-                    .label("X symmetry")
-                    .on_toggle(Message::SymmetryToggled)
-                    .text_size(theme::TEXT_SIZE_SMALL),
+                self.symmetry_row(),
                 self.pen_panel(),
                 self.spacemouse_panel(),
                 text("HISTORY").size(theme::CAPTION_SIZE).color(theme::TEXT_MUTE),
@@ -370,6 +367,27 @@ impl Brokkr {
         ]
         .spacing(theme::S2)
         .into()
+    }
+
+    /// One toggle per mirror plane.
+    ///
+    /// Three checkboxes on one line rather than a picker: the useful settings
+    /// are the combinations, and a picker would hide that x and y can both be
+    /// on at once.
+    fn symmetry_row(&self) -> Element<'_, Message> {
+        let toggles =
+            MirrorAxis::ALL.into_iter().fold(row![].spacing(theme::S3), |assembled, axis| {
+                assembled.push(
+                    checkbox(self.symmetry.axis(axis))
+                        .label(axis.label())
+                        .on_toggle(move |on| Message::SymmetryToggled(axis, on))
+                        .text_size(theme::TEXT_SIZE_SMALL),
+                )
+            });
+
+        column![text("MIRROR").size(theme::CAPTION_SIZE).color(theme::TEXT_MUTE), toggles,]
+            .spacing(theme::S2)
+            .into()
     }
 
     /// Resolution controls.

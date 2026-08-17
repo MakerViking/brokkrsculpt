@@ -38,7 +38,8 @@ pub use brick::{
     OUTSIDE,
 };
 pub use brush::{
-    Brush, BrushDirection, BrushKind, BrushScratch, FalloffCurve, Stamp, Symmetry, lean_normal,
+    Brush, BrushDirection, BrushKind, BrushScratch, FalloffCurve, MirrorAxis, Stamp, Symmetry,
+    lean_normal,
 };
 pub use export::{ExportMesh, MeshReport};
 pub use mesh::{BrickMesh, MeshScratch, Vertex};

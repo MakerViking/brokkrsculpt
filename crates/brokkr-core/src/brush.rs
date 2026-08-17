@@ -258,38 +258,117 @@ impl std::fmt::Display for BrushKind {
     }
 }
 
-/// Mirroring applied to every stamp.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum Symmetry {
-    #[default]
-    Off,
-    /// Mirror across the world plane x = 0.
+/// One of the three world planes a stamp can be mirrored across.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MirrorAxis {
+    /// Mirror across the plane x = 0.
     X,
+    /// Mirror across the plane y = 0.
+    Y,
+    /// Mirror across the plane z = 0.
+    Z,
 }
 
-impl Symmetry {
-    /// The mirrored twin of a stamp, or `None` when symmetry is off.
-    ///
-    /// A stamp landing on the mirror plane is applied twice at nearly the same
-    /// place. That is deliberate: the two falloffs overlap smoothly, whereas
-    /// suppressing the twin near the plane would put a visible step in the
-    /// stroke strength exactly where the user is trying to work.
-    pub fn mirror(self, stamp: &Stamp) -> Option<Stamp> {
-        match self {
-            Symmetry::Off => None,
-            Symmetry::X => Some(Stamp {
-                centre: Vec3::new(-stamp.centre.x, stamp.centre.y, stamp.centre.z),
-                normal: Vec3::new(-stamp.normal.x, stamp.normal.y, stamp.normal.z),
-                ..*stamp
-            }),
-        }
-    }
+impl MirrorAxis {
+    pub const ALL: [MirrorAxis; 3] = [MirrorAxis::X, MirrorAxis::Y, MirrorAxis::Z];
 
     pub fn label(self) -> &'static str {
         match self {
-            Symmetry::Off => "Off",
-            Symmetry::X => "X",
+            MirrorAxis::X => "X",
+            MirrorAxis::Y => "Y",
+            MirrorAxis::Z => "Z",
         }
+    }
+
+    fn index(self) -> usize {
+        self as usize
+    }
+}
+
+/// Which world planes every stamp is mirrored across.
+///
+/// A set rather than a single choice, because the combinations are what make
+/// it useful: x and y together give the four way symmetry a face or a wheel
+/// wants, and all three give eight way.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Symmetry {
+    enabled: [bool; 3],
+}
+
+impl Symmetry {
+    /// No mirroring at all.
+    pub const OFF: Symmetry = Symmetry { enabled: [false; 3] };
+
+    /// Mirroring across x = 0 only, which is the common case and the one the
+    /// application starts every other feature's tests from.
+    pub const X: Symmetry = Symmetry { enabled: [true, false, false] };
+
+    /// Most twins a single stamp can have: one per non-empty combination of
+    /// three planes, so `2^3 - 1`.
+    pub const MAX_MIRRORS: usize = 7;
+
+    pub fn is_off(self) -> bool {
+        self.enabled.iter().all(|on| !on)
+    }
+
+    pub fn axis(self, axis: MirrorAxis) -> bool {
+        self.enabled[axis.index()]
+    }
+
+    pub fn with_axis(mut self, axis: MirrorAxis, on: bool) -> Self {
+        self.enabled[axis.index()] = on;
+        self
+    }
+
+    pub fn toggled(self, axis: MirrorAxis) -> Self {
+        self.with_axis(axis, !self.axis(axis))
+    }
+
+    /// Write every mirrored twin of a stamp into `out`, returning how many
+    /// there are. Never includes the stamp itself.
+    ///
+    /// Fills a caller owned array rather than returning a `Vec`, because this
+    /// runs once per stamp and a stroke lays down thousands: allocating here
+    /// would put the sculpt loop back in the allocator.
+    ///
+    /// A stamp landing on a mirror plane is applied twice at nearly the same
+    /// place. That is deliberate: the two falloffs overlap smoothly, whereas
+    /// suppressing the twin near the plane would put a visible step in the
+    /// stroke strength exactly where the user is trying to work.
+    pub fn mirrors(self, stamp: &Stamp, out: &mut [Stamp; Self::MAX_MIRRORS]) -> usize {
+        let mut count = 0;
+        // Each combination is a bit per axis; 0 is the original, which is the
+        // caller's to apply and not a twin.
+        for combination in 1..=Self::MAX_MIRRORS {
+            let flips = |index: usize| combination & (1 << index) != 0;
+            if (0..3).any(|index| flips(index) && !self.enabled[index]) {
+                continue;
+            }
+            let mut mirrored = *stamp;
+            for index in 0..3 {
+                if flips(index) {
+                    // Reflecting across the plane negates that one component
+                    // of the position and of the surface normal.
+                    mirrored.centre[index] = -mirrored.centre[index];
+                    mirrored.normal[index] = -mirrored.normal[index];
+                }
+            }
+            out[count] = mirrored;
+            count += 1;
+        }
+        count
+    }
+
+    /// The enabled planes as "Off", "X", or "XZ".
+    pub fn label(self) -> String {
+        if self.is_off() {
+            return "Off".to_string();
+        }
+        MirrorAxis::ALL
+            .into_iter()
+            .filter(|axis| self.axis(*axis))
+            .map(|axis| axis.label())
+            .collect()
     }
 }
 
@@ -361,7 +440,7 @@ impl Brush {
         (self.radius * 0.25).max(voxel_size)
     }
 
-    /// Apply one stamp, plus its mirror when symmetry is on.
+    /// Apply one stamp, plus its mirrors when symmetry is on.
     pub fn apply_symmetric(
         &self,
         volume: &mut Volume,
@@ -370,8 +449,13 @@ impl Brush {
         scratch: &mut BrushScratch,
     ) {
         self.apply(volume, stamp, scratch);
-        if let Some(mirrored) = symmetry.mirror(stamp) {
-            self.apply(volume, &mirrored, scratch);
+        if symmetry.is_off() {
+            return;
+        }
+        let mut twins = [*stamp; Symmetry::MAX_MIRRORS];
+        let count = symmetry.mirrors(stamp, &mut twins);
+        for twin in &twins[..count] {
+            self.apply(volume, twin, scratch);
         }
     }
 
@@ -904,6 +988,101 @@ mod tests {
         );
     }
 
+    /// The reason symmetry became a set: the combinations are the useful part.
+    #[test]
+    fn each_axis_mirrors_across_its_own_plane_and_combinations_reach_every_octant() {
+        let stamp =
+            Stamp::new(Vec3::new(3.0, 5.0, 7.0), Vec3::new(1.0, 0.0, 0.0), BrushDirection::Add);
+        let mut twins = [stamp; Symmetry::MAX_MIRRORS];
+
+        // One plane gives one twin, with exactly that component negated.
+        for (axis, expected) in [
+            (MirrorAxis::X, Vec3::new(-3.0, 5.0, 7.0)),
+            (MirrorAxis::Y, Vec3::new(3.0, -5.0, 7.0)),
+            (MirrorAxis::Z, Vec3::new(3.0, 5.0, -7.0)),
+        ] {
+            let count = Symmetry::OFF.with_axis(axis, true).mirrors(&stamp, &mut twins);
+            assert_eq!(count, 1, "{} alone should give one twin", axis.label());
+            assert_eq!(twins[0].centre, expected);
+        }
+
+        // Two planes give three twins, three planes give seven: every octant
+        // except the one the original is already in.
+        let two = Symmetry::OFF.with_axis(MirrorAxis::X, true).with_axis(MirrorAxis::Y, true);
+        assert_eq!(two.mirrors(&stamp, &mut twins), 3);
+
+        let all = Symmetry { enabled: [true; 3] };
+        let count = all.mirrors(&stamp, &mut twins);
+        assert_eq!(count, Symmetry::MAX_MIRRORS);
+
+        let mut octants: Vec<[bool; 3]> = twins[..count]
+            .iter()
+            .map(|twin| [twin.centre.x < 0.0, twin.centre.y < 0.0, twin.centre.z < 0.0])
+            .collect();
+        octants.sort();
+        octants.dedup();
+        assert_eq!(octants.len(), 7, "the twins overlapped instead of covering seven octants");
+        assert!(
+            !octants.contains(&[false, false, false]),
+            "a twin landed on top of the original stamp"
+        );
+    }
+
+    #[test]
+    fn a_mirrored_normal_is_reflected_along_with_the_position() {
+        let stamp =
+            Stamp::new(Vec3::new(4.0, 0.0, 0.0), Vec3::new(1.0, 0.0, 0.0), BrushDirection::Add);
+        let mut twins = [stamp; Symmetry::MAX_MIRRORS];
+        Symmetry::X.mirrors(&stamp, &mut twins);
+
+        // Still pointing out of the sphere, not back into it. Reflecting the
+        // position without the normal would make the mirrored stamp carve.
+        assert_eq!(twins[0].normal, Vec3::new(-1.0, 0.0, 0.0));
+        assert!(twins[0].normal.dot(twins[0].centre) > 0.0);
+    }
+
+    #[test]
+    fn symmetry_off_produces_no_twins_at_all() {
+        let stamp = Stamp::new(Vec3::X, Vec3::X, BrushDirection::Add);
+        let mut twins = [stamp; Symmetry::MAX_MIRRORS];
+        assert!(Symmetry::OFF.is_off());
+        assert_eq!(Symmetry::OFF.mirrors(&stamp, &mut twins), 0);
+        assert_eq!(Symmetry::default(), Symmetry::OFF);
+    }
+
+    #[test]
+    fn y_symmetry_mirrors_a_real_stroke_to_the_other_side() {
+        let mut volume = sphere();
+        let mut scratch = BrushScratch::new();
+        let at = Vec3::new(0.0, 20.0, 12.0);
+        let normal = volume.gradient_world(at);
+        let mirrored_probe = Vec3::new(at.x, -at.y, at.z);
+        let before = volume.sample_world(mirrored_probe);
+
+        brush(BrushKind::Draw).apply_symmetric(
+            &mut volume,
+            &Stamp::new(at, normal, BrushDirection::Add),
+            Symmetry::OFF.with_axis(MirrorAxis::Y, true),
+            &mut scratch,
+        );
+
+        assert!(
+            volume.sample_world(mirrored_probe) < before,
+            "the y mirrored half of the stroke never landed"
+        );
+    }
+
+    #[test]
+    fn the_label_names_every_enabled_plane() {
+        assert_eq!(Symmetry::OFF.label(), "Off");
+        assert_eq!(Symmetry::X.label(), "X");
+        assert_eq!(
+            Symmetry::OFF.with_axis(MirrorAxis::X, true).with_axis(MirrorAxis::Z, true).label(),
+            "XZ"
+        );
+        assert_eq!(Symmetry { enabled: [true; 3] }.label(), "XYZ");
+    }
+
     #[test]
     fn symmetry_off_leaves_the_other_side_untouched() {
         let mut volume = sphere();
@@ -916,7 +1095,7 @@ mod tests {
         brush(BrushKind::Draw).apply_symmetric(
             &mut volume,
             &Stamp::new(at, normal, BrushDirection::Add),
-            Symmetry::Off,
+            Symmetry::OFF,
             &mut scratch,
         );
         assert_eq!(volume.sample_world(mirrored_probe), before);

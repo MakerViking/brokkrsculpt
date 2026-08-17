@@ -9,8 +9,8 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use brokkr_core::{
-    BrickCoord, BrickMesh, Brush, BrushDirection, BrushScratch, History, HistoryStats, Stamp,
-    Stroke, Symmetry, Volume, VolumeStats, lean_normal, raycast,
+    BrickCoord, BrickMesh, Brush, BrushDirection, BrushKind, BrushScratch, History, HistoryStats,
+    MirrorAxis, Stamp, Stroke, Symmetry, Volume, VolumeStats, lean_normal, raycast,
 };
 use glam::{Vec2, Vec3};
 use iced::Subscription;
@@ -37,6 +37,11 @@ const VOXEL_SIZE_MM: f32 = 0.25;
 /// a 60 mm ball at 0.055 mm comes to 11.2 million triangles and 6.2 million
 /// vertices against a pool of 8 million. Going finer would overflow it and put
 /// an incomplete model on screen, so the interface will not offer it.
+/// Range the brush radius may be nudged to with the keyboard, in millimetres.
+/// The same range the slider offers, so the two cannot disagree.
+pub(crate) const MIN_RADIUS_MM: f32 = 0.25;
+pub(crate) const MAX_RADIUS_MM: f32 = 12.0;
+
 const FINEST_VOXEL_MM: f32 = 0.06;
 const COARSEST_VOXEL_MM: f32 = 2.0;
 
@@ -182,7 +187,7 @@ impl Brokkr {
             volume,
             camera: OrbitCamera::framing(Vec3::ZERO, MODEL_RADIUS_MM),
             brush: Brush::default(),
-            symmetry: Symmetry::Off,
+            symmetry: Symmetry::OFF,
             tablet,
             spacemouse,
             pressure_enabled: true,
@@ -287,7 +292,7 @@ impl Brokkr {
         if start {
             self.stroke.begin(point, &mut self.stamp_centres);
         } else {
-            let spacing = self.brush.spacing(self.volume.voxel_size());
+            let spacing = self.effective_brush().spacing(self.volume.voxel_size());
             self.stroke.advance(point, spacing, &mut self.stamp_centres);
         }
 
@@ -296,6 +301,7 @@ impl Brokkr {
         // re-reading it would only add jitter.
         let pressure = self.tablet.stamp_pressure(self.pressure_enabled, self.pressure_curve);
         let lean = self.pen_lean();
+        let brush = self.effective_brush();
 
         for index in 0..self.stamp_centres.len() {
             let centre = self.stamp_centres[index];
@@ -306,18 +312,28 @@ impl Brokkr {
             // steers every brush at once because they all read this normal.
             let normal = lean_normal(self.volume.gradient_world(centre), lean);
             let stamp = Stamp::new(centre, normal, direction).with_pressure(pressure);
-            self.brush.apply_symmetric(
-                &mut self.volume,
-                &stamp,
-                self.symmetry,
-                &mut self.brush_scratch,
-            );
+            brush.apply_symmetric(&mut self.volume, &stamp, self.symmetry, &mut self.brush_scratch);
         }
         self.perf.stamps = self.stamp_centres.len();
         self.perf.pressure = pressure;
         self.perf.edit_ms = started.elapsed().as_secs_f32() * 1000.0;
 
         self.remesh_dirty();
+    }
+
+    /// The brush a stamp actually runs with.
+    ///
+    /// Holding shift smooths, which is the convention every sculpting tool
+    /// uses and the single biggest ergonomic win available here. Shift already
+    /// modified right drag into a pan, and this is left drag, so there is no
+    /// clash.
+    ///
+    /// Deliberately does NOT swap `self.brush.kind` and swap it back: nothing
+    /// then has to notice a key being released while the window is unfocused,
+    /// and the tool strip does not flicker between two highlights during a
+    /// stroke. The selection is never touched, so there is nothing to restore.
+    fn effective_brush(&self) -> Brush {
+        if self.shift { Brush { kind: BrushKind::Smooth, ..self.brush } } else { self.brush }
     }
 
     /// Direction for a new stroke, honouring the invert modifier, the eraser
@@ -504,8 +520,7 @@ impl Brokkr {
                     self.publish_camera();
                 }
                 ButtonAction::ToggleSymmetry => {
-                    self.symmetry =
-                        if self.symmetry == Symmetry::Off { Symmetry::X } else { Symmetry::Off };
+                    self.symmetry = self.symmetry.toggled(MirrorAxis::X);
                 }
             }
         }
@@ -660,8 +675,13 @@ impl Brokkr {
             Message::FalloffChanged(curve) => self.brush.falloff = curve,
             Message::BrushRadiusChanged(radius) => self.brush.radius = radius,
             Message::BrushStrengthChanged(strength) => self.brush.strength = strength,
-            Message::SymmetryToggled(on) => {
-                self.symmetry = if on { Symmetry::X } else { Symmetry::Off };
+            Message::SymmetryToggled(axis, on) => {
+                self.symmetry = self.symmetry.with_axis(axis, on);
+            }
+            Message::SymmetryAxisToggled(axis) => self.symmetry = self.symmetry.toggled(axis),
+            Message::BrushRadiusScaled(factor) => {
+                self.brush.radius =
+                    (self.brush.radius * factor).clamp(MIN_RADIUS_MM, MAX_RADIUS_MM);
             }
             Message::PressureToggled(on) => self.pressure_enabled = on,
             Message::PressureCurveChanged(curve) => self.pressure_curve = curve,
@@ -858,7 +878,7 @@ mod tests {
     #[test]
     fn symmetry_sculpts_both_sides_at_once() {
         let mut app = app();
-        app.update(Message::SymmetryToggled(true));
+        app.update(Message::SymmetryToggled(MirrorAxis::X, true));
         // Nothing has told the application how big the viewport is yet, and
         // the ray depends on it.
         app.viewport_size = Vec2::new(SIZE.x, SIZE.y);
@@ -878,6 +898,115 @@ mod tests {
             app.volume.sample_world(mirrored) < before,
             "the mirrored half of the stroke never landed"
         );
+    }
+
+    /// The ZBrush convention, and the biggest ergonomic win in this round.
+    #[test]
+    fn holding_shift_sculpts_with_smooth_without_changing_the_selection() {
+        let mut app = app();
+        app.update(Message::BrushKindChanged(BrushKind::Draw));
+        assert_eq!(app.effective_brush().kind, BrushKind::Draw);
+
+        app.update(Message::Pointer(PointerEvent::Modifiers { shift: true, control: false }));
+        assert_eq!(app.effective_brush().kind, BrushKind::Smooth, "shift should smooth");
+        assert_eq!(
+            app.brush.kind,
+            BrushKind::Draw,
+            "the selection itself must not change, or the tool strip would flicker \
+             and a key released out of focus would strand the wrong brush"
+        );
+
+        app.update(Message::Pointer(PointerEvent::Modifiers { shift: false, control: false }));
+        assert_eq!(app.effective_brush().kind, BrushKind::Draw, "releasing shift should restore");
+    }
+
+    #[test]
+    fn holding_shift_actually_smooths_the_model_rather_than_drawing_on_it() {
+        let mut app = app();
+        // A move first, so the application knows the viewport size and
+        // `surface_under` agrees with where a press will actually land. The
+        // default size is not SIZE, and disagreeing here probes a point the
+        // brush never touches.
+        app.on_pointer(PointerEvent::Moved { position: centre_of_viewport(), size: SIZE });
+        let probe = app
+            .surface_under(Vec2::new(SIZE.x / 2.0, SIZE.y / 2.0))
+            .expect("the centre of the viewport should hit the sphere");
+        let flat = app.volume.sample_world(probe);
+
+        app.update(Message::BrushKindChanged(BrushKind::Draw));
+        for _ in 0..4 {
+            press(&mut app, centre_of_viewport());
+            release(&mut app);
+        }
+        let raised = app.volume.sample_world(probe);
+        assert!(raised < flat, "drawing should have pushed the surface out past the probe");
+
+        // Now the same gesture with shift held. Nothing about the selection
+        // changes, but the strokes must smooth rather than pile on more.
+        app.update(Message::Pointer(PointerEvent::Modifiers { shift: true, control: false }));
+        for _ in 0..12 {
+            press(&mut app, centre_of_viewport());
+            release(&mut app);
+        }
+        let smoothed = app.volume.sample_world(probe);
+
+        assert_ne!(smoothed, raised, "holding shift changed nothing at all");
+        assert!(
+            smoothed > raised,
+            "shift should have flattened the bump back, not built on it: \
+             {flat} flat, {raised} raised, {smoothed} after smoothing"
+        );
+        assert_eq!(app.brush.kind, BrushKind::Draw, "the selection must be untouched");
+    }
+
+    #[test]
+    fn each_mirror_axis_reaches_the_opposite_side() {
+        for (axis, probe) in [
+            (MirrorAxis::X, Vec3::new(-1.0, 1.0, 1.0)),
+            (MirrorAxis::Y, Vec3::new(1.0, -1.0, 1.0)),
+            (MirrorAxis::Z, Vec3::new(1.0, 1.0, -1.0)),
+        ] {
+            let mut app = app();
+            app.update(Message::SymmetryAxisToggled(axis));
+            assert!(app.symmetry.axis(axis), "{} did not turn on", axis.label());
+
+            // On the surface, and off all three planes, so only the axis
+            // under test can carry the stroke to the probe point.
+            let at = Vec3::new(14.0, 14.0, 18.0).normalize() * MODEL_RADIUS_MM;
+            let normal = app.volume.gradient_world(at);
+            let before = app.volume.sample_world(at * probe);
+
+            app.volume.begin_stroke();
+            app.brush.apply_symmetric(
+                &mut app.volume,
+                &Stamp::new(at, normal, BrushDirection::Add),
+                app.symmetry,
+                &mut app.brush_scratch,
+            );
+
+            assert!(
+                app.volume.sample_world(at * probe) < before,
+                "{} symmetry never reached the other side",
+                axis.label()
+            );
+
+            // ...and toggling it again turns it back off.
+            app.update(Message::SymmetryAxisToggled(axis));
+            assert!(!app.symmetry.axis(axis));
+        }
+    }
+
+    #[test]
+    fn the_radius_keys_stay_inside_the_range_the_slider_offers() {
+        let mut app = app();
+        for _ in 0..200 {
+            app.update(Message::BrushRadiusScaled(1.5));
+        }
+        assert_eq!(app.brush.radius, MAX_RADIUS_MM);
+        for _ in 0..200 {
+            app.update(Message::BrushRadiusScaled(1.0 / 1.5));
+        }
+        assert_eq!(app.brush.radius, MIN_RADIUS_MM);
     }
 
     #[test]

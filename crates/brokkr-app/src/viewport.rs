@@ -17,7 +17,7 @@
 
 use std::sync::{Arc, Mutex};
 
-use brokkr_core::{BrickCoord, BrickMesh};
+use brokkr_core::{BrickCoord, BrickMesh, BrushKind, MirrorAxis};
 use brokkr_gpu::{Frustum, PixelRect, PoolStats, SculptRenderer, Uniforms};
 use iced::mouse;
 use iced::widget::shader;
@@ -106,6 +106,48 @@ fn button_of(button: mouse::Button) -> Option<PointerButton> {
     }
 }
 
+/// How much one press of the radius keys changes it.
+///
+/// Multiplicative, because the radius spans fifty to one: a fixed step would
+/// crawl at the coarse end and jump in whole multiples at the fine end.
+const RADIUS_STEP: f32 = 1.15;
+
+/// The message a key press means, if it means anything.
+///
+/// Pulled out of `update` so it can be tested without building a widget tree
+/// or a window, which on this machine is the only way to test input at all:
+/// it is a Wayland session, and XTEST pointer and key synthesis silently does
+/// nothing there.
+fn shortcut(character: &str, command: bool, shift: bool) -> Option<Message> {
+    if command {
+        // The only chorded shortcuts. Anything else with control held belongs
+        // to the toolkit or the window manager.
+        return character.eq_ignore_ascii_case("z").then_some(if shift {
+            Message::Redo
+        } else {
+            Message::Undo
+        });
+    }
+
+    // Brushes are numbered in the order the tool strip shows them, so the key
+    // and the button are always the same thing.
+    if let Ok(digit) = character.parse::<usize>()
+        && let Some(index) = digit.checked_sub(1)
+        && let Some(kind) = BrushKind::ALL.get(index)
+    {
+        return Some(Message::BrushKindChanged(*kind));
+    }
+
+    match character.to_ascii_lowercase().as_str() {
+        "x" => Some(Message::SymmetryAxisToggled(MirrorAxis::X)),
+        "y" => Some(Message::SymmetryAxisToggled(MirrorAxis::Y)),
+        "z" => Some(Message::SymmetryAxisToggled(MirrorAxis::Z)),
+        "[" => Some(Message::BrushRadiusScaled(1.0 / RADIUS_STEP)),
+        "]" => Some(Message::BrushRadiusScaled(RADIUS_STEP)),
+        _ => None,
+    }
+}
+
 impl shader::Program<Message> for Viewport {
     // Drag state lives in the application, not the widget, because sculpting
     // mutates the volume and that is the application's to own.
@@ -154,17 +196,14 @@ impl shader::Program<Message> for Viewport {
             iced::Event::Keyboard(keyboard::Event::ModifiersChanged(modifiers)) => {
                 PointerEvent::Modifiers { shift: modifiers.shift(), control: modifiers.control() }
             }
-            // Undo and redo are handled here rather than through a global
-            // shortcut because the shader widget already receives every event,
-            // wherever the cursor happens to be.
+            // Shortcuts are handled here rather than through a global one
+            // because the shader widget already receives every event, wherever
+            // the cursor happens to be.
             iced::Event::Keyboard(keyboard::Event::KeyPressed { key, modifiers, .. }) => {
                 let keyboard::Key::Character(character) = key else {
                     return None;
                 };
-                if !modifiers.command() || !character.eq_ignore_ascii_case("z") {
-                    return None;
-                }
-                let message = if modifiers.shift() { Message::Redo } else { Message::Undo };
+                let message = shortcut(character, modifiers.command(), modifiers.shift())?;
                 return Some(shader::Action::publish(message).and_capture());
             }
             _ => return None,
@@ -364,5 +403,82 @@ mod tests {
 
         let recycled = shared.take_mesh();
         assert_eq!(recycled.vertices.capacity(), capacity, "the buffer was not reused");
+    }
+}
+
+#[cfg(test)]
+mod shortcut_tests {
+    use super::*;
+
+    /// Note the test target: `shortcut`, not a synthesised key event. This is
+    /// a Wayland session, where XTEST key and pointer synthesis silently does
+    /// nothing, so driving the real widget from a test is not an option.
+    fn press(character: &str) -> Option<Message> {
+        shortcut(character, false, false)
+    }
+
+    #[test]
+    fn the_digits_select_brushes_in_the_order_the_tool_strip_shows_them() {
+        for (index, kind) in BrushKind::ALL.into_iter().enumerate() {
+            let key = (index + 1).to_string();
+            assert!(
+                matches!(press(&key), Some(Message::BrushKindChanged(selected)) if selected == kind),
+                "key {key} should select {kind}"
+            );
+        }
+        // One past the last brush, so the mapping cannot silently wrap round.
+        let past_the_end = (BrushKind::ALL.len() + 1).to_string();
+        assert!(press(&past_the_end).is_none());
+        assert!(press("0").is_none(), "there is no brush zero");
+    }
+
+    #[test]
+    fn xyz_toggle_their_own_mirror_plane() {
+        for (key, axis) in [("x", MirrorAxis::X), ("y", MirrorAxis::Y), ("z", MirrorAxis::Z)] {
+            assert!(
+                matches!(press(key), Some(Message::SymmetryAxisToggled(a)) if a == axis),
+                "{key} should toggle {}",
+                axis.label()
+            );
+            // Shift alone must not change what a letter means.
+            assert!(matches!(shortcut(key, false, true), Some(Message::SymmetryAxisToggled(_))));
+        }
+        // Capitals reach the same place.
+        assert!(matches!(press("X"), Some(Message::SymmetryAxisToggled(MirrorAxis::X))));
+    }
+
+    /// `z` is the collision worth pinning: bare it mirrors, with control it
+    /// undoes, and the two must never be confused.
+    #[test]
+    fn control_z_still_undoes_rather_than_mirroring() {
+        assert!(matches!(shortcut("z", true, false), Some(Message::Undo)));
+        assert!(matches!(shortcut("z", true, true), Some(Message::Redo)));
+        assert!(matches!(shortcut("Z", true, false), Some(Message::Undo)));
+        assert!(matches!(press("z"), Some(Message::SymmetryAxisToggled(MirrorAxis::Z))));
+    }
+
+    #[test]
+    fn the_bracket_keys_scale_the_radius_in_opposite_directions() {
+        let Some(Message::BrushRadiusScaled(down)) = press("[") else {
+            panic!("[ did not change the radius");
+        };
+        let Some(Message::BrushRadiusScaled(up)) = press("]") else {
+            panic!("] did not change the radius");
+        };
+        assert!(down < 1.0, "[ should shrink the brush");
+        assert!(up > 1.0, "] should grow it");
+        // One in each direction returns to where it started.
+        assert!((down * up - 1.0).abs() < 1.0e-6);
+    }
+
+    #[test]
+    fn keys_that_mean_nothing_are_left_for_the_toolkit() {
+        assert!(press("q").is_none());
+        assert!(press("").is_none());
+        // Every other control chord belongs to the toolkit or the window
+        // manager, so claiming it here would steal it.
+        assert!(shortcut("s", true, false).is_none());
+        assert!(shortcut("x", true, false).is_none(), "ctrl x is not a mirror toggle");
+        assert!(shortcut("1", true, false).is_none());
     }
 }

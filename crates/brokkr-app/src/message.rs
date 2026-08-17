@@ -2,7 +2,7 @@
 
 //! Messages exchanged between the widget tree and the application.
 
-use brokkr_core::{BrushKind, FalloffCurve};
+use brokkr_core::{BrushKind, FalloffCurve, MirrorAxis};
 use iced::Vector;
 
 use crate::spacemouse::{Action, Axis, ButtonAction, Mode};
@@ -106,7 +106,14 @@ pub enum Message {
     BrushRadiusChanged(f32),
     BrushStrengthChanged(f32),
     FalloffChanged(FalloffCurve),
-    SymmetryToggled(bool),
+    SymmetryToggled(MirrorAxis, bool),
+    /// Flip one mirror plane. The keyboard's version, which unlike the
+    /// checkbox does not know what the current state is.
+    SymmetryAxisToggled(MirrorAxis),
+    /// Multiply the brush radius, for the keyboard nudge. Multiplicative
+    /// because the radius spans fifty to one and a fixed step would crawl at
+    /// the top and jump at the bottom.
+    BrushRadiusScaled(f32),
     PressureToggled(bool),
     PressureCurveChanged(f32),
     TiltToggled(bool),
