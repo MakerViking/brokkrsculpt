@@ -28,6 +28,14 @@
 //! World units are millimetres throughout, so no conversion happens here. STL
 //! and OBJ carry no unit information and every slicer assumes millimetres for
 //! them. 3MF states it explicitly.
+//!
+//! # Axes
+//!
+//! [`ExportMesh`] is in sculpt space, which is Y-up. The three writers rotate to
+//! the Z-up the printing formats are read as, each at the moment it writes a
+//! vector out, so nothing upstream of a file has to think about it. See
+//! [`crate::orientation`] for why that rotation is not the axis swap it looks
+//! like.
 
 pub mod obj;
 pub mod stl;

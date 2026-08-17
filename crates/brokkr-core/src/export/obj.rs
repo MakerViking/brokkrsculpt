@@ -7,10 +7,14 @@
 //! for printing assumes millimetres, which is what the sculpt is in.
 //!
 //! Indices are one based, which is the single most common way to get OBJ wrong.
+//!
+//! Coordinates and normals are rotated to Z-up on the way out. See
+//! [`crate::orientation`].
 
 use std::io::{self, Write};
 
 use super::ExportMesh;
+use crate::orientation::to_print_space;
 
 /// Write `mesh` as an OBJ.
 ///
@@ -26,9 +30,14 @@ pub fn write(mesh: &ExportMesh, out: &mut impl Write) -> io::Result<()> {
     writeln!(out, "o BrokkrSculpt")?;
 
     for position in &mesh.positions {
+        let position = to_print_space(*position);
         writeln!(out, "v {} {} {}", position.x, position.y, position.z)?;
     }
     for normal in &mesh.normals {
+        // Rotated alongside the positions. A normal left in sculpt space beside
+        // a rotated vertex shades as if the light were coming from the wrong
+        // place, which reads as a material problem rather than an axis one.
+        let normal = to_print_space(*normal);
         writeln!(out, "vn {} {} {}", normal.x, normal.y, normal.z)?;
     }
 
@@ -50,6 +59,7 @@ pub fn write(mesh: &ExportMesh, out: &mut impl Write) -> io::Result<()> {
 mod tests {
     use super::*;
     use crate::Volume;
+    use crate::orientation::from_print_space;
     use glam::Vec3;
 
     fn exported() -> ExportMesh {
@@ -64,6 +74,21 @@ mod tests {
         let mut bytes = Vec::new();
         write(mesh, &mut bytes).expect("writing to a vector cannot fail");
         String::from_utf8(bytes).expect("OBJ is text")
+    }
+
+    /// Every vector written under one keyword, read back out of the text.
+    fn vectors(written: &str, keyword: &str) -> Vec<Vec3> {
+        written
+            .lines()
+            .filter(|line| line.starts_with(keyword))
+            .map(|line| {
+                let mut parts = line
+                    .split_whitespace()
+                    .skip(1)
+                    .map(|value| value.parse::<f32>().expect("coordinates are floats"));
+                Vec3::new(parts.next().unwrap(), parts.next().unwrap(), parts.next().unwrap())
+            })
+            .collect()
     }
 
     #[test]
@@ -122,20 +147,41 @@ mod tests {
 
     #[test]
     fn positions_round_trip_through_the_text() {
+        // The file is Z-up while the sculpt is Y-up, so the text holds the
+        // rotated vertex. Rotating what was read back exercises both halves of
+        // the mapping at once.
+        let mesh = exported();
+        let parsed = vectors(&text(&mesh), "v ");
+
+        let expected: Vec<Vec3> = mesh.positions.iter().copied().map(to_print_space).collect();
+        assert_eq!(parsed, expected);
+        assert_eq!(
+            parsed.into_iter().map(from_print_space).collect::<Vec<_>>(),
+            mesh.positions,
+            "rotating back has to land on the sculpt again"
+        );
+    }
+
+    #[test]
+    fn normals_are_rotated_with_the_positions_they_belong_to() {
+        // A rotated vertex carrying a sculpt space normal still renders, and
+        // still looks nearly right, so nothing but a test catches it.
         let mesh = exported();
         let written = text(&mesh);
-        let parsed: Vec<Vec3> = written
-            .lines()
-            .filter(|line| line.starts_with("v "))
-            .map(|line| {
-                let mut parts = line
-                    .split_whitespace()
-                    .skip(1)
-                    .map(|value| value.parse::<f32>().expect("coordinates are floats"));
-                Vec3::new(parts.next().unwrap(), parts.next().unwrap(), parts.next().unwrap())
-            })
-            .collect();
-        assert_eq!(parsed, mesh.positions);
+
+        let expected: Vec<Vec3> = mesh.normals.iter().copied().map(to_print_space).collect();
+        assert_eq!(vectors(&written, "vn "), expected);
+
+        // And still outward, measured in the file's own space: the sphere is
+        // centred on the origin, which the rotation leaves where it is.
+        let positions = vectors(&written, "v ");
+        let outward = positions
+            .iter()
+            .zip(&expected)
+            .filter(|(position, normal)| position.normalize_or_zero().dot(**normal) > 0.0)
+            .count();
+        let fraction = outward as f32 / expected.len() as f32;
+        assert!(fraction > 0.99, "only {:.1}% of normals faced outward", fraction * 100.0);
     }
 
     #[test]

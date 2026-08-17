@@ -16,10 +16,14 @@
 //!
 //! The output is checked by reading it back with a real ZIP implementation in
 //! the tests, not by trusting this code.
+//!
+//! Coordinates are rotated to Z-up on the way out. See [`crate::orientation`].
+//! 3MF carries no vertex normals, so positions are all there is to rotate.
 
 use std::io::{self, Write};
 
 use super::ExportMesh;
+use crate::orientation::to_print_space;
 
 /// The core specification namespace, which every consumer keys off.
 const CORE_NAMESPACE: &str = "http://schemas.microsoft.com/3dmanufacturing/core/2015/02";
@@ -39,6 +43,7 @@ fn model_xml(mesh: &ExportMesh) -> String {
 
     xml.push_str("    <vertices>\n");
     for position in &mesh.positions {
+        let position = to_print_space(*position);
         xml.push_str(&format!(
             "     <vertex x=\"{}\" y=\"{}\" z=\"{}\"/>\n",
             position.x, position.y, position.z
@@ -230,6 +235,40 @@ mod tests {
         let xml = model_xml(&mesh);
         assert_eq!(xml.matches("<vertex ").count(), mesh.positions.len());
         assert_eq!(xml.matches("<triangle ").count(), mesh.triangles.len());
+    }
+
+    #[test]
+    fn the_vertices_in_the_xml_are_z_up() {
+        // The file is Z-up while the sculpt is Y-up. 3MF is the archival copy,
+        // so getting this wrong here is the version that outlives the others.
+        let mesh = exported();
+        let xml = model_xml(&mesh);
+
+        let written: Vec<Vec3> = xml
+            .lines()
+            .filter(|line| line.contains("<vertex "))
+            .map(|line| {
+                let value = |name: &str| {
+                    let at =
+                        line.find(name).expect("a vertex has all three coordinates") + name.len();
+                    let rest = &line[at..];
+                    rest[..rest.find('"').expect("the attribute is quoted")]
+                        .parse::<f32>()
+                        .expect("coordinates are floats")
+                };
+                Vec3::new(value("x=\""), value("y=\""), value("z=\""))
+            })
+            .collect();
+
+        let expected: Vec<Vec3> = mesh.positions.iter().copied().map(to_print_space).collect();
+        assert_eq!(written, expected);
+
+        // The sphere sits at the origin, so a mesh that had been left Y-up
+        // would be indistinguishable by extent alone. Compare axis by axis.
+        let height = |vectors: &[Vec3], axis: fn(&Vec3) -> f32| {
+            vectors.iter().map(axis).fold(f32::NEG_INFINITY, f32::max)
+        };
+        assert_eq!(height(&written, |v| v.z), height(&mesh.positions, |v| v.y));
     }
 
     #[test]
