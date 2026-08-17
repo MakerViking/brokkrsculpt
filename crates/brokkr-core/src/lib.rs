@@ -26,6 +26,7 @@ pub mod brush;
 pub mod export;
 pub mod import;
 pub mod mesh;
+pub mod orientation;
 pub mod pattern;
 pub mod project;
 pub mod raycast;
@@ -48,6 +49,7 @@ pub use brush::{
 pub use export::{ExportMesh, MeshReport};
 pub use import::{ImportError, MESH_EXTENSIONS};
 pub use mesh::{BrickMesh, MeshScratch, Vertex};
+pub use orientation::{from_print_space, to_print_space};
 pub use pattern::{MAX_SCALE_MM, MIN_SCALE_VOXELS, Pattern, PatternKind};
 pub use project::{ProjectError, ProjectState};
 pub use raycast::{Hit, raycast};
