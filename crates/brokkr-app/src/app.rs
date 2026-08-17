@@ -16,6 +16,7 @@ use iced::{Alignment, Element, Length, Subscription};
 
 use crate::camera::OrbitCamera;
 use crate::message::{Message, PointerButton, PointerEvent};
+use crate::tablet::{Diagnosis, Tablet};
 use crate::theme;
 use crate::viewport::{SharedFrame, Viewport};
 
@@ -56,6 +57,9 @@ struct Perf {
     remesh_ms: f32,
     dirty_bricks: usize,
     stamps: usize,
+    /// Pressure the last stroke step ran at, so the overlay can show a pen
+    /// working without the user having to guess.
+    pressure: f32,
     /// Cost of the one off full mesh at load. Kept apart from the per stroke
     /// numbers so a 70 ms load does not sit in the slot that is supposed to
     /// show an 8 ms budget.
@@ -90,6 +94,13 @@ pub struct Brokkr {
     camera: OrbitCamera,
     brush: Brush,
     symmetry: Symmetry,
+    tablet: Tablet,
+    /// Whether stylus pressure scales the brush. Off means every stamp runs at
+    /// full strength, which is also what happens when there is no pen.
+    pressure_enabled: bool,
+    /// Exponent applied to raw pressure. Below 1 makes light touches bite
+    /// harder, above 1 gives finer control at the light end.
+    pressure_curve: f32,
     stroke: Stroke,
     history: History,
     shared: Arc<SharedFrame>,
@@ -112,6 +123,12 @@ pub struct Brokkr {
 
 impl Brokkr {
     pub fn new() -> Self {
+        Self::with_tablet(Tablet::start())
+    }
+
+    /// Build with a given pressure source, so tests do not go looking through
+    /// `/dev/input` and spawn reader threads.
+    fn with_tablet(tablet: Tablet) -> Self {
         let shared = SharedFrame::new();
         let mut volume = Volume::new(VOXEL_SIZE_MM);
         volume.seed_sphere(Vec3::ZERO, MODEL_RADIUS_MM);
@@ -124,6 +141,9 @@ impl Brokkr {
             camera: OrbitCamera::framing(Vec3::ZERO, MODEL_RADIUS_MM),
             brush: Brush::default(),
             symmetry: Symmetry::Off,
+            tablet,
+            pressure_enabled: true,
+            pressure_curve: 1.0,
             stroke: Stroke::new(),
             history: History::default(),
             shared,
@@ -220,13 +240,18 @@ impl Brokkr {
             self.stroke.advance(point, spacing, &mut self.stamp_centres);
         }
 
+        // Sampled once for the whole event rather than per stamp: the pen has
+        // not moved between the stamps that one pointer event interpolates, so
+        // re-reading it would only add jitter.
+        let pressure = self.tablet.stamp_pressure(self.pressure_enabled, self.pressure_curve);
+
         for index in 0..self.stamp_centres.len() {
             let centre = self.stamp_centres[index];
             // Take the normal from the field at each stamp rather than reusing
             // the one from the raycast, so a stroke curving around a form stays
             // oriented to the surface it is actually on.
             let normal = self.volume.gradient_world(centre);
-            let stamp = Stamp::new(centre, normal, direction);
+            let stamp = Stamp::new(centre, normal, direction).with_pressure(pressure);
             self.brush.apply_symmetric(
                 &mut self.volume,
                 &stamp,
@@ -235,6 +260,7 @@ impl Brokkr {
             );
         }
         self.perf.stamps = self.stamp_centres.len();
+        self.perf.pressure = pressure;
         self.perf.edit_ms = started.elapsed().as_secs_f32() * 1000.0;
 
         self.remesh_dirty();
@@ -351,6 +377,9 @@ impl Brokkr {
             Message::SymmetryToggled(on) => {
                 self.symmetry = if on { Symmetry::X } else { Symmetry::Off };
             }
+            Message::PressureToggled(on) => self.pressure_enabled = on,
+            Message::PressureCurveChanged(curve) => self.pressure_curve = curve,
+            Message::ResetPressurePeak => self.tablet.reset_peak(),
             Message::Undo => self.undo(),
             Message::Redo => self.redo(),
             Message::ResetSphere => {
@@ -441,7 +470,15 @@ impl Brokkr {
                 self.perf.dirty_bricks,
                 self.perf.load_ms
             ),
-            format!("{} triangles   {} meshed bricks", pool.triangles, pool.bricks),
+            format!(
+                "{} triangles   {} meshed bricks   pen {}",
+                pool.triangles,
+                pool.bricks,
+                match self.tablet.devices().first() {
+                    Some(device) => format!("{:.2} ({})", self.perf.pressure, device.name),
+                    None => self.tablet.diagnosis().explain().to_string(),
+                }
+            ),
             format!(
                 "{} dense + {} uniform bricks   {volume_mb:.1} MB volume   {pool_mb:.1} MB mesh",
                 self.volume_stats.dense_bricks, self.volume_stats.uniform_bricks
@@ -524,6 +561,7 @@ impl Brokkr {
                     .label("X symmetry")
                     .on_toggle(Message::SymmetryToggled)
                     .text_size(theme::TEXT_SIZE_SMALL),
+                self.pen_panel(),
                 text("HISTORY").size(theme::CAPTION_SIZE).color(theme::TEXT_MUTE),
                 history,
                 button(text("Reset sphere").size(theme::TEXT_SIZE_SMALL))
@@ -540,6 +578,63 @@ impl Brokkr {
         .width(Length::Fixed(240.0))
         .height(Length::Fill)
         .style(theme::panel)
+        .into()
+    }
+
+    /// Pen controls, plus enough of a live readout that a user can tell whether
+    /// their tablet is being seen at all.
+    ///
+    /// Without this, a tablet that is connected but unreadable looks exactly
+    /// like a mouse: strokes work, they just never vary. The device name, the
+    /// device's own pressure range and a live peak turn that into something
+    /// answerable in a few seconds.
+    fn pen_panel(&self) -> Element<'_, Message> {
+        let devices = self.tablet.devices();
+        let status: Element<'_, Message> = match devices.first() {
+            Some(device) => column![
+                text(device.name.clone()).size(theme::CAPTION_SIZE).color(theme::OK),
+                text(format!("{} levels", device.pressure_max))
+                    .size(theme::CAPTION_SIZE)
+                    .color(theme::TEXT_MUTE),
+            ]
+            .spacing(1)
+            .into(),
+            None => text(self.tablet.diagnosis().explain())
+                .size(theme::CAPTION_SIZE)
+                .color(match self.tablet.diagnosis() {
+                    Diagnosis::PermissionDenied => theme::WARN,
+                    _ => theme::TEXT_MUTE,
+                })
+                .into(),
+        };
+
+        let pen = self.tablet.state();
+        let live = if pen.in_proximity {
+            format!("now {:.2}   peak {:.2}", pen.pressure, self.tablet.peak())
+        } else {
+            format!("pen away   peak {:.2}", self.tablet.peak())
+        };
+
+        column![
+            text("PEN").size(theme::CAPTION_SIZE).color(theme::TEXT_MUTE),
+            status,
+            checkbox(self.pressure_enabled)
+                .label("Pressure")
+                .on_toggle(Message::PressureToggled)
+                .text_size(theme::TEXT_SIZE_SMALL),
+            text(format!("Curve  {:.2}", self.pressure_curve))
+                .size(theme::TEXT_SIZE_SMALL)
+                .color(theme::TEXT_DIM),
+            slider(0.30..=3.00, self.pressure_curve, Message::PressureCurveChanged).step(0.05),
+            row![
+                text(live).size(theme::CAPTION_SIZE).font(theme::MONO).color(theme::TEXT_DIM),
+                button(text("reset").size(theme::CAPTION_SIZE))
+                    .on_press(Message::ResetPressurePeak),
+            ]
+            .spacing(theme::S2)
+            .align_y(Alignment::Center),
+        ]
+        .spacing(theme::S2)
         .into()
     }
 }
@@ -561,6 +656,10 @@ mod tests {
         Vector::new(SIZE.x / 2.0, SIZE.y / 2.0)
     }
 
+    fn app() -> Brokkr {
+        Brokkr::with_tablet(crate::tablet::Tablet::inert())
+    }
+
     fn press(app: &mut Brokkr, at: Vector) {
         app.on_pointer(PointerEvent::Pressed {
             button: PointerButton::Left,
@@ -578,7 +677,7 @@ mod tests {
     /// brush, and leave meshed bricks waiting for upload.
     #[test]
     fn a_press_at_the_centre_of_the_viewport_changes_the_model() {
-        let mut app = Brokkr::new();
+        let mut app = app();
         let front = app.camera.eye().normalize() * MODEL_RADIUS_MM;
         let before = app.volume.sample_world(front);
 
@@ -594,7 +693,7 @@ mod tests {
 
     #[test]
     fn the_history_budget_is_reported_before_anything_is_drawn() {
-        let app = Brokkr::new();
+        let app = app();
         assert!(
             app.history_stats.budget_bytes > 0,
             "the overlay would show a zero byte history budget until the first stroke"
@@ -603,7 +702,7 @@ mod tests {
 
     #[test]
     fn a_press_that_misses_the_model_changes_nothing() {
-        let mut app = Brokkr::new();
+        let mut app = app();
         let bricks_before = app.volume.brick_count();
 
         // The far corner of the viewport looks past the sphere into empty space.
@@ -615,7 +714,7 @@ mod tests {
 
     #[test]
     fn orbiting_moves_the_camera_without_touching_the_model() {
-        let mut app = Brokkr::new();
+        let mut app = app();
         let yaw = app.camera.yaw;
         let bricks = app.volume.brick_count();
 
@@ -632,7 +731,7 @@ mod tests {
 
     #[test]
     fn releasing_a_different_button_does_not_cancel_a_stroke() {
-        let mut app = Brokkr::new();
+        let mut app = app();
         press(&mut app, centre_of_viewport());
         app.on_pointer(PointerEvent::Released { button: PointerButton::Right });
         assert!(app.drag.is_some(), "the left button drag should still be live");
@@ -643,7 +742,7 @@ mod tests {
 
     #[test]
     fn a_finished_stroke_becomes_exactly_one_undo_entry() {
-        let mut app = Brokkr::new();
+        let mut app = app();
         press(&mut app, centre_of_viewport());
         for offset in 1..8 {
             app.on_pointer(PointerEvent::Moved {
@@ -662,7 +761,7 @@ mod tests {
 
     #[test]
     fn undo_returns_the_model_to_where_it_started() {
-        let mut app = Brokkr::new();
+        let mut app = app();
         let front = app.camera.eye().normalize() * MODEL_RADIUS_MM;
         let before = app.volume.sample_world(front);
 
@@ -682,7 +781,7 @@ mod tests {
     fn a_drag_stamps_more_than_once_along_its_path() {
         // Without interpolation a fast drag leaves a dotted trail, so check the
         // stroke actually produced several stamps from one pointer event.
-        let mut app = Brokkr::new();
+        let mut app = app();
         app.brush.radius = 1.0;
         press(&mut app, centre_of_viewport());
 
@@ -699,7 +798,7 @@ mod tests {
 
     #[test]
     fn symmetry_sculpts_both_sides_at_once() {
-        let mut app = Brokkr::new();
+        let mut app = app();
         app.update(Message::SymmetryToggled(true));
         // Nothing has told the application how big the viewport is yet, and
         // the ray depends on it.
@@ -724,7 +823,7 @@ mod tests {
 
     #[test]
     fn control_does_not_invert_a_brush_that_has_no_opposite() {
-        let mut app = Brokkr::new();
+        let mut app = app();
         app.control = true;
 
         app.update(Message::BrushKindChanged(BrushKind::Draw));
@@ -742,7 +841,7 @@ mod tests {
     fn resetting_discards_history_that_refers_to_the_old_model() {
         // Undoing into a volume the entry was not recorded against would splice
         // pieces of the discarded model back in.
-        let mut app = Brokkr::new();
+        let mut app = app();
         press(&mut app, centre_of_viewport());
         release(&mut app);
         assert!(app.history.can_undo());
@@ -757,7 +856,7 @@ mod tests {
         // Cheap breadth: each brush goes through the whole application path
         // once, which is where a bad plane or a zero normal would surface.
         for kind in BrushKind::ALL {
-            let mut app = Brokkr::new();
+            let mut app = app();
             app.update(Message::BrushKindChanged(kind));
             app.update(Message::BrushStrengthChanged(0.6));
             press(&mut app, centre_of_viewport());

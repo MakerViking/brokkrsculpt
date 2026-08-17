@@ -22,3 +22,11 @@ glam.workspace = true
 iced = { workspace = true, features = ["advanced", "wgpu", "debug"] }
 log.workspace = true
 wgpu.workspace = true
+
+# Stylus pressure is read straight from the kernel's evdev interface. That sits
+# below the display server, so one code path covers X11, XWayland and Wayland,
+# and it works with any tablet the kernel has a driver for rather than a list of
+# vendors. Nothing else in the stack can supply it: iced 0.14 drops winit's
+# force field, and winit 0.30 only ever had it for touch.
+[target.'cfg(target_os = "linux")'.dependencies]
+evdev.workspace = true

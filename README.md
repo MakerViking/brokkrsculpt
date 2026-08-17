@@ -15,7 +15,8 @@ Full design and milestone plan: [docs/BUILD-SPEC.md](docs/BUILD-SPEC.md).
 ## Status
 
 **M1, the brush system.** Six brushes, stroke interpolation, X symmetry,
-falloff curves and undo. Still no export, no masking, no multiresolution.
+falloff curves, stylus pressure and undo. Still no export, no masking, no
+multiresolution.
 
 Measured on a Radeon RX 6900 XT, at a 256 cubed effective volume, with
 everything switched on at once: interpolation producing several stamps per
@@ -62,6 +63,44 @@ average, has gain above one somewhere and turns its own rounding error into
 visible crust over a stroke. Both now resample the field from a shifted
 position instead, which cannot introduce detail that was not already there.
 
+## Stylus pressure
+
+Pressure works with any tablet the Linux kernel has a driver for. There is no
+vendor list and no per device configuration: a stylus is any input device that
+reports both `ABS_PRESSURE` and `BTN_TOOL_PEN`, which every tablet driver sets.
+Each device's own pressure range is read from the device, so a Huion reporting
+8191 levels and a Wacom reporting 2047 both normalise correctly.
+
+It is read straight from the kernel's evdev interface rather than from the
+window system. That is not a shortcut: iced 0.14's touch events carry only a
+position and drop winit's `force` field, and winit 0.30 never had force for pens
+at all. Reading evdev also means one code path covers X11, XWayland and Wayland,
+because it sits below all three.
+
+**Reading `/dev/input` needs the `input` group on most distributions.** Without
+it the tablet is simply invisible and the brush runs at full strength, exactly
+as it does for a mouse. To fix that, then log out and back in:
+
+```fish
+sudo usermod -aG input $USER
+```
+
+The **PEN** panel names the tablet it found, shows the device's pressure range,
+and gives a live reading with a peak, so you can confirm a tablet is working in
+a few seconds rather than guessing from how the brush feels. If it says no
+tablet was found, this prints every input device and why each was accepted or
+rejected:
+
+```fish
+cargo run --release -p brokkr-app -- --tablets
+```
+
+The **Curve** slider shapes the response: below 1 makes light touches bite
+harder, above 1 gives finer control at the light end.
+
+Windows and macOS fall back to full pressure. Those need Pointer Input or Wintab
+and `NSEvent` respectively, and both are milestones away.
+
 ## Building
 
 Needs a recent stable Rust toolchain and a Vulkan capable GPU.
@@ -81,10 +120,8 @@ Controls:
 | wheel | zoom |
 | ctrl z, ctrl shift z | undo, redo |
 
-Stylus pressure is plumbed through as a first class value on every stamp, but
-nothing supplies it: iced 0.14 drops winit's `force` field, so no pressure
-reaches the application. Wiring it up means patching iced or bypassing it for
-pointer input.
+Pen pressure scales the brush automatically when a tablet is present. See
+[Stylus pressure](#stylus-pressure).
 
 ## Checking it
 
@@ -99,6 +136,11 @@ The tests worth knowing about:
   is closed, every edge shared by exactly two triangles, after every brush has
   been dragged across brick corners. This is the crack test. It ships with a
   control that proves it can detect a gap.
+- `tablet.rs` builds a synthetic tablet with uinput, lets the ordinary scanner
+  find it through `/dev/input` like any other hardware, and checks that pressure
+  comes out the far end at half, full and feather touch. Nothing in it is a
+  mock, so the same path runs for real hardware. It skips loudly when
+  `/dev/uinput` is not writable.
 - `crates/brokkr-gpu/tests/offscreen.rs` renders the sculpt to a texture with no
   window and checks the pixels, then sculpts and checks they changed. It catches
   the class of bug that compiles, passes every unit test, and shows a blank

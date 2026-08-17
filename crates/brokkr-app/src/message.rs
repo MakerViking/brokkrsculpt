@@ -49,6 +49,9 @@ pub enum Message {
     BrushStrengthChanged(f32),
     FalloffChanged(FalloffCurve),
     SymmetryToggled(bool),
+    PressureToggled(bool),
+    PressureCurveChanged(f32),
+    ResetPressurePeak,
     Undo,
     Redo,
     /// Throw the model away and start from a fresh sphere.

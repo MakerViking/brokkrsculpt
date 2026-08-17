@@ -34,6 +34,15 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
+      # The stylus tests build a synthetic tablet with uinput. Best effort:
+      # if the runner will not allow it the test prints a skip and passes, which
+      # is why the local run is the one that counts for pen work.
+      - name: Try to make uinput usable
+        continue-on-error: true
+        run: |
+          sudo modprobe uinput || true
+          sudo chmod 666 /dev/uinput || true
+
       - name: Format
         run: cargo fmt --all -- --check
 

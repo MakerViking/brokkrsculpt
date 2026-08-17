@@ -5,6 +5,7 @@
 mod app;
 mod camera;
 mod message;
+mod tablet;
 mod theme;
 mod viewport;
 
@@ -18,6 +19,13 @@ fn app_theme(_state: &Brokkr) -> iced::Theme {
 }
 
 fn main() -> iced::Result {
+    // A tablet that does not work is hard to diagnose from inside a running
+    // application, so the same detection logic is available without one.
+    if std::env::args().any(|argument| argument == "--tablets") {
+        print!("{}", tablet::report());
+        return Ok(());
+    }
+
     env_logger::Builder::from_env(
         env_logger::Env::default().default_filter_or("warn,brokkr_app=info,brokkr_gpu=info"),
     )
