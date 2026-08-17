@@ -957,6 +957,15 @@ mod tests {
     }
 
     #[test]
+    fn a_fresh_application_starts_with_every_mirror_plane_off() {
+        let app = app();
+        assert!(app.symmetry.is_off(), "symmetry was {:?}", app.symmetry);
+        for axis in MirrorAxis::ALL {
+            assert!(!app.symmetry.axis(axis), "{} was on at startup", axis.label());
+        }
+    }
+
+    #[test]
     fn each_mirror_axis_reaches_the_opposite_side() {
         for (axis, probe) in [
             (MirrorAxis::X, Vec3::new(-1.0, 1.0, 1.0)),

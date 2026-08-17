@@ -13,8 +13,10 @@
 use std::sync::Arc;
 
 use brokkr_core::{BrushKind, FalloffCurve, MirrorAxis};
-use iced::widget::{button, checkbox, column, container, pick_list, row, slider, stack, text};
-use iced::{Alignment, Element, Length};
+use iced::widget::{
+    button, checkbox, column, container, pick_list, row, scrollable, slider, stack, text,
+};
+use iced::{Alignment, Element, Length, Padding};
 
 use super::{
     Brokkr, COARSEST_VOXEL_MM, FINEST_VOXEL_MM, PuckAction, SpaceMouseConfig, SpaceMouseSetting,
@@ -98,6 +100,12 @@ impl Brokkr {
             format!(
                 "{} triangles   {} drawn / {} culled bricks",
                 pool.triangles, pool.drawn, pool.culled
+            ),
+            format!(
+                "brush {}   mirror {}   radius {:.2} mm",
+                self.effective_brush().kind,
+                self.symmetry.label(),
+                self.brush.radius
             ),
             format!(
                 "{} meshed bricks   pen {}",
@@ -233,9 +241,18 @@ impl Brokkr {
 
         let falloff = column![
             text("Falloff").size(theme::TEXT_SIZE_SMALL).color(theme::TEXT_DIM),
-            pick_list(FalloffCurve::ALL, Some(self.brush.falloff), Message::FalloffChanged)
-                .text_size(theme::TEXT_SIZE_SMALL)
-                .width(Length::Fill),
+            FalloffCurve::ALL.into_iter().fold(row![].spacing(theme::S1), |assembled, curve| {
+                assembled.push(
+                    button(text(curve.label()).size(theme::CAPTION_SIZE))
+                        .width(Length::Fill)
+                        .style(if curve == self.brush.falloff {
+                            theme::tool_button_active
+                        } else {
+                            theme::tool_button
+                        })
+                        .on_press(Message::FalloffChanged(curve)),
+                )
+            }),
         ]
         .spacing(theme::S2);
 
@@ -248,7 +265,7 @@ impl Brokkr {
         .spacing(theme::S2);
 
         container(
-            column![
+            scrollable(column![
                 text(self.brush.kind.label().to_uppercase())
                     .size(theme::CAPTION_SIZE)
                     .color(theme::TEXT_MUTE),
@@ -270,10 +287,13 @@ impl Brokkr {
                 .size(theme::CAPTION_SIZE)
                 .color(theme::TEXT_MUTE),
             ]
-            .spacing(theme::S4),
+            .spacing(theme::S4)
+            // Room for the scrollbar, which iced draws over the content rather
+            // than beside it. Without this the last button of a row is clipped.
+            .padding(Padding { right: theme::S4, ..Padding::ZERO })),
         )
         .padding(theme::PANEL_PADDING)
-        .width(Length::Fixed(240.0))
+        .width(Length::Fixed(258.0))
         .height(Length::Fill)
         .style(theme::panel)
         .into()
