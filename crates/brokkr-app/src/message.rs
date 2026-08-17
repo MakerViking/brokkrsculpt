@@ -5,6 +5,8 @@
 use brokkr_core::{BrushKind, FalloffCurve};
 use iced::Vector;
 
+use crate::spacemouse::{Action, Axis, ButtonAction, Mode};
+
 /// A file format the sculpt can be written to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExportFormat {
@@ -70,6 +72,30 @@ pub enum PointerEvent {
     },
 }
 
+/// One change to the SpaceMouse settings.
+///
+/// Gathered into one message rather than a variant each, because there are
+/// twelve of them and they all do the same thing: patch the config and, for
+/// the ones that are not mid drag, write it out.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum SpaceMouseSetting {
+    Mode(Mode),
+    Deadzone(f32),
+    PanSens(f32),
+    ZoomSens(f32),
+    OrbitSens(f32),
+    /// Which raw axis drives an action.
+    Binding(Action, Axis),
+    Invert(Action, bool),
+    Button(usize, ButtonAction),
+    /// Back to the values ported from SindriCAD.
+    Reset,
+    /// Persist the current settings. Sent when a slider is released rather
+    /// than on every step of a drag, which would rewrite the file sixty times
+    /// a second.
+    Save,
+}
+
 #[derive(Debug, Clone, Copy)]
 pub enum Message {
     Pointer(PointerEvent),
@@ -94,4 +120,5 @@ pub enum Message {
     /// Rebuild the volume at a different voxel size, which is the explicit
     /// operation that increases or reduces detail.
     Resample(f32),
+    SpaceMouse(SpaceMouseSetting),
 }

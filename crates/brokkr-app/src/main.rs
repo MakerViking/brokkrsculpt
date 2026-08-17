@@ -7,6 +7,7 @@ mod camera;
 #[cfg(target_os = "linux")]
 mod input_watch;
 mod message;
+mod spacemouse;
 mod tablet;
 mod theme;
 mod viewport;
@@ -25,6 +26,12 @@ fn main() -> iced::Result {
     // application, so the same detection logic is available without one.
     if std::env::args().any(|argument| argument == "--tablets") {
         print!("{}", tablet::report());
+        return Ok(());
+    }
+    // Likewise for the puck: "it is plugged in and nothing happens" is
+    // otherwise indistinguishable from "it was never found".
+    if std::env::args().any(|argument| argument == "--spacemouse") {
+        print!("{}", spacemouse::report());
         return Ok(());
     }
 

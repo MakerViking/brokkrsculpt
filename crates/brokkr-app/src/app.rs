@@ -15,7 +15,10 @@ use iced::widget::{button, checkbox, column, container, pick_list, row, slider, 
 use iced::{Alignment, Element, Length, Subscription};
 
 use crate::camera::OrbitCamera;
-use crate::message::{ExportFormat, Message, PointerButton, PointerEvent};
+use crate::message::{ExportFormat, Message, PointerButton, PointerEvent, SpaceMouseSetting};
+use crate::spacemouse::{
+    self, Action as PuckAction, AxisBinding, ButtonAction, Config as SpaceMouseConfig, SpaceMouse,
+};
 use crate::tablet::{Diagnosis, Tablet};
 use crate::theme;
 use crate::viewport::{SharedFrame, Viewport};
@@ -83,14 +86,21 @@ struct Perf {
 }
 
 impl Perf {
-    fn record_frame(&mut self) {
+    /// Record a presented frame and return how long it took, in milliseconds.
+    ///
+    /// The SpaceMouse scales its motion by this, so it reads the same clock
+    /// the overlay does rather than keeping a second one that could disagree.
+    fn record_frame(&mut self) -> f32 {
         let now = Instant::now();
-        if let Some(previous) = self.last_frame.replace(now) {
-            if self.frame_ms.len() == FRAME_HISTORY {
-                self.frame_ms.pop_front();
-            }
-            self.frame_ms.push_back(now.duration_since(previous).as_secs_f32() * 1000.0);
+        let Some(previous) = self.last_frame.replace(now) else {
+            return 0.0;
+        };
+        let elapsed_ms = now.duration_since(previous).as_secs_f32() * 1000.0;
+        if self.frame_ms.len() == FRAME_HISTORY {
+            self.frame_ms.pop_front();
         }
+        self.frame_ms.push_back(elapsed_ms);
+        elapsed_ms
     }
 
     fn average_frame_ms(&self) -> f32 {
@@ -111,6 +121,7 @@ pub struct Brokkr {
     brush: Brush,
     symmetry: Symmetry,
     tablet: Tablet,
+    spacemouse: SpaceMouse,
     /// Whether stylus pressure scales the brush. Off means every stamp runs at
     /// full strength, which is also what happens when there is no pen.
     pressure_enabled: bool,
@@ -147,12 +158,19 @@ pub struct Brokkr {
 
 impl Brokkr {
     pub fn new() -> Self {
-        Self::with_tablet(Tablet::start())
+        Self::with_devices(Tablet::start(), SpaceMouse::start())
     }
 
-    /// Build with a given pressure source, so tests do not go looking through
-    /// `/dev/input` and spawn reader threads.
+    /// Build with a given pressure source and an inert puck, which is what
+    /// almost every test wants.
+    #[cfg(test)]
     fn with_tablet(tablet: Tablet) -> Self {
+        Self::with_devices(tablet, SpaceMouse::inert())
+    }
+
+    /// Build with given input devices, so tests do not go looking through
+    /// `/dev/input` and spawn reader threads.
+    fn with_devices(tablet: Tablet, spacemouse: SpaceMouse) -> Self {
         let shared = SharedFrame::new();
         let mut volume = Volume::new(VOXEL_SIZE_MM);
         volume.seed_sphere(Vec3::ZERO, MODEL_RADIUS_MM);
@@ -166,6 +184,7 @@ impl Brokkr {
             brush: Brush::default(),
             symmetry: Symmetry::Off,
             tablet,
+            spacemouse,
             pressure_enabled: true,
             pressure_curve: 1.0,
             tilt_enabled: true,
@@ -459,6 +478,95 @@ impl Brokkr {
         log::info!("{}", self.status);
     }
 
+    /// Apply one frame of puck motion, and whatever its buttons asked for.
+    fn drive_from_spacemouse(&mut self, elapsed_ms: f32) {
+        for action in self.spacemouse.take_presses() {
+            match action {
+                ButtonAction::None => {}
+                ButtonAction::Undo => self.undo(),
+                ButtonAction::Redo => self.redo(),
+                // Recentre and refit without losing which way the model is
+                // being looked at, which is what makes this useful mid sculpt.
+                ButtonAction::FrameModel => {
+                    let framed = OrbitCamera::framing(Vec3::ZERO, MODEL_RADIUS_MM);
+                    self.camera = OrbitCamera {
+                        yaw: self.camera.yaw,
+                        pitch: self.camera.pitch,
+                        roll: self.camera.roll,
+                        ..framed
+                    };
+                    self.publish_camera();
+                }
+                // Everything back to the start, roll included. This is the way
+                // out of a view that has been twisted somewhere confusing.
+                ButtonAction::ResetView => {
+                    self.camera = OrbitCamera::framing(Vec3::ZERO, MODEL_RADIUS_MM);
+                    self.publish_camera();
+                }
+                ButtonAction::ToggleSymmetry => {
+                    self.symmetry =
+                        if self.symmetry == Symmetry::Off { Symmetry::X } else { Symmetry::Off };
+                }
+            }
+        }
+
+        let motion = self.spacemouse.motion();
+        let moved = self.spacemouse.config.apply(
+            &motion,
+            elapsed_ms,
+            &mut self.camera,
+            self.viewport_size.y,
+        );
+        if moved {
+            self.publish_camera();
+        }
+    }
+
+    fn configure_spacemouse(&mut self, setting: SpaceMouseSetting) {
+        let config = &mut self.spacemouse.config;
+        // Whether this change should reach the disk now. A slider mid drag
+        // should not: it sends a message per step, and `Save` follows on
+        // release.
+        let mut persist = true;
+        match setting {
+            SpaceMouseSetting::Mode(mode) => config.mode = mode,
+            SpaceMouseSetting::Deadzone(value) => {
+                config.deadzone = value;
+                persist = false;
+            }
+            SpaceMouseSetting::PanSens(value) => {
+                config.pan_sens = value;
+                persist = false;
+            }
+            SpaceMouseSetting::ZoomSens(value) => {
+                config.zoom_sens = value;
+                persist = false;
+            }
+            SpaceMouseSetting::OrbitSens(value) => {
+                config.orbit_sens = value;
+                persist = false;
+            }
+            SpaceMouseSetting::Binding(action, source) => {
+                let invert = config.binding(action).invert;
+                config.set_binding(action, AxisBinding { source, invert });
+            }
+            SpaceMouseSetting::Invert(action, invert) => {
+                let source = config.binding(action).source;
+                config.set_binding(action, AxisBinding { source, invert });
+            }
+            SpaceMouseSetting::Button(index, action) => {
+                if let Some(slot) = config.buttons.get_mut(index) {
+                    *slot = action;
+                }
+            }
+            SpaceMouseSetting::Reset => *config = SpaceMouseConfig::default(),
+            SpaceMouseSetting::Save => {}
+        }
+        if persist {
+            self.spacemouse.config.save();
+        }
+    }
+
     fn undo(&mut self) {
         if self.history.undo(&mut self.volume) {
             self.history_stats = self.history.stats();
@@ -544,7 +652,10 @@ impl Brokkr {
     pub fn update(&mut self, message: Message) {
         match message {
             Message::Pointer(event) => self.on_pointer(event),
-            Message::Frame => self.perf.record_frame(),
+            Message::Frame => {
+                let elapsed_ms = self.perf.record_frame();
+                self.drive_from_spacemouse(elapsed_ms);
+            }
             Message::BrushKindChanged(kind) => self.brush.kind = kind,
             Message::FalloffChanged(curve) => self.brush.falloff = curve,
             Message::BrushRadiusChanged(radius) => self.brush.radius = radius,
@@ -560,6 +671,7 @@ impl Brokkr {
             Message::Redo => self.redo(),
             Message::Export(format) => self.export(format),
             Message::Resample(voxel_size) => self.resample(voxel_size),
+            Message::SpaceMouse(setting) => self.configure_spacemouse(setting),
             Message::ResetSphere => {
                 let mut volume = Volume::new(self.voxel_size);
                 volume.seed_sphere(Vec3::ZERO, MODEL_RADIUS_MM);
@@ -743,6 +855,7 @@ impl Brokkr {
                     .on_toggle(Message::SymmetryToggled)
                     .text_size(theme::TEXT_SIZE_SMALL),
                 self.pen_panel(),
+                self.spacemouse_panel(),
                 text("HISTORY").size(theme::CAPTION_SIZE).color(theme::TEXT_MUTE),
                 history,
                 self.detail_panel(),
@@ -761,6 +874,170 @@ impl Brokkr {
         .width(Length::Fixed(240.0))
         .height(Length::Fill)
         .style(theme::panel)
+        .into()
+    }
+
+    /// SpaceMouse settings, plus the live readout.
+    ///
+    /// The readout is the point of this panel as much as the bindings are: a
+    /// puck that is connected but silent, or one whose axes are not where the
+    /// labels claim, is otherwise undiagnosable from inside the application.
+    /// The pen panel exists for the same reason.
+    fn spacemouse_panel(&self) -> Element<'_, Message> {
+        let config = &self.spacemouse.config;
+        let motion = self.spacemouse.motion();
+        let full_scale = self.spacemouse.full_scale();
+
+        let status = self.spacemouse.diagnosis();
+        let header: Element<'_, Message> = match self.spacemouse.devices().first() {
+            Some(device) => {
+                text(device.name.clone()).size(theme::CAPTION_SIZE).color(theme::TEXT_DIM).into()
+            }
+            None => text(status.explain())
+                .size(theme::CAPTION_SIZE)
+                .color(if status == spacemouse::Diagnosis::NoDevice {
+                    theme::TEXT_MUTE
+                } else {
+                    theme::WARN
+                })
+                .into(),
+        };
+
+        // One line per raw axis: name, a bar, and the number. Scaled against
+        // the largest push seen, because a relative axis carries no range to
+        // read from the device.
+        let readout = spacemouse::Axis::ALL.into_iter().fold(
+            column![].spacing(theme::S1),
+            |assembled, axis| {
+                let value = motion.axis(axis);
+                let past_deadzone = value.abs() >= config.deadzone;
+                assembled.push(
+                    row![
+                        text(axis.label())
+                            .size(theme::CAPTION_SIZE)
+                            .color(theme::TEXT_MUTE)
+                            .width(Length::Fixed(84.0)),
+                        text(format!("{value:>6.0}"))
+                            .size(theme::CAPTION_SIZE)
+                            .color(if past_deadzone { theme::ACCENT } else { theme::TEXT_MUTE }),
+                        text(format!("{:>4.0}%", value / full_scale.max(1.0) * 100.0))
+                            .size(theme::CAPTION_SIZE)
+                            .color(theme::TEXT_MUTE),
+                    ]
+                    .spacing(theme::S2),
+                )
+            },
+        );
+
+        // One row per action: which axis drives it, and whether it is flipped.
+        let bindings =
+            PuckAction::ALL.into_iter().fold(column![].spacing(theme::S2), |assembled, action| {
+                let binding = config.binding(action);
+                assembled.push(
+                    column![
+                        text(action.label()).size(theme::CAPTION_SIZE).color(theme::TEXT_DIM),
+                        row![
+                            pick_list(spacemouse::Axis::ALL, Some(binding.source), move |axis| {
+                                Message::SpaceMouse(SpaceMouseSetting::Binding(action, axis))
+                            })
+                            .text_size(theme::CAPTION_SIZE)
+                            .width(Length::Fill),
+                            checkbox(binding.invert)
+                                .label("flip")
+                                .on_toggle(move |invert| Message::SpaceMouse(
+                                    SpaceMouseSetting::Invert(action, invert)
+                                ))
+                                .text_size(theme::CAPTION_SIZE),
+                        ]
+                        .spacing(theme::S2)
+                        .align_y(Alignment::Center),
+                    ]
+                    .spacing(theme::S1),
+                )
+            });
+
+        let buttons = (0..self.spacemouse.config.buttons.len()).fold(
+            column![].spacing(theme::S2),
+            |assembled, index| {
+                assembled.push(
+                    column![
+                        text(format!("Button {}", index + 1))
+                            .size(theme::CAPTION_SIZE)
+                            .color(theme::TEXT_DIM),
+                        pick_list(
+                            ButtonAction::ALL,
+                            Some(self.spacemouse.config.buttons[index]),
+                            move |action| Message::SpaceMouse(SpaceMouseSetting::Button(
+                                index, action
+                            ))
+                        )
+                        .text_size(theme::CAPTION_SIZE)
+                        .width(Length::Fill),
+                    ]
+                    .spacing(theme::S1),
+                )
+            },
+        );
+
+        // Sensitivities are shown as a multiple of the ported default rather
+        // than as 6e-7, which is a number nobody can reason about.
+        let sensitivity =
+            |label: &'static str, value: f32, default: f32, make: fn(f32) -> SpaceMouseSetting| {
+                let multiple = value / default;
+                column![
+                    text(format!("{label}  {multiple:.2}x"))
+                        .size(theme::CAPTION_SIZE)
+                        .color(theme::TEXT_DIM),
+                    slider(0.1..=5.0, multiple, move |m| Message::SpaceMouse(make(m * default)))
+                        .step(0.05)
+                        .on_release(Message::SpaceMouse(SpaceMouseSetting::Save)),
+                ]
+                .spacing(theme::S1)
+            };
+
+        let defaults = SpaceMouseConfig::default();
+
+        column![
+            text("SPACEMOUSE").size(theme::CAPTION_SIZE).color(theme::TEXT_MUTE),
+            header,
+            readout,
+            row![
+                text("Mode").size(theme::CAPTION_SIZE).color(theme::TEXT_DIM),
+                pick_list(
+                    [spacemouse::Mode::Object, spacemouse::Mode::Camera],
+                    Some(config.mode),
+                    |mode| Message::SpaceMouse(SpaceMouseSetting::Mode(mode))
+                )
+                .text_size(theme::CAPTION_SIZE)
+                .width(Length::Fill),
+            ]
+            .spacing(theme::S2)
+            .align_y(Alignment::Center),
+            column![
+                text(format!("Deadzone  {:.0}", config.deadzone))
+                    .size(theme::CAPTION_SIZE)
+                    .color(theme::TEXT_DIM),
+                slider(0.0..=120.0, config.deadzone, |value| Message::SpaceMouse(
+                    SpaceMouseSetting::Deadzone(value)
+                ))
+                .step(1.0)
+                .on_release(Message::SpaceMouse(SpaceMouseSetting::Save)),
+            ]
+            .spacing(theme::S1),
+            sensitivity("Pan", config.pan_sens, defaults.pan_sens, SpaceMouseSetting::PanSens),
+            sensitivity("Zoom", config.zoom_sens, defaults.zoom_sens, SpaceMouseSetting::ZoomSens),
+            sensitivity(
+                "Rotate",
+                config.orbit_sens,
+                defaults.orbit_sens,
+                SpaceMouseSetting::OrbitSens
+            ),
+            bindings,
+            buttons,
+            button(text("Reset puck settings").size(theme::CAPTION_SIZE))
+                .on_press(Message::SpaceMouse(SpaceMouseSetting::Reset)),
+        ]
+        .spacing(theme::S2)
         .into()
     }
 
