@@ -140,7 +140,9 @@ pub enum SpaceMouseSetting {
     Save,
 }
 
-#[derive(Debug, Clone, Copy)]
+/// Not `Copy`: one variant carries the raw text of a numeric field being typed
+/// into, which has to be owned so a half typed value survives.
+#[derive(Debug, Clone)]
 pub enum Message {
     Pointer(PointerEvent),
     /// One presented frame, used to drive the frame rate readout and to keep
@@ -172,6 +174,13 @@ pub enum Message {
     /// Whether the radius tracks the model's size (ZBrush calls it Dynamic)
     /// rather than staying a fixed number of millimetres.
     DynamicRadiusToggled(bool),
+    /// Close the right-click menu.
+    MenuClosed,
+    /// A numeric field in the menu was typed into. Carries the raw text, since
+    /// a half typed value has to survive until it parses.
+    MenuFieldEdited(SizingTarget, String),
+    /// Commit whatever is in the field being edited and stop editing it.
+    MenuFieldSubmitted,
     PressureToggled(bool),
     PressureCurveChanged(f32),
     TiltToggled(bool),

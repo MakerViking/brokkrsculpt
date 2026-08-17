@@ -15,12 +15,16 @@ use std::sync::Arc;
 use brokkr_core::{BrushKind, FalloffCurve, MirrorAxis, PatternKind};
 use iced::widget::{
     button, checkbox, column, container, pick_list, row, scrollable, slider, stack, text,
+    text_input,
 };
 use iced::{Alignment, Element, Length, Padding};
 
 use super::{
     Brokkr, COARSEST_VOXEL_MM, FINEST_VOXEL_MM, PuckAction, SpaceMouseConfig, SpaceMouseSetting,
 };
+use glam::Vec2;
+
+use crate::app::SizingTarget;
 use crate::message::{ExportFormat, Message, PanelSection};
 use crate::spacemouse::{self, ButtonAction};
 use crate::tablet::Diagnosis;
@@ -38,7 +42,10 @@ impl Brokkr {
             .height(Length::Fill)
             .style(theme::viewport_well);
 
-        let scene = stack![well, self.overlay()];
+        let scene = match self.menu {
+            Some(at) => stack![well, self.overlay(), self.tool_menu(at)],
+            None => stack![well, self.overlay()],
+        };
 
         column![
             self.header(),
@@ -142,6 +149,143 @@ impl Brokkr {
         container(container(readout).padding(theme::S3).style(theme::overlay_card))
             .padding(theme::S4)
             .into()
+    }
+
+    /// The current tool's own controls, at the cursor.
+    ///
+    /// This is ZBrush's QuickMenu: the documented point of it there is reaching
+    /// the brush numbers without moving the cursor to the edge of the screen,
+    /// and that is the point of it here. Nomad reaches the same place from the
+    /// other direction -- it has no radial menu at all, and its answer is a
+    /// bound key plus a drag, which is the `s` and `u` gesture.
+    ///
+    /// Radius and strength get a typed field as well as a slider, because that
+    /// is the thing a slider genuinely cannot do: name an exact 2.5 mm.
+    fn tool_menu(&self, at: Vec2) -> Element<'_, Message> {
+        const WIDTH: f32 = 210.0;
+        // Roughly how tall it comes out. Only used to keep it on screen, so
+        // being a little out costs nothing.
+        const HEIGHT: f32 = 300.0;
+
+        let numeric = |label: &'static str,
+                       which: SizingTarget,
+                       range: std::ops::RangeInclusive<f32>,
+                       step: f32,
+                       on_slide: fn(f32) -> Message| {
+            let value = match which {
+                SizingTarget::Radius => self.brush.radius,
+                SizingTarget::Strength => self.brush.strength,
+            };
+            column![
+                row![
+                    text(label)
+                        .size(theme::CAPTION_SIZE)
+                        .color(theme::TEXT_DIM)
+                        .width(Length::FillPortion(2)),
+                    text_input("", &self.menu_field_text(which))
+                        .on_input(move |text| Message::MenuFieldEdited(which, text))
+                        .on_submit(Message::MenuFieldSubmitted)
+                        .size(theme::CAPTION_SIZE)
+                        .width(Length::FillPortion(1)),
+                ]
+                .spacing(theme::S2)
+                .align_y(Alignment::Center),
+                slider(range, value, on_slide).step(step),
+            ]
+            .spacing(theme::S1)
+        };
+
+        let falloff =
+            FalloffCurve::ALL.into_iter().fold(row![].spacing(theme::S1), |assembled, curve| {
+                assembled.push(
+                    button(text(curve.label()).size(theme::CAPTION_SIZE))
+                        .width(Length::Fill)
+                        .style(if curve == self.brush.falloff {
+                            theme::tool_button_active
+                        } else {
+                            theme::tool_button
+                        })
+                        .on_press(Message::FalloffChanged(curve)),
+                )
+            });
+
+        let patterns =
+            PatternKind::ALL.into_iter().fold(row![].spacing(theme::S1), |assembled, kind| {
+                assembled.push(
+                    button(text(kind.short_label()).size(theme::CAPTION_SIZE))
+                        .width(Length::Fill)
+                        .style(if kind == self.brush.pattern.kind {
+                            theme::tool_button_active
+                        } else {
+                            theme::tool_button
+                        })
+                        .on_press(Message::PatternChanged(kind)),
+                )
+            });
+
+        let mut body = column![
+            text(self.effective_brush().kind.label().to_uppercase())
+                .size(theme::CAPTION_SIZE)
+                .color(theme::TEXT_MUTE),
+            numeric(
+                "Radius mm",
+                SizingTarget::Radius,
+                super::MIN_RADIUS_MM..=super::MAX_RADIUS_MM,
+                0.05,
+                Message::BrushRadiusChanged
+            ),
+            numeric(
+                "Strength",
+                SizingTarget::Strength,
+                super::MIN_STRENGTH..=super::MAX_STRENGTH,
+                0.01,
+                Message::BrushStrengthChanged
+            ),
+            text("Falloff").size(theme::CAPTION_SIZE).color(theme::TEXT_DIM),
+            falloff,
+            text("Pattern").size(theme::CAPTION_SIZE).color(theme::TEXT_DIM),
+            patterns,
+        ]
+        .spacing(theme::S3);
+
+        // The pattern's own numbers only mean anything once one is chosen.
+        if self.brush.pattern.kind != PatternKind::None {
+            let floor = self.voxel_size * brokkr_core::MIN_SCALE_VOXELS;
+            body = body.push(
+                column![
+                    text(format!("Feature  {:.2} mm", self.brush.pattern.scale_mm))
+                        .size(theme::CAPTION_SIZE)
+                        .color(theme::TEXT_DIM),
+                    slider(
+                        floor..=brokkr_core::MAX_SCALE_MM,
+                        self.brush.pattern.scale_mm.clamp(floor, brokkr_core::MAX_SCALE_MM),
+                        Message::PatternScaleChanged
+                    )
+                    .step(0.05),
+                    text(format!("Depth  {:.2}", self.brush.pattern.depth))
+                        .size(theme::CAPTION_SIZE)
+                        .color(theme::TEXT_DIM),
+                    slider(0.0..=1.0, self.brush.pattern.depth, Message::PatternDepthChanged)
+                        .step(0.02),
+                ]
+                .spacing(theme::S1),
+            );
+        }
+
+        // Kept on screen: opened near the right or bottom edge it would
+        // otherwise hang off, and the controls furthest from the cursor are the
+        // ones that would go.
+        let left = at.x.min((self.viewport_size.x - WIDTH).max(0.0)).max(0.0);
+        let top = at.y.min((self.viewport_size.y - HEIGHT).max(0.0)).max(0.0);
+
+        container(
+            container(body)
+                .padding(theme::S4)
+                .width(Length::Fixed(WIDTH))
+                .style(theme::overlay_card),
+        )
+        .padding(Padding { left, top, ..Padding::ZERO })
+        .into()
     }
 
     /// The always visible strip of brushes down the left.

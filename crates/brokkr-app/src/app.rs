@@ -78,6 +78,17 @@ const FRAME_HISTORY: usize = 60;
 /// matrix on arrival.
 const PITCH_SAFE: f32 = std::f32::consts::FRAC_PI_2 - 0.02;
 
+/// How far the pointer may travel during a right press and still count as a
+/// click rather than an orbit.
+///
+/// Right drag orbits, so this is the whole difficulty of putting a menu on right
+/// click: too tight and a click that wobbles a pixel opens nothing, too loose
+/// and a small deliberate orbit opens a menu over the model. Four pixels and a
+/// quarter second are a starting point to tune by feel, which is why both are
+/// named.
+const CLICK_SLOP_PX: f32 = 4.0;
+const CLICK_MS: u128 = 250;
+
 /// What a held pointer button is currently doing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DragKind {
@@ -90,10 +101,17 @@ enum DragKind {
 
 /// A drag in progress, tagged with the button that started it so that
 /// releasing a different button does not cancel it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 struct Drag {
     button: PointerButton,
     kind: DragKind,
+    /// Where the button went down, and when.
+    origin: Vec2,
+    pressed_at: Instant,
+    /// Whether the pointer has travelled far enough to count as a drag rather
+    /// than a click. Once true it stays true: a drag that returns to where it
+    /// started is still a drag.
+    moved: bool,
 }
 
 /// Timings for the debug overlay.
@@ -207,6 +225,14 @@ pub struct Brokkr {
     cube_hover: Option<navcube::Part>,
     /// A camera move in progress after clicking the cube.
     flight: Option<Flight>,
+    /// Where the right-click menu is open, in widget pixels.
+    menu: Option<Vec2>,
+    /// A numeric field in the menu being typed into.
+    ///
+    /// Held as text rather than parsed on every keystroke, because a half typed
+    /// value like `2.` does not parse and snapping the field back to the old
+    /// number mid-edit makes it unusable.
+    menu_edit: Option<(SizingTarget, String)>,
 }
 
 /// An animated camera move to an orientation.
@@ -301,6 +327,8 @@ impl Brokkr {
             cube: brokkr_gpu::OverlayBatch::default(),
             cube_hover: None,
             flight: None,
+            menu: None,
+            menu_edit: None,
         };
         app.remesh_dirty();
         // Otherwise the overlay reports a zero byte budget until the first
@@ -776,6 +804,42 @@ impl Brokkr {
         }
     }
 
+    /// Take a keystroke in one of the menu's numeric fields.
+    ///
+    /// The text is kept whatever it says, so `2.` and an empty field survive
+    /// being typed through. The value only moves when the text parses to
+    /// something inside the same bounds the sliders use -- a field that silently
+    /// accepted 500 mm would be worse than one that ignores it.
+    fn edit_menu_field(&mut self, which: SizingTarget, text: String) {
+        if let Ok(value) = text.trim().parse::<f32>()
+            && value.is_finite()
+        {
+            match which {
+                SizingTarget::Radius => {
+                    self.brush.radius = value.clamp(MIN_RADIUS_MM, MAX_RADIUS_MM);
+                }
+                SizingTarget::Strength => {
+                    self.brush.strength = value.clamp(MIN_STRENGTH, MAX_STRENGTH);
+                }
+            }
+        }
+        self.menu_edit = Some((which, text));
+    }
+
+    /// The text a menu field should show: what is being typed, or the current
+    /// value formatted.
+    pub(crate) fn menu_field_text(&self, which: SizingTarget) -> String {
+        if let Some((editing, text)) = &self.menu_edit
+            && *editing == which
+        {
+            return text.clone();
+        }
+        match which {
+            SizingTarget::Radius => format!("{:.2}", self.brush.radius),
+            SizingTarget::Strength => format!("{:.2}", self.brush.strength),
+        }
+    }
+
     /// Move the number a sizing gesture is holding, from how far the pointer
     /// has travelled since it began.
     ///
@@ -830,6 +894,12 @@ impl Brokkr {
                 let position = Vec2::new(position.x, position.y);
                 self.cursor = Some(position);
 
+                // An open menu swallows the next press: closing it is what the
+                // click was for, and sculpting as well would be a surprise.
+                if self.menu.take().is_some() {
+                    return;
+                }
+
                 // A press on the navigation cube belongs to the cube. Checked
                 // before anything else, or clicking it would also carve a divot
                 // out of the model behind it.
@@ -856,7 +926,13 @@ impl Brokkr {
                         }
                     }
                 };
-                self.drag = Some(Drag { button, kind });
+                self.drag = Some(Drag {
+                    button,
+                    kind,
+                    origin: position,
+                    pressed_at: Instant::now(),
+                    moved: false,
+                });
 
                 if let DragKind::Sculpt(direction) = kind {
                     // One stroke is one undo entry, so recording opens here and
@@ -868,9 +944,18 @@ impl Brokkr {
                 self.refresh_overlay();
             }
             PointerEvent::Released { button } => {
-                if self.drag.is_some_and(|drag| drag.button == button) {
-                    if matches!(self.drag.map(|drag| drag.kind), Some(DragKind::Sculpt(_))) {
+                if let Some(drag) = self.drag.filter(|drag| drag.button == button) {
+                    if matches!(drag.kind, DragKind::Sculpt(_)) {
                         self.finish_stroke();
+                    }
+                    // A right press that neither moved nor lingered was a click,
+                    // and a click opens the tool's own controls where the hand
+                    // already is. Anything else was an orbit or a pan.
+                    if button == PointerButton::Right
+                        && !drag.moved
+                        && drag.pressed_at.elapsed().as_millis() < CLICK_MS
+                    {
+                        self.menu = Some(drag.origin);
                     }
                     self.drag = None;
                 }
@@ -881,6 +966,15 @@ impl Brokkr {
                 let position = Vec2::new(position.x, position.y);
                 let delta = self.cursor.map(|previous| position - previous).unwrap_or(Vec2::ZERO);
                 self.cursor = Some(position);
+
+                // Past the slop this is a drag, not a click, and it stays one
+                // even if it comes back: otherwise an orbit that ends where it
+                // began would open the menu.
+                if let Some(drag) = &mut self.drag
+                    && position.distance(drag.origin) > CLICK_SLOP_PX
+                {
+                    drag.moved = true;
+                }
 
                 // A held sizing key owns the pointer whether or not a button
                 // is down, so this comes before the drag cases.
@@ -964,6 +1058,12 @@ impl Brokkr {
                 }
             }
             Message::SizingEnded => self.sizing = None,
+            Message::MenuClosed => {
+                self.menu = None;
+                self.menu_edit = None;
+            }
+            Message::MenuFieldEdited(which, text) => self.edit_menu_field(which, text),
+            Message::MenuFieldSubmitted => self.menu_edit = None,
             Message::DynamicRadiusToggled(on) => self.dynamic_radius = on,
             Message::BrushRadiusScaled(factor) => {
                 self.brush.radius =
@@ -1513,6 +1613,116 @@ mod tests {
         app.update(Message::Frame);
         let elapsed = app.flight.expect("the flight ended early").elapsed_ms;
         assert!(elapsed > 0.0, "the frame tick did not advance the flight");
+    }
+
+    fn right_press(app: &mut Brokkr, at: Vector) {
+        app.on_pointer(PointerEvent::Pressed {
+            button: PointerButton::Right,
+            position: at,
+            size: SIZE,
+        });
+    }
+
+    fn right_release(app: &mut Brokkr) {
+        app.on_pointer(PointerEvent::Released { button: PointerButton::Right });
+    }
+
+    /// Right drag already orbits, so the menu has to be told apart from it by
+    /// movement and time. All three outcomes matter, and getting any of them
+    /// wrong makes either the menu or the orbit unusable.
+    #[test]
+    fn a_right_click_opens_the_menu_but_a_right_drag_orbits() {
+        let centre = centre_of_viewport();
+        let moved_to = |dx: f32| Vector::new(SIZE.x / 2.0 + dx, SIZE.y / 2.0);
+
+        // A click that does not move: the menu.
+        let mut click = app();
+        right_press(&mut click, centre);
+        right_release(&mut click);
+        assert!(click.menu.is_some(), "a right click did not open the menu");
+
+        // A drag: orbits, and opens nothing.
+        let mut orbit = app();
+        let before = orbit.camera.yaw;
+        right_press(&mut orbit, centre);
+        orbit.on_pointer(PointerEvent::Moved { position: moved_to(60.0), size: SIZE });
+        right_release(&mut orbit);
+        assert!(orbit.menu.is_none(), "an orbit opened the menu");
+        assert_ne!(orbit.camera.yaw, before, "the orbit did not happen");
+
+        // A drag that returns to where it started is still a drag.
+        let mut returned = app();
+        right_press(&mut returned, centre);
+        for dx in [40.0, 0.0] {
+            returned.on_pointer(PointerEvent::Moved { position: moved_to(dx), size: SIZE });
+        }
+        right_release(&mut returned);
+        assert!(returned.menu.is_none(), "an orbit that came back opened the menu");
+
+        // Inside the slop is still a click: a hand never holds perfectly still.
+        let mut wobble = app();
+        right_press(&mut wobble, centre);
+        wobble.on_pointer(PointerEvent::Moved {
+            position: moved_to(CLICK_SLOP_PX * 0.5),
+            size: SIZE,
+        });
+        right_release(&mut wobble);
+        assert!(wobble.menu.is_some(), "a click that wobbled a pixel opened nothing");
+    }
+
+    #[test]
+    fn the_menu_closes_on_escape_and_on_a_click_elsewhere() {
+        let mut app = app();
+        right_press(&mut app, centre_of_viewport());
+        right_release(&mut app);
+        assert!(app.menu.is_some());
+
+        app.update(Message::MenuClosed);
+        assert!(app.menu.is_none(), "escape did not close it");
+
+        // Open again, then click elsewhere: the click closes it and must not
+        // also sculpt, or dismissing a menu would carve the model.
+        right_press(&mut app, centre_of_viewport());
+        right_release(&mut app);
+        let probe = app
+            .surface_under(Vec2::new(SIZE.x / 2.0, SIZE.y / 2.0))
+            .expect("the centre should hit the sphere");
+        let before = app.volume.sample_world(probe);
+
+        press(&mut app, centre_of_viewport());
+        release(&mut app);
+        assert!(app.menu.is_none(), "a click elsewhere did not close the menu");
+        assert_eq!(app.volume.sample_world(probe), before, "dismissing the menu sculpted");
+    }
+
+    /// A numeric field is the reason the menu beats the panel, and the reason it
+    /// is fiddly: half typed text has to survive, but a value outside the
+    /// slider's range must not be accepted quietly.
+    #[test]
+    fn a_typed_field_survives_being_half_written_and_still_clamps() {
+        let mut app = app();
+
+        // Part way through typing "2.5": neither "" nor "2." parses, and
+        // snapping the field back mid-edit would make it unusable.
+        for text in ["", "2", "2.", "2.5"] {
+            app.update(Message::MenuFieldEdited(SizingTarget::Radius, text.to_string()));
+            assert_eq!(app.menu_field_text(SizingTarget::Radius), text, "the text was lost");
+        }
+        assert!((app.brush.radius - 2.5).abs() < 1.0e-5, "the value never arrived");
+
+        // Junk leaves the value alone rather than zeroing it.
+        app.update(Message::MenuFieldEdited(SizingTarget::Radius, "banana".into()));
+        assert!((app.brush.radius - 2.5).abs() < 1.0e-5, "junk moved the value");
+
+        // Out of range is clamped, not accepted.
+        app.update(Message::MenuFieldEdited(SizingTarget::Radius, "500".into()));
+        assert_eq!(app.brush.radius, MAX_RADIUS_MM);
+        app.update(Message::MenuFieldEdited(SizingTarget::Strength, "-5".into()));
+        assert_eq!(app.brush.strength, MIN_STRENGTH);
+
+        // Once submitted the field goes back to showing the real value.
+        app.update(Message::MenuFieldSubmitted);
+        assert_eq!(app.menu_field_text(SizingTarget::Radius), format!("{:.2}", app.brush.radius));
     }
 
     #[test]

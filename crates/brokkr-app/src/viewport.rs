@@ -232,6 +232,11 @@ impl shader::Program<Message> for Viewport {
             // because the shader widget already receives every event, wherever
             // the cursor happens to be.
             iced::Event::Keyboard(keyboard::Event::KeyPressed { key, modifiers, .. }) => {
+                // Escape closes the right-click menu. Handled before the
+                // character keys because it is a named key, not a character.
+                if matches!(key, keyboard::Key::Named(keyboard::key::Named::Escape)) {
+                    return Some(shader::Action::publish(Message::MenuClosed).and_capture());
+                }
                 let keyboard::Key::Character(character) = key else {
                     return None;
                 };
