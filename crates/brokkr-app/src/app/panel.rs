@@ -203,10 +203,7 @@ impl Brokkr {
         };
 
         container(
-            container(body)
-                .padding(theme::S2)
-                .width(Length::Fixed(190.0))
-                .style(theme::overlay_card),
+            container(body).padding(theme::S2).width(Length::Fixed(190.0)).style(theme::menu_card),
         )
         .padding(Padding { left, top: 0.0, ..Padding::ZERO })
         .into()
@@ -412,10 +409,7 @@ impl Brokkr {
         let top = at.y.min((self.viewport_size.y - HEIGHT).max(0.0)).max(0.0);
 
         container(
-            container(body)
-                .padding(theme::S4)
-                .width(Length::Fixed(WIDTH))
-                .style(theme::overlay_card),
+            container(body).padding(theme::S4).width(Length::Fixed(WIDTH)).style(theme::menu_card),
         )
         .padding(Padding { left, top, ..Padding::ZERO })
         .into()

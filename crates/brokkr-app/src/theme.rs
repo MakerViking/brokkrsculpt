@@ -189,6 +189,20 @@ pub fn tool_button_active(
     }
 }
 
+/// A menu that drops from the bar, or any surface you must be able to read.
+///
+/// Opaque, unlike [`overlay_card`]. That card is 0.82 alpha because it floats
+/// over the model and should not hide it; a menu floats over the *debug
+/// overlay*, and at two translucent layers the text of both became unreadable.
+pub fn menu_card(_theme: &iced::Theme) -> iced::widget::container::Style {
+    iced::widget::container::Style {
+        background: Some(PANEL_2.into()),
+        text_color: Some(TEXT),
+        border: iced::Border { color: LINE_STRONG, width: 1.0, radius: RADIUS_MD.into() },
+        ..Default::default()
+    }
+}
+
 /// A collapsible section heading. Flat and borderless, so it reads as a
 /// heading rather than as a button, but brightens on hover so it is
 /// discoverable as one.
