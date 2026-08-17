@@ -34,6 +34,7 @@ pub mod resample;
 pub mod stroke;
 pub mod undo;
 pub mod volume;
+pub mod voxelise;
 
 pub use apron::ApronBuffer;
 pub use brick::{

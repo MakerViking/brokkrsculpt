@@ -283,3 +283,66 @@ fn patterned_sculpting_keeps_the_surface_closed() {
         &open.iter().take(5).collect::<Vec<_>>()
     );
 }
+
+/// An imported model has to tile as cleanly as a sculpted one.
+///
+/// This is the specific guard for the voxeliser's binning invariant. A brick is
+/// binned only when a triangle reaches its band-expanded box; if that test were
+/// ever narrowed, the bricks just outside the shell would stop being filled and
+/// the band would be truncated at a brick face. What that produces is a flat
+/// facet aligned to the 32 voxel grid -- which renders perfectly, exports with a
+/// plausible triangle count, and is invisible to everything except an edge
+/// count. The mesh is deliberately built off the lattice and spanning several
+/// brick boundaries so the seams have somewhere to go wrong.
+#[test]
+fn a_voxelised_import_produces_a_closed_surface() {
+    use brokkr_core::ExportMesh;
+    use brokkr_core::voxelise::{VoxeliseOptions, voxelise};
+
+    // A cube deliberately NOT aligned to the lattice, big enough to span
+    // several bricks on every axis.
+    let low = Vec3::new(-17.3, -21.7, -14.1);
+    let high = Vec3::new(19.9, 15.3, 22.7);
+    let c = [
+        Vec3::new(low.x, low.y, low.z),
+        Vec3::new(high.x, low.y, low.z),
+        Vec3::new(high.x, high.y, low.z),
+        Vec3::new(low.x, high.y, low.z),
+        Vec3::new(low.x, low.y, high.z),
+        Vec3::new(high.x, low.y, high.z),
+        Vec3::new(high.x, high.y, high.z),
+        Vec3::new(low.x, high.y, high.z),
+    ];
+    let faces: [[u32; 3]; 12] = [
+        [0, 2, 1],
+        [0, 3, 2],
+        [4, 5, 6],
+        [4, 6, 7],
+        [0, 1, 5],
+        [0, 5, 4],
+        [3, 7, 6],
+        [3, 6, 2],
+        [0, 4, 7],
+        [0, 7, 3],
+        [1, 2, 6],
+        [1, 6, 5],
+    ];
+    let mesh = ExportMesh { positions: c.to_vec(), normals: Vec::new(), triangles: faces.to_vec() };
+
+    let (volume, report) =
+        voxelise(&mesh, &VoxeliseOptions::at(0.25)).expect("an off-lattice cube should voxelise");
+    assert!(report.uniform_bricks > 0, "the import came back hollow");
+
+    let coords = brick_range(&volume);
+    let (edges, triangles) = edge_use_counts(&volume, &coords);
+    assert!(triangles > 10_000, "only {triangles} triangles, so this proves little");
+
+    let open: Vec<_> = edges.iter().filter(|(_, count)| **count != 2).collect();
+    assert!(
+        open.is_empty(),
+        "a voxelised import left {} of {} edges open. First few: {:?}",
+        open.len(),
+        edges.len(),
+        &open.iter().take(5).collect::<Vec<_>>()
+    );
+}
