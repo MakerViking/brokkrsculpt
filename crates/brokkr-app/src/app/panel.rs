@@ -457,8 +457,24 @@ impl Brokkr {
             ),
             bindings,
             buttons,
-            button(text("Reset puck settings").size(theme::CAPTION_SIZE))
-                .on_press(Message::SpaceMouse(SpaceMouseSetting::Reset)),
+            row![
+                button(text("Invert all").size(theme::CAPTION_SIZE))
+                    .width(Length::Fill)
+                    .on_press(Message::SpaceMouse(SpaceMouseSetting::InvertAll)),
+                button(text("Reset").size(theme::CAPTION_SIZE))
+                    .width(Length::Fill)
+                    .on_press(Message::SpaceMouse(SpaceMouseSetting::Reset)),
+            ]
+            .spacing(theme::S2),
+            // Where the tuned settings end up, so they can be read back and
+            // pasted in as the built in defaults once they are right.
+            text(
+                spacemouse::Config::path()
+                    .map(|path| path.display().to_string())
+                    .unwrap_or_else(|| "settings cannot be saved: no config directory".into())
+            )
+            .size(theme::CAPTION_SIZE)
+            .color(theme::TEXT_MUTE),
         ]
         .spacing(theme::S2)
         .into()

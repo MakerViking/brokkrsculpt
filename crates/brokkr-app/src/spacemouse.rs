@@ -279,13 +279,30 @@ impl Default for Config {
             zoom_sens: 7.0e-7,
             orbit_sens: 2.2e-6,
             stale_ms: 120,
+            // Which axis drives what is SindriCAD's map, verbatim. The invert
+            // flags are NOT: every one of them is the opposite of SindriCAD's,
+            // and deliberately so.
+            //
+            // SindriCAD drives `camera-controls`, whose `truck` and `tumble`
+            // move the camera and leave it to the caller to negate for
+            // object-style motion — which is what its `modeSign` is for.
+            // `OrbitCamera` already bakes that negation in, because a mouse
+            // drag has to carry the model with the cursor. Porting the sign
+            // convention verbatim on top of that double-negates, and every
+            // axis comes out backwards on the real device.
+            //
+            // These are a starting point to tune from, not a finished answer:
+            // the two conventions differ per axis rather than uniformly, so
+            // the flags below will not all be right. Flip them in the
+            // settings panel, then the file at `Config::path()` is what
+            // should be pasted back in here to lock the defaults in.
             bind: [
-                bind(Axis::Tx, false), // pan x
-                bind(Axis::Tz, false), // pan y
-                bind(Axis::Ty, false), // zoom
-                bind(Axis::Rz, true),  // orbit azimuth
-                bind(Axis::Rx, false), // orbit polar
-                bind(Axis::Ry, false), // roll
+                bind(Axis::Tx, true),  // pan x
+                bind(Axis::Tz, true),  // pan y
+                bind(Axis::Ty, true),  // zoom
+                bind(Axis::Rz, false), // orbit azimuth
+                bind(Axis::Rx, true),  // orbit polar
+                bind(Axis::Ry, true),  // roll
             ],
             buttons: [ButtonAction::Undo, ButtonAction::Redo],
         }
@@ -316,6 +333,19 @@ impl Config {
 
     pub fn set_binding(&mut self, action: Action, binding: AxisBinding) {
         self.bind[action as usize] = binding;
+    }
+
+    /// Flip every action at once.
+    ///
+    /// Worth a button of its own because the two camera conventions this was
+    /// ported between differ by a sign on most axes, so "everything is
+    /// backwards" is the single most likely thing to be wrong, and fixing it
+    /// six checkboxes at a time is six chances to lose track of which have
+    /// been done.
+    pub fn invert_all(&mut self) {
+        for binding in &mut self.bind {
+            binding.invert = !binding.invert;
+        }
     }
 
     /// The deadzoned, sign corrected value of whatever axis drives `action`.
@@ -1059,8 +1089,11 @@ mod tests {
         OrbitCamera::framing(glam::Vec3::ZERO, 30.0)
     }
 
-    /// The defaults are a port of SindriCAD's tuned values, not fresh guesses.
-    /// Pinning them here means a well meaning tweak has to be deliberate.
+    /// The sensitivities, deadzone and staleness are a port of SindriCAD's
+    /// tuned values, not fresh guesses, and the axis each action reads is its
+    /// map. Pinning them here means a well meaning tweak has to be deliberate.
+    /// The invert flags are the deliberate exception -- see
+    /// `the_invert_flags_are_the_opposite_of_sindricads_on_purpose`.
     #[test]
     fn the_defaults_are_the_values_sindricad_tuned() {
         let config = Config::default();
@@ -1071,16 +1104,134 @@ mod tests {
         assert_eq!(config.stale_ms, 120);
         assert_eq!(config.mode, Mode::Object);
 
-        assert_eq!(config.binding(Action::PanX), AxisBinding { source: Axis::Tx, invert: false });
-        assert_eq!(config.binding(Action::PanY), AxisBinding { source: Axis::Tz, invert: false });
-        assert_eq!(config.binding(Action::Zoom), AxisBinding { source: Axis::Ty, invert: false });
-        assert_eq!(config.binding(Action::OrbitAz), AxisBinding { source: Axis::Rz, invert: true });
-        assert_eq!(
-            config.binding(Action::OrbitPolar),
-            AxisBinding { source: Axis::Rx, invert: false }
-        );
-        assert_eq!(config.binding(Action::Roll), AxisBinding { source: Axis::Ry, invert: false });
+        // Which axis drives what, which is the part taken verbatim.
+        for (action, source) in [
+            (Action::PanX, Axis::Tx),
+            (Action::PanY, Axis::Tz),
+            (Action::Zoom, Axis::Ty),
+            (Action::OrbitAz, Axis::Rz),
+            (Action::OrbitPolar, Axis::Rx),
+            (Action::Roll, Axis::Ry),
+        ] {
+            assert_eq!(config.binding(action).source, source, "{} moved axis", action.key());
+        }
         assert_eq!(config.buttons, [ButtonAction::Undo, ButtonAction::Redo]);
+    }
+
+    /// A camera in a known pose, so "which way did it go" has one answer.
+    ///
+    /// Target at the origin, no yaw or pitch, so the eye sits on +Z looking
+    /// down -Z with right = +X and up = +Y.
+    fn known_pose() -> OrbitCamera {
+        OrbitCamera {
+            target: glam::Vec3::ZERO,
+            yaw: 0.0,
+            pitch: 0.0,
+            roll: 0.0,
+            ..OrbitCamera::framing(glam::Vec3::ZERO, 30.0)
+        }
+    }
+
+    /// What one action does to the camera, in world terms, at full deflection.
+    fn drive(action: Action, config: &Config) -> OrbitCamera {
+        let binding = config.binding(action);
+        let mut axes = [0.0; 6];
+        axes[binding.source as usize] = 300.0;
+        let mut camera = known_pose();
+        config.apply(&motion(axes), 16.0, &mut camera, 720.0);
+        camera
+    }
+
+    /// Pins which way every action moves the camera.
+    ///
+    /// These directions were WRONG on the real device on first contact: the
+    /// bindings are a port from SindriCAD, whose `camera-controls` primitives
+    /// move the camera and leave the object-style negation to the caller,
+    /// while `OrbitCamera` already bakes it in. The two conventions differ per
+    /// axis rather than uniformly, so this is the test that stops a future
+    /// change flipping one back without anyone noticing.
+    ///
+    /// Read the assertions as "what the user sees". Moving the target left
+    /// carries the view left, so the model appears to move RIGHT.
+    ///
+    /// These record what the defaults DO, not what they ought to do -- the
+    /// directions are still being tuned against the real device. When a
+    /// default is changed on purpose, change the matching line here; when one
+    /// changes by accident, this is what says so.
+    #[test]
+    fn each_action_moves_the_camera_the_documented_way() {
+        let config = Config::default();
+
+        // Slide the cap right: the target goes left, which carries the view
+        // left, so the model appears to move RIGHT with the hand.
+        assert!(drive(Action::PanX, &config).target.x < 0.0, "pan x direction changed");
+
+        // Lift the cap: the target rises, so the model appears to move DOWN.
+        assert!(drive(Action::PanY, &config).target.y > 0.0, "pan y direction changed");
+
+        // Push the cap: further away.
+        assert!(
+            drive(Action::Zoom, &config).distance > known_pose().distance,
+            "zoom direction changed"
+        );
+
+        assert!(drive(Action::OrbitAz, &config).yaw > 0.0, "azimuth direction changed");
+        assert!(drive(Action::OrbitPolar, &config).pitch > 0.0, "polar direction changed");
+        assert!(drive(Action::Roll, &config).roll > 0.0, "roll direction changed");
+    }
+
+    /// The single most likely thing to be wrong on a new device, so it gets a
+    /// button and a test rather than six checkboxes and a hope.
+    #[test]
+    fn inverting_everything_reverses_every_action_and_is_its_own_undo() {
+        let mut config = Config::default();
+        let before: Vec<OrbitCamera> = Action::ALL.map(|a| drive(a, &config)).into();
+
+        config.invert_all();
+        for (action, was) in Action::ALL.into_iter().zip(&before) {
+            let now = drive(action, &config);
+            match action {
+                Action::PanX => assert!(now.target.x * was.target.x < 0.0, "pan x did not flip"),
+                Action::PanY => assert!(now.target.y * was.target.y < 0.0, "pan y did not flip"),
+                Action::Zoom => assert!(
+                    (now.distance - known_pose().distance) * (was.distance - known_pose().distance)
+                        < 0.0,
+                    "zoom did not flip"
+                ),
+                Action::OrbitAz => assert!(now.yaw * was.yaw < 0.0, "azimuth did not flip"),
+                Action::OrbitPolar => {
+                    assert!(now.pitch * was.pitch < 0.0, "polar did not flip")
+                }
+                Action::Roll => assert!(now.roll * was.roll < 0.0, "roll did not flip"),
+            }
+        }
+
+        // Twice is the identity, so a mis-click costs nothing.
+        config.invert_all();
+        assert_eq!(config, Config::default());
+    }
+
+    /// The defaults deliberately differ from SindriCAD's invert flags. If
+    /// someone "restores" them to match, every axis goes backwards again, so
+    /// the divergence is pinned here with the reason.
+    #[test]
+    fn the_invert_flags_are_the_opposite_of_sindricads_on_purpose() {
+        let config = Config::default();
+        for (action, sindricad_invert) in [
+            (Action::PanX, false),
+            (Action::PanY, false),
+            (Action::Zoom, false),
+            (Action::OrbitAz, true),
+            (Action::OrbitPolar, false),
+            (Action::Roll, false),
+        ] {
+            assert_ne!(
+                config.binding(action).invert,
+                sindricad_invert,
+                "{} matches SindriCAD's flag, which double-negates against OrbitCamera",
+                action.key()
+            );
+        }
     }
 
     #[test]
@@ -1138,14 +1289,18 @@ mod tests {
         assert!((ratio - 2.0).abs() < 0.01, "twice as far should pan twice as much, got {ratio}");
     }
 
+    /// Which way "positive" zooms is a default under tuning, so this asserts
+    /// only that the axis does something and that it undoes itself. The
+    /// direction lives in `each_action_moves_the_camera_the_documented_way`,
+    /// where it is meant to be edited when a default changes.
     #[test]
-    fn a_positive_zoom_axis_moves_closer_and_is_reversible() {
+    fn the_zoom_axis_is_reversible() {
         let config = Config::default();
         let mut moved = camera();
         let before = moved.distance;
 
         config.apply(&push(Axis::Ty, 300.0), 16.0, &mut moved, 720.0);
-        assert!(moved.distance < before, "a positive zoom axis should move closer");
+        assert!((moved.distance - before).abs() > 1.0e-4, "the zoom axis did nothing");
 
         config.apply(&push(Axis::Ty, -300.0), 16.0, &mut moved, 720.0);
         assert!((moved.distance - before).abs() < 1.0e-3, "zoom was not reversible");
@@ -1379,7 +1534,18 @@ mod tests {
         assert_eq!(parse_binding("-rz"), Some(AxisBinding { source: Axis::Rz, invert: true }));
         assert_eq!(parse_binding("rz"), Some(AxisBinding { source: Axis::Rz, invert: false }));
         assert_eq!(parse_binding("nonsense"), None);
-        assert!(Config::default().to_text().contains("orbit_az = -rz"));
+        // Whichever action happens to be inverted in the defaults must survive
+        // being written out and read back.
+        let text = Config::default().to_text();
+        for action in Action::ALL {
+            let binding = Config::default().binding(action);
+            let sign = if binding.invert { "-" } else { "" };
+            assert!(
+                text.contains(&format!("{} = {sign}{}", action.key(), binding.source.key())),
+                "{} did not round trip, file said:\n{text}",
+                action.key()
+            );
+        }
     }
 
     #[test]

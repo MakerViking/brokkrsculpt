@@ -88,7 +88,9 @@ pub enum SpaceMouseSetting {
     Binding(Action, Axis),
     Invert(Action, bool),
     Button(usize, ButtonAction),
-    /// Back to the values ported from SindriCAD.
+    /// Flip every axis at once.
+    InvertAll,
+    /// Back to the built in defaults.
     Reset,
     /// Persist the current settings. Sent when a slider is released rather
     /// than on every step of a drag, which would rewrite the file sixty times

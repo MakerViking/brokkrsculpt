@@ -579,6 +579,7 @@ impl Brokkr {
                     *slot = action;
                 }
             }
+            SpaceMouseSetting::InvertAll => config.invert_all(),
             SpaceMouseSetting::Reset => *config = SpaceMouseConfig::default(),
             SpaceMouseSetting::Save => {}
         }
