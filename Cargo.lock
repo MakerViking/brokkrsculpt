@@ -412,7 +412,9 @@ dependencies = [
  "fast-surface-nets",
  "glam 0.33.3",
  "rayon",
+ "roxmltree",
  "rustc-hash 2.1.3",
+ "yazi",
 ]
 
 [[package]]
