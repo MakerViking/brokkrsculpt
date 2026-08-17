@@ -1661,12 +1661,24 @@ mod uinput_tests {
         );
 
         // Push the cap sideways. The axis is bound to pan by default.
-        emit(&mut device, &[axis_event(RelativeAxisCode::REL_X, FULL_PUSH)]);
-        assert!(
-            wait_for(|| puck.motion().axis(Axis::Tx) == FULL_PUSH as f32),
-            "the deflection never arrived, got {:?}",
-            puck.motion()
-        );
+        //
+        // Held down rather than emitted once, because that is what the hardware
+        // does: a real puck streams its current deflection every 8 ms for as
+        // long as it is deflected, which is the whole reason the reader has a
+        // 120 ms staleness timeout. A single event goes stale in less time than
+        // `wait_for`'s 100 ms poll interval, so the one-shot version of this
+        // failed about half the time on a loaded machine -- and read as a
+        // SpaceMouse bug rather than as a test that did not model the device.
+        let mut arrived = false;
+        for _ in 0..250 {
+            emit(&mut device, &[axis_event(RelativeAxisCode::REL_X, FULL_PUSH)]);
+            if puck.motion().axis(Axis::Tx) == FULL_PUSH as f32 {
+                arrived = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(8));
+        }
+        assert!(arrived, "the deflection never arrived, got {:?}", puck.motion());
         assert_eq!(puck.diagnosis(), Diagnosis::Working);
         assert_eq!(puck.full_scale(), FULL_PUSH as f32, "full scale was not learnt from use");
 
