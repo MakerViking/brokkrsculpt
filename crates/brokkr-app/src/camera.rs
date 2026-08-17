@@ -64,6 +64,21 @@ impl OrbitCamera {
         Vec3::new(cos_pitch * sin_yaw, sin_pitch, cos_pitch * cos_yaw)
     }
 
+    /// The camera's right axis in world space.
+    ///
+    /// The rows of a view matrix are the camera basis vectors, which is why
+    /// this reads down a column of each axis rather than along one.
+    pub fn right(&self) -> Vec3 {
+        let view = self.view();
+        Vec3::new(view.x_axis.x, view.y_axis.x, view.z_axis.x)
+    }
+
+    /// The camera's up axis in world space.
+    pub fn up(&self) -> Vec3 {
+        let view = self.view();
+        Vec3::new(view.x_axis.y, view.y_axis.y, view.z_axis.y)
+    }
+
     pub fn view(&self) -> Mat4 {
         glam::camera::rh::view::look_at_mat4(self.eye(), self.target, Vec3::Y)
     }
@@ -102,11 +117,7 @@ impl OrbitCamera {
             return;
         }
         let world_per_pixel = 2.0 * self.distance * (self.fov_y * 0.5).tan() / viewport_height;
-        let view = self.view();
-        // Rows of a view matrix are the camera basis vectors in world space.
-        let right = Vec3::new(view.x_axis.x, view.y_axis.x, view.z_axis.x);
-        let up = Vec3::new(view.x_axis.y, view.y_axis.y, view.z_axis.y);
-        self.target += (-right * delta.x + up * delta.y) * world_per_pixel;
+        self.target += (-self.right() * delta.x + self.up() * delta.y) * world_per_pixel;
     }
 
     /// Wheel to zoom. Positive `amount` moves closer.
@@ -180,8 +191,7 @@ mod tests {
         let (_, centre) = camera.ray(Vec2::ZERO, 1.0);
         let (_, right) = camera.ray(Vec2::new(0.5, 0.0), 1.0);
 
-        let view = camera.view();
-        let camera_right = Vec3::new(view.x_axis.x, view.y_axis.x, view.z_axis.x);
+        let camera_right = camera.right();
         assert!(
             right.dot(camera_right) > centre.dot(camera_right),
             "a ray at positive ndc x must lean along the camera's right axis"
@@ -217,5 +227,29 @@ mod tests {
             camera.target.dot(forward).abs() < 1.0e-4,
             "panning must not move the target along the view direction"
         );
+    }
+}
+
+#[cfg(test)]
+mod basis_tests {
+    use super::*;
+
+    #[test]
+    fn the_basis_axes_are_unit_length_and_mutually_perpendicular() {
+        let camera = OrbitCamera { yaw: 0.9, pitch: -0.4, ..OrbitCamera::framing(Vec3::ZERO, 5.0) };
+        let right = camera.right();
+        let up = camera.up();
+
+        assert!((right.length() - 1.0).abs() < 1.0e-5);
+        assert!((up.length() - 1.0).abs() < 1.0e-5);
+        assert!(right.dot(up).abs() < 1.0e-5, "right and up were not perpendicular");
+    }
+
+    #[test]
+    fn the_basis_axes_are_perpendicular_to_the_view_direction() {
+        let camera = OrbitCamera::framing(Vec3::new(2.0, -1.0, 4.0), 3.0);
+        let forward = (camera.target - camera.eye()).normalize();
+        assert!(camera.right().dot(forward).abs() < 1.0e-5);
+        assert!(camera.up().dot(forward).abs() < 1.0e-5);
     }
 }

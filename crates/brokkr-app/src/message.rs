@@ -51,6 +51,7 @@ pub enum Message {
     SymmetryToggled(bool),
     PressureToggled(bool),
     PressureCurveChanged(f32),
+    TiltToggled(bool),
     ResetPressurePeak,
     Undo,
     Redo,

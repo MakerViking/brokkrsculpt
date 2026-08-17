@@ -37,6 +37,8 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::time::Instant;
 
+use glam::Vec2;
+
 /// How long after the last pen event the pen is still considered present.
 ///
 /// Some drivers do not send a clean `BTN_TOOL_PEN` release when the device is
@@ -48,14 +50,25 @@ const PEN_TIMEOUT_MS: u64 = 1_500;
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct PenState {
     /// A stylus is in range of a tablet, so its pressure is meaningful.
+    ///
+    /// True for either end of the pen. The eraser and the tip are reported as
+    /// separate tools by the kernel and are never in range at the same time, so
+    /// checking only for the tip would make every eraser stroke look like a
+    /// mouse and quietly run at full pressure.
     pub in_proximity: bool,
     /// Normalised to 0 through 1 using the device's own reported range.
     pub pressure: f32,
+    /// The eraser end of the stylus is the one in range.
+    pub eraser: bool,
+    /// Tilt away from vertical, each axis normalised to -1 through 1 against
+    /// the device's own reported range. Zero is upright.
+    pub tilt: Vec2,
 }
 
 impl PenState {
     /// What a mouse looks like: no pen, so strokes run at full strength.
-    pub const NONE: Self = Self { in_proximity: false, pressure: 0.0 };
+    pub const NONE: Self =
+        Self { in_proximity: false, pressure: 0.0, eraser: false, tilt: Vec2::ZERO };
 }
 
 /// A tablet the application has found and is listening to.
@@ -68,6 +81,11 @@ pub struct TabletDevice {
     /// the interface because it is the quickest way to tell a working tablet
     /// from a misdetected one.
     pub pressure_max: i32,
+    /// Whether the device reports tilt. Plenty of pens do not, and saying so is
+    /// better than leaving the user to wonder why leaning does nothing.
+    pub has_tilt: bool,
+    /// Whether the device has an eraser end.
+    pub has_eraser: bool,
 }
 
 /// Why no pressure is arriving, for the interface to explain.
@@ -105,6 +123,12 @@ struct Shared {
     /// tablet reaches full range without having to watch a number flicker.
     peak: AtomicU32,
     in_proximity: AtomicBool,
+    /// The two pen ends, tracked separately because proximity is either of
+    /// them and the kernel reports them as different tools.
+    tool_tip: AtomicBool,
+    tool_eraser: AtomicBool,
+    tilt_x: AtomicU32,
+    tilt_y: AtomicU32,
     /// Milliseconds since `started` at the last pen event.
     last_event_ms: AtomicU64,
     started: Instant,
@@ -118,6 +142,10 @@ impl Shared {
             pressure: AtomicU32::new(0),
             peak: AtomicU32::new(0),
             in_proximity: AtomicBool::new(false),
+            tool_tip: AtomicBool::new(false),
+            tool_eraser: AtomicBool::new(false),
+            tilt_x: AtomicU32::new(0),
+            tilt_y: AtomicU32::new(0),
             last_event_ms: AtomicU64::new(0),
             started: Instant::now(),
             devices: Mutex::new(Vec::new()),
@@ -139,12 +167,37 @@ impl Shared {
         self.touch();
     }
 
-    fn set_proximity(&self, present: bool) {
+    fn set_tilt(&self, tilt: Vec2) {
+        self.tilt_x.store(tilt.x.to_bits(), Ordering::Relaxed);
+        self.tilt_y.store(tilt.y.to_bits(), Ordering::Relaxed);
+        self.touch();
+    }
+
+    /// Record which end of the stylus is in range.
+    ///
+    /// Proximity is either end. Pressure and tilt are cleared when both are
+    /// gone, so a lifted pen cannot leave a stale value scaling later strokes.
+    fn set_tool(&self, tip: Option<bool>, eraser: Option<bool>) {
+        if let Some(down) = tip {
+            self.tool_tip.store(down, Ordering::Relaxed);
+        }
+        if let Some(down) = eraser {
+            self.tool_eraser.store(down, Ordering::Relaxed);
+        }
+        let present =
+            self.tool_tip.load(Ordering::Relaxed) || self.tool_eraser.load(Ordering::Relaxed);
         self.in_proximity.store(present, Ordering::Relaxed);
         if !present {
             self.pressure.store(0.0f32.to_bits(), Ordering::Relaxed);
+            self.tilt_x.store(0.0f32.to_bits(), Ordering::Relaxed);
+            self.tilt_y.store(0.0f32.to_bits(), Ordering::Relaxed);
         }
         self.touch();
+    }
+
+    /// Convenience for tests and for dropping every tool at once.
+    fn set_proximity(&self, present: bool) {
+        self.set_tool(Some(present), Some(false));
     }
 
     fn state(&self) -> PenState {
@@ -162,6 +215,11 @@ impl Shared {
         PenState {
             in_proximity: self.in_proximity.load(Ordering::Relaxed),
             pressure: f32::from_bits(self.pressure.load(Ordering::Relaxed)),
+            eraser: self.tool_eraser.load(Ordering::Relaxed),
+            tilt: Vec2::new(
+                f32::from_bits(self.tilt_x.load(Ordering::Relaxed)),
+                f32::from_bits(self.tilt_y.load(Ordering::Relaxed)),
+            ),
         }
     }
 }
@@ -193,6 +251,22 @@ impl Tablet {
 
     pub fn state(&self) -> PenState {
         self.shared.state()
+    }
+
+    /// Feed a pen state in directly, so code that consumes the pen can be
+    /// tested without a device.
+    #[cfg(test)]
+    pub fn simulate(&self, state: PenState) {
+        // Which end is in range only means anything while the pen is in range
+        // at all, or an "eraser away" state would report as present.
+        self.shared.set_tool(
+            Some(state.in_proximity && !state.eraser),
+            Some(state.in_proximity && state.eraser),
+        );
+        if state.in_proximity {
+            self.shared.set_pressure(state.pressure);
+            self.shared.set_tilt(state.tilt);
+        }
     }
 
     pub fn devices(&self) -> Vec<TabletDevice> {
@@ -260,6 +334,19 @@ fn normalise(value: i32, minimum: i32, maximum: i32) -> f32 {
     ((value - minimum) as f32 / (maximum - minimum) as f32).clamp(0.0, 1.0)
 }
 
+/// Normalise a signed axis such as tilt to -1 through 1.
+///
+/// Scaled against the larger half of the range rather than mapped across the
+/// whole of it, so that an upright pen reading zero comes out as exactly zero
+/// even on a device whose range is slightly lopsided, like -64 to 63.
+fn normalise_signed(value: i32, minimum: i32, maximum: i32) -> f32 {
+    let extent = minimum.abs().max(maximum.abs());
+    if extent == 0 {
+        return 0.0;
+    }
+    (value as f32 / extent as f32).clamp(-1.0, 1.0)
+}
+
 /// Print what every input device looks like to the scanner, and why each was
 /// accepted or rejected.
 ///
@@ -273,14 +360,15 @@ pub fn report() -> String {
 
 #[cfg(target_os = "linux")]
 mod backend {
-    use super::{Shared, TabletDevice, normalise};
+    use super::{Shared, TabletDevice, normalise, normalise_signed};
     use std::collections::HashSet;
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
     use std::sync::atomic::Ordering;
     use std::time::Duration;
 
-    use evdev::{AbsoluteAxisCode, Device, EventType, KeyCode};
+    use evdev::{AbsInfo, AbsoluteAxisCode, Device, EventType, KeyCode};
+    use glam::Vec2;
 
     pub const SUPPORTED: bool = true;
 
@@ -296,6 +384,15 @@ mod backend {
     /// `ABS_PRESSURE` for finger contact, and some pressure sensitive pads do
     /// too. `BTN_TOOL_PEN` is what the kernel uses to mean "this is a pen", and
     /// every tablet driver sets it.
+    /// Range of an absolute axis, if the device has it.
+    fn axis_range(device: &Device, axis: AbsoluteAxisCode) -> Option<(i32, i32)> {
+        device
+            .get_absinfo()
+            .ok()?
+            .find(|(code, _)| *code == axis)
+            .map(|(_, info): (_, AbsInfo)| (info.minimum(), info.maximum()))
+    }
+
     fn is_stylus(device: &Device) -> bool {
         let has_pressure = device
             .supported_absolute_axes()
@@ -354,6 +451,20 @@ mod backend {
                         .map(|(_, info)| format!("{} to {}", info.minimum(), info.maximum()))
                         .unwrap_or_else(|| "unknown".into());
 
+                    let mut extras = Vec::new();
+                    if device
+                        .supported_absolute_axes()
+                        .is_some_and(|axes| axes.contains(AbsoluteAxisCode::ABS_TILT_X))
+                    {
+                        extras.push("tilt");
+                    }
+                    if device
+                        .supported_keys()
+                        .is_some_and(|keys| keys.contains(KeyCode::BTN_TOOL_RUBBER))
+                    {
+                        extras.push("eraser");
+                    }
+
                     let verdict = match (pressure, pen) {
                         (true, true) => {
                             found += 1;
@@ -365,9 +476,14 @@ mod backend {
                         (false, true) => "ignored: identifies a pen but reports no pressure",
                         (false, false) => unreachable!("filtered above"),
                     };
+                    let also = if extras.is_empty() {
+                        String::new()
+                    } else {
+                        format!(", {}", extras.join(", "))
+                    };
                     let _ = writeln!(
                         out,
-                        "{}\n  {name}\n  pressure range {range}\n  {verdict}\n",
+                        "{}\n  {name}\n  pressure range {range}{also}\n  {verdict}\n",
                         path.display()
                     );
                 }
@@ -447,10 +563,12 @@ mod backend {
                         if let Some(info) = adopt(&shared, &path, device) {
                             open.insert(path);
                             log::info!(
-                                "tablet: reading {} at {} with {} pressure levels",
+                                "tablet: reading {} at {} with {} pressure levels{}{}",
                                 info.name,
                                 info.path,
-                                info.pressure_max
+                                info.pressure_max,
+                                if info.has_tilt { ", tilt" } else { "" },
+                                if info.has_eraser { ", eraser" } else { "" },
                             );
                         }
                     }
@@ -474,18 +592,30 @@ mod backend {
         }
     }
 
+    /// Everything about one device's axes that the reader needs.
+    #[derive(Debug, Clone, Copy)]
+    struct Axes {
+        pressure: (i32, i32),
+        tilt_x: Option<(i32, i32)>,
+        tilt_y: Option<(i32, i32)>,
+    }
+
     /// Take ownership of a stylus device and start a thread reading it.
     fn adopt(shared: &Arc<Shared>, path: &Path, mut device: Device) -> Option<TabletDevice> {
-        let (minimum, maximum) = device
-            .get_absinfo()
-            .ok()?
-            .find(|(axis, _)| *axis == AbsoluteAxisCode::ABS_PRESSURE)
-            .map(|(_, info)| (info.minimum(), info.maximum()))?;
+        let axes = Axes {
+            pressure: axis_range(&device, AbsoluteAxisCode::ABS_PRESSURE)?,
+            tilt_x: axis_range(&device, AbsoluteAxisCode::ABS_TILT_X),
+            tilt_y: axis_range(&device, AbsoluteAxisCode::ABS_TILT_Y),
+        };
 
         let info = TabletDevice {
             name: device.name().unwrap_or("unnamed tablet").to_string(),
             path: path.to_string_lossy().into_owned(),
-            pressure_max: maximum,
+            pressure_max: axes.pressure.1,
+            has_tilt: axes.tilt_x.is_some() && axes.tilt_y.is_some(),
+            has_eraser: device
+                .supported_keys()
+                .is_some_and(|keys| keys.contains(KeyCode::BTN_TOOL_RUBBER)),
         };
 
         shared.devices.lock().expect("tablet state poisoned").push(info.clone());
@@ -495,7 +625,7 @@ mod backend {
         std::thread::Builder::new()
             .name("brokkr-tablet-read".into())
             .spawn(move || {
-                read_loop(&shared, &mut device, minimum, maximum);
+                read_loop(&shared, &mut device, axes);
                 // Unplugged, or the read failed. Drop the registration so the
                 // scanner can pick the device up again if it comes back.
                 shared
@@ -511,7 +641,11 @@ mod backend {
         Some(info)
     }
 
-    fn read_loop(shared: &Arc<Shared>, device: &mut Device, minimum: i32, maximum: i32) {
+    fn read_loop(shared: &Arc<Shared>, device: &mut Device, axes: Axes) {
+        // Tilt arrives one axis at a time, so the other half has to be
+        // remembered in order to publish a complete vector.
+        let mut tilt = Vec2::ZERO;
+
         loop {
             let events = match device.fetch_events() {
                 Ok(events) => events,
@@ -523,10 +657,28 @@ mod backend {
             for event in events {
                 match event.event_type() {
                     EventType::ABSOLUTE if event.code() == AbsoluteAxisCode::ABS_PRESSURE.0 => {
+                        let (minimum, maximum) = axes.pressure;
                         shared.set_pressure(normalise(event.value(), minimum, maximum));
                     }
+                    EventType::ABSOLUTE if event.code() == AbsoluteAxisCode::ABS_TILT_X.0 => {
+                        if let Some((minimum, maximum)) = axes.tilt_x {
+                            tilt.x = normalise_signed(event.value(), minimum, maximum);
+                            shared.set_tilt(tilt);
+                        }
+                    }
+                    EventType::ABSOLUTE if event.code() == AbsoluteAxisCode::ABS_TILT_Y.0 => {
+                        if let Some((minimum, maximum)) = axes.tilt_y {
+                            tilt.y = normalise_signed(event.value(), minimum, maximum);
+                            shared.set_tilt(tilt);
+                        }
+                    }
+                    // The two ends of the stylus are separate tools and are
+                    // never in range together, so each only updates its own.
                     EventType::KEY if event.code() == KeyCode::BTN_TOOL_PEN.0 => {
-                        shared.set_proximity(event.value() != 0);
+                        shared.set_tool(Some(event.value() != 0), None);
+                    }
+                    EventType::KEY if event.code() == KeyCode::BTN_TOOL_RUBBER.0 => {
+                        shared.set_tool(None, Some(event.value() != 0));
                     }
                     _ => {}
                 }
@@ -674,6 +826,71 @@ mod tests {
     }
 
     #[test]
+    fn signed_axes_keep_zero_at_zero() {
+        // A lopsided range like -64 to 63 is normal for tilt. Mapping it across
+        // the whole span would leave an upright pen reporting a small lean, and
+        // every stroke would drift.
+        assert_eq!(normalise_signed(0, -64, 63), 0.0);
+        assert_eq!(normalise_signed(-64, -64, 63), -1.0);
+        assert_eq!(normalise_signed(64, -64, 63), 1.0);
+        assert!((normalise_signed(32, -64, 63) - 0.5).abs() < 1.0e-6);
+    }
+
+    #[test]
+    fn signed_axes_clamp_and_survive_a_degenerate_range() {
+        assert_eq!(normalise_signed(999, -60, 60), 1.0);
+        assert_eq!(normalise_signed(-999, -60, 60), -1.0);
+        assert_eq!(normalise_signed(5, 0, 0), 0.0);
+    }
+
+    #[test]
+    fn the_eraser_end_counts_as_a_pen_being_present() {
+        // The bug this guards against: the kernel reports the tip and the
+        // eraser as separate tools that are never in range together, so
+        // checking only for the tip made every eraser stroke look like a mouse
+        // and silently run at full pressure.
+        let tablet = Tablet::inert();
+        tablet.shared.set_tool(None, Some(true));
+        tablet.shared.set_pressure(0.4);
+
+        let pen = tablet.state();
+        assert!(pen.in_proximity, "the eraser end must count as a pen in range");
+        assert!(pen.eraser);
+        assert!(
+            (tablet.stamp_pressure(true, 1.0) - 0.4).abs() < 1.0e-6,
+            "eraser strokes must be pressure sensitive too"
+        );
+    }
+
+    #[test]
+    fn the_pen_is_only_gone_once_both_ends_are_out_of_range() {
+        let tablet = Tablet::inert();
+        tablet.shared.set_tool(Some(true), None);
+        assert!(tablet.state().in_proximity);
+
+        // Flipping the pen over: the tip leaves and the eraser arrives.
+        tablet.shared.set_tool(None, Some(true));
+        tablet.shared.set_tool(Some(false), None);
+        assert!(tablet.state().in_proximity, "the eraser is still in range");
+        assert!(tablet.state().eraser);
+
+        tablet.shared.set_tool(None, Some(false));
+        assert!(!tablet.state().in_proximity);
+    }
+
+    #[test]
+    fn lifting_the_pen_clears_the_tilt_as_well_as_the_pressure() {
+        // A stale tilt would keep steering strokes after the pen was put down.
+        let tablet = Tablet::inert();
+        tablet.shared.set_tool(Some(true), None);
+        tablet.shared.set_tilt(Vec2::new(0.7, -0.3));
+        assert_eq!(tablet.state().tilt, Vec2::new(0.7, -0.3));
+
+        tablet.shared.set_tool(Some(false), None);
+        assert_eq!(tablet.state().tilt, Vec2::ZERO);
+    }
+
+    #[test]
     fn an_inert_tablet_reports_why_it_is_silent() {
         let tablet = Tablet::inert();
         let diagnosis = tablet.diagnosis();
@@ -703,22 +920,32 @@ mod uinput_tests {
     use evdev::{
         AbsInfo, AbsoluteAxisCode, AttributeSet, EventType, InputEvent, KeyCode, UinputAbsSetup,
     };
+    use glam::Vec2;
     use std::time::Duration;
 
     /// What a Huion Kamvas 13 reports. Chosen so the test would catch a
     /// hard coded 0 to 1 or 0 to 255 assumption anywhere in the chain.
     const PRESSURE_MAX: i32 = 8191;
 
+    /// The tilt range a real tablet reports: lopsided, which is exactly the
+    /// case that would leave an upright pen reporting a small lean if the
+    /// normalisation mapped across the whole span.
+    const TILT_MIN: i32 = -64;
+    const TILT_MAX: i32 = 63;
+
     fn build(name: &str, pen_tool: bool) -> Option<VirtualDevice> {
         let mut keys = AttributeSet::<KeyCode>::new();
         keys.insert(KeyCode::BTN_TOUCH);
         if pen_tool {
             keys.insert(KeyCode::BTN_TOOL_PEN);
+            keys.insert(KeyCode::BTN_TOOL_RUBBER);
         }
 
         let axis = |code, maximum| UinputAbsSetup::new(code, AbsInfo::new(0, 0, maximum, 0, 0, 0));
+        let signed_axis =
+            |code| UinputAbsSetup::new(code, AbsInfo::new(0, TILT_MIN, TILT_MAX, 0, 0, 0));
 
-        VirtualDevice::builder()
+        let mut builder = VirtualDevice::builder()
             .ok()?
             .name(name)
             .with_keys(&keys)
@@ -728,9 +955,15 @@ mod uinput_tests {
             .with_absolute_axis(&axis(AbsoluteAxisCode::ABS_Y, 1080))
             .ok()?
             .with_absolute_axis(&axis(AbsoluteAxisCode::ABS_PRESSURE, PRESSURE_MAX))
-            .ok()?
-            .build()
-            .ok()
+            .ok()?;
+        if pen_tool {
+            builder = builder
+                .with_absolute_axis(&signed_axis(AbsoluteAxisCode::ABS_TILT_X))
+                .ok()?
+                .with_absolute_axis(&signed_axis(AbsoluteAxisCode::ABS_TILT_Y))
+                .ok()?;
+        }
+        builder.build().ok()
     }
 
     fn emit(device: &mut VirtualDevice, events: &[InputEvent]) {
@@ -743,6 +976,14 @@ mod uinput_tests {
 
     fn pen_tool_event(down: bool) -> InputEvent {
         InputEvent::new(EventType::KEY.0, KeyCode::BTN_TOOL_PEN.0, i32::from(down))
+    }
+
+    fn eraser_tool_event(down: bool) -> InputEvent {
+        InputEvent::new(EventType::KEY.0, KeyCode::BTN_TOOL_RUBBER.0, i32::from(down))
+    }
+
+    fn tilt_event(axis: AbsoluteAxisCode, raw: i32) -> InputEvent {
+        InputEvent::new(EventType::ABSOLUTE.0, axis.0, raw)
     }
 
     /// Poll until `predicate` holds, up to roughly twelve seconds. The scanner
@@ -787,6 +1028,8 @@ mod uinput_tests {
             stylus_info.pressure_max, PRESSURE_MAX,
             "the device's own pressure range was not read from it"
         );
+        assert!(stylus_info.has_tilt, "tilt axes were not detected");
+        assert!(stylus_info.has_eraser, "the eraser end was not detected");
         assert!(
             !devices.iter().any(|device| device.name == "BrokkrSculpt test touchscreen"),
             "a device with pressure but no pen tool was mistaken for a stylus"
@@ -824,6 +1067,55 @@ mod uinput_tests {
             tablet.state()
         );
 
+        // Tilt. A lopsided device range must still put an upright pen at zero.
+        emit(&mut stylus, &[tilt_event(AbsoluteAxisCode::ABS_TILT_X, 0)]);
+        emit(&mut stylus, &[tilt_event(AbsoluteAxisCode::ABS_TILT_Y, 0)]);
+        assert!(
+            wait_for(|| tablet.state().tilt == Vec2::ZERO),
+            "an upright pen should report no tilt, got {:?}",
+            tablet.state().tilt
+        );
+
+        emit(
+            &mut stylus,
+            &[
+                tilt_event(AbsoluteAxisCode::ABS_TILT_X, TILT_MAX),
+                tilt_event(AbsoluteAxisCode::ABS_TILT_Y, TILT_MIN / 2),
+            ],
+        );
+        assert!(
+            wait_for(|| {
+                let tilt = tablet.state().tilt;
+                tilt.x > 0.9 && (tilt.y + 0.5).abs() < 0.02
+            }),
+            "tilt did not come through normalised, got {:?}",
+            tablet.state().tilt
+        );
+
+        // Flip to the eraser end. The kernel reports the two ends as separate
+        // tools that are never in range together, so this is the case where
+        // only checking for the tip would silently drop back to full pressure.
+        emit(&mut stylus, &[pen_tool_event(false), eraser_tool_event(true)]);
+        emit(&mut stylus, &[pressure_event(PRESSURE_MAX / 4)]);
+        assert!(
+            wait_for(|| {
+                let pen = tablet.state();
+                pen.in_proximity && pen.eraser && (pen.pressure - 0.25).abs() < 0.01
+            }),
+            "the eraser end did not report as a pen with pressure, got {:?}",
+            tablet.state()
+        );
+        assert!(
+            (tablet.stamp_pressure(true, 1.0) - 0.25).abs() < 0.01,
+            "eraser strokes must be pressure sensitive, not full strength"
+        );
+
+        emit(&mut stylus, &[eraser_tool_event(false), pen_tool_event(true)]);
+        assert!(
+            wait_for(|| !tablet.state().eraser && tablet.state().in_proximity),
+            "flipping back to the tip did not register"
+        );
+
         // Pen lifted out of range: the brush must go back to full strength so a
         // mouse still works.
         emit(&mut stylus, &[pen_tool_event(false)]);
@@ -837,6 +1129,7 @@ mod uinput_tests {
             1.0,
             "with the pen away the brush must run at full strength"
         );
+        assert_eq!(tablet.state().tilt, Vec2::ZERO, "a lifted pen must not leave a stale tilt");
 
         // Unplugging must deregister the device rather than leaving a ghost.
         drop(stylus);

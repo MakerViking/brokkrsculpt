@@ -78,6 +78,36 @@ const STAMP_FRACTION_OF_RADIUS: f32 = 0.25;
 /// Kept under one voxel so the warped read stays inside the snapshot's padding.
 const PINCH_PULL_VOXELS: f32 = 0.85;
 
+/// Rotate a surface normal by a lean, giving the direction a tilted stylus is
+/// pushing in.
+///
+/// `lean` is a world space vector whose length is the tilt angle in radians and
+/// whose direction is the way the pen is leaning. Only the part of it lying in
+/// the surface's tangent plane can steer anything: a lean straight into or out
+/// of the surface would just be asking the brush to push harder, which is what
+/// pressure is for.
+///
+/// Every brush reads the stamp normal, so tilting it steers all of them at
+/// once. Draw pushes clay sideways, the clay and flatten planes tip over so a
+/// surface can be flattened at an angle, and pinch's axis leans with the pen.
+///
+/// An upright pen returns the normal unchanged, so nothing about the existing
+/// behaviour depends on a tablet being present.
+pub fn lean_normal(normal: Vec3, lean: Vec3) -> Vec3 {
+    let angle = lean.length();
+    if angle < 1.0e-5 {
+        return normal;
+    }
+    let Some(direction) = lean.try_normalize() else {
+        return normal;
+    };
+    let Some(tangential) = (direction - normal * direction.dot(normal)).try_normalize() else {
+        // Leaning exactly along the normal steers nothing.
+        return normal;
+    };
+    (normal * angle.cos() + tangential * angle.sin()).normalize_or(normal)
+}
+
 /// Which way a brush moves the surface.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BrushDirection {
@@ -920,5 +950,89 @@ mod tests {
         assert_eq!(tiny.spacing(0.25), 0.25);
         let large = Brush { radius: 8.0, ..Brush::default() };
         assert_eq!(large.spacing(0.25), 2.0);
+    }
+}
+
+#[cfg(test)]
+mod tilt_tests {
+    use super::*;
+
+    #[test]
+    fn an_upright_pen_leaves_the_normal_alone() {
+        // The whole feature has to be invisible without a tablet.
+        let normal = Vec3::new(0.3, 0.9, -0.2).normalize();
+        assert_eq!(lean_normal(normal, Vec3::ZERO), normal);
+    }
+
+    #[test]
+    fn leaning_rotates_the_normal_by_exactly_that_angle() {
+        let normal = Vec3::Y;
+        let angle = 0.4_f32;
+        let tilted = lean_normal(normal, Vec3::X * angle);
+
+        assert!((tilted.length() - 1.0).abs() < 1.0e-5, "the result must stay a unit vector");
+        let measured = normal.dot(tilted).clamp(-1.0, 1.0).acos();
+        assert!((measured - angle).abs() < 1.0e-4, "rotated by {measured} instead of {angle}");
+        // And it leaned the way the pen did.
+        assert!(tilted.x > 0.0, "leaned along minus X: {tilted:?}");
+    }
+
+    #[test]
+    fn only_the_tangential_part_of_a_lean_steers() {
+        let normal = Vec3::Y;
+        // Leaning straight along the normal cannot mean anything directional.
+        assert_eq!(lean_normal(normal, Vec3::Y * 0.5), normal);
+
+        // A lean partly into the surface still steers by its tangential part,
+        // rotating within the plane the pen is leaning in.
+        let tilted = lean_normal(normal, Vec3::new(0.3, 0.3, 0.0));
+        assert!(tilted.x > 0.0);
+        assert!((tilted.length() - 1.0).abs() < 1.0e-5);
+    }
+
+    #[test]
+    fn opposite_leans_give_opposite_results() {
+        let normal = Vec3::Z;
+        let left = lean_normal(normal, Vec3::X * 0.3);
+        let right = lean_normal(normal, -Vec3::X * 0.3);
+        assert!((left.x + right.x).abs() < 1.0e-5, "{left:?} against {right:?}");
+        assert!((left.z - right.z).abs() < 1.0e-5);
+    }
+
+    #[test]
+    fn a_leaning_pen_steers_where_the_clay_goes() {
+        // The point of the whole thing: the same stroke on the same spot moves
+        // material to a different place when the pen is leaned.
+        let mut scratch = BrushScratch::new();
+        let point = Vec3::new(24.0, 0.0, 0.0);
+        let brush = Brush { kind: BrushKind::Draw, radius: 8.0, strength: 1.0, ..Brush::default() };
+
+        let mut sculpt = |lean: Vec3| {
+            let mut volume = Volume::new(1.0);
+            volume.seed_sphere(Vec3::ZERO, 24.0);
+            let normal = lean_normal(volume.gradient_world(point), lean);
+            for _ in 0..6 {
+                brush.apply(
+                    &mut volume,
+                    &Stamp::new(point, normal, BrushDirection::Add),
+                    &mut scratch,
+                );
+            }
+            // Where the material ended up, measured to one side of the stroke.
+            volume.sample_world(point + Vec3::new(0.0, 6.0, 0.0))
+        };
+
+        let upright = sculpt(Vec3::ZERO);
+        let leaned_towards = sculpt(Vec3::Y * 0.7);
+        let leaned_away = sculpt(-Vec3::Y * 0.7);
+
+        assert!(
+            leaned_towards < upright,
+            "leaning toward the probe should have pushed clay that way: {upright} then {leaned_towards}"
+        );
+        assert!(
+            leaned_away > leaned_towards,
+            "leaning the other way should not pile material in the same place"
+        );
     }
 }

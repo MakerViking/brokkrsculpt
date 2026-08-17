@@ -85,11 +85,41 @@ as it does for a mouse. To fix that, then log out and back in:
 sudo usermod -aG input $USER
 ```
 
-The **PEN** panel names the tablet it found, shows the device's pressure range,
-and gives a live reading with a peak, so you can confirm a tablet is working in
-a few seconds rather than guessing from how the brush feels. If it says no
-tablet was found, this prints every input device and why each was accepted or
-rejected:
+### The eraser end
+
+Flipping the stylus over inverts the brush, the same as holding the modifier
+key. The two combine rather than override, so holding the modifier while using
+the eraser gives the additive brush back. Brushes with no opposite, smooth and
+flatten, ignore both.
+
+The kernel reports the tip and the eraser as separate tools that are never in
+range at the same time, which is worth knowing: anything checking only for the
+tip treats every eraser stroke as a mouse and quietly runs it at full pressure.
+
+### Tilt
+
+Leaning the pen rotates the direction the brush pushes in, up to sixty degrees.
+That steers every brush at once, because they all work from the same stroke
+normal: draw pushes clay sideways, the clay and flatten planes tip over so a
+surface can be flattened at an angle, and pinch's axis leans with the pen.
+
+Leaning also reduces how far the brush pushes outward, by the cosine of the
+angle, which is what makes a leaned stroke feel like a glancing one.
+
+Tilt arrives in the tablet's frame, which lines up with the screen, and is
+carried into world space through the camera. Positive tilt on the second axis
+is taken to mean the pen is leaning toward you, and so toward the bottom of the
+screen. If steering comes out mirrored on some tablet, that convention is a
+single sign in `pen_lean`.
+
+### Checking a tablet
+
+The **PEN** panel names the tablet it found, shows the device's pressure range
+and whether it has tilt and an eraser, and gives a live reading of pressure,
+tilt and which end of the pen is in range. That is enough to confirm a tablet
+is working in a few seconds rather than guessing from how the brush feels. If
+it says no tablet was found, this prints every input device and why each was
+accepted or rejected:
 
 ```fish
 cargo run --release -p brokkr-app -- --tablets
@@ -119,9 +149,12 @@ Controls:
 | shift right drag | pan |
 | wheel | zoom |
 | ctrl z, ctrl shift z | undo, redo |
+| pen pressure | scales the brush |
+| pen eraser end | inverts the brush |
+| pen tilt | steers which way the brush pushes |
 
-Pen pressure scales the brush automatically when a tablet is present. See
-[Stylus pressure](#stylus-pressure).
+See [Stylus pressure](#stylus-pressure) for what a tablet adds and how to check
+one is being seen.
 
 ## Checking it
 
@@ -137,9 +170,9 @@ The tests worth knowing about:
   been dragged across brick corners. This is the crack test. It ships with a
   control that proves it can detect a gap.
 - `tablet.rs` builds a synthetic tablet with uinput, lets the ordinary scanner
-  find it through `/dev/input` like any other hardware, and checks that pressure
-  comes out the far end at half, full and feather touch. Nothing in it is a
-  mock, so the same path runs for real hardware. It skips loudly when
+  find it through `/dev/input` like any other hardware, and checks that
+  pressure, tilt and both ends of the pen come out the far end. Nothing in it is
+  a mock, so the same path runs for real hardware. It skips loudly when
   `/dev/uinput` is not writable.
 - `crates/brokkr-gpu/tests/offscreen.rs` renders the sculpt to a texture with no
   window and checks the pixels, then sculpts and checks they changed. It catches

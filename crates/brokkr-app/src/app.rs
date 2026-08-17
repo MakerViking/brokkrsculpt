@@ -8,7 +8,7 @@ use std::time::Instant;
 
 use brokkr_core::{
     BrickCoord, Brush, BrushDirection, BrushKind, BrushScratch, FalloffCurve, History,
-    HistoryStats, MeshScratch, Stamp, Stroke, Symmetry, Volume, VolumeStats, raycast,
+    HistoryStats, MeshScratch, Stamp, Stroke, Symmetry, Volume, VolumeStats, lean_normal, raycast,
 };
 use glam::{Vec2, Vec3};
 use iced::widget::{button, checkbox, column, container, pick_list, row, slider, stack, text};
@@ -27,6 +27,13 @@ use crate::viewport::{SharedFrame, Viewport};
 /// the 256 cubed effective volume the milestones are measured against.
 const MODEL_RADIUS_MM: f32 = 30.0;
 const VOXEL_SIZE_MM: f32 = 0.25;
+
+/// Largest angle a fully tilted pen steers the stroke by.
+///
+/// Tablets report tilt against their own range, so this is applied to the
+/// normalised value rather than trusting a device to report degrees. Sixty
+/// degrees is about as far as a pen can be leaned while still drawing.
+const MAX_TILT: f32 = std::f32::consts::PI / 3.0;
 
 /// Frame intervals kept for the rate readout. At 60 fps this averages over
 /// about a second, which is long enough to be steady and short enough to react.
@@ -101,6 +108,8 @@ pub struct Brokkr {
     /// Exponent applied to raw pressure. Below 1 makes light touches bite
     /// harder, above 1 gives finer control at the light end.
     pressure_curve: f32,
+    /// Whether leaning the pen steers the stroke.
+    tilt_enabled: bool,
     stroke: Stroke,
     history: History,
     shared: Arc<SharedFrame>,
@@ -144,6 +153,7 @@ impl Brokkr {
             tablet,
             pressure_enabled: true,
             pressure_curve: 1.0,
+            tilt_enabled: true,
             stroke: Stroke::new(),
             history: History::default(),
             shared,
@@ -244,13 +254,16 @@ impl Brokkr {
         // not moved between the stamps that one pointer event interpolates, so
         // re-reading it would only add jitter.
         let pressure = self.tablet.stamp_pressure(self.pressure_enabled, self.pressure_curve);
+        let lean = self.pen_lean();
 
         for index in 0..self.stamp_centres.len() {
             let centre = self.stamp_centres[index];
             // Take the normal from the field at each stamp rather than reusing
             // the one from the raycast, so a stroke curving around a form stays
             // oriented to the surface it is actually on.
-            let normal = self.volume.gradient_world(centre);
+            // Leaning the pen rotates the direction the brush pushes in, which
+            // steers every brush at once because they all read this normal.
+            let normal = lean_normal(self.volume.gradient_world(centre), lean);
             let stamp = Stamp::new(centre, normal, direction).with_pressure(pressure);
             self.brush.apply_symmetric(
                 &mut self.volume,
@@ -266,14 +279,53 @@ impl Brokkr {
         self.remesh_dirty();
     }
 
-    /// Direction for a new stroke, honouring the invert modifier and the fact
-    /// that some brushes have no opposite.
+    /// Direction for a new stroke, honouring the invert modifier, the eraser
+    /// end of the stylus, and the fact that some brushes have no opposite.
+    ///
+    /// The two inverts combine rather than override: holding the modifier while
+    /// using the eraser gives back the additive brush, which is the same
+    /// behaviour every drawing application has.
     fn stroke_direction(&self) -> BrushDirection {
-        if self.control && self.brush.kind.is_directional() {
+        let inverted = self.control != self.eraser_in_use();
+        if inverted && self.brush.kind.is_directional() {
             BrushDirection::Subtract
         } else {
             BrushDirection::Add
         }
+    }
+
+    /// Whether the eraser end of the stylus is the one in range.
+    fn eraser_in_use(&self) -> bool {
+        let pen = self.tablet.state();
+        pen.in_proximity && pen.eraser
+    }
+
+    /// The world space lean of the pen, as a vector whose length is the tilt
+    /// angle in radians.
+    ///
+    /// Tilt arrives in the tablet's own frame, which lines up with the screen,
+    /// so it has to be carried into world space through the camera basis before
+    /// it can steer anything.
+    fn pen_lean(&self) -> Vec3 {
+        if !self.tilt_enabled {
+            return Vec3::ZERO;
+        }
+        let pen = self.tablet.state();
+        if !pen.in_proximity {
+            return Vec3::ZERO;
+        }
+
+        let magnitude = pen.tilt.length().min(1.0);
+        if magnitude < 1.0e-4 {
+            return Vec3::ZERO;
+        }
+
+        // Screen y grows downward and the camera's up axis grows upward, and a
+        // positive tilt on that axis means the pen is leaning toward the user,
+        // which is toward the bottom of the screen. Hence the subtraction.
+        let direction =
+            (self.camera.right() * pen.tilt.x - self.camera.up() * pen.tilt.y).normalize_or_zero();
+        direction * (magnitude * MAX_TILT)
     }
 
     fn finish_stroke(&mut self) {
@@ -379,6 +431,7 @@ impl Brokkr {
             }
             Message::PressureToggled(on) => self.pressure_enabled = on,
             Message::PressureCurveChanged(curve) => self.pressure_curve = curve,
+            Message::TiltToggled(on) => self.tilt_enabled = on,
             Message::ResetPressurePeak => self.tablet.reset_peak(),
             Message::Undo => self.undo(),
             Message::Redo => self.redo(),
@@ -610,10 +663,28 @@ impl Brokkr {
 
         let pen = self.tablet.state();
         let live = if pen.in_proximity {
-            format!("now {:.2}   peak {:.2}", pen.pressure, self.tablet.peak())
+            format!(
+                "{} {:.2}  peak {:.2}\ntilt {:+.2} {:+.2}",
+                if pen.eraser { "eraser" } else { "tip   " },
+                pen.pressure,
+                self.tablet.peak(),
+                pen.tilt.x,
+                pen.tilt.y
+            )
         } else {
             format!("pen away   peak {:.2}", self.tablet.peak())
         };
+
+        let capabilities = devices.first().map(|device| {
+            let mut parts = Vec::new();
+            if device.has_tilt {
+                parts.push("tilt");
+            }
+            if device.has_eraser {
+                parts.push("eraser");
+            }
+            if parts.is_empty() { "pressure only".to_string() } else { parts.join(", ") }
+        });
 
         column![
             text("PEN").size(theme::CAPTION_SIZE).color(theme::TEXT_MUTE),
@@ -626,6 +697,13 @@ impl Brokkr {
                 .size(theme::TEXT_SIZE_SMALL)
                 .color(theme::TEXT_DIM),
             slider(0.30..=3.00, self.pressure_curve, Message::PressureCurveChanged).step(0.05),
+            checkbox(self.tilt_enabled)
+                .label("Tilt steers stroke")
+                .on_toggle(Message::TiltToggled)
+                .text_size(theme::TEXT_SIZE_SMALL),
+            text(capabilities.unwrap_or_default())
+                .size(theme::CAPTION_SIZE)
+                .color(theme::TEXT_MUTE),
             row![
                 text(live).size(theme::CAPTION_SIZE).font(theme::MONO).color(theme::TEXT_DIM),
                 button(text("reset").size(theme::CAPTION_SIZE))
@@ -648,6 +726,7 @@ impl Default for Brokkr {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tablet::PenState;
     use iced::Vector;
 
     const SIZE: Vector = Vector { x: 800.0, y: 600.0 };
@@ -834,6 +913,117 @@ mod tests {
             app.stroke_direction(),
             BrushDirection::Add,
             "smooth has no opposite, so inverting it should do nothing"
+        );
+    }
+
+    fn pen(tilt: glam::Vec2, eraser: bool) -> PenState {
+        PenState { in_proximity: true, pressure: 1.0, eraser, tilt }
+    }
+
+    #[test]
+    fn the_eraser_end_inverts_the_brush() {
+        let mut app = app();
+        assert_eq!(app.stroke_direction(), BrushDirection::Add);
+
+        app.tablet.simulate(pen(glam::Vec2::ZERO, true));
+        assert_eq!(app.stroke_direction(), BrushDirection::Subtract);
+
+        // The modifier and the eraser combine rather than override, so holding
+        // one while using the other gives back the additive brush.
+        app.control = true;
+        assert_eq!(app.stroke_direction(), BrushDirection::Add);
+    }
+
+    #[test]
+    fn the_eraser_does_nothing_to_a_brush_with_no_opposite() {
+        let mut app = app();
+        app.update(Message::BrushKindChanged(BrushKind::Smooth));
+        app.tablet.simulate(pen(glam::Vec2::ZERO, true));
+        assert_eq!(app.stroke_direction(), BrushDirection::Add);
+    }
+
+    #[test]
+    fn a_pen_that_is_away_cannot_erase() {
+        let app = app();
+        app.tablet.simulate(PenState { eraser: true, ..PenState::NONE });
+        assert_eq!(app.stroke_direction(), BrushDirection::Add);
+    }
+
+    #[test]
+    fn leaning_the_pen_produces_a_world_space_lean_along_the_camera_axes() {
+        let mut app = app();
+        assert_eq!(app.pen_lean(), Vec3::ZERO, "no pen means no lean");
+
+        app.tablet.simulate(pen(glam::Vec2::new(1.0, 0.0), false));
+        let lean = app.pen_lean();
+        assert!(
+            (lean.length() - MAX_TILT).abs() < 1.0e-4,
+            "a fully tilted pen should lean by the maximum angle, got {}",
+            lean.length()
+        );
+        assert!(
+            lean.normalize().dot(app.camera.right()) > 0.999,
+            "tilt on the x axis should lean along the camera's right axis"
+        );
+
+        // Tilt on the y axis leans down the screen, which is away from up.
+        app.tablet.simulate(pen(glam::Vec2::new(0.0, 1.0), false));
+        assert!(app.pen_lean().normalize().dot(app.camera.up()) < -0.999);
+
+        app.update(Message::TiltToggled(false));
+        assert_eq!(app.pen_lean(), Vec3::ZERO, "turning tilt off must disable it entirely");
+    }
+
+    #[test]
+    fn leaning_the_pen_moves_where_the_clay_lands() {
+        // The end to end statement of what tilt is for: the same stroke on the
+        // same spot puts material somewhere else when the pen is leaned.
+        //
+        // Measured as the difference between the two sides of the stroke rather
+        // than against an upright stroke. Leaning also reduces how far the
+        // brush pushes outward, by the cosine of the angle, and that term is
+        // larger than the sideways one at this scale. Comparing left against
+        // right cancels it, because it applies to both equally.
+        let sculpt = |tilt: glam::Vec2| {
+            let mut app = app();
+            app.viewport_size = Vec2::new(SIZE.x, SIZE.y);
+            app.brush.strength = 0.8;
+            app.brush.radius = 6.0;
+            app.tablet.simulate(pen(tilt, false));
+
+            let hit = app
+                .surface_under(Vec2::new(SIZE.x / 2.0, SIZE.y / 2.0))
+                .expect("the centre of the view is on the model");
+            let sideways = app.camera.right() * 4.0;
+
+            // One stamp moves the surface by a fraction of a voxel, so the
+            // stroke has to be laid down repeatedly to be measurable.
+            for _ in 0..8 {
+                press(&mut app, centre_of_viewport());
+                release(&mut app);
+            }
+            (app.volume.sample_world(hit + sideways), app.volume.sample_world(hit - sideways))
+        };
+
+        let (right_upright, left_upright) = sculpt(glam::Vec2::ZERO);
+        assert!(
+            (right_upright - left_upright).abs() < 0.02,
+            "an upright pen should build up evenly on both sides: \
+             {right_upright} against {left_upright}"
+        );
+
+        let (right_leaned, left_leaned) = sculpt(glam::Vec2::new(1.0, 0.0));
+        assert!(
+            right_leaned < left_leaned - 0.02,
+            "leaning right should pile material to the right: \
+             right {right_leaned}, left {left_leaned}"
+        );
+
+        let (right_other_way, left_other_way) = sculpt(glam::Vec2::new(-1.0, 0.0));
+        assert!(
+            left_other_way < right_other_way - 0.02,
+            "leaning left should pile material to the left: \
+             right {right_other_way}, left {left_other_way}"
         );
     }
 

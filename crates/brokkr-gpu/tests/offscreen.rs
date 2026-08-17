@@ -423,3 +423,59 @@ fn every_brush_leaves_a_visible_mark() {
         assert_eq!(renderer.stats().overflowed, 0, "{kind} overflowed the mesh pool");
     }
 }
+
+#[test]
+fn a_leaned_stroke_looks_different_from_an_upright_one() {
+    // Tilt steering is checked numerically in the engine and the application,
+    // but brush behaviour in this project has twice looked wrong on screen
+    // while every number passed, so it gets a picture too.
+    let Some(harness) = Harness::new() else {
+        eprintln!("no usable wgpu adapter, skipping the offscreen render test");
+        return;
+    };
+
+    let distance = MODEL_RADIUS * 3.0;
+    let front = Vec3::new(0.45, 0.35, 1.0).normalize() * MODEL_RADIUS;
+    // Lean across the stroke, which runs up and down the screen.
+    let sideways = Vec3::new(0.45, 0.35, 1.0).normalize().cross(Vec3::Y).normalize();
+
+    let mut frames = Vec::new();
+    for (label, lean) in [("tilt-upright", Vec3::ZERO), ("tilt-leaned", sideways * 0.9)] {
+        let mut renderer = SculptRenderer::new(&harness.device, &harness.queue, TARGET_FORMAT);
+        renderer.resize(&harness.device, WIDTH, HEIGHT);
+        renderer.write_uniforms(&harness.queue, &uniforms(distance));
+
+        let mut volume = Volume::new(VOXEL_SIZE);
+        volume.seed_sphere(Vec3::ZERO, MODEL_RADIUS);
+
+        let mut brush_scratch = BrushScratch::new();
+        let brush = Brush { kind: BrushKind::Draw, radius: 9.0, strength: 0.9, ..Brush::default() };
+        for step in -4..=4 {
+            let at = front + Vec3::new(0.0, step as f32 * 2.5, 0.0);
+            let normal = brokkr_core::lean_normal(volume.gradient_world(at), lean);
+            for _ in 0..6 {
+                brush.apply(
+                    &mut volume,
+                    &Stamp::new(at, normal, BrushDirection::Add),
+                    &mut brush_scratch,
+                );
+            }
+        }
+
+        upload_all(&mut renderer, &harness.queue, &mut volume);
+        let frame = harness.frame(&renderer);
+        dump(label, &frame);
+        assert!(coverage(&frame).0 > 0, "{label} rendered nothing");
+        frames.push(frame);
+    }
+
+    let changed = frames[0]
+        .chunks_exact(4)
+        .zip(frames[1].chunks_exact(4))
+        .filter(|(a, b)| a[..3] != b[..3])
+        .count();
+    assert!(
+        changed > 1_000,
+        "leaning the pen changed only {changed} pixels, so it is not steering the stroke"
+    );
+}

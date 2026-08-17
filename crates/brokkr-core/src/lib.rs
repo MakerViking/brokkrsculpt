@@ -35,7 +35,9 @@ pub use brick::{
     APRON_DIM, APRON_VOXELS, BRICK_DIM, BRICK_VOXELS, Brick, BrickCoord, INSIDE, NARROW_BAND,
     OUTSIDE,
 };
-pub use brush::{Brush, BrushDirection, BrushKind, BrushScratch, FalloffCurve, Stamp, Symmetry};
+pub use brush::{
+    Brush, BrushDirection, BrushKind, BrushScratch, FalloffCurve, Stamp, Symmetry, lean_normal,
+};
 pub use mesh::{BrickMesh, MeshScratch, Vertex};
 pub use raycast::{Hit, raycast};
 pub use region::FieldRegion;
