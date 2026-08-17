@@ -26,6 +26,7 @@ pub mod brush;
 pub mod export;
 pub mod mesh;
 pub mod pattern;
+pub mod project;
 pub mod raycast;
 pub mod region;
 pub mod resample;
@@ -45,6 +46,7 @@ pub use brush::{
 pub use export::{ExportMesh, MeshReport};
 pub use mesh::{BrickMesh, MeshScratch, Vertex};
 pub use pattern::{MAX_SCALE_MM, MIN_SCALE_VOXELS, Pattern, PatternKind};
+pub use project::{ProjectError, ProjectState};
 pub use raycast::{Hit, raycast};
 pub use region::FieldRegion;
 pub use stroke::{MAX_STAMPS_PER_EVENT, Stroke};
