@@ -249,6 +249,7 @@ impl Brokkr {
                 let mut items = column![
                     entry("New", Message::NewSculpt),
                     entry("Open…", Message::OpenRequested),
+                    entry("Import mesh…", Message::ImportRequested),
                 ]
                 .spacing(1);
                 // Only when there is one to recover. A permanently greyed item
@@ -273,11 +274,7 @@ impl Brokkr {
                     .push(separator())
                     .push(exports)
             }
-            // No Import here on purpose. Importing a mesh is a voxeliser, not
-            // file plumbing, so the item appears when that exists rather than
-            // sitting greyed out promising something.
-            //
-            // No Settings either: the properties panel already carries every
+            // No Settings menu: the properties panel already carries every
             // setting there is, and a second surface for the same state would
             // drift from it.
             TopMenu::Help => column![

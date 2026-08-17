@@ -103,6 +103,48 @@ pub enum ConfirmChoice {
     Cancel,
 }
 
+/// A finished import, on its way from a background task to the update loop.
+///
+/// Hand written rather than a `Box` or a plain field, and the reason is not
+/// stylistic: `Message` derives `Debug` and `Clone`, `Volume` derives neither,
+/// and `Box<T>` is `Clone` only when `T` is. `Arc<Mutex<T>>` is `Clone` for any
+/// `T` but is `Debug` only when `T` is, so the `Debug` impl below is what makes
+/// the pair work. Do not "simplify" this into a `Box` -- it will not compile.
+///
+/// The slot is taken from rather than read, because the volume moves out into
+/// the application exactly once.
+#[derive(Clone)]
+pub struct ImportPayload(
+    pub std::sync::Arc<std::sync::Mutex<Option<Result<Imported, brokkr_core::import::ImportError>>>>,
+);
+
+impl ImportPayload {
+    pub fn new(result: Result<Imported, brokkr_core::import::ImportError>) -> Self {
+        Self(std::sync::Arc::new(std::sync::Mutex::new(Some(result))))
+    }
+
+    /// Take the result out. A second call yields `None`, which is correct: a
+    /// message can in principle be delivered twice and the volume must move
+    /// once.
+    pub fn take(&self) -> Option<Result<Imported, brokkr_core::import::ImportError>> {
+        self.0.lock().ok().and_then(|mut slot| slot.take())
+    }
+}
+
+impl std::fmt::Debug for ImportPayload {
+    fn fmt(&self, out: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        out.write_str("ImportPayload(..)")
+    }
+}
+
+/// What a successful import produced.
+pub struct Imported {
+    pub volume: brokkr_core::Volume,
+    pub report: brokkr_core::voxelise::VoxeliseReport,
+    pub source: std::path::PathBuf,
+    pub elapsed_ms: f64,
+}
+
 /// A collapsible block of the properties panel.
 ///
 /// The panel has more in it than fits a 1080 high window, and a scrollable
@@ -236,6 +278,15 @@ pub enum Message {
     OpenRecent(std::path::PathBuf),
     /// Load the crash net left behind by a session that did not save.
     RecoverAutosave,
+    /// Import a mesh: ask for a file, then read and voxelise whatever came back.
+    ImportRequested,
+    ImportChosen(Option<std::path::PathBuf>),
+    /// The finished import, or why it failed.
+    ///
+    /// The payload is carried in a shared slot because `Message` derives `Debug`
+    /// and `Clone` while `Volume` derives neither, so it cannot be put in a
+    /// variant directly. See [`ImportPayload`].
+    ImportLoaded(ImportPayload),
     /// Save. Over the current file if there is one, otherwise as a new one.
     SaveRequested,
     SaveAsRequested,

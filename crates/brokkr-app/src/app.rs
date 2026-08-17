@@ -308,6 +308,9 @@ pub(crate) enum PendingAction {
     /// autosave path, because the document that comes back must NOT be owned by
     /// that path -- see [`Brokkr::recover_autosave`].
     RecoverAutosave,
+    /// Import a mesh. Discards the document exactly as Open does, so it goes
+    /// through the same gate.
+    Import,
     /// Carries the window, because with `exit_on_close_request(false)` the
     /// close has to be issued by us against that specific window.
     Quit(iced::window::Id),
@@ -320,6 +323,7 @@ impl PendingAction {
             PendingAction::NewSculpt => "Starting a new sculpt",
             PendingAction::Open | PendingAction::OpenRecent(_) => "Opening another file",
             PendingAction::RecoverAutosave => "Recovering the autosave",
+            PendingAction::Import => "Importing a mesh",
             PendingAction::Quit(_) => "Quitting",
         }
     }
@@ -389,6 +393,19 @@ async fn pick_export_target(format: ExportFormat) -> Option<std::path::PathBuf> 
         })
 }
 
+/// Ask for a mesh to import.
+///
+/// `pick_file`, so unlike the two save dialogs there is no extension fixup: the
+/// file already exists and its name is not ours to correct.
+async fn pick_mesh_to_import() -> Option<std::path::PathBuf> {
+    rfd::AsyncFileDialog::new()
+        .set_title("Import mesh")
+        .add_filter("Mesh", &brokkr_core::MESH_EXTENSIONS)
+        .pick_file()
+        .await
+        .map(|handle| handle.path().to_path_buf())
+}
+
 /// A hold-and-drag gesture adjusting one brush number.
 ///
 /// Holds where the pointer started and what the value was, so the gesture is
@@ -432,6 +449,11 @@ impl Brokkr {
         ));
         app.recent = crate::recent::Recent::load_from(Some(scratch.join("recent")));
         app.autosave_file = Some(scratch.join("autosave.brokkr"));
+        // `with_devices` has already looked for a crash net, and at that point
+        // it was still looking at the real one -- so on a machine that has an
+        // autosave the status line would arrive pre-filled and every test
+        // asserting on it would fail for a reason outside its own scope.
+        app.status = String::new();
         app
     }
 
@@ -562,6 +584,7 @@ impl Brokkr {
                 self.recover_autosave();
                 Task::none()
             }
+            PendingAction::Import => Task::perform(pick_mesh_to_import(), Message::ImportChosen),
             // Destroying the last window is what ends a non-daemon iced
             // application (`iced_winit` sends `Control::Exit` once the window
             // manager is empty), so this really does quit.
@@ -1182,6 +1205,58 @@ impl Brokkr {
         self.refresh_overlay();
     }
 
+    /// Swap an imported model in, modelled on `open_project`.
+    ///
+    /// Four things here are individually silent when wrong.
+    ///
+    /// `project_path` is cleared, where `open_project` sets it. An import must
+    /// not adopt the mesh's path, or the next plain Save would write a `.brokkr`
+    /// container straight over the user's `.stl` with no dialog and no warning.
+    /// This is the most damaging mistake available in this function.
+    ///
+    /// The stale brick loop clears the outgoing model from the renderer's mesh
+    /// pool. Skipping it compiles and leaves the previous model's triangles
+    /// drawn on top of the new one.
+    ///
+    /// `mark_everything_dirty` is done by `voxelise` itself, exactly as
+    /// `project::read` does it, which is why neither this nor `open_project`
+    /// appears to need it.
+    ///
+    /// The camera is framed on `MODEL_RADIUS_MM` like every other call site, not
+    /// on `bounding_radius`: that is measured from the origin over brick
+    /// extents, so for a centred model it over-reports by up to about 1.7 times
+    /// plus padding and the camera sits visibly too far back.
+    fn adopt_import(&mut self, imported: crate::message::Imported) {
+        let stale: Vec<BrickCoord> = self.volume.brick_coords().collect();
+        self.volume = imported.volume;
+        for coord in stale {
+            self.volume.mark_dirty(coord);
+        }
+
+        self.voxel_size = self.volume.voxel_size();
+        self.camera = OrbitCamera::framing(Vec3::ZERO, MODEL_RADIUS_MM);
+        self.history.clear();
+        self.history_stats = self.history.stats();
+        self.project_path = None;
+        // An import is unsaved work by definition: there is no `.brokkr` file
+        // holding it, and quitting now would lose the whole thing.
+        self.unsaved = true;
+        self.status = format!(
+            "imported {}: {}, {:.0} ms",
+            imported
+                .source
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_else(|| imported.source.display().to_string()),
+            imported.report.summary(),
+            imported.elapsed_ms,
+        );
+        log::info!("{}", self.status);
+        self.publish_camera();
+        self.remesh_dirty();
+        self.refresh_overlay();
+    }
+
     fn save_project(&mut self, path: &std::path::Path) {
         let state = self.project_state();
 
@@ -1759,6 +1834,52 @@ impl Brokkr {
             Message::OpenRequested => return self.guard(PendingAction::Open),
             Message::OpenRecent(path) => return self.guard(PendingAction::OpenRecent(path)),
             Message::RecoverAutosave => return self.guard(PendingAction::RecoverAutosave),
+
+            // --- importing a mesh --------------------------------------------
+            Message::ImportRequested => return self.guard(PendingAction::Import),
+            Message::ImportChosen(path) => {
+                let Some(path) = path else {
+                    return Task::none();
+                };
+                self.status = format!("importing {}…", path.display());
+                let voxel_size = self.voxel_size;
+                // Off the update loop, unlike open and save. Those are
+                // milliseconds; voxelising a large mesh is seconds, and the
+                // update loop is the thread that draws.
+                return Task::perform(
+                    async move {
+                        let started = Instant::now();
+                        let outcome = brokkr_core::import::read_path(&path).and_then(|mesh| {
+                            let options = brokkr_core::voxelise::VoxeliseOptions::at(voxel_size);
+                            brokkr_core::voxelise::voxelise(&mesh, &options).map(
+                                |(volume, report)| crate::message::Imported {
+                                    volume,
+                                    report,
+                                    source: path.clone(),
+                                    elapsed_ms: started.elapsed().as_secs_f64() * 1000.0,
+                                },
+                            )
+                        });
+                        crate::message::ImportPayload::new(outcome)
+                    },
+                    Message::ImportLoaded,
+                );
+            }
+            Message::ImportLoaded(payload) => {
+                match payload.take() {
+                    Some(Ok(imported)) => self.adopt_import(imported),
+                    // The "could not" prefix is load bearing: the header colours
+                    // the status line by that substring, so a message without it
+                    // renders in muted grey as though the import had worked.
+                    Some(Err(error)) => {
+                        self.status = format!("could not import: {error}");
+                        log::error!("{}", self.status);
+                    }
+                    // Already taken, which can only happen if the message were
+                    // delivered twice. Nothing to do, and nothing is lost.
+                    None => {}
+                }
+            }
             Message::OpenChosen(path) => {
                 if let Some(path) = path {
                     self.open_project(&path);
@@ -2680,6 +2801,101 @@ mod tests {
         );
 
         std::fs::remove_dir_all(&directory).ok();
+    }
+
+    // --- importing a mesh ----------------------------------------------------
+
+    /// Drives the import through the application rather than the voxeliser,
+    /// because the interesting failures are all in the wiring: a stale mesh
+    /// pool, history outliving its model, and above all a document that thinks
+    /// it belongs to the STL it came from.
+    #[test]
+    fn importing_a_mesh_replaces_the_model_without_claiming_its_file() {
+        let directory = scratch("import");
+        let path = directory.join("cube.stl");
+
+        // Write a real STL through this project's own writer, so the test
+        // exercises the reader rather than an assumption about the format.
+        let mut source = brokkr_core::Volume::new(0.5);
+        source.seed_sphere(Vec3::ZERO, 14.0);
+        source.mark_everything_dirty();
+        let (mesh, report) = source.export_mesh();
+        assert!(report.is_printable(), "the fixture is not printable");
+        let mut bytes = Vec::new();
+        brokkr_core::export::stl::write(&mesh, &mut bytes).unwrap();
+        std::fs::write(&path, &bytes).unwrap();
+
+        let mut app = app();
+        app.project_path = Some(directory.join("previous.brokkr"));
+        press(&mut app, centre_of_viewport());
+        release(&mut app);
+
+        let imported = brokkr_core::import::read_path(&path).expect("the STL should read");
+        let options = brokkr_core::voxelise::VoxeliseOptions::at(app.voxel_size);
+        let (volume, voxel_report) =
+            brokkr_core::voxelise::voxelise(&imported, &options).expect("it should voxelise");
+        app.adopt_import(crate::message::Imported {
+            volume,
+            report: voxel_report,
+            source: path.clone(),
+            elapsed_ms: 0.0,
+        });
+
+        assert!(
+            app.project_path.is_none(),
+            "the import adopted the mesh's path, so the next plain Save would write a .brokkr \
+             container straight over the user's .stl"
+        );
+        assert!(app.unsaved, "an imported model is unsaved work and quitting would lose it");
+        assert!(!app.history.can_undo(), "history outlived the model it belonged to");
+        assert!(app.perf.dirty_bricks > 0, "nothing was meshed, so the import is invisible");
+        assert!(app.status.starts_with("imported"), "reported: {}", app.status);
+
+        let (_, after) = app.volume.export_mesh();
+        assert!(after.is_printable(), "the imported model is not printable: {}", after.summary());
+
+        std::fs::remove_dir_all(&directory).ok();
+    }
+
+    /// A file that cannot be read must leave the sculpt on screen alone, and
+    /// must say so in a way the header renders as an error.
+    #[test]
+    fn a_mesh_that_cannot_be_read_reports_and_changes_nothing() {
+        let directory = scratch("import-bad");
+        let path = directory.join("broken.stl");
+        std::fs::write(&path, b"this is not an STL of any flavour").unwrap();
+
+        let mut app = app();
+        press(&mut app, centre_of_viewport());
+        release(&mut app);
+        let before = app.volume.sample_world(Vec3::ZERO);
+
+        let payload = crate::message::ImportPayload::new(
+            brokkr_core::import::read_path(&path).map(|_| unreachable!("it should not parse")),
+        );
+        update(&mut app, Message::ImportLoaded(payload));
+
+        assert!(
+            app.status.contains("could not"),
+            "the failure does not contain the substring the header colours as an error: {}",
+            app.status
+        );
+        assert_eq!(
+            app.volume.sample_world(Vec3::ZERO),
+            before,
+            "a failed import changed the model"
+        );
+        assert!(app.history.can_undo(), "a failed import cleared history");
+
+        std::fs::remove_dir_all(&directory).ok();
+    }
+
+    /// Import discards the document, so it goes through the same gate as Open.
+    #[test]
+    fn importing_with_unsaved_work_raises_the_prompt() {
+        let mut app = app_with_unsaved_work();
+        update(&mut app, Message::ImportRequested);
+        assert_eq!(app.confirm, Some(PendingAction::Import));
     }
 
     #[test]
