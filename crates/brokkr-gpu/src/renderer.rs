@@ -11,6 +11,7 @@
 use brokkr_core::{BrickCoord, BrickMesh, Vertex};
 use bytemuck::{Pod, Zeroable};
 
+use crate::frustum::Frustum;
 use crate::matcap;
 use crate::mesh_pool::{MeshPool, PoolStats};
 
@@ -312,6 +313,7 @@ impl SculptRenderer {
         encoder: &mut wgpu::CommandEncoder,
         target: &wgpu::TextureView,
         clip: PixelRect,
+        frustum: &Frustum,
     ) {
         if clip.width == 0 || clip.height == 0 {
             return;
@@ -348,7 +350,7 @@ impl SculptRenderer {
             1.0,
         );
         pass.set_scissor_rect(clip.x, clip.y, clip.width, clip.height);
-        self.pool.draw(&mut pass);
+        self.pool.draw(&mut pass, frustum);
     }
 }
 

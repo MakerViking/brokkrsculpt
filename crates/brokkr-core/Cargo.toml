@@ -16,6 +16,7 @@ rust-version.workspace = true
 bytemuck.workspace = true
 fast-surface-nets.workspace = true
 glam.workspace = true
+rayon.workspace = true
 rustc-hash.workspace = true
 
 [dev-dependencies]
@@ -23,4 +24,8 @@ glam.workspace = true
 
 [[bench]]
 name = "budget"
+harness = false
+
+[[bench]]
+name = "scale"
 harness = false

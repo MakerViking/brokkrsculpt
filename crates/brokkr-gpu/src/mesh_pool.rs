@@ -7,25 +7,39 @@
 //! GPU memory after startup: the two big buffers are made once and the
 //! suballocator hands out and reclaims ranges inside them.
 
+use std::sync::atomic::{AtomicUsize, Ordering};
+
 use brokkr_core::{BrickCoord, BrickMesh, Vertex};
+use glam::Vec3;
 use rustc_hash::FxHashMap;
 
-/// Vertices the pool can hold. At 24 bytes each this is 48 MB.
-///
-/// A 256 cubed sphere meshes to roughly 300k vertices before per brick seam
-/// duplication, so this leaves several times the headroom M0 needs. Growing the
-/// pool at run time is deliberately not implemented: the GPU rewrite in M2
-/// replaces this with a brick pool and an atomic free list.
-pub const VERTEX_CAPACITY: u64 = 2_000_000;
+use crate::frustum::Frustum;
 
-/// Indices the pool can hold. At 4 bytes each this is 32 MB.
-pub const INDEX_CAPACITY: u64 = 8_000_000;
-
-/// Smallest suballocation, as a power of two count of elements.
+/// Vertices the pool can hold. At 24 bytes each this is 192 MB.
 ///
-/// Rounding every request up to at least this keeps the free lists short and
-/// stops a brick that meshes to three vertices from fragmenting the pool.
-const MIN_BLOCK_SHIFT: u32 = 8;
+/// Sized from measurement rather than guessed: a 30 mm sphere at a 0.055 mm
+/// voxel comes to 11.2 million triangles, 6.2 million vertices and 33.6 million
+/// indices, which is the scale M2 targets. This leaves about a quarter again on
+/// top of that.
+///
+/// Reserved up front. Growing a wgpu buffer means making a new one and copying,
+/// and the pool reports an overflow loudly rather than doing that mid stroke.
+pub const VERTEX_CAPACITY: u64 = 8_000_000;
+
+/// Indices the pool can hold. At 4 bytes each this is 176 MB.
+pub const INDEX_CAPACITY: u64 = 44_000_000;
+
+/// Allocation granularity, in elements.
+///
+/// This replaced power of two size classes, which wasted most of the pool. An
+/// average brick meshes to around 1100 vertices, and a power of two scheme
+/// rounds that up to 2048: at M2 scale the reserved space came to nearly twice
+/// what was in use and the pool overflowed on a model it had room for. Rounding
+/// to a multiple of this costs about a tenth instead.
+///
+/// Small enough to keep the waste down, large enough that the free lists stay
+/// short and a brick meshing to three vertices does not get its own bucket.
+const GRANULARITY: u64 = 256;
 
 /// A range inside one of the big buffers, measured in elements.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -34,15 +48,16 @@ struct Block {
     capacity: u64,
 }
 
-/// Power of two size class suballocator over a fixed range.
+/// Fixed granularity suballocator over a fixed range.
 ///
 /// Blocks are never split or merged, so a freed block can only be reused by a
-/// request in the same size class. Brick meshes cluster tightly in size, which
-/// is what makes that acceptable.
+/// request that rounds to the same size. Brick meshes cluster tightly in size,
+/// which is what makes that acceptable.
 #[derive(Debug)]
 struct BlockAllocator {
     capacity: u64,
     bump: u64,
+    /// Free block offsets, indexed by how many granules they hold.
     free: Vec<Vec<u64>>,
     live: u64,
 }
@@ -52,19 +67,19 @@ impl BlockAllocator {
         Self { capacity, bump: 0, free: Vec::new(), live: 0 }
     }
 
-    fn class_shift(count: u64) -> u32 {
-        count.max(1).next_power_of_two().trailing_zeros().max(MIN_BLOCK_SHIFT)
+    /// Granules needed for a request, never zero.
+    fn granules(count: u64) -> usize {
+        count.max(1).div_ceil(GRANULARITY) as usize
     }
 
     fn allocate(&mut self, count: u64) -> Option<Block> {
-        let shift = Self::class_shift(count);
-        let capacity = 1u64 << shift;
-        let class = (shift - MIN_BLOCK_SHIFT) as usize;
+        let granules = Self::granules(count);
+        let capacity = granules as u64 * GRANULARITY;
 
-        if self.free.len() <= class {
-            self.free.resize(class + 1, Vec::new());
+        if self.free.len() <= granules {
+            self.free.resize(granules + 1, Vec::new());
         }
-        if let Some(offset) = self.free[class].pop() {
+        if let Some(offset) = self.free[granules].pop() {
             self.live += capacity;
             return Some(Block { offset, capacity });
         }
@@ -79,15 +94,15 @@ impl BlockAllocator {
     }
 
     fn release(&mut self, block: Block) {
-        let class = (block.capacity.trailing_zeros() - MIN_BLOCK_SHIFT) as usize;
-        if self.free.len() <= class {
-            self.free.resize(class + 1, Vec::new());
+        let granules = (block.capacity / GRANULARITY) as usize;
+        if self.free.len() <= granules {
+            self.free.resize(granules + 1, Vec::new());
         }
-        self.free[class].push(block.offset);
+        self.free[granules].push(block.offset);
         self.live -= block.capacity;
     }
 
-    /// Elements handed out, including the padding inside each size class.
+    /// Elements handed out, including the padding inside each block.
     fn live(&self) -> u64 {
         self.live
     }
@@ -100,6 +115,23 @@ struct Slot {
     indices: Block,
     vertex_count: u32,
     index_count: u32,
+    /// World space bounds of this brick's geometry, for culling. Taken from the
+    /// mesh rather than from the brick's extent, because a brick is usually only
+    /// clipped by the surface in a thin band and the tighter box culls better.
+    minimum: Vec3,
+    maximum: Vec3,
+}
+
+/// Bounds of a set of vertices, or `None` if there are none.
+fn bounds(vertices: &[Vertex]) -> Option<(Vec3, Vec3)> {
+    let mut minimum = Vec3::splat(f32::INFINITY);
+    let mut maximum = Vec3::splat(f32::NEG_INFINITY);
+    for vertex in vertices {
+        let position = Vec3::from_array(vertex.position);
+        minimum = minimum.min(position);
+        maximum = maximum.max(position);
+    }
+    (vertices.is_empty()).then_some(()).map_or(Some((minimum, maximum)), |_| None)
 }
 
 /// What the pool is currently holding, for the debug overlay.
@@ -107,15 +139,22 @@ struct Slot {
 pub struct PoolStats {
     pub bricks: usize,
     pub triangles: usize,
-    /// Vertices actually in use, as opposed to the space reserved for them.
+    /// Vertices and indices actually in use.
     pub vertices: usize,
-    pub vertices_used: u64,
-    pub indices_used: u64,
+    pub indices: usize,
+    /// Space handed out for them, which includes the padding inside each block.
+    /// The gap between this and the counts above is the allocator's waste, and
+    /// it is what runs the pool out of room, so both are worth showing.
+    pub vertices_reserved: u64,
+    pub indices_reserved: u64,
     pub vertex_capacity: u64,
     pub index_capacity: u64,
     /// Bricks skipped because the pool was full. Any value above zero means
     /// the model on screen is incomplete.
     pub overflowed: usize,
+    /// Bricks drawn and bricks culled on the last frame.
+    pub drawn: usize,
+    pub culled: usize,
 }
 
 /// The shared mesh buffers and the map from brick to slice.
@@ -130,6 +169,10 @@ pub struct MeshPool {
     vertices: usize,
     overflowed: usize,
     warned_about_overflow: bool,
+    /// Counts from the last draw. Atomic because drawing takes a shared borrow
+    /// and Iced requires the pipeline it owns to be `Sync`.
+    drawn: AtomicUsize,
+    culled: AtomicUsize,
 }
 
 impl MeshPool {
@@ -157,6 +200,8 @@ impl MeshPool {
             vertices: 0,
             overflowed: 0,
             warned_about_overflow: false,
+            drawn: AtomicUsize::new(0),
+            culled: AtomicUsize::new(0),
         }
     }
 
@@ -210,7 +255,14 @@ impl MeshPool {
                     }
                     return;
                 };
-                Slot { vertices, indices, vertex_count: 0, index_count: 0 }
+                Slot {
+                    vertices,
+                    indices,
+                    vertex_count: 0,
+                    index_count: 0,
+                    minimum: Vec3::ZERO,
+                    maximum: Vec3::ZERO,
+                }
             }
         };
 
@@ -227,34 +279,51 @@ impl MeshPool {
 
         self.triangles += mesh.indices.len() / 3;
         self.vertices += mesh.vertices.len();
+        let (minimum, maximum) = bounds(&mesh.vertices).unwrap_or((Vec3::ZERO, Vec3::ZERO));
         self.slots.insert(
             coord,
             Slot {
                 vertex_count: mesh.vertices.len() as u32,
                 index_count: mesh.indices.len() as u32,
+                minimum,
+                maximum,
                 ..slot
             },
         );
     }
 
-    /// Record one indexed draw per brick.
+    /// Record one indexed draw per visible brick.
     ///
-    /// Per brick draws are fine at M0 scale and get replaced by batching and
-    /// indirect draws in M2. Indices are brick local, so the slice's vertex
-    /// offset goes in as the base vertex.
-    pub fn draw(&self, pass: &mut wgpu::RenderPass<'_>) {
+    /// Indices are brick local, so the slice's vertex offset goes in as the base
+    /// vertex. Bricks outside the frustum are skipped: at M2 scale a model is
+    /// several thousand bricks and most of them are off screen at any moment, so
+    /// not drawing those is the cheapest saving available.
+    pub fn draw(&self, pass: &mut wgpu::RenderPass<'_>, frustum: &Frustum) {
+        self.drawn.store(0, Ordering::Relaxed);
+        self.culled.store(0, Ordering::Relaxed);
         if self.slots.is_empty() {
             return;
         }
+
         pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
         pass.set_index_buffer(self.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+
+        let mut drawn = 0;
+        let mut culled = 0;
         for slot in self.slots.values() {
             if slot.index_count == 0 {
                 continue;
             }
+            if !frustum.intersects(slot.minimum, slot.maximum) {
+                culled += 1;
+                continue;
+            }
+            drawn += 1;
             let start = slot.indices.offset as u32;
             pass.draw_indexed(start..start + slot.index_count, slot.vertices.offset as i32, 0..1);
         }
+        self.drawn.store(drawn, Ordering::Relaxed);
+        self.culled.store(culled, Ordering::Relaxed);
     }
 
     pub fn stats(&self) -> PoolStats {
@@ -262,11 +331,14 @@ impl MeshPool {
             bricks: self.slots.len(),
             triangles: self.triangles,
             vertices: self.vertices,
-            vertices_used: self.vertex_allocator.live(),
-            indices_used: self.index_allocator.live(),
+            indices: self.triangles * 3,
+            vertices_reserved: self.vertex_allocator.live(),
+            indices_reserved: self.index_allocator.live(),
             vertex_capacity: VERTEX_CAPACITY,
             index_capacity: INDEX_CAPACITY,
             overflowed: self.overflowed,
+            drawn: self.drawn.load(Ordering::Relaxed),
+            culled: self.culled.load(Ordering::Relaxed),
         }
     }
 }
@@ -276,11 +348,29 @@ mod tests {
     use super::*;
 
     #[test]
-    fn allocations_round_up_to_the_minimum_class() {
+    fn allocations_round_up_to_one_granule() {
         let mut allocator = BlockAllocator::new(1 << 20);
         let block = allocator.allocate(3).expect("space is available");
-        assert_eq!(block.capacity, 1 << MIN_BLOCK_SHIFT);
+        assert_eq!(block.capacity, GRANULARITY);
         assert_eq!(block.offset, 0);
+    }
+
+    #[test]
+    fn the_padding_on_a_typical_brick_stays_small() {
+        // The regression test for a real overflow. Power of two size classes
+        // rounded an average brick's 1100 vertices up to 2048, so the pool
+        // reserved nearly twice what was in use and ran out of room on a model
+        // it had space for.
+        let mut allocator = BlockAllocator::new(1 << 24);
+        for request in [900_u64, 1100, 1500, 2100, 3300] {
+            let block = allocator.allocate(request).expect("space is available");
+            let waste = block.capacity - request;
+            assert!(
+                waste < GRANULARITY,
+                "a request for {request} reserved {} and wasted {waste}",
+                block.capacity
+            );
+        }
     }
 
     #[test]

@@ -151,6 +151,7 @@ fn main() {
     let spacing = brush.spacing(voxel_size);
 
     let mut brush_scratch = BrushScratch::new();
+    let mut meshes: Vec<BrickMesh> = Vec::new();
     let mut history = History::default();
     let mut centres: Vec<Vec3> = Vec::new();
 
@@ -194,9 +195,10 @@ fn main() {
             dirty_total += dirty.len();
 
             let remesh_start = Instant::now();
-            for &coord in &dirty {
-                volume.mesh_brick(coord, &mut scratch, &mut mesh);
+            while meshes.len() < dirty.len() {
+                meshes.push(BrickMesh::default());
             }
+            volume.mesh_bricks(&dirty, &mut meshes[..dirty.len()]);
             let remesh_time = remesh_start.elapsed();
 
             edit_samples.0.push(edit_time);
@@ -233,9 +235,10 @@ fn main() {
     let undo_time = undo_start.elapsed();
     volume.take_dirty(&mut dirty);
     let restore_start = Instant::now();
-    for &coord in &dirty {
-        volume.mesh_brick(coord, &mut scratch, &mut mesh);
+    while meshes.len() < dirty.len() {
+        meshes.push(BrickMesh::default());
     }
+    volume.mesh_bricks(&dirty, &mut meshes[..dirty.len()]);
     println!(
         "  undo of a whole stroke: {:.2} ms to restore {} bricks, {:.1} ms to remesh {} of them (no budget, not per frame)",
         millis(undo_time),

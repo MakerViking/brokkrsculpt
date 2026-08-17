@@ -18,7 +18,7 @@
 use std::sync::{Arc, Mutex};
 
 use brokkr_core::{BrickCoord, BrickMesh};
-use brokkr_gpu::{PixelRect, PoolStats, SculptRenderer, Uniforms};
+use brokkr_gpu::{Frustum, PixelRect, PoolStats, SculptRenderer, Uniforms};
 use iced::mouse;
 use iced::widget::shader;
 use iced::{Rectangle, Vector};
@@ -213,13 +213,17 @@ impl shader::Primitive for SculptPrimitive {
         let camera = *self.shared.camera.lock().expect("shared frame poisoned");
         let aspect = bounds.width / bounds.height.max(1.0);
         let view = camera.view();
+        let view_projection = camera.projection(aspect) * view;
         let uniforms = Uniforms {
-            view_projection: (camera.projection(aspect) * view).to_cols_array_2d(),
+            view_projection: view_projection.to_cols_array_2d(),
             view: view.to_cols_array_2d(),
             srgb_target: u32::from(pipeline.renderer.target_is_srgb()),
             padding: [0; 3],
         };
         pipeline.renderer.write_uniforms(queue, &uniforms);
+        // Culling has to use the same matrix the vertex shader will, or bricks
+        // vanish a frame before or after they should.
+        pipeline.frustum = Frustum::from_view_projection(view_projection);
 
         let drained: Vec<PendingUpload> = {
             let mut pending = self.shared.pending.lock().expect("shared frame poisoned");
@@ -252,6 +256,7 @@ impl shader::Primitive for SculptPrimitive {
                 width: clip_bounds.width,
                 height: clip_bounds.height,
             },
+            &pipeline.frustum,
         );
     }
 }
@@ -261,11 +266,17 @@ impl shader::Primitive for SculptPrimitive {
 #[derive(Debug)]
 pub struct SculptPipeline {
     renderer: SculptRenderer,
+    /// Rebuilt in `prepare` from the same matrix the shader gets, and used in
+    /// `render`, which is a separate call and has no access to the camera.
+    frustum: Frustum,
 }
 
 impl shader::Pipeline for SculptPipeline {
     fn new(device: &wgpu::Device, queue: &wgpu::Queue, format: wgpu::TextureFormat) -> Self {
-        Self { renderer: SculptRenderer::new(device, queue, format) }
+        Self {
+            renderer: SculptRenderer::new(device, queue, format),
+            frustum: Frustum::from_view_projection(glam::Mat4::IDENTITY),
+        }
     }
 }
 

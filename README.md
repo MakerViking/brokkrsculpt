@@ -14,33 +14,65 @@ Full design and milestone plan: [docs/BUILD-SPEC.md](docs/BUILD-SPEC.md).
 
 ## Status
 
-**M1, the brush system.** Six brushes, stroke interpolation, X symmetry,
-falloff curves, stylus pressure and undo. Still no export, no masking, no
-multiresolution.
+**M2, scale.** Six brushes, stroke interpolation, X symmetry, falloff curves,
+stylus pressure with tilt and an eraser, undo, and eleven million triangles
+staying interactive. Still no export, no masking, no multiresolution.
 
-Measured on a Radeon RX 6900 XT, at a 256 cubed effective volume, with
-everything switched on at once: interpolation producing several stamps per
-pointer event, symmetry applying each of them twice, and undo recording
-snapshotting each brick on first touch.
+All figures on a Radeon RX 6900 XT and a Ryzen 9 7900X.
+
+At M1 sizes, a 240 cubed effective volume, with everything on at once:
+interpolation producing several stamps per pointer event, symmetry applying each
+of them twice, and undo snapshotting each brick on first touch.
 
 | | slow drag | fast drag | budget |
 | --- | --- | --- | --- |
-| brush edit, p95 | 2.15 ms | 3.32 ms | 4 ms |
-| dirty remesh, p95 | 1.53 ms | 2.18 ms | 8 ms |
-| both, p95 | 3.64 ms | 5.30 ms | 16 ms |
+| brush edit, p95 | 2.24 ms | 3.53 ms | 4 ms |
+| dirty remesh, p95 | 0.58 ms | 0.59 ms | 8 ms |
+| both, p95 | 2.82 ms | 4.03 ms | 16 ms |
 
-Rendering 543k triangles fits inside a 6.94 ms vsync interval, and the volume
-holds 40 MB against a 3 GB design ceiling.
+At M2's target, a 30 mm sphere at a 0.055 mm voxel, which is 1090 cubed
+effective:
 
-The fast drag column is the one to watch: it is 4.8 stamps per event doubled by
-symmetry, and it is the only figure without a large margin. Draw and pinch cost
-roughly three times what the other four do, because both resample the field
-rather than adding to it. Moving edits to compute shaders in M2 is the answer,
-not shaving this.
+| | measured | budget |
+| --- | --- | --- |
+| triangles | 11,216,268 | 10 million |
+| brush edit, one stamp | 2.63 ms | 4 ms |
+| dirty remesh, 64 bricks | 0.86 ms | 8 ms |
+| render, all 5435 bricks drawn | 1.13 ms | 16 ms |
+| volume plus mesh | 1027 MB | well under 3 GB |
 
-An average stroke step remeshes about 13 bricks out of 408, which is the
+An average stroke step remeshes about 13 bricks out of 6056, which is the
 property the whole design exists to protect: work is proportional to what the
 brush touched, never to the size of the model.
+
+### M2 was met without compute shaders
+
+The build spec's plan for M2 was to move both the SDF edits and the meshing to
+wgpu compute, with a GPU brick pool and a page table. Measuring first showed
+that was not what stood in the way, and it is worth recording why the code does
+not look like the plan.
+
+At the target size the CPU path had exactly one problem: a brush edit took
+13.9 ms against a 4 ms budget, because a brush covers a fixed world radius and
+so touches cubically more voxels as the voxel size shrinks. Meshing and memory
+were already inside their budgets. Two changes fixed it:
+
+- Meshing across cores took a full mesh from 2547 ms to 233 ms and a stroke's
+  remesh from 5.6 ms to under 1 ms. Bricks are independent and meshing only
+  reads, so this is close to free parallelism.
+- Editing across cores, above a work threshold, took one stamp from 13.9 ms to
+  2.6 ms.
+
+Two things the plan called for turned out not to be needed. Drawing all 5435
+bricks individually costs 1.13 ms, so per brick batching would buy nothing. And
+16 bit distance values would halve a volume that already fits in a third of its
+ceiling.
+
+There is also an argument against moving only the edits: with meshing on the CPU,
+GPU edits would need a read back every stamp, and waiting for the GPU costs more
+than the edit saved. The compute route is close to all or nothing, and its one
+justification has gone. It remains the right answer for scales far beyond this,
+and the CPU path is a working reference to check it against when that time comes.
 
 ## Brushes
 

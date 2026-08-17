@@ -19,7 +19,7 @@ use brokkr_core::{
     BrickCoord, BrickMesh, Brush, BrushDirection, BrushKind, BrushScratch, MeshScratch, Stamp,
     Volume,
 };
-use brokkr_gpu::{PixelRect, SculptRenderer, Uniforms};
+use brokkr_gpu::{Frustum, PixelRect, SculptRenderer, Uniforms};
 use glam::{IVec3, Vec3};
 
 const WIDTH: u32 = 480;
@@ -37,6 +37,8 @@ struct Harness {
     view: wgpu::TextureView,
     readback: wgpu::Buffer,
     padded_row_bytes: u32,
+    /// The matrix the frames are rendered with, so culling and the shader agree.
+    view_projection: glam::Mat4,
 }
 
 impl Harness {
@@ -74,11 +76,23 @@ impl Harness {
             mapped_at_creation: false,
         });
 
-        Some(Self { device, queue, target, view, readback, padded_row_bytes })
+        Some(Self {
+            device,
+            queue,
+            target,
+            view,
+            readback,
+            padded_row_bytes,
+            view_projection: view_projection(MODEL_RADIUS * 3.0),
+        })
     }
 
     /// Clear to a known background, draw the sculpt, then read the pixels back
     /// as tightly packed RGBA.
+    ///
+    /// Culling uses the same matrix the shader gets, which is what the
+    /// application does too. A frustum that disagreed with the projection would
+    /// show up here as missing geometry.
     fn frame(&self, renderer: &SculptRenderer) -> Vec<u8> {
         let mut encoder = self
             .device
@@ -108,6 +122,7 @@ impl Harness {
             &mut encoder,
             &self.view,
             PixelRect { x: 0, y: 0, width: WIDTH, height: HEIGHT },
+            &Frustum::from_view_projection(self.view_projection),
         );
 
         encoder.copy_texture_to_buffer(
@@ -200,17 +215,25 @@ fn upload_dirty(renderer: &mut SculptRenderer, queue: &wgpu::Queue, volume: &mut
 
 /// A camera looking at the origin from a fixed direction, matching the
 /// conventions the application uses.
-fn uniforms(distance: f32) -> Uniforms {
+fn view_matrix(distance: f32) -> glam::Mat4 {
     let eye = Vec3::new(0.45, 0.35, 1.0).normalize() * distance;
-    let view = glam::camera::rh::view::look_at_mat4(eye, Vec3::ZERO, Vec3::Y);
+    glam::camera::rh::view::look_at_mat4(eye, Vec3::ZERO, Vec3::Y)
+}
+
+fn view_projection(distance: f32) -> glam::Mat4 {
     let projection = glam::camera::rh::proj::directx::perspective(
         45f32.to_radians(),
         WIDTH as f32 / HEIGHT as f32,
         0.1,
         distance * 4.0,
     );
+    projection * view_matrix(distance)
+}
+
+fn uniforms(distance: f32) -> Uniforms {
+    let view = view_matrix(distance);
     Uniforms {
-        view_projection: (projection * view).to_cols_array_2d(),
+        view_projection: view_projection(distance).to_cols_array_2d(),
         view: view.to_cols_array_2d(),
         // The offscreen target is an sRGB format, so the shader must not encode
         // a second time.

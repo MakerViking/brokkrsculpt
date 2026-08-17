@@ -7,8 +7,8 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use brokkr_core::{
-    BrickCoord, Brush, BrushDirection, BrushKind, BrushScratch, FalloffCurve, History,
-    HistoryStats, MeshScratch, Stamp, Stroke, Symmetry, Volume, VolumeStats, lean_normal, raycast,
+    BrickCoord, BrickMesh, Brush, BrushDirection, BrushKind, BrushScratch, FalloffCurve, History,
+    HistoryStats, Stamp, Stroke, Symmetry, Volume, VolumeStats, lean_normal, raycast,
 };
 use glam::{Vec2, Vec3};
 use iced::widget::{button, checkbox, column, container, pick_list, row, slider, stack, text};
@@ -113,7 +113,9 @@ pub struct Brokkr {
     stroke: Stroke,
     history: History,
     shared: Arc<SharedFrame>,
-    mesh_scratch: MeshScratch,
+    /// Buffers the dirty bricks are meshed into, refilled from the renderer's
+    /// recycled ones so a stroke never allocates.
+    mesh_buffers: Vec<BrickMesh>,
     brush_scratch: BrushScratch,
     /// Stamp centres produced by the current pointer event. Reused so a stroke
     /// does not allocate.
@@ -157,7 +159,7 @@ impl Brokkr {
             stroke: Stroke::new(),
             history: History::default(),
             shared,
-            mesh_scratch: MeshScratch::new(),
+            mesh_buffers: Vec::new(),
             brush_scratch: BrushScratch::new(),
             stamp_centres: Vec::new(),
             dirty: Vec::new(),
@@ -205,10 +207,15 @@ impl Brokkr {
         }
 
         let started = Instant::now();
-        for &coord in &self.dirty {
-            let mut mesh = self.shared.take_mesh();
-            self.volume.mesh_brick(coord, &mut self.mesh_scratch, &mut mesh);
-            self.shared.publish(coord, mesh);
+        let count = self.dirty.len();
+        while self.mesh_buffers.len() < count {
+            self.mesh_buffers.push(self.shared.take_mesh());
+        }
+        // Across every core. At the sizes M2 targets this is the difference
+        // between a remesh at 70 percent of its budget and one at under 10.
+        self.volume.mesh_bricks(&self.dirty, &mut self.mesh_buffers[..count]);
+        for (coord, mesh) in self.dirty.iter().zip(self.mesh_buffers.drain(..count)) {
+            self.shared.publish(*coord, mesh);
         }
         self.perf.remesh_ms = started.elapsed().as_secs_f32() * 1000.0;
         self.volume_stats = self.volume.stats();
@@ -524,8 +531,11 @@ impl Brokkr {
                 self.perf.load_ms
             ),
             format!(
-                "{} triangles   {} meshed bricks   pen {}",
-                pool.triangles,
+                "{} triangles   {} drawn / {} culled bricks",
+                pool.triangles, pool.drawn, pool.culled
+            ),
+            format!(
+                "{} meshed bricks   pen {}",
                 pool.bricks,
                 match self.tablet.devices().first() {
                     Some(device) => format!("{:.2} ({})", self.perf.pressure, device.name),

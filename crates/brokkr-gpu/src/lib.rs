@@ -7,9 +7,11 @@
 //! and a target format, and draws into whatever texture view it is handed, so
 //! the Iced specific glue stays in `brokkr-app`.
 
+pub mod frustum;
 pub mod matcap;
 pub mod mesh_pool;
 pub mod renderer;
 
+pub use frustum::Frustum;
 pub use mesh_pool::{INDEX_CAPACITY, MeshPool, PoolStats, VERTEX_CAPACITY};
 pub use renderer::{PixelRect, SculptRenderer, Uniforms};

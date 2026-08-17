@@ -21,3 +21,7 @@ wgpu.workspace = true
 brokkr-core.workspace = true
 glam.workspace = true
 pollster.workspace = true
+
+[[bench]]
+name = "render"
+harness = false

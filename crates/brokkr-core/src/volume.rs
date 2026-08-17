@@ -3,11 +3,13 @@
 //! The sparse brick volume: storage, sampling, editing and dirty tracking.
 
 use glam::{IVec3, Vec3};
+use rayon::prelude::*;
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::apron::ApronBuffer;
 use crate::brick::{
-    BRICK_DIM, Brick, BrickCoord, INSIDE, NARROW_BAND, OUTSIDE, apron_index, brick_index,
+    BRICK_DIM, BRICK_VOXELS, Brick, BrickCoord, INSIDE, NARROW_BAND, OUTSIDE, apron_index,
+    brick_index,
 };
 use crate::mesh::{BrickMesh, MeshScratch, mesh_apron};
 use crate::region::FieldRegion;
@@ -24,6 +26,62 @@ pub struct VolumeStats {
     pub resident_bytes: usize,
 }
 
+/// One brick lifted out of the map for the duration of an edit.
+///
+/// Taking bricks out is what lets the writing phase hold several mutable bricks
+/// at once, and it costs a pointer move each rather than a scan of the volume.
+struct Taken {
+    coord: BrickCoord,
+    brick: Brick,
+    /// Inclusive voxel range of this brick that the edit's box covers.
+    lo: IVec3,
+    hi: IVec3,
+    existed: bool,
+    was_uniform: bool,
+    recorded_now: bool,
+    changed: bool,
+}
+
+/// Apply an edit to one brick's voxels, returning whether anything changed.
+///
+/// A generic function rather than a closure, so that the brush's per voxel
+/// maths, which for the resampling brushes is an eight tap trilinear read,
+/// inlines into the loop.
+#[inline]
+fn write_voxels<F>(
+    data: &mut [f32; BRICK_VOXELS],
+    origin: IVec3,
+    lo: IVec3,
+    hi: IVec3,
+    voxel_size: f32,
+    edit: &F,
+) -> bool
+where
+    F: Fn(IVec3, Vec3, f32) -> f32 + Sync,
+{
+    let mut changed = false;
+    for wz in lo.z..=hi.z {
+        for wy in lo.y..=hi.y {
+            for wx in lo.x..=hi.x {
+                let voxel = IVec3::new(wx, wy, wz);
+                let index = brick_index(
+                    (wx - origin.x) as usize,
+                    (wy - origin.y) as usize,
+                    (wz - origin.z) as usize,
+                );
+                let position = voxel.as_vec3() * voxel_size;
+                let old = data[index];
+                let new = edit(voxel, position, old).clamp(INSIDE, OUTSIDE);
+                if new != old {
+                    data[index] = new;
+                    changed = true;
+                }
+            }
+        }
+    }
+    changed
+}
+
 /// A sparse grid of bricks at a fixed world space voxel size.
 ///
 /// Only bricks that carry detail are stored. Absent bricks read as [`OUTSIDE`],
@@ -37,6 +95,10 @@ pub struct Volume {
     /// when no stroke is in progress. The inner `None` means the brick did not
     /// exist, which undo has to restore just as faithfully as any content.
     recorder: Option<FxHashMap<BrickCoord, Option<Brick>>>,
+    /// Working space for [`Volume::edit_voxels`], kept between calls. A stroke
+    /// lays down thousands of stamps, and the budget forbids allocating in that
+    /// path.
+    edit_scratch: Vec<Taken>,
 }
 
 impl Volume {
@@ -52,6 +114,7 @@ impl Volume {
             bricks: FxHashMap::default(),
             dirty: FxHashSet::default(),
             recorder: None,
+            edit_scratch: Vec::new(),
         }
     }
 
@@ -184,6 +247,39 @@ impl Volume {
     pub fn mesh_brick(&self, coord: BrickCoord, scratch: &mut MeshScratch, out: &mut BrickMesh) {
         self.gather_apron(coord, &mut scratch.apron);
         mesh_apron(&scratch.apron, coord, self.voxel_size, &mut scratch.surface_nets, out);
+    }
+
+    /// Mesh many bricks at once, across every core.
+    ///
+    /// `out` must already hold one mesh per coordinate; they are reused rather
+    /// than allocated, so a stroke settles into steady state without touching
+    /// the allocator. Each worker keeps its own scratch, which is why this does
+    /// not take one.
+    ///
+    /// Meshing is read only on the volume and every brick is independent, so
+    /// this is close to linear in the core count. Worth it: at the M2 target
+    /// size a full mesh takes over two seconds on one core, and a stroke's
+    /// remesh reaches 70 percent of its budget.
+    pub fn mesh_bricks(&self, coords: &[BrickCoord], out: &mut [BrickMesh]) {
+        assert_eq!(coords.len(), out.len(), "one output mesh per brick");
+
+        // Below this the thread hand off costs more than the meshing saves.
+        const PARALLEL_THRESHOLD: usize = 4;
+
+        if coords.len() < PARALLEL_THRESHOLD {
+            let mut scratch = MeshScratch::new();
+            for (coord, mesh) in coords.iter().zip(out.iter_mut()) {
+                self.mesh_brick(*coord, &mut scratch, mesh);
+            }
+            return;
+        }
+
+        out.par_iter_mut().zip(coords.par_iter()).for_each_init(
+            MeshScratch::new,
+            |scratch, (mesh, coord)| {
+                self.mesh_brick(*coord, scratch, mesh);
+            },
+        );
     }
 
     // ---------------------------------------------------------- dirty tracking
@@ -324,12 +420,49 @@ impl Volume {
     ///
     /// Cost is proportional to the box, never to the size of the model. That
     /// property is the whole point of the brick grid and must not regress.
+    ///
+    /// There are two implementations because a brush covers a fixed world radius
+    /// and so touches cubically more voxels as the voxel size shrinks. A default
+    /// brush at a quarter millimetre voxel is a few thousand voxels and belongs
+    /// on one core. The same brush at the sizes M2 targets is over a million and
+    /// takes six times less wall clock across cores.
     pub fn edit_voxels(
         &mut self,
         v_min: IVec3,
         v_max: IVec3,
-        mut edit: impl FnMut(IVec3, Vec3, f32) -> f32,
+        edit: impl Fn(IVec3, Vec3, f32) -> f32 + Sync,
     ) {
+        /// Voxels in the box below which the edit stays on one core.
+        ///
+        /// Measured, and it matters in both directions. Sending a small stamp to
+        /// a thread pool cost more than it saved and put the fast drag case over
+        /// its budget. Two bricks' worth of voxels sits comfortably between the
+        /// two regimes.
+        const PARALLEL_VOXEL_THRESHOLD: i64 = 2 * BRICK_VOXELS as i64;
+
+        let voxels_in_box =
+            (v_max - v_min + IVec3::ONE).max(IVec3::ZERO).as_i64vec3().element_product();
+
+        if voxels_in_box >= PARALLEL_VOXEL_THRESHOLD {
+            self.edit_voxels_across_cores(v_min, v_max, &edit);
+        } else {
+            self.edit_voxels_on_one_core(v_min, v_max, &edit);
+        }
+
+        self.mark_dirty_voxel_range(v_min, v_max);
+    }
+
+    /// One brick at a time, resolving and writing each before moving on.
+    ///
+    /// Kept separate from the parallel version rather than sharing its three
+    /// phase shape, because that shape has to lift each brick out of the map and
+    /// put it back, and doing that thousands of times a stroke leaves enough
+    /// deletion markers in the table to cost 20 percent. This path only ever
+    /// looks a brick up.
+    fn edit_voxels_on_one_core<F>(&mut self, v_min: IVec3, v_max: IVec3, edit: &F)
+    where
+        F: Fn(IVec3, Vec3, f32) -> f32 + Sync,
+    {
         let voxel_size = self.voxel_size;
         let b_min = BrickCoord::containing(v_min).0;
         let b_max = BrickCoord::containing(v_max).0;
@@ -348,58 +481,118 @@ impl Volume {
                     // The prior contents have to be captured before the brick is
                     // promoted to dense, because that is what destroys them.
                     let recorded_now = self.record_for_undo(coord);
-
                     let existed = self.bricks.contains_key(&coord);
                     let brick = self.bricks.entry(coord).or_insert(Brick::Uniform(OUTSIDE));
                     let was_uniform = matches!(brick, Brick::Uniform(_));
                     let data = brick.make_dense();
 
-                    let mut changed = false;
-                    for wz in lo.z..=hi.z {
-                        for wy in lo.y..=hi.y {
-                            for wx in lo.x..=hi.x {
-                                let voxel = IVec3::new(wx, wy, wz);
-                                let index = brick_index(
-                                    (wx - origin.x) as usize,
-                                    (wy - origin.y) as usize,
-                                    (wz - origin.z) as usize,
-                                );
-                                let position = voxel.as_vec3() * voxel_size;
-                                let old = data[index];
-                                let new = edit(voxel, position, old).clamp(INSIDE, OUTSIDE);
-                                if new != old {
-                                    data[index] = new;
-                                    changed = true;
-                                }
-                            }
-                        }
-                    }
-
-                    // A brush box always clips a few bricks it does not reach.
-                    // Undo the promotion for those rather than leaving a 128 KB
-                    // allocation behind, and drop the undo record so an
-                    // untouched brick does not consume history budget.
+                    let changed = write_voxels(data, origin, lo, hi, voxel_size, edit);
                     if !changed {
-                        if let Some(recorder) = self.recorder.as_mut().filter(|_| recorded_now) {
-                            recorder.remove(&coord);
-                        }
-                        if was_uniform {
-                            let value = match self.bricks.get(&coord) {
-                                Some(Brick::Dense(data)) => data[0],
-                                _ => OUTSIDE,
-                            };
-                            if existed {
-                                self.bricks.insert(coord, Brick::Uniform(value));
-                            } else {
-                                self.bricks.remove(&coord);
-                            }
-                        }
+                        self.undo_promotion(coord, existed, was_uniform, recorded_now);
                     }
                 }
             }
         }
+    }
 
-        self.mark_dirty_voxel_range(v_min, v_max);
+    /// Lift the affected bricks out of the map, write them across every core,
+    /// then put them back.
+    ///
+    /// Removing them is what allows several to be held mutably at once, and it
+    /// costs a pointer move each rather than a scan of the whole volume.
+    fn edit_voxels_across_cores<F>(&mut self, v_min: IVec3, v_max: IVec3, edit: &F)
+    where
+        F: Fn(IVec3, Vec3, f32) -> f32 + Sync,
+    {
+        let voxel_size = self.voxel_size;
+        let b_min = BrickCoord::containing(v_min).0;
+        let b_max = BrickCoord::containing(v_max).0;
+
+        let mut taken = std::mem::take(&mut self.edit_scratch);
+        taken.clear();
+        for bz in b_min.z..=b_max.z {
+            for by in b_min.y..=b_max.y {
+                for bx in b_min.x..=b_max.x {
+                    let coord = BrickCoord::new(bx, by, bz);
+                    let lo = v_min.max(coord.origin());
+                    let hi = v_max.min(coord.max_voxel());
+                    if lo.cmpgt(hi).any() {
+                        continue;
+                    }
+
+                    let recorded_now = self.record_for_undo(coord);
+                    let existed = self.bricks.contains_key(&coord);
+                    let mut brick = self.bricks.remove(&coord).unwrap_or(Brick::Uniform(OUTSIDE));
+                    let was_uniform = matches!(brick, Brick::Uniform(_));
+                    brick.make_dense();
+
+                    taken.push(Taken {
+                        coord,
+                        brick,
+                        lo,
+                        hi,
+                        existed,
+                        was_uniform,
+                        recorded_now,
+                        changed: false,
+                    });
+                }
+            }
+        }
+
+        // Every brick is now a disjoint piece of memory that this thread owns,
+        // and `edit` only reads, so there is nothing to synchronise.
+        taken.par_iter_mut().for_each(|entry| {
+            let data = match &mut entry.brick {
+                Brick::Dense(data) => data,
+                Brick::Uniform(_) => unreachable!("made dense above"),
+            };
+            entry.changed =
+                write_voxels(data, entry.coord.origin(), entry.lo, entry.hi, voxel_size, edit);
+        });
+
+        for entry in taken.drain(..) {
+            self.bricks.insert(entry.coord, entry.brick);
+            if !entry.changed {
+                self.undo_promotion(
+                    entry.coord,
+                    entry.existed,
+                    entry.was_uniform,
+                    entry.recorded_now,
+                );
+            }
+        }
+
+        self.edit_scratch = taken;
+    }
+
+    /// Roll back a brick that an edit's box clipped but never actually reached.
+    ///
+    /// A brush box always catches a few of those, and leaving them behind would
+    /// mean a 128 KB allocation and an undo entry for a brick nothing touched.
+    fn undo_promotion(
+        &mut self,
+        coord: BrickCoord,
+        existed: bool,
+        was_uniform: bool,
+        recorded_now: bool,
+    ) {
+        if let Some(recorder) = self.recorder.as_mut().filter(|_| recorded_now) {
+            recorder.remove(&coord);
+        }
+        if !was_uniform {
+            return;
+        }
+        let value = match self.bricks.get(&coord) {
+            Some(Brick::Dense(data)) => data[0],
+            Some(Brick::Uniform(value)) => *value,
+            None => OUTSIDE,
+        };
+        if existed {
+            self.bricks.insert(coord, Brick::Uniform(value));
+        } else {
+            self.bricks.remove(&coord);
+        }
     }
 
     /// Apply `edit` to every voxel whose world position falls inside the
@@ -408,7 +601,7 @@ impl Volume {
         &mut self,
         min_world: Vec3,
         max_world: Vec3,
-        mut edit: impl FnMut(Vec3, f32) -> f32,
+        edit: impl Fn(Vec3, f32) -> f32 + Sync,
     ) {
         let (v_min, v_max) = self.voxel_bounds(min_world, max_world);
         self.edit_voxels(v_min, v_max, |_, position, value| edit(position, value));
@@ -635,6 +828,123 @@ mod tests {
             }
         }
         assert_eq!(apron.coord(), Some(coord));
+    }
+
+    #[test]
+    fn the_two_edit_paths_agree_exactly() {
+        // There are two implementations of the same edit, chosen by how much
+        // work the box holds, because the one that parallelises has to lift
+        // bricks out of the map and doing that for small stamps costs more than
+        // it saves. Two implementations of one thing need pinning together.
+        let build = || {
+            let mut volume = Volume::new(1.0);
+            volume.seed_sphere(Vec3::new(6.0, -3.0, 2.0), 30.0);
+            volume.take_dirty(&mut Vec::new());
+            volume
+        };
+
+        // A box spanning several bricks, including a brick it clips but whose
+        // voxels the edit leaves alone, so the rollback path is exercised too.
+        let lo = IVec3::new(-40, -20, -10);
+        let hi = IVec3::new(20, 30, 40);
+        let edit = |voxel: IVec3, _position: Vec3, value: f32| {
+            if voxel.x > 10 { value } else { value - 0.25 }
+        };
+
+        let mut one_core = build();
+        one_core.edit_voxels_on_one_core(lo, hi, &edit);
+        let mut many_cores = build();
+        many_cores.edit_voxels_across_cores(lo, hi, &edit);
+
+        assert_eq!(
+            one_core.stats(),
+            many_cores.stats(),
+            "the two paths left different amounts of storage allocated"
+        );
+        for z in lo.z - 2..=hi.z + 2 {
+            for y in lo.y - 2..=hi.y + 2 {
+                for x in lo.x - 2..=hi.x + 2 {
+                    let voxel = IVec3::new(x, y, z);
+                    assert_eq!(
+                        one_core.sample_voxel(voxel),
+                        many_cores.sample_voxel(voxel),
+                        "the two edit paths disagree at {voxel:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn both_edit_paths_record_the_same_undo_entry() {
+        let build = || {
+            let mut volume = Volume::new(1.0);
+            volume.seed_sphere(Vec3::ZERO, 30.0);
+            volume.take_dirty(&mut Vec::new());
+            volume.begin_stroke();
+            volume
+        };
+        let lo = IVec3::new(-40, -20, -10);
+        let hi = IVec3::new(20, 30, 40);
+        let edit = |voxel: IVec3, _: Vec3, value: f32| {
+            if voxel.x > 10 { value } else { value - 0.25 }
+        };
+
+        let mut one_core = build();
+        one_core.edit_voxels_on_one_core(lo, hi, &edit);
+        let mut many_cores = build();
+        many_cores.edit_voxels_across_cores(lo, hi, &edit);
+
+        let from_one = one_core.end_stroke().expect("the edit changed something");
+        let from_many = many_cores.end_stroke().expect("the edit changed something");
+        assert_eq!(from_one.len(), from_many.len(), "different numbers of bricks snapshotted");
+        assert_eq!(from_one.bytes(), from_many.bytes());
+    }
+
+    #[test]
+    fn meshing_in_parallel_gives_the_same_result_as_one_at_a_time() {
+        // Meshing across cores is only safe because bricks are independent and
+        // the volume is read only during it. If that ever stopped being true
+        // the difference would be intermittent and awful to chase, so pin it.
+        let mut volume = Volume::new(1.0);
+        volume.seed_sphere(Vec3::new(10.0, -6.0, 4.0), 40.0);
+
+        let mut coords: Vec<BrickCoord> = Vec::new();
+        volume.take_dirty(&mut coords);
+        coords.sort();
+        assert!(coords.len() > 8, "the test needs enough bricks to be worth parallelising");
+
+        let mut scratch = MeshScratch::new();
+        let mut serial = BrickMesh::default();
+
+        let mut parallel = vec![BrickMesh::default(); coords.len()];
+        volume.mesh_bricks(&coords, &mut parallel);
+
+        for (coord, from_many) in coords.iter().zip(parallel.iter()) {
+            volume.mesh_brick(*coord, &mut scratch, &mut serial);
+            assert_eq!(
+                serial.vertices, from_many.vertices,
+                "brick {coord:?} meshed differently in parallel"
+            );
+            assert_eq!(serial.indices, from_many.indices, "brick {coord:?} indices differ");
+        }
+    }
+
+    #[test]
+    fn meshing_reuses_the_buffers_it_is_given() {
+        let mut volume = Volume::new(1.0);
+        volume.seed_sphere(Vec3::ZERO, 20.0);
+        let mut coords: Vec<BrickCoord> = Vec::new();
+        volume.take_dirty(&mut coords);
+
+        let mut meshes = vec![BrickMesh::default(); coords.len()];
+        volume.mesh_bricks(&coords, &mut meshes);
+        let capacities: Vec<usize> = meshes.iter().map(|mesh| mesh.vertices.capacity()).collect();
+
+        volume.mesh_bricks(&coords, &mut meshes);
+        for (mesh, capacity) in meshes.iter().zip(capacities) {
+            assert_eq!(mesh.vertices.capacity(), capacity, "a buffer was reallocated");
+        }
     }
 
     #[test]
