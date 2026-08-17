@@ -26,6 +26,7 @@ use iced::{Rectangle, Vector};
 use crate::app::SizingTarget;
 use crate::camera::OrbitCamera;
 use crate::message::{Message, PointerButton, PointerEvent};
+use crate::navcube;
 
 /// One brick's mesh on its way to the GPU.
 #[derive(Debug)]
@@ -46,6 +47,9 @@ pub struct SharedFrame {
     /// instead of allocating. This is what keeps a stroke out of the allocator.
     spare: Mutex<Vec<BrickMesh>>,
     stats: Mutex<PoolStats>,
+    /// The navigation cube's geometry, in its own batch because it is drawn in
+    /// its own pass with its own matrix.
+    cube: Mutex<OverlayBatch>,
     /// The brush ring and the mirror planes, rebuilt by the application
     /// whenever something they depend on changes.
     overlay: Mutex<OverlayBatch>,
@@ -74,6 +78,11 @@ impl SharedFrame {
     /// giving back the previous one so neither side allocates.
     pub fn swap_overlay(&self, batch: &mut OverlayBatch) {
         std::mem::swap(&mut *self.overlay.lock().expect("shared frame poisoned"), batch);
+    }
+
+    /// The same hand off for the navigation cube.
+    pub fn swap_cube(&self, batch: &mut OverlayBatch) {
+        std::mem::swap(&mut *self.cube.lock().expect("shared frame poisoned"), batch);
     }
 
     /// The overlay geometry currently waiting for the renderer.
@@ -300,6 +309,22 @@ impl shader::Primitive for SculptPrimitive {
             let overlay = self.shared.overlay.lock().expect("shared frame poisoned");
             pipeline.renderer.write_overlay(device, queue, &overlay, view_projection);
         }
+        {
+            let cube = self.shared.cube.lock().expect("shared frame poisoned");
+            pipeline.renderer.write_cube(device, queue, &cube, navcube::view_projection(&camera));
+        }
+        // The cube's corner box is defined in logical pixels so it stays the
+        // same physical size at any scale factor, but a render pass wants
+        // physical ones. Worked out here because `render` sees neither the
+        // widget's logical bounds nor the scale factor.
+        let scale = viewport.scale_factor();
+        let (corner, size) = navcube::corner_rect(glam::Vec2::new(bounds.width, bounds.height));
+        pipeline.cube_offset = PixelRect {
+            x: (corner.x * scale).max(0.0) as u32,
+            y: (corner.y * scale).max(0.0) as u32,
+            width: (size.x * scale).max(1.0) as u32,
+            height: (size.y * scale).max(1.0) as u32,
+        };
         // Culling has to use the same matrix the vertex shader will, or bricks
         // vanish a frame before or after they should.
         pipeline.frustum = Frustum::from_view_projection(view_projection);
@@ -337,6 +362,16 @@ impl shader::Primitive for SculptPrimitive {
             },
             &pipeline.frustum,
         );
+
+        // The cube's box, offset from the widget into the window. Clamped to the
+        // clip rect so a viewport narrower than the cube cannot scissor outside
+        // its own bounds and paint over the panels.
+        let cube = &pipeline.cube_offset;
+        let x = clip_bounds.x + cube.x;
+        let y = clip_bounds.y + cube.y;
+        let width = cube.width.min(clip_bounds.width.saturating_sub(cube.x));
+        let height = cube.height.min(clip_bounds.height.saturating_sub(cube.y));
+        pipeline.renderer.render_cube(encoder, target, PixelRect { x, y, width, height });
     }
 }
 
@@ -345,6 +380,10 @@ impl shader::Primitive for SculptPrimitive {
 #[derive(Debug)]
 pub struct SculptPipeline {
     renderer: SculptRenderer,
+    /// The cube's corner box in physical pixels, relative to the widget's own
+    /// origin. Worked out in `prepare`, which is the only place the scale factor
+    /// and the logical bounds are both available.
+    cube_offset: PixelRect,
     /// Rebuilt in `prepare` from the same matrix the shader gets, and used in
     /// `render`, which is a separate call and has no access to the camera.
     frustum: Frustum,
@@ -354,6 +393,7 @@ impl shader::Pipeline for SculptPipeline {
     fn new(device: &wgpu::Device, queue: &wgpu::Queue, format: wgpu::TextureFormat) -> Self {
         Self {
             renderer: SculptRenderer::new(device, queue, format),
+            cube_offset: PixelRect { x: 0, y: 0, width: 0, height: 0 },
             frustum: Frustum::from_view_projection(glam::Mat4::IDENTITY),
         }
     }

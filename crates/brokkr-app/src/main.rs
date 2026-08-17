@@ -8,6 +8,7 @@ mod cursor;
 #[cfg(target_os = "linux")]
 mod input_watch;
 mod message;
+mod navcube;
 mod spacemouse;
 mod tablet;
 mod theme;

@@ -20,6 +20,7 @@ use crate::cursor;
 use crate::message::{
     ExportFormat, Message, PanelSection, PointerButton, PointerEvent, SpaceMouseSetting,
 };
+use crate::navcube;
 use crate::spacemouse::{
     Action as PuckAction, AxisBinding, ButtonAction, Config as SpaceMouseConfig, SpaceMouse,
 };
@@ -69,6 +70,13 @@ const MAX_TILT: f32 = std::f32::consts::PI / 3.0;
 /// Frame intervals kept for the rate readout. At 60 fps this averages over
 /// about a second, which is long enough to be steady and short enough to react.
 const FRAME_HISTORY: usize = 60;
+
+/// How close a flown-to pitch may come to straight up or down.
+///
+/// The camera clamps this itself, but a flight interpolates the field directly,
+/// so it has to respect the same limit or a top view would collapse the view
+/// matrix on arrival.
+const PITCH_SAFE: f32 = std::f32::consts::FRAC_PI_2 - 0.02;
 
 /// What a held pointer button is currently doing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -192,7 +200,29 @@ pub struct Brokkr {
     /// The model's bounding radius, refreshed on remesh. `Volume::bounding_radius`
     /// walks the brick map, so it is not something to call per frame.
     model_radius: f32,
+    /// The navigation cube's geometry, swapped to the renderer the same way.
+    cube: brokkr_gpu::OverlayBatch,
+    /// The cube part under the pointer, lit so a click's effect is visible
+    /// before the click.
+    cube_hover: Option<navcube::Part>,
+    /// A camera move in progress after clicking the cube.
+    flight: Option<Flight>,
 }
+
+/// An animated camera move to an orientation.
+///
+/// Instant would be disorienting on a sculpt: with nothing but a shaded form to
+/// go on there is no way to tell a jump from a different model. A quarter second
+/// is enough to follow and short enough not to be in the way.
+#[derive(Debug, Clone, Copy)]
+struct Flight {
+    from: (f32, f32, f32),
+    to: (f32, f32, f32),
+    elapsed_ms: f32,
+}
+
+/// How long a click on the navigation cube takes to arrive.
+const FLIGHT_MS: f32 = 260.0;
 
 /// A hold-and-drag gesture adjusting one brush number.
 ///
@@ -268,6 +298,9 @@ impl Brokkr {
             sizing: None,
             dynamic_radius: false,
             model_radius: MODEL_RADIUS_MM,
+            cube: brokkr_gpu::OverlayBatch::default(),
+            cube_hover: None,
+            flight: None,
         };
         app.remesh_dirty();
         // Otherwise the overlay reports a zero byte budget until the first
@@ -291,8 +324,55 @@ impl Brokkr {
         iced::window::frames().map(|_| Message::Frame)
     }
 
-    fn publish_camera(&self) {
+    fn publish_camera(&mut self) {
         self.shared.set_camera(self.camera);
+        // The cube shows the camera's orientation, so it is stale the moment the
+        // camera moves. This is the one place that knows that happened.
+        self.refresh_cube();
+    }
+
+    /// Rebuild the navigation cube and hand it to the renderer.
+    fn refresh_cube(&mut self) {
+        let mut batch = std::mem::take(&mut self.cube);
+        navcube::build(&mut batch, &self.camera, self.cube_hover);
+        self.shared.swap_cube(&mut batch);
+        self.cube = batch;
+    }
+
+    /// Start an animated move to a cube part's orientation.
+    fn fly_to(&mut self, part: navcube::Part) {
+        let (yaw, pitch) = navcube::orientation(part.direction, self.camera.yaw);
+        // Clamped the way a drag would be, so a top or bottom face lands just
+        // short of the pole rather than collapsing the view matrix.
+        let pitch = pitch.clamp(-PITCH_SAFE, PITCH_SAFE);
+        // The shortest way round, so a click never spins the model several times
+        // to reach a heading a few degrees away.
+        let yaw = self.camera.yaw + OrbitCamera::shortest_angle_delta(self.camera.yaw, yaw);
+        self.flight = Some(Flight {
+            from: (self.camera.yaw, self.camera.pitch, self.camera.roll),
+            to: (yaw, pitch, 0.0),
+            elapsed_ms: 0.0,
+        });
+    }
+
+    /// Advance a camera flight. Returns whether the camera moved.
+    fn advance_flight(&mut self, elapsed_ms: f32) -> bool {
+        let Some(mut flight) = self.flight else {
+            return false;
+        };
+        flight.elapsed_ms += elapsed_ms.clamp(0.0, 50.0);
+        let t = (flight.elapsed_ms / FLIGHT_MS).clamp(0.0, 1.0);
+        // Smoothstep, so it eases out of the old view and into the new one
+        // rather than starting and stopping abruptly.
+        let eased = t * t * (3.0 - 2.0 * t);
+        let lerp = |from: f32, to: f32| from + (to - from) * eased;
+
+        self.camera.yaw = lerp(flight.from.0, flight.to.0);
+        self.camera.pitch = lerp(flight.from.1, flight.to.1);
+        self.camera.roll = lerp(flight.from.2, flight.to.2);
+
+        self.flight = (t < 1.0).then_some(flight);
+        true
     }
 
     /// Mesh every brick the volume has marked dirty and hand the results to the
@@ -750,6 +830,16 @@ impl Brokkr {
                 let position = Vec2::new(position.x, position.y);
                 self.cursor = Some(position);
 
+                // A press on the navigation cube belongs to the cube. Checked
+                // before anything else, or clicking it would also carve a divot
+                // out of the model behind it.
+                if button == PointerButton::Left
+                    && let Some(part) = navcube::pick(&self.camera, self.viewport_size, position)
+                {
+                    self.fly_to(part);
+                    return;
+                }
+
                 let kind = match button {
                     // Left sculpts -- unless a hold-and-drag resize is in
                     // progress, in which case the pointer belongs to that
@@ -813,6 +903,19 @@ impl Brokkr {
                     Some(DragKind::Sizing) | None => {}
                 }
 
+                // Over the cube: light the part under the pointer, and draw no
+                // brush ring, because a press there will not sculpt.
+                let over_cube = navcube::pick(&self.camera, self.viewport_size, position);
+                if over_cube != self.cube_hover {
+                    self.cube_hover = over_cube;
+                    self.refresh_cube();
+                }
+                if over_cube.is_some() {
+                    self.hover = None;
+                    self.refresh_overlay();
+                    return;
+                }
+
                 // The ring follows the pointer, and the surface under it moves
                 // as a stroke cuts into it.
                 self.update_hover(position);
@@ -830,6 +933,9 @@ impl Brokkr {
             Message::Pointer(event) => self.on_pointer(event),
             Message::Frame => {
                 let elapsed_ms = self.perf.record_frame();
+                if self.advance_flight(elapsed_ms) {
+                    self.publish_camera();
+                }
                 self.drive_from_spacemouse(elapsed_ms);
             }
             Message::BrushKindChanged(kind) => self.brush.kind = kind,
@@ -921,6 +1027,21 @@ mod tests {
 
     fn app() -> Brokkr {
         Brokkr::with_tablet(crate::tablet::Tablet::inert())
+    }
+
+    /// Run a camera flight to completion in controlled time.
+    ///
+    /// `Message::Frame` scales by the real clock, and consecutive calls in a
+    /// test are microseconds apart, so driving it that way would never arrive.
+    fn finish_flight(app: &mut Brokkr) {
+        for _ in 0..200 {
+            if app.flight.is_none() {
+                return;
+            }
+            app.advance_flight(16.0);
+            app.publish_camera();
+        }
+        panic!("the flight never finished");
     }
 
     fn press(app: &mut Brokkr, at: Vector) {
@@ -1304,6 +1425,116 @@ mod tests {
         );
     }
 
+    /// Clicking the cube must move the camera and must NOT sculpt. Getting that
+    /// wrong takes a divot out of the model every time someone reaches for a
+    /// standard view.
+    #[test]
+    fn clicking_the_navigation_cube_flies_the_camera_without_sculpting() {
+        let mut app = app();
+        app.on_pointer(PointerEvent::Moved { position: centre_of_viewport(), size: SIZE });
+        let probe = app
+            .surface_under(Vec2::new(SIZE.x / 2.0, SIZE.y / 2.0))
+            .expect("the centre should hit the sphere");
+        let before_field = app.volume.sample_world(probe);
+        let before_yaw = app.camera.yaw;
+
+        let (origin, size) = crate::navcube::corner_rect(Vec2::new(SIZE.x, SIZE.y));
+        let middle = origin + size * 0.5;
+        press(&mut app, Vector::new(middle.x, middle.y));
+        release(&mut app);
+
+        assert!(app.flight.is_some(), "clicking the cube did not start a move");
+        assert_eq!(
+            app.volume.sample_world(probe),
+            before_field,
+            "clicking the cube carved the model"
+        );
+        assert!(!app.history.can_undo(), "clicking the cube recorded an undo entry");
+        assert!(app.drag.is_none(), "clicking the cube started a drag");
+
+        finish_flight(&mut app);
+        assert!(app.flight.is_none(), "the move never finished");
+        assert_ne!(app.camera.yaw, before_yaw, "the camera did not actually move");
+        assert!(app.camera.view().to_cols_array().iter().all(|v| v.is_finite()));
+    }
+
+    /// A click on Top asks for a pitch of ninety degrees, which is exactly where
+    /// the view matrix collapses. The flight interpolates the field directly, so
+    /// it has to respect the same limit the drag path does.
+    #[test]
+    fn flying_to_a_pole_stops_short_of_collapsing_the_view() {
+        for direction in [Vec3::Y, Vec3::NEG_Y] {
+            let mut app = app();
+            app.fly_to(crate::navcube::Part { direction, extremes: 1 });
+            finish_flight(&mut app);
+            assert!(app.flight.is_none());
+            assert!(
+                app.camera.pitch.abs() < std::f32::consts::FRAC_PI_2,
+                "{direction:?} reached the pole: pitch {}",
+                app.camera.pitch
+            );
+            assert!(app.camera.view().to_cols_array().iter().all(|v| v.is_finite()));
+            assert!((app.camera.right().length() - 1.0).abs() < 1.0e-4);
+        }
+    }
+
+    /// The camera must not spin several times round to reach a heading a few
+    /// degrees away, which is what interpolating an unwrapped yaw would do.
+    #[test]
+    fn a_flight_takes_the_short_way_round_and_unwinds_any_roll() {
+        let mut app = app();
+        // Many turns of yaw, and a roll from the puck, as a session would
+        // accumulate.
+        app.camera.yaw = std::f32::consts::TAU * 3.0 + 0.2;
+        app.camera.roll = 0.7;
+
+        app.fly_to(crate::navcube::Part { direction: Vec3::Z, extremes: 1 });
+        let flight = app.flight.expect("no flight started");
+        let travel = (flight.to.0 - flight.from.0).abs();
+        assert!(travel <= std::f32::consts::PI + 1.0e-4, "the flight would spin {travel} radians");
+
+        finish_flight(&mut app);
+        assert!(
+            app.camera.roll.abs() < 1.0e-4,
+            "a standard view should be level, roll was {}",
+            app.camera.roll
+        );
+    }
+
+    /// The flight is driven off the frame tick, so that link needs its own
+    /// test: the tests above supply their own time to get a result at all.
+    #[test]
+    fn the_frame_tick_is_what_advances_a_flight() {
+        let mut app = app();
+        app.fly_to(crate::navcube::Part { direction: Vec3::X, extremes: 1 });
+        // The first frame has no previous one to measure against, so it
+        // contributes nothing; the second is the one that moves.
+        app.update(Message::Frame);
+        app.update(Message::Frame);
+        let elapsed = app.flight.expect("the flight ended early").elapsed_ms;
+        assert!(elapsed > 0.0, "the frame tick did not advance the flight");
+    }
+
+    #[test]
+    fn hovering_the_cube_hides_the_brush_ring() {
+        let mut app = app();
+        app.on_pointer(PointerEvent::Moved { position: centre_of_viewport(), size: SIZE });
+        assert!(app.hover.is_some(), "the model should be under the pointer");
+
+        let (origin, size) = crate::navcube::corner_rect(Vec2::new(SIZE.x, SIZE.y));
+        let middle = origin + size * 0.5;
+        app.on_pointer(PointerEvent::Moved {
+            position: Vector::new(middle.x, middle.y),
+            size: SIZE,
+        });
+
+        assert!(app.cube_hover.is_some(), "the cube should be under the pointer");
+        // No ring: a press here will not sculpt, and drawing one would promise
+        // that it would.
+        assert!(app.hover.is_none());
+        assert!(app.shared.overlay_snapshot().lines.is_empty());
+    }
+
     #[test]
     fn the_cursor_ring_appears_where_the_pointer_meets_the_model() {
         let mut app = app();
@@ -1507,6 +1738,63 @@ mod export_tests {
 
     fn app() -> Brokkr {
         Brokkr::with_tablet(crate::tablet::Tablet::inert())
+    }
+
+    /// The starting ball has to straddle every mirror plane equally, or turning
+    /// on symmetry works against a model that was never centred.
+    ///
+    /// It always has -- but "I measured it once" is not a guarantee, and the
+    /// defaults it depends on (`MODEL_RADIUS_MM`, `VOXEL_SIZE_MM`, and the fact
+    /// that voxel index 0 sits exactly on the origin) are three separate things
+    /// a future change could move. This is what makes it permanent.
+    #[test]
+    fn the_default_model_is_centred_on_every_mirror_plane() {
+        let app = app();
+        let (mesh, _) = app.volume.export_mesh();
+        assert!(!mesh.positions.is_empty());
+
+        let mut low = Vec3::splat(f32::MAX);
+        let mut high = Vec3::splat(f32::MIN);
+        for position in &mesh.positions {
+            low = low.min(*position);
+            high = high.max(*position);
+        }
+
+        // Well under a voxel: the lattice is symmetric about the origin, so the
+        // only error available is f32 rounding.
+        let tolerance = VOXEL_SIZE_MM * 0.01;
+        let midpoint = (low + high) * 0.5;
+        for (axis, offset) in [("x", midpoint.x), ("y", midpoint.y), ("z", midpoint.z)] {
+            assert!(offset.abs() < tolerance, "the model is off centre on {axis} by {offset} mm");
+        }
+
+        // And it reaches the same distance either way along each axis, which is
+        // what "equal sides of the centreline" actually means.
+        for (axis, lo, hi) in [("x", low.x, high.x), ("y", low.y, high.y), ("z", low.z, high.z)] {
+            assert!(
+                (hi + lo).abs() < tolerance,
+                "the model reaches {hi} one way on {axis} and {lo} the other"
+            );
+        }
+
+        // The field itself, in mirrored pairs, not just the mesh it produced.
+        for step in 0..24 {
+            let probe = Vec3::new(
+                MODEL_RADIUS_MM - 1.0 + step as f32 * 0.05,
+                step as f32 * 0.37,
+                step as f32 * -0.21,
+            );
+            for flip in
+                [Vec3::new(-1.0, 1.0, 1.0), Vec3::new(1.0, -1.0, 1.0), Vec3::new(1.0, 1.0, -1.0)]
+            {
+                let here = app.volume.sample_world(probe);
+                let mirrored = app.volume.sample_world(probe * flip);
+                assert!(
+                    (here - mirrored).abs() < 1.0e-4,
+                    "the field disagrees across {flip:?}: {here} against {mirrored}"
+                );
+            }
+        }
     }
 
     #[test]

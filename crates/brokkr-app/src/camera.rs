@@ -173,6 +173,24 @@ impl OrbitCamera {
         self.distance = (self.distance * factor).clamp(self.near * 10.0, self.far);
     }
 
+    /// The shortest way round from one angle to another, in radians.
+    ///
+    /// Yaw is unbounded, so two headings that look identical can be many turns
+    /// apart as numbers. Interpolating those directly makes the camera spin the
+    /// long way — several times round, in the worst case — for a click that
+    /// should have moved it a few degrees.
+    pub fn shortest_angle_delta(from: f32, to: f32) -> f32 {
+        use std::f32::consts::{PI, TAU};
+        let delta = (to - from) % TAU;
+        if delta > PI {
+            delta - TAU
+        } else if delta < -PI {
+            delta + TAU
+        } else {
+            delta
+        }
+    }
+
     /// The world space ray through a point given in normalised device
     /// coordinates, where x and y both run from -1 to 1 and y points up.
     pub fn ray(&self, ndc: Vec2, aspect: f32) -> (Vec3, Vec3) {
@@ -364,6 +382,30 @@ mod roll_tests {
             assert!((right.length() - 1.0).abs() < 1.0e-4, "right was not unit at roll {steps}");
             assert!((up.length() - 1.0).abs() < 1.0e-4, "up was not unit at roll {steps}");
             assert!(right.dot(up).abs() < 1.0e-4, "axes not perpendicular at roll {steps}");
+        }
+    }
+
+    /// Without this a click on the navigation cube can spin the model several
+    /// times round to reach a heading a few degrees away.
+    #[test]
+    fn the_shortest_way_round_never_takes_the_long_way() {
+        use std::f32::consts::{PI, TAU};
+        for (from, to, expected) in [
+            (0.0, 0.1, 0.1),
+            (0.0, -0.1, -0.1),
+            // Just past half a turn: the short way is backwards.
+            (0.0, PI + 0.2, -(PI - 0.2)),
+            (0.0, -(PI + 0.2), PI - 0.2),
+            // Many turns apart as numbers, identical as headings.
+            (0.0, TAU * 3.0, 0.0),
+            (TAU * 5.0 + 0.3, 0.3, 0.0),
+        ] {
+            let delta = OrbitCamera::shortest_angle_delta(from, to);
+            assert!(
+                (delta - expected).abs() < 1.0e-4,
+                "{from} to {to} gave {delta}, expected {expected}"
+            );
+            assert!(delta.abs() <= PI + 1.0e-4, "{from} to {to} took the long way: {delta}");
         }
     }
 
