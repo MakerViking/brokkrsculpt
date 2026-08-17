@@ -194,6 +194,8 @@ pub struct Brokkr {
     viewport_size: Vec2,
     shift: bool,
     control: bool,
+    /// Alt, which inverts the brush the same way control does.
+    alt: bool,
     perf: Perf,
     volume_stats: VolumeStats,
     history_stats: HistoryStats,
@@ -313,6 +315,7 @@ impl Brokkr {
             viewport_size: Vec2::new(1280.0, 720.0),
             shift: false,
             control: false,
+            alt: false,
             perf: Perf::default(),
             volume_stats: VolumeStats::default(),
             history_stats: HistoryStats::default(),
@@ -564,7 +567,13 @@ impl Brokkr {
     /// using the eraser gives back the additive brush, which is the same
     /// behaviour every drawing application has.
     fn stroke_direction(&self) -> BrushDirection {
-        let inverted = self.control != self.eraser_in_use();
+        // Either modifier inverts. Alt is what ZBrush and Nomad both use, and
+        // control is what this had first; keeping both costs nothing and means
+        // neither habit is wrong. They do NOT compound -- holding both is still
+        // one inversion, because a user pressing both means "invert", not
+        // "invert twice".
+        let modifier = self.control || self.alt;
+        let inverted = modifier != self.eraser_in_use();
         if inverted && self.brush.kind.is_directional() {
             BrushDirection::Subtract
         } else {
@@ -882,9 +891,10 @@ impl Brokkr {
 
     fn on_pointer(&mut self, event: PointerEvent) {
         match event {
-            PointerEvent::Modifiers { shift, control } => {
+            PointerEvent::Modifiers { shift, control, alt } => {
                 self.shift = shift;
                 self.control = control;
+                self.alt = alt;
                 // Both change what a press would do, so the ring has to say so
                 // before the press rather than after.
                 self.refresh_overlay();
@@ -1312,7 +1322,11 @@ mod tests {
         app.update(Message::BrushKindChanged(BrushKind::Draw));
         assert_eq!(app.effective_brush().kind, BrushKind::Draw);
 
-        app.update(Message::Pointer(PointerEvent::Modifiers { shift: true, control: false }));
+        app.update(Message::Pointer(PointerEvent::Modifiers {
+            shift: true,
+            control: false,
+            alt: false,
+        }));
         assert_eq!(app.effective_brush().kind, BrushKind::Smooth, "shift should smooth");
         assert_eq!(
             app.brush.kind,
@@ -1321,7 +1335,11 @@ mod tests {
              and a key released out of focus would strand the wrong brush"
         );
 
-        app.update(Message::Pointer(PointerEvent::Modifiers { shift: false, control: false }));
+        app.update(Message::Pointer(PointerEvent::Modifiers {
+            shift: false,
+            control: false,
+            alt: false,
+        }));
         assert_eq!(app.effective_brush().kind, BrushKind::Draw, "releasing shift should restore");
     }
 
@@ -1348,7 +1366,11 @@ mod tests {
 
         // Now the same gesture with shift held. Nothing about the selection
         // changes, but the strokes must smooth rather than pile on more.
-        app.update(Message::Pointer(PointerEvent::Modifiers { shift: true, control: false }));
+        app.update(Message::Pointer(PointerEvent::Modifiers {
+            shift: true,
+            control: false,
+            alt: false,
+        }));
         for _ in 0..12 {
             press(&mut app, centre_of_viewport());
             release(&mut app);
@@ -1779,6 +1801,54 @@ mod tests {
             app.update(Message::BrushRadiusScaled(1.0 / 1.5));
         }
         assert_eq!(app.brush.radius, MIN_RADIUS_MM);
+    }
+
+    /// ZBrush and Nomad both invert on alt; this had control first. Both work,
+    /// and holding both is still one inversion rather than two.
+    #[test]
+    fn either_modifier_inverts_and_holding_both_is_not_a_double_negative() {
+        let mut app = app();
+        app.update(Message::BrushKindChanged(BrushKind::Draw));
+        assert_eq!(app.stroke_direction(), BrushDirection::Add);
+
+        let modifiers = |app: &mut Brokkr, control, alt| {
+            app.on_pointer(PointerEvent::Modifiers { shift: false, control, alt });
+        };
+
+        modifiers(&mut app, true, false);
+        assert_eq!(app.stroke_direction(), BrushDirection::Subtract, "control should invert");
+
+        modifiers(&mut app, false, true);
+        assert_eq!(app.stroke_direction(), BrushDirection::Subtract, "alt should invert");
+
+        modifiers(&mut app, true, true);
+        assert_eq!(
+            app.stroke_direction(),
+            BrushDirection::Subtract,
+            "both held is one inversion, not two"
+        );
+
+        modifiers(&mut app, false, false);
+        assert_eq!(app.stroke_direction(), BrushDirection::Add, "releasing should restore");
+    }
+
+    /// The eraser end still combines with a modifier the way it always did:
+    /// inverting an inverted stroke gives back the additive brush.
+    #[test]
+    fn alt_combines_with_the_eraser_the_way_control_does() {
+        for (control, alt) in [(true, false), (false, true)] {
+            let mut app = app();
+            app.update(Message::BrushKindChanged(BrushKind::Draw));
+            app.tablet.simulate(pen(glam::Vec2::ZERO, true));
+            assert_eq!(app.stroke_direction(), BrushDirection::Subtract, "the eraser alone");
+
+            app.on_pointer(PointerEvent::Modifiers { shift: false, control, alt });
+            assert_eq!(
+                app.stroke_direction(),
+                BrushDirection::Add,
+                "a modifier over the eraser should give back the additive brush"
+            );
+        }
     }
 
     #[test]

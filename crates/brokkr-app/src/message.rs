@@ -70,6 +70,7 @@ pub enum PointerEvent {
     Modifiers {
         shift: bool,
         control: bool,
+        alt: bool,
     },
 }
 

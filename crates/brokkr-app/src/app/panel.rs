@@ -362,7 +362,7 @@ impl Brokkr {
 
     fn tools(&self) -> Element<'_, Message> {
         let invert_hint = if self.brush.kind.is_directional() {
-            "ctrl drag removes"
+            "ctrl or alt drag removes"
         } else {
             "no opposite: ctrl does nothing"
         };
@@ -444,7 +444,7 @@ impl Brokkr {
                 button(text("Reset sphere").size(theme::TEXT_SIZE_SMALL))
                     .on_press(Message::ResetSphere),
                 text(
-                    "drag: sculpt\nctrl drag: invert\nshift drag: smooth\nright drag: orbit\nshift right drag: pan\nwheel: zoom\n1-6: brush\nx y z: mirror\n[ ]: radius\nctrl z, ctrl shift z: undo, redo"
+                    "drag: sculpt\nctrl or alt drag: invert\nshift drag: smooth\nright drag: orbit\nshift right drag: pan\nwheel: zoom\n1-6: brush\nx y z: mirror\n[ ]: radius\nctrl z, ctrl shift z: undo, redo"
                 )
                 .size(theme::CAPTION_SIZE)
                 .color(theme::TEXT_MUTE),

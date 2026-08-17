@@ -226,7 +226,11 @@ impl shader::Program<Message> for Viewport {
                 PointerEvent::Scrolled { amount }
             }
             iced::Event::Keyboard(keyboard::Event::ModifiersChanged(modifiers)) => {
-                PointerEvent::Modifiers { shift: modifiers.shift(), control: modifiers.control() }
+                PointerEvent::Modifiers {
+                    shift: modifiers.shift(),
+                    control: modifiers.control(),
+                    alt: modifiers.alt(),
+                }
             }
             // Shortcuts are handled here rather than through a global one
             // because the shader widget already receives every event, wherever
