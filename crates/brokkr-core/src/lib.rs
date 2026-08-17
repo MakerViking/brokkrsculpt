@@ -24,6 +24,7 @@ pub mod apron;
 pub mod brick;
 pub mod brush;
 pub mod export;
+pub mod import;
 pub mod mesh;
 pub mod pattern;
 pub mod project;
@@ -44,6 +45,7 @@ pub use brush::{
     lean_normal,
 };
 pub use export::{ExportMesh, MeshReport};
+pub use import::{ImportError, MESH_EXTENSIONS};
 pub use mesh::{BrickMesh, MeshScratch, Vertex};
 pub use pattern::{MAX_SCALE_MM, MIN_SCALE_VOXELS, Pattern, PatternKind};
 pub use project::{ProjectError, ProjectState};
