@@ -138,18 +138,23 @@ fn the_seam_test_can_actually_detect_a_gap() {
 fn sculpting_keeps_the_surface_closed() {
     // Cracks that only appear after an edit are the more likely failure: the
     // edit dirties bricks and the remesh has to keep the tiling consistent.
-    use brokkr_core::{BrushDirection, DrawBrush};
+    use brokkr_core::{Brush, BrushDirection, BrushKind, BrushScratch, Stamp};
 
     let mut volume = sphere_spanning_several_bricks();
-    let brush = DrawBrush { radius: 9.0, strength: 0.3 };
+    let mut scratch = BrushScratch::new();
 
-    // Deliberately stamp right on a brick corner, the worst case for tiling.
-    for (centre, direction) in [
-        (Vec3::new(64.0, 64.0, 64.0), BrushDirection::Add),
-        (Vec3::new(32.0, 32.0, 48.0), BrushDirection::Subtract),
-        (Vec3::new(48.0, 8.0, 48.0), BrushDirection::Add),
-    ] {
-        brush.apply(&mut volume, centre, direction);
+    // Every brush, and deliberately stamped right on brick corners, which is
+    // the worst case for tiling.
+    for (index, kind) in BrushKind::ALL.into_iter().enumerate() {
+        let brush = Brush { kind, radius: 9.0, strength: 0.5, ..Brush::default() };
+        for (centre, direction) in [
+            (Vec3::new(64.0, 64.0, 64.0), BrushDirection::Add),
+            (Vec3::new(32.0, 32.0, 48.0), BrushDirection::Subtract),
+            (Vec3::new(48.0, 8.0, 48.0 + index as f32), BrushDirection::Add),
+        ] {
+            let normal = volume.gradient_world(centre);
+            brush.apply(&mut volume, &Stamp::new(centre, normal, direction), &mut scratch);
+        }
     }
 
     let coords = brick_range(&volume);
@@ -171,7 +176,7 @@ fn remeshing_only_dirty_bricks_matches_remeshing_everything() {
     // The performance property is that a stroke remeshes only what it touched.
     // That is only safe if the dirty set is complete: anything it misses stays
     // stale on screen. Compare an incremental remesh against a full one.
-    use brokkr_core::{BrushDirection, DrawBrush};
+    use brokkr_core::{Brush, BrushDirection, BrushKind, BrushScratch, Stamp};
 
     let mut volume = sphere_spanning_several_bricks();
     let all = brick_range(&volume);
@@ -189,8 +194,14 @@ fn remeshing_only_dirty_bricks_matches_remeshing_everything() {
     // Sculpt, then remesh only what the volume reported as dirty.
     let mut dirty = Vec::new();
     volume.take_dirty(&mut dirty);
-    let brush = DrawBrush { radius: 7.0, strength: 0.35 };
-    brush.apply(&mut volume, Vec3::new(48.0, 88.0, 48.0), BrushDirection::Add);
+    let brush = Brush { kind: BrushKind::Draw, radius: 7.0, strength: 0.35, ..Brush::default() };
+    let at = Vec3::new(48.0, 88.0, 48.0);
+    let normal = volume.gradient_world(at);
+    brush.apply(
+        &mut volume,
+        &Stamp::new(at, normal, BrushDirection::Add),
+        &mut BrushScratch::new(),
+    );
     volume.take_dirty(&mut dirty);
 
     assert!(!dirty.is_empty(), "a stroke must dirty something");

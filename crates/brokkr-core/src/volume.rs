@@ -10,6 +10,8 @@ use crate::brick::{
     BRICK_DIM, Brick, BrickCoord, INSIDE, NARROW_BAND, OUTSIDE, apron_index, brick_index,
 };
 use crate::mesh::{BrickMesh, MeshScratch, mesh_apron};
+use crate::region::FieldRegion;
+use crate::undo::StrokeEdit;
 
 /// Counters for the debug overlay and the memory budget.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -31,6 +33,10 @@ pub struct Volume {
     voxel_size: f32,
     bricks: FxHashMap<BrickCoord, Brick>,
     dirty: FxHashSet<BrickCoord>,
+    /// Prior contents of every brick touched since the stroke began, or `None`
+    /// when no stroke is in progress. The inner `None` means the brick did not
+    /// exist, which undo has to restore just as faithfully as any content.
+    recorder: Option<FxHashMap<BrickCoord, Option<Brick>>>,
 }
 
 impl Volume {
@@ -41,7 +47,12 @@ impl Volume {
     /// operation, not something a brush does.
     pub fn new(voxel_size: f32) -> Self {
         assert!(voxel_size > 0.0, "voxel size must be positive");
-        Self { voxel_size, bricks: FxHashMap::default(), dirty: FxHashSet::default() }
+        Self {
+            voxel_size,
+            bricks: FxHashMap::default(),
+            dirty: FxHashSet::default(),
+            recorder: None,
+        }
     }
 
     #[inline]
@@ -229,25 +240,97 @@ impl Volume {
 
     // ------------------------------------------------------------------ editing
 
-    /// Apply `edit` to every voxel whose world position falls inside the
-    /// inclusive world space box, allocating bricks as needed and marking the
-    /// affected region dirty.
+    /// Inclusive voxel bounds covering a world space box.
+    pub fn voxel_bounds(&self, min_world: Vec3, max_world: Vec3) -> (IVec3, IVec3) {
+        (
+            (min_world / self.voxel_size).floor().as_ivec3(),
+            (max_world / self.voxel_size).ceil().as_ivec3(),
+        )
+    }
+
+    /// World space position of a voxel's centre.
+    #[inline]
+    pub fn voxel_position(&self, voxel: IVec3) -> Vec3 {
+        voxel.as_vec3() * self.voxel_size
+    }
+
+    /// Copy the field over an inclusive voxel box into `region`, grown by one
+    /// voxel on every side so gradients and neighbour averages are available
+    /// throughout the box.
     ///
-    /// `edit` receives the voxel's world position and current value and returns
-    /// the new value, which is clamped to the narrow band.
+    /// Brushes read from this copy rather than from the volume so that every
+    /// voxel sees the same starting field, whatever order the writes happen in.
+    ///
+    /// Copied brick by brick in contiguous runs along X rather than by sampling
+    /// each voxel. A stamp of radius 12 voxels covers about 20 000 samples, and
+    /// looking every one of them up through the brick map put the fast drag
+    /// case within one percent of the edit budget on its own.
+    pub fn snapshot(&self, lo: IVec3, hi: IVec3, region: &mut FieldRegion) {
+        let lo = lo - IVec3::ONE;
+        let hi = hi + IVec3::ONE;
+        let size = hi - lo + IVec3::ONE;
+        let values = region.resize(lo, hi);
+
+        let b_min = BrickCoord::containing(lo).0;
+        let b_max = BrickCoord::containing(hi).0;
+
+        for bz in b_min.z..=b_max.z {
+            for by in b_min.y..=b_max.y {
+                for bx in b_min.x..=b_max.x {
+                    let coord = BrickCoord::new(bx, by, bz);
+                    let brick_lo = coord.origin();
+
+                    // The part of this brick that falls inside the box.
+                    let clip_lo = lo.max(brick_lo);
+                    let clip_hi = hi.min(coord.max_voxel());
+                    if clip_lo.cmpgt(clip_hi).any() {
+                        continue;
+                    }
+
+                    let run = (clip_hi.x - clip_lo.x + 1) as usize;
+                    let brick = self.bricks.get(&coord);
+
+                    for wz in clip_lo.z..=clip_hi.z {
+                        for wy in clip_lo.y..=clip_hi.y {
+                            let local = IVec3::new(clip_lo.x, wy, wz) - lo;
+                            let start =
+                                (local.x + local.y * size.x + local.z * size.x * size.y) as usize;
+                            let destination = &mut values[start..start + run];
+
+                            match brick {
+                                None => destination.fill(OUTSIDE),
+                                Some(Brick::Uniform(value)) => destination.fill(*value),
+                                Some(Brick::Dense(data)) => {
+                                    let source = brick_index(
+                                        (clip_lo.x - brick_lo.x) as usize,
+                                        (wy - brick_lo.y) as usize,
+                                        (wz - brick_lo.z) as usize,
+                                    );
+                                    destination.copy_from_slice(&data[source..source + run]);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Apply `edit` to every voxel in an inclusive voxel box, allocating bricks
+    /// as needed and marking the affected region dirty.
+    ///
+    /// `edit` receives the voxel coordinate, its world position and its current
+    /// value, and returns the new value, which is clamped to the narrow band.
     ///
     /// Cost is proportional to the box, never to the size of the model. That
     /// property is the whole point of the brick grid and must not regress.
-    pub fn edit_box(
+    pub fn edit_voxels(
         &mut self,
-        min_world: Vec3,
-        max_world: Vec3,
-        mut edit: impl FnMut(Vec3, f32) -> f32,
+        v_min: IVec3,
+        v_max: IVec3,
+        mut edit: impl FnMut(IVec3, Vec3, f32) -> f32,
     ) {
         let voxel_size = self.voxel_size;
-        let v_min = (min_world / voxel_size).floor().as_ivec3();
-        let v_max = (max_world / voxel_size).ceil().as_ivec3();
-
         let b_min = BrickCoord::containing(v_min).0;
         let b_max = BrickCoord::containing(v_max).0;
 
@@ -262,6 +345,10 @@ impl Volume {
                         continue;
                     }
 
+                    // The prior contents have to be captured before the brick is
+                    // promoted to dense, because that is what destroys them.
+                    let recorded_now = self.record_for_undo(coord);
+
                     let existed = self.bricks.contains_key(&coord);
                     let brick = self.bricks.entry(coord).or_insert(Brick::Uniform(OUTSIDE));
                     let was_uniform = matches!(brick, Brick::Uniform(_));
@@ -271,14 +358,15 @@ impl Volume {
                     for wz in lo.z..=hi.z {
                         for wy in lo.y..=hi.y {
                             for wx in lo.x..=hi.x {
+                                let voxel = IVec3::new(wx, wy, wz);
                                 let index = brick_index(
                                     (wx - origin.x) as usize,
                                     (wy - origin.y) as usize,
                                     (wz - origin.z) as usize,
                                 );
-                                let position = IVec3::new(wx, wy, wz).as_vec3() * voxel_size;
+                                let position = voxel.as_vec3() * voxel_size;
                                 let old = data[index];
-                                let new = edit(position, old).clamp(INSIDE, OUTSIDE);
+                                let new = edit(voxel, position, old).clamp(INSIDE, OUTSIDE);
                                 if new != old {
                                     data[index] = new;
                                     changed = true;
@@ -289,16 +377,22 @@ impl Volume {
 
                     // A brush box always clips a few bricks it does not reach.
                     // Undo the promotion for those rather than leaving a 128 KB
-                    // allocation behind for nothing.
-                    if !changed && was_uniform {
-                        let value = match self.bricks.get(&coord) {
-                            Some(Brick::Dense(data)) => data[0],
-                            _ => OUTSIDE,
-                        };
-                        if existed {
-                            self.bricks.insert(coord, Brick::Uniform(value));
-                        } else {
-                            self.bricks.remove(&coord);
+                    // allocation behind, and drop the undo record so an
+                    // untouched brick does not consume history budget.
+                    if !changed {
+                        if let Some(recorder) = self.recorder.as_mut().filter(|_| recorded_now) {
+                            recorder.remove(&coord);
+                        }
+                        if was_uniform {
+                            let value = match self.bricks.get(&coord) {
+                                Some(Brick::Dense(data)) => data[0],
+                                _ => OUTSIDE,
+                            };
+                            if existed {
+                                self.bricks.insert(coord, Brick::Uniform(value));
+                            } else {
+                                self.bricks.remove(&coord);
+                            }
                         }
                     }
                 }
@@ -306,6 +400,81 @@ impl Volume {
         }
 
         self.mark_dirty_voxel_range(v_min, v_max);
+    }
+
+    /// Apply `edit` to every voxel whose world position falls inside the
+    /// inclusive world space box.
+    pub fn edit_box(
+        &mut self,
+        min_world: Vec3,
+        max_world: Vec3,
+        mut edit: impl FnMut(Vec3, f32) -> f32,
+    ) {
+        let (v_min, v_max) = self.voxel_bounds(min_world, max_world);
+        self.edit_voxels(v_min, v_max, |_, position, value| edit(position, value));
+    }
+
+    // -------------------------------------------------------------------- undo
+
+    /// Begin recording the prior contents of every brick a stroke touches.
+    ///
+    /// One stroke is one undo entry, so this is called when the button goes
+    /// down and [`Volume::end_stroke`] when it comes back up. Recording is per
+    /// brick and happens on first touch only, so a stroke that passes over the
+    /// same brick a hundred times still costs one snapshot of it.
+    pub fn begin_stroke(&mut self) {
+        self.recorder = Some(FxHashMap::default());
+    }
+
+    /// Finish recording and return the undo entry, or `None` if the stroke
+    /// changed nothing.
+    pub fn end_stroke(&mut self) -> Option<StrokeEdit> {
+        let recorder = self.recorder.take()?;
+        StrokeEdit::from_recording(recorder)
+    }
+
+    /// True while a stroke is being recorded.
+    #[inline]
+    pub fn is_recording(&self) -> bool {
+        self.recorder.is_some()
+    }
+
+    /// Capture a brick's prior contents if a stroke is being recorded and this
+    /// is the first time it has been touched. Returns whether it recorded.
+    fn record_for_undo(&mut self, coord: BrickCoord) -> bool {
+        let Some(recorder) = self.recorder.as_ref() else {
+            return false;
+        };
+        if recorder.contains_key(&coord) {
+            return false;
+        }
+        let prior = self.bricks.get(&coord).cloned();
+        self.recorder.as_mut().expect("checked just above").insert(coord, prior);
+        true
+    }
+
+    /// Swap a set of bricks back into the volume and return what was there, so
+    /// the caller can undo the undo.
+    ///
+    /// Every restored brick and its neighbours are marked dirty, because a
+    /// brick's apron reads one voxel into each of them.
+    pub fn apply_edit(&mut self, edit: StrokeEdit) -> StrokeEdit {
+        let mut inverse = Vec::with_capacity(edit.len());
+        for (coord, brick) in edit.into_bricks() {
+            let previous = match brick {
+                Some(brick) => self.bricks.insert(coord, brick),
+                None => self.bricks.remove(&coord),
+            };
+            inverse.push((coord, previous));
+            for dz in -1..=1 {
+                for dy in -1..=1 {
+                    for dx in -1..=1 {
+                        self.dirty.insert(BrickCoord(coord.0 + IVec3::new(dx, dy, dz)));
+                    }
+                }
+            }
+        }
+        StrokeEdit::from_bricks(inverse)
     }
 
     /// Seed a sphere, replacing anything already in the volume within its
@@ -466,6 +635,35 @@ mod tests {
             }
         }
         assert_eq!(apron.coord(), Some(coord));
+    }
+
+    #[test]
+    fn a_snapshot_reproduces_the_field_exactly() {
+        // The snapshot copies brick by brick for speed rather than sampling
+        // each voxel, so it can silently disagree with the volume at a brick
+        // boundary. Every brush reads through it, so that would be wrong
+        // everywhere at once.
+        let mut volume = Volume::new(1.0);
+        volume.seed_sphere(Vec3::new(20.0, -12.0, 33.0), 26.0);
+
+        let mut region = FieldRegion::new();
+        // Deliberately straddling several bricks, including negative ones.
+        let lo = IVec3::new(-40, -20, 25);
+        let hi = IVec3::new(6, 14, 70);
+        volume.snapshot(lo, hi, &mut region);
+
+        for z in lo.z - 1..=hi.z + 1 {
+            for y in lo.y - 1..=hi.y + 1 {
+                for x in lo.x - 1..=hi.x + 1 {
+                    let voxel = IVec3::new(x, y, z);
+                    assert_eq!(
+                        region.get(voxel),
+                        volume.sample_voxel(voxel),
+                        "snapshot disagrees at {voxel:?}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]

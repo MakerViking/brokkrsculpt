@@ -15,7 +15,10 @@
 //! Set `BROKKR_DUMP_FRAMES=<directory>` to also write the frames out as binary
 //! PPM for a human to look at.
 
-use brokkr_core::{BrickCoord, BrickMesh, BrushDirection, DrawBrush, MeshScratch, Volume};
+use brokkr_core::{
+    BrickCoord, BrickMesh, Brush, BrushDirection, BrushKind, BrushScratch, MeshScratch, Stamp,
+    Volume,
+};
 use brokkr_gpu::{PixelRect, SculptRenderer, Uniforms};
 use glam::{IVec3, Vec3};
 
@@ -283,11 +286,14 @@ fn the_sculpt_loop_renders_and_responds_to_a_stroke() {
 
     // Now sculpt. The stroke is placed on the front of the sphere by hand
     // rather than by raycasting, so this test stays about rendering.
-    let brush = DrawBrush { radius: 9.0, strength: 0.5 };
+    let brush = Brush { kind: BrushKind::Draw, radius: 9.0, strength: 0.5, ..Brush::default() };
+    let mut brush_scratch = BrushScratch::new();
     let front = Vec3::new(0.45, 0.35, 1.0).normalize() * MODEL_RADIUS;
     for step in 0..6 {
         let along = Vec3::new(0.0, 1.0, 0.0) * (step as f32 - 2.5) * 3.0;
-        brush.apply(&mut volume, front + along, BrushDirection::Add);
+        let at = front + along;
+        let normal = volume.gradient_world(at);
+        brush.apply(&mut volume, &Stamp::new(at, normal, BrushDirection::Add), &mut brush_scratch);
     }
 
     let dirty = upload_dirty(&mut renderer, &harness.queue, &mut volume);
@@ -340,4 +346,80 @@ fn an_empty_volume_draws_nothing() {
 
     let (lit, _) = coverage(&harness.frame(&renderer));
     assert_eq!(lit, 0, "an empty volume drew {lit} pixels");
+}
+
+#[test]
+fn every_brush_leaves_a_visible_mark() {
+    // Field level tests pin down what each brush does to the numbers. This
+    // checks the other half: that the result reaches the screen at all, and by
+    // a plausible amount. A brush that dirties bricks but produces geometry
+    // identical to what was there would pass every unit test in the engine.
+    //
+    // Run with BROKKR_DUMP_FRAMES set to look at the six results.
+    let Some(harness) = Harness::new() else {
+        eprintln!("no usable wgpu adapter, skipping the offscreen render test");
+        return;
+    };
+
+    let distance = MODEL_RADIUS * 3.0;
+    let front = Vec3::new(0.45, 0.35, 1.0).normalize() * MODEL_RADIUS;
+
+    for kind in BrushKind::ALL {
+        let mut renderer = SculptRenderer::new(&harness.device, &harness.queue, TARGET_FORMAT);
+        renderer.resize(&harness.device, WIDTH, HEIGHT);
+        renderer.write_uniforms(&harness.queue, &uniforms(distance));
+
+        let mut volume = Volume::new(VOXEL_SIZE);
+        volume.seed_sphere(Vec3::ZERO, MODEL_RADIUS);
+
+        // Give smooth, pinch and flatten something to work on, otherwise they
+        // are operating on an already smooth sphere and correctly do very
+        // little.
+        let mut brush_scratch = BrushScratch::new();
+        let ridge = Brush { kind: BrushKind::Draw, radius: 6.0, strength: 0.9, ..Brush::default() };
+        for step in -3..=3 {
+            let at = front + Vec3::new(0.0, step as f32 * 4.0, 0.0);
+            let normal = volume.gradient_world(at);
+            ridge.apply(
+                &mut volume,
+                &Stamp::new(at, normal, BrushDirection::Add),
+                &mut brush_scratch,
+            );
+        }
+        upload_all(&mut renderer, &harness.queue, &mut volume);
+        let before = harness.frame(&renderer);
+
+        let brush = Brush { kind, radius: 10.0, strength: 0.7, ..Brush::default() };
+        for step in -3..=3 {
+            let at = front + Vec3::new(0.0, step as f32 * 3.0, 0.0);
+            let normal = volume.gradient_world(at);
+            for _ in 0..4 {
+                brush.apply(
+                    &mut volume,
+                    &Stamp::new(at, normal, BrushDirection::Add),
+                    &mut brush_scratch,
+                );
+            }
+        }
+
+        let dirty = upload_dirty(&mut renderer, &harness.queue, &mut volume);
+        assert!(dirty > 0, "{kind} dirtied nothing");
+
+        let after = harness.frame(&renderer);
+        dump(&format!("brush-{}", kind.label().to_lowercase()), &after);
+
+        let changed = before
+            .chunks_exact(4)
+            .zip(after.chunks_exact(4))
+            .filter(|(a, b)| a[..3] != b[..3])
+            .count();
+        assert!(
+            changed > 200,
+            "{kind} changed only {changed} pixels, so it did not reach the screen"
+        );
+
+        let (lit, _) = coverage(&after);
+        assert!(lit > 0, "{kind} left nothing on screen at all");
+        assert_eq!(renderer.stats().overflowed, 0, "{kind} overflowed the mesh pool");
+    }
 }

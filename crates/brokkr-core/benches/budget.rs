@@ -13,7 +13,10 @@
 
 use std::time::{Duration, Instant};
 
-use brokkr_core::{BrickCoord, BrickMesh, BrushDirection, DrawBrush, MeshScratch, Volume};
+use brokkr_core::{
+    BrickCoord, BrickMesh, Brush, BrushDirection, BrushKind, BrushScratch, FalloffCurve, History,
+    MeshScratch, Stamp, Stroke, Symmetry, Volume,
+};
 use glam::Vec3;
 
 /// Total frame budget at 60 fps.
@@ -129,49 +132,142 @@ fn main() {
     );
     println!();
 
+    let mut passed = true;
+
     // A stroke that drags across the surface, which is what a user actually
     // does and what the per frame budget has to cover.
-    let brush = DrawBrush { radius: 12.0 * voxel_size, strength: 0.25 };
-    let mut edit_samples = Samples::new();
-    let mut remesh_samples = Samples::new();
-    let mut combined_samples = Samples::new();
-    let mut dirty_total = 0usize;
-    let mut remeshed_triangles = 0usize;
+    //
+    // Run with everything M1 added switched on: stroke interpolation, so one
+    // pointer event can produce several stamps, X symmetry, so each of those is
+    // applied twice, and undo recording, so the first touch of each brick also
+    // copies it. Measuring a bare single stamp would flatter the result and
+    // measure something the user never does.
+    let brush = Brush {
+        kind: BrushKind::Draw,
+        radius: 12.0 * voxel_size,
+        strength: 0.25,
+        falloff: FalloffCurve::Smooth,
+    };
+    let spacing = brush.spacing(voxel_size);
 
-    for step in 0..STEPS {
-        // Walk the brush around a great circle on the sphere.
-        let angle = step as f32 / STEPS as f32 * std::f32::consts::TAU;
-        let tilt = (step as f32 * 0.11).sin() * 0.8;
-        let point = centre
-            + Vec3::new(angle.cos() * tilt.cos(), tilt.sin(), angle.sin() * tilt.cos()) * radius;
+    let mut brush_scratch = BrushScratch::new();
+    let mut history = History::default();
+    let mut centres: Vec<Vec3> = Vec::new();
 
-        let edit_start = Instant::now();
-        brush.apply(&mut volume, point, BrushDirection::Add);
-        let edit_time = edit_start.elapsed();
+    // Slow and fast drags over the same path. The fast one is the case the
+    // per event budget really has to survive: fewer pointer samples means more
+    // interpolated stamps per event.
+    for (label, events) in [("slow drag", STEPS), ("fast drag", STEPS / 5)] {
+        let mut edit_samples = Samples::new();
+        let mut remesh_samples = Samples::new();
+        let mut combined_samples = Samples::new();
+        let mut dirty_total = 0usize;
+        let mut stamp_total = 0usize;
 
-        volume.take_dirty(&mut dirty);
-        dirty_total += dirty.len();
+        let mut stroke = Stroke::new();
+        volume.begin_stroke();
 
-        let remesh_start = Instant::now();
-        for &coord in &dirty {
-            volume.mesh_brick(coord, &mut scratch, &mut mesh);
-            remeshed_triangles += mesh.triangle_count();
+        for step in 0..events {
+            // Walk the brush around a great circle on the sphere.
+            let angle = step as f32 / events as f32 * std::f32::consts::TAU;
+            let tilt = (step as f32 * 0.11).sin() * 0.8;
+            let point = centre
+                + Vec3::new(angle.cos() * tilt.cos(), tilt.sin(), angle.sin() * tilt.cos())
+                    * radius;
+
+            let edit_start = Instant::now();
+            centres.clear();
+            stroke.advance(point, spacing, &mut centres);
+            for &at in &centres {
+                let normal = volume.gradient_world(at);
+                brush.apply_symmetric(
+                    &mut volume,
+                    &Stamp::new(at, normal, BrushDirection::Add),
+                    Symmetry::X,
+                    &mut brush_scratch,
+                );
+            }
+            let edit_time = edit_start.elapsed();
+            stamp_total += centres.len();
+
+            volume.take_dirty(&mut dirty);
+            dirty_total += dirty.len();
+
+            let remesh_start = Instant::now();
+            for &coord in &dirty {
+                volume.mesh_brick(coord, &mut scratch, &mut mesh);
+            }
+            let remesh_time = remesh_start.elapsed();
+
+            edit_samples.0.push(edit_time);
+            remesh_samples.0.push(remesh_time);
+            combined_samples.0.push(edit_time + remesh_time);
         }
-        let remesh_time = remesh_start.elapsed();
 
-        edit_samples.0.push(edit_time);
-        remesh_samples.0.push(remesh_time);
-        combined_samples.0.push(edit_time + remesh_time);
+        let undo_start = Instant::now();
+        if let Some(edit) = volume.end_stroke() {
+            print!(
+                "  undo entry covers {} bricks, {:.1} MB",
+                edit.len(),
+                edit.bytes() as f64 / (1024.0 * 1024.0)
+            );
+            history.push(edit);
+        }
+        println!(", recorded in {:.2} ms", millis(undo_start.elapsed()));
+
+        println!(
+            "  {label}: {events} pointer events, {:.1} stamps and {:.1} bricks remeshed per event",
+            stamp_total as f64 / events as f64,
+            dirty_total as f64 / events as f64
+        );
+        passed &= report("  brush edit", &mut edit_samples, EDIT_BUDGET);
+        passed &= report("  dirty remesh", &mut remesh_samples, REMESH_BUDGET);
+        passed &= report("  edit plus remesh", &mut combined_samples, FRAME_BUDGET);
+        println!();
     }
 
-    println!("  average {:.1} bricks remeshed per step", dirty_total as f64 / STEPS as f64);
-    println!("  {remeshed_triangles} triangles rebuilt over the stroke");
+    // Undo and redo are not per frame work, so they carry no budget, but a
+    // multi second undo would still be unusable and is worth watching.
+    let undo_start = Instant::now();
+    let undone = history.undo(&mut volume);
+    let undo_time = undo_start.elapsed();
+    volume.take_dirty(&mut dirty);
+    let restore_start = Instant::now();
+    for &coord in &dirty {
+        volume.mesh_brick(coord, &mut scratch, &mut mesh);
+    }
+    println!(
+        "  undo of a whole stroke: {:.2} ms to restore {} bricks, {:.1} ms to remesh {} of them (no budget, not per frame)",
+        millis(undo_time),
+        if undone { "the recorded" } else { "no" },
+        millis(restore_start.elapsed()),
+        dirty.len()
+    );
+    println!("  history holds {:.1} MB", history.stats().bytes as f64 / (1024.0 * 1024.0));
     println!();
 
-    let mut passed = true;
-    passed &= report("brush edit", &mut edit_samples, EDIT_BUDGET);
-    passed &= report("dirty remesh", &mut remesh_samples, REMESH_BUDGET);
-    passed &= report("edit plus remesh", &mut combined_samples, FRAME_BUDGET);
+    // Per brush comparison. Smooth, pinch and flatten read a neighbourhood, so
+    // they cost more than the ones that are a pure function of the voxel.
+    println!("  cost of one stamp by brush, radius {} voxels:", (brush.radius / voxel_size) as u32);
+    for kind in BrushKind::ALL {
+        let each = Brush { kind, ..brush };
+        let mut samples = Samples::new();
+        for step in 0..60 {
+            let angle = step as f32 / 60.0 * std::f32::consts::TAU;
+            let at = centre + Vec3::new(angle.cos(), 0.0, angle.sin()) * radius;
+            let normal = volume.gradient_world(at);
+            let started = Instant::now();
+            each.apply(
+                &mut volume,
+                &Stamp::new(at, normal, BrushDirection::Add),
+                &mut brush_scratch,
+            );
+            samples.0.push(started.elapsed());
+            volume.take_dirty(&mut dirty);
+        }
+        passed &= report(&format!("  {kind}"), &mut samples, EDIT_BUDGET);
+    }
+    println!();
 
     let after = volume.stats();
     println!();

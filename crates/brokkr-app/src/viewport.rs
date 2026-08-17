@@ -154,6 +154,19 @@ impl shader::Program<Message> for Viewport {
             iced::Event::Keyboard(keyboard::Event::ModifiersChanged(modifiers)) => {
                 PointerEvent::Modifiers { shift: modifiers.shift(), control: modifiers.control() }
             }
+            // Undo and redo are handled here rather than through a global
+            // shortcut because the shader widget already receives every event,
+            // wherever the cursor happens to be.
+            iced::Event::Keyboard(keyboard::Event::KeyPressed { key, modifiers, .. }) => {
+                let keyboard::Key::Character(character) = key else {
+                    return None;
+                };
+                if !modifiers.command() || !character.eq_ignore_ascii_case("z") {
+                    return None;
+                }
+                let message = if modifiers.shift() { Message::Redo } else { Message::Undo };
+                return Some(shader::Action::publish(message).and_capture());
+            }
             _ => return None,
         };
 

@@ -2,6 +2,7 @@
 
 //! Messages exchanged between the widget tree and the application.
 
+use brokkr_core::{BrushKind, FalloffCurve};
 use iced::Vector;
 
 /// Which pointer button an event refers to.
@@ -43,8 +44,13 @@ pub enum Message {
     /// One presented frame, used to drive the frame rate readout and to keep
     /// the viewport redrawing while a stroke is in progress.
     Frame,
+    BrushKindChanged(BrushKind),
     BrushRadiusChanged(f32),
     BrushStrengthChanged(f32),
+    FalloffChanged(FalloffCurve),
+    SymmetryToggled(bool),
+    Undo,
+    Redo,
     /// Throw the model away and start from a fresh sphere.
     ResetSphere,
 }
