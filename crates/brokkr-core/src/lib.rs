@@ -23,9 +23,11 @@
 pub mod apron;
 pub mod brick;
 pub mod brush;
+pub mod export;
 pub mod mesh;
 pub mod raycast;
 pub mod region;
+pub mod resample;
 pub mod stroke;
 pub mod undo;
 pub mod volume;
@@ -38,6 +40,7 @@ pub use brick::{
 pub use brush::{
     Brush, BrushDirection, BrushKind, BrushScratch, FalloffCurve, Stamp, Symmetry, lean_normal,
 };
+pub use export::{ExportMesh, MeshReport};
 pub use mesh::{BrickMesh, MeshScratch, Vertex};
 pub use raycast::{Hit, raycast};
 pub use region::FieldRegion;

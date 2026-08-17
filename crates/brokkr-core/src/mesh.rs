@@ -5,7 +5,7 @@
 use bytemuck::{Pod, Zeroable};
 use fast_surface_nets::ndshape::ConstShape3u32;
 use fast_surface_nets::{SurfaceNetsBuffer, surface_nets};
-use glam::Vec3;
+use glam::{IVec3, Vec3};
 
 use crate::apron::ApronBuffer;
 use crate::brick::{APRON_DIM, BrickCoord};
@@ -35,6 +35,19 @@ pub struct Vertex {
 pub struct BrickMesh {
     pub vertices: Vec<Vertex>,
     pub indices: Vec<u32>,
+    /// The lattice cell each vertex came from, in world voxel coordinates.
+    ///
+    /// Surface nets puts at most one vertex in each cell, and two bricks sharing
+    /// a seam derive that cell from the same world coordinate. So this is an
+    /// exact identity for a vertex, which is what export welds on.
+    ///
+    /// Welding on the positions instead does not work. Two bricks compute the
+    /// same seam vertex from the same corner values but at different
+    /// intermediate magnitudes, so the results differ in the last bits, and any
+    /// scheme that rounds a position onto a grid will split the pair whenever
+    /// they straddle a boundary. That happened to about one vertex in a hundred
+    /// and left hundreds of holes in an otherwise closed model.
+    pub cells: Vec<IVec3>,
 }
 
 impl BrickMesh {
@@ -43,6 +56,7 @@ impl BrickMesh {
     pub fn clear(&mut self) {
         self.vertices.clear();
         self.indices.clear();
+        self.cells.clear();
     }
 
     #[inline]
@@ -120,7 +134,15 @@ pub(crate) fn mesh_apron(
     let origin = coord.origin().as_vec3() - Vec3::ONE;
 
     out.vertices.reserve(scratch.positions.len());
-    for (position, normal) in scratch.positions.iter().zip(scratch.normals.iter()) {
+    out.cells.reserve(scratch.positions.len());
+    // Apron local coordinate of the cell each vertex came from, offset to world.
+    let cell_origin = coord.origin() - IVec3::ONE;
+    for (index, (position, normal)) in
+        scratch.positions.iter().zip(scratch.normals.iter()).enumerate()
+    {
+        let cell = scratch.surface_points[index];
+        out.cells.push(cell_origin + IVec3::new(cell[0] as i32, cell[1] as i32, cell[2] as i32));
+
         let local = Vec3::from_array(*position);
         let world = (local + origin) * voxel_size;
         // Surface nets returns unnormalised gradients. Normalise once here

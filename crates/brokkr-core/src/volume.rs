@@ -758,6 +758,34 @@ impl Volume {
     pub fn brick_coords(&self) -> impl Iterator<Item = BrickCoord> + '_ {
         self.bricks.keys().copied()
     }
+
+    /// The brick at a coordinate, if it is stored.
+    #[inline]
+    pub(crate) fn brick(&self, coord: BrickCoord) -> Option<&Brick> {
+        self.bricks.get(&coord)
+    }
+
+    /// Put a brick in directly. Used when building a volume from another one.
+    pub(crate) fn insert_brick(&mut self, coord: BrickCoord, brick: Brick) {
+        self.bricks.insert(coord, brick);
+    }
+
+    /// World space bounds of every stored brick, or `None` when empty.
+    ///
+    /// Brick extents rather than the surface itself, so this is a little loose,
+    /// which is what a caller wanting to cover the content needs.
+    pub fn world_bounds(&self) -> Option<(Vec3, Vec3)> {
+        let mut minimum = IVec3::splat(i32::MAX);
+        let mut maximum = IVec3::splat(i32::MIN);
+        for coord in self.bricks.keys() {
+            minimum = minimum.min(coord.origin());
+            maximum = maximum.max(coord.max_voxel());
+        }
+        if minimum.x > maximum.x {
+            return None;
+        }
+        Some((minimum.as_vec3() * self.voxel_size, maximum.as_vec3() * self.voxel_size))
+    }
 }
 
 #[inline]

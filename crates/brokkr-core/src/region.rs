@@ -15,6 +15,14 @@
 
 use glam::{IVec3, Vec3};
 
+/// Most samples a region may hold, which is 256 MB of `f32`.
+///
+/// A guard rail rather than a tuning knob. Every intended caller asks for a box
+/// around a brush or a brick, which is thousands of samples. Anything wildly
+/// past that is a mistake in working out the bounds, and the resample operation
+/// made exactly that mistake when asked to coarsen by a large factor.
+pub const MAX_SAMPLES: i64 = 64 << 20;
+
 /// Reusable storage for one stamp's worth of field values.
 #[derive(Debug, Default, Clone)]
 pub struct FieldRegion {
@@ -38,9 +46,19 @@ impl FieldRegion {
         self.lo = lo;
         self.hi = hi;
         self.size = hi - lo + IVec3::ONE;
-        let count = (self.size.x * self.size.y * self.size.z) as usize;
+
+        // Counted in 64 bits and checked. A caller asking for a box far larger
+        // than intended is a bug worth stopping on: computing this in 32 bits
+        // silently overflowed and then tried to allocate whatever fell out.
+        let count = self.size.as_i64vec3().element_product();
+        assert!(
+            (0..=MAX_SAMPLES).contains(&count),
+            "a field region of {:?} would hold {count} samples, past the {MAX_SAMPLES} limit",
+            self.size
+        );
+
         self.values.clear();
-        self.values.resize(count, 0.0);
+        self.values.resize(count as usize, 0.0);
         &mut self.values
     }
 

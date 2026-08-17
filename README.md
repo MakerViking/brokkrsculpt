@@ -14,9 +14,11 @@ Full design and milestone plan: [docs/BUILD-SPEC.md](docs/BUILD-SPEC.md).
 
 ## Status
 
-**M2, scale.** Six brushes, stroke interpolation, X symmetry, falloff curves,
-stylus pressure with tilt and an eraser, undo, and eleven million triangles
-staying interactive. Still no export, no masking, no multiresolution.
+**M3, print ready export.** Six brushes, stroke interpolation, X symmetry,
+falloff curves, stylus pressure with tilt and an eraser, undo, eleven million
+triangles staying interactive, and STL, OBJ and 3MF output that is checked to be
+watertight before it is written. Still no masking and no procedural primitives,
+and not packaged for distribution.
 
 All figures on a Radeon RX 6900 XT and a Ryzen 9 7900X.
 
@@ -94,6 +96,57 @@ displacement by the local gradient, or amplifies the difference from a local
 average, has gain above one somewhere and turns its own rounding error into
 visible crust over a stroke. Both now resample the field from a shifted
 position instead, which cannot introduce detail that was not already there.
+
+## Export
+
+**STL**, **OBJ** and **3MF**, written to `$HOME/brokkrsculpt/`. The path is shown
+in the interface, because there is no file dialog: Iced has no picker, and
+pulling one in is a dependency and a desktop portal for something a first version
+can do without.
+
+World units are millimetres throughout, so nothing is converted on the way out.
+STL and OBJ carry no unit information and every slicer assumes millimetres for
+them. 3MF states it outright, which is the main reason to prefer it.
+
+### Watertight is checked, not assumed
+
+Bricks are meshed independently, so the vertices along every brick seam exist
+twice. That is what makes the renderer's job easy and a printer's impossible: a
+slicer reads two coincident vertices as two surfaces with a crack between them.
+
+Export therefore welds those duplicates, drops the triangles that collapse to
+nothing in the process, and then counts what it produced. A closed surface has
+every edge shared by exactly two triangles; an edge used once is a hole, and an
+edge used three or more times is a place a slicer cannot resolve into inside and
+outside. Both are counted, and **the application refuses to write a file that
+would not print** rather than leaving that to be discovered after a failed job.
+
+Welding is done on the lattice cell each vertex came from, not on its position.
+That distinction is load bearing and was found the hard way: two bricks compute
+the same seam vertex from the same corner values but at different intermediate
+magnitudes, so the results differ in the last bits. Any scheme that rounds a
+position onto a grid splits such a pair whenever they straddle a boundary, which
+happened to roughly one vertex in a hundred and left 576 holes in a model that
+looked perfect on screen. Surface nets puts at most one vertex in each lattice
+cell, and both bricks derive that cell from the same world coordinate, so keying
+on it is exact and needs no tolerance at all.
+
+## Detail
+
+Resolution is uniform and fixed, which is what keeps the sculpt loop's cost
+predictable. Getting finer detail therefore means resampling the whole field onto
+a finer lattice, which is a deliberate button rather than something a brush does.
+
+The **finer** and **coarser** buttons halve and double the voxel size. They stop
+at 0.06 mm, which is where the mesh pool has been measured to hold the result: a
+60 mm ball at 0.055 mm is 11.2 million triangles and 6.2 million vertices against
+a pool of 8 million, and going further would put an incomplete model on screen.
+
+Two things a resample has to get right, both of which have tests. Distance values
+are stored in voxels rather than world units, so they are rescaled by the ratio of
+the two sizes; copying them across unchanged would move the surface. And empty and
+solid regions are recognised from the brick structure without sampling anything,
+so resampling a solid ball does not allocate its whole interior.
 
 ## Stylus pressure
 
@@ -215,8 +268,14 @@ The tests worth knowing about:
 - `no_brush_carves_a_pit_where_it_should_raise_a_bump` in `brush.rs` is the
   regression test for that crust, measuring how far the surface height jumps
   between neighbouring samples after a stroke.
+- `export.rs` asserts that seeded, sculpted and carved models all export
+  watertight and manifold, at several voxel sizes, and ships the counterparts
+  that prove the check can fail. The format modules parse their own output back
+  rather than trusting the code that wrote it, and `tests/export_files.rs` leaves
+  real files in a temporary directory to open in a slicer.
 - `cargo bench` is a budget gate, not a benchmark report. It exits non zero when
-  a budget is blown.
+  a budget is blown. `--bench scale` reports what the engine does as the voxel
+  size shrinks, and `-p brokkr-gpu --bench render` what it costs to draw.
 
 To look at what the offscreen tests rendered:
 

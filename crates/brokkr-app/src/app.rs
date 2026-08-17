@@ -15,7 +15,7 @@ use iced::widget::{button, checkbox, column, container, pick_list, row, slider, 
 use iced::{Alignment, Element, Length, Subscription};
 
 use crate::camera::OrbitCamera;
-use crate::message::{Message, PointerButton, PointerEvent};
+use crate::message::{ExportFormat, Message, PointerButton, PointerEvent};
 use crate::tablet::{Diagnosis, Tablet};
 use crate::theme;
 use crate::viewport::{SharedFrame, Viewport};
@@ -27,6 +27,15 @@ use crate::viewport::{SharedFrame, Viewport};
 /// the 256 cubed effective volume the milestones are measured against.
 const MODEL_RADIUS_MM: f32 = 30.0;
 const VOXEL_SIZE_MM: f32 = 0.25;
+
+/// Range the voxel size may be resampled to, in millimetres.
+///
+/// The lower bound is where the mesh pool has been measured to hold the result:
+/// a 60 mm ball at 0.055 mm comes to 11.2 million triangles and 6.2 million
+/// vertices against a pool of 8 million. Going finer would overflow it and put
+/// an incomplete model on screen, so the interface will not offer it.
+const FINEST_VOXEL_MM: f32 = 0.06;
+const COARSEST_VOXEL_MM: f32 = 2.0;
 
 /// Largest angle a fully tilted pen steers the stroke by.
 ///
@@ -130,6 +139,10 @@ pub struct Brokkr {
     perf: Perf,
     volume_stats: VolumeStats,
     history_stats: HistoryStats,
+    /// Current voxel size, which the resample operation changes.
+    voxel_size: f32,
+    /// What the last export or resample did, for the interface to show.
+    status: String,
 }
 
 impl Brokkr {
@@ -171,6 +184,8 @@ impl Brokkr {
             perf: Perf::default(),
             volume_stats: VolumeStats::default(),
             history_stats: HistoryStats::default(),
+            voxel_size: VOXEL_SIZE_MM,
+            status: String::new(),
         };
         app.remesh_dirty();
         // Otherwise the overlay reports a zero byte budget until the first
@@ -343,6 +358,107 @@ impl Brokkr {
         }
     }
 
+    /// Where exported files go.
+    ///
+    /// A fixed directory rather than a file dialog: Iced has no file picker and
+    /// pulling one in is a dependency and a portal setup for something a first
+    /// version can do without. The path is shown in the interface so it is never
+    /// a guess.
+    fn export_directory() -> std::path::PathBuf {
+        let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+        home.unwrap_or_else(std::env::temp_dir).join("brokkrsculpt")
+    }
+
+    /// Weld the sculpt into one mesh and write it out.
+    ///
+    /// Refuses to write anything that would not print. A slicer given a mesh
+    /// with holes either rejects it or fills it wrong, and finding that out
+    /// after a failed print is worse than being told here.
+    fn export(&mut self, format: ExportFormat) {
+        let started = Instant::now();
+        let (mesh, report) = self.volume.export_mesh();
+
+        if !report.is_printable() {
+            self.status = format!("not exported, {}", report.summary());
+            log::error!("refusing to export: {}", report.summary());
+            return;
+        }
+
+        let directory = Self::export_directory();
+        if let Err(error) = std::fs::create_dir_all(&directory) {
+            self.status = format!("could not make {}: {error}", directory.display());
+            return;
+        }
+        let path = directory.join(format!("sculpt.{}", format.extension()));
+
+        let write = || -> std::io::Result<()> {
+            let file = std::fs::File::create(&path)?;
+            let mut file = std::io::BufWriter::new(file);
+            match format {
+                ExportFormat::Stl => brokkr_core::export::stl::write(&mesh, &mut file)?,
+                ExportFormat::Obj => brokkr_core::export::obj::write(&mesh, &mut file)?,
+                ExportFormat::ThreeMf => brokkr_core::export::threemf::write(&mesh, &mut file)?,
+            }
+            std::io::Write::flush(&mut file)
+        };
+
+        match write() {
+            Ok(()) => {
+                let bytes = std::fs::metadata(&path).map(|data| data.len()).unwrap_or(0);
+                self.status = format!(
+                    "{} to {} ({:.1} MB, {:.0} ms)",
+                    report.summary(),
+                    path.display(),
+                    bytes as f64 / (1024.0 * 1024.0),
+                    started.elapsed().as_secs_f64() * 1000.0
+                );
+                log::info!("{}", self.status);
+            }
+            Err(error) => {
+                self.status = format!("could not write {}: {error}", path.display());
+                log::error!("{}", self.status);
+            }
+        }
+    }
+
+    /// The voxel size a request actually lands on.
+    fn clamped_voxel_size(requested: f32) -> f32 {
+        requested.clamp(FINEST_VOXEL_MM, COARSEST_VOXEL_MM)
+    }
+
+    /// Rebuild the volume at a different voxel size.
+    fn resample(&mut self, voxel_size: f32) {
+        let voxel_size = Self::clamped_voxel_size(voxel_size);
+        if (voxel_size - self.voxel_size).abs() < 1.0e-6 {
+            return;
+        }
+
+        let started = Instant::now();
+        let mut resampled = self.volume.resampled(voxel_size);
+        // The old bricks have to be cleared out of the renderer's pool, and
+        // after a resample their coordinates mean something different, so they
+        // are marked in the new volume to remesh to nothing.
+        for coord in self.volume.brick_coords() {
+            resampled.mark_dirty(coord);
+        }
+
+        self.volume = resampled;
+        self.voxel_size = voxel_size;
+        // History refers to bricks of a volume that no longer exists, and at a
+        // different resolution, so keeping it would splice nonsense back in.
+        self.history.clear();
+        self.history_stats = self.history.stats();
+        self.remesh_dirty();
+
+        self.status = format!(
+            "resampled to {voxel_size:.3} mm, {} dense bricks, {:.0} MB, {:.0} ms",
+            self.volume_stats.dense_bricks,
+            self.volume_stats.resident_bytes as f64 / (1024.0 * 1024.0),
+            started.elapsed().as_secs_f64() * 1000.0
+        );
+        log::info!("{}", self.status);
+    }
+
     fn undo(&mut self) {
         if self.history.undo(&mut self.volume) {
             self.history_stats = self.history.stats();
@@ -442,8 +558,10 @@ impl Brokkr {
             Message::ResetPressurePeak => self.tablet.reset_peak(),
             Message::Undo => self.undo(),
             Message::Redo => self.redo(),
+            Message::Export(format) => self.export(format),
+            Message::Resample(voxel_size) => self.resample(voxel_size),
             Message::ResetSphere => {
-                let mut volume = Volume::new(VOXEL_SIZE_MM);
+                let mut volume = Volume::new(self.voxel_size);
                 volume.seed_sphere(Vec3::ZERO, MODEL_RADIUS_MM);
                 volume.mark_everything_dirty();
                 // The old bricks must be cleared from the pool too, or their
@@ -627,6 +745,8 @@ impl Brokkr {
                 self.pen_panel(),
                 text("HISTORY").size(theme::CAPTION_SIZE).color(theme::TEXT_MUTE),
                 history,
+                self.detail_panel(),
+                self.export_panel(),
                 button(text("Reset sphere").size(theme::TEXT_SIZE_SMALL))
                     .on_press(Message::ResetSphere),
                 text(
@@ -642,6 +762,67 @@ impl Brokkr {
         .height(Length::Fill)
         .style(theme::panel)
         .into()
+    }
+
+    /// Resolution controls.
+    ///
+    /// Halving and doubling rather than a free slider: the voxel size sets
+    /// memory by its inverse cube, so a dragged slider would walk a model
+    /// straight past what the mesh pool holds. Two steps make the cost of each
+    /// one obvious.
+    fn detail_panel(&self) -> Element<'_, Message> {
+        let finer = self.voxel_size / 2.0;
+        let coarser = self.voxel_size * 2.0;
+
+        column![
+            text("DETAIL").size(theme::CAPTION_SIZE).color(theme::TEXT_MUTE),
+            text(format!("Voxel  {:.3} mm", self.voxel_size))
+                .size(theme::TEXT_SIZE_SMALL)
+                .color(theme::TEXT_DIM),
+            row![
+                button(text("finer").size(theme::TEXT_SIZE_SMALL))
+                    .on_press_maybe((finer >= FINEST_VOXEL_MM).then_some(Message::Resample(finer))),
+                button(text("coarser").size(theme::TEXT_SIZE_SMALL)).on_press_maybe(
+                    (coarser <= COARSEST_VOXEL_MM).then_some(Message::Resample(coarser))
+                ),
+            ]
+            .spacing(theme::S2),
+        ]
+        .spacing(theme::S2)
+        .into()
+    }
+
+    /// Export controls, plus what the last attempt did.
+    fn export_panel(&self) -> Element<'_, Message> {
+        let buttons =
+            ExportFormat::ALL.into_iter().fold(row![].spacing(theme::S2), |assembled, format| {
+                assembled.push(
+                    button(text(format.label()).size(theme::TEXT_SIZE_SMALL))
+                        .on_press(Message::Export(format)),
+                )
+            });
+
+        let status: Element<'_, Message> = if self.status.is_empty() {
+            text(format!("to {}", Self::export_directory().display()))
+                .size(theme::CAPTION_SIZE)
+                .color(theme::TEXT_MUTE)
+                .into()
+        } else {
+            text(self.status.clone())
+                .size(theme::CAPTION_SIZE)
+                .color(
+                    if self.status.contains("not exported") || self.status.contains("could not") {
+                        theme::ERROR
+                    } else {
+                        theme::OK
+                    },
+                )
+                .into()
+        };
+
+        column![text("EXPORT").size(theme::CAPTION_SIZE).color(theme::TEXT_MUTE), buttons, status,]
+            .spacing(theme::S2)
+            .into()
     }
 
     /// Pen controls, plus enough of a live readout that a user can tell whether
@@ -1067,5 +1248,113 @@ mod tests {
             release(&mut app);
             assert_eq!(app.history_stats.undo_entries, 1, "{kind} recorded no undo entry");
         }
+    }
+}
+
+#[cfg(test)]
+mod export_tests {
+    use super::*;
+    use brokkr_core::BrickCoord;
+
+    fn app() -> Brokkr {
+        Brokkr::with_tablet(crate::tablet::Tablet::inert())
+    }
+
+    #[test]
+    fn the_default_model_exports_watertight() {
+        // The most basic promise of a printing tool: what it opens with can be
+        // printed.
+        let app = app();
+        let (_, report) = app.volume.export_mesh();
+        assert!(
+            report.is_printable(),
+            "the model the application starts with does not print: {}",
+            report.summary()
+        );
+    }
+
+    #[test]
+    fn a_sculpted_model_exports_watertight() {
+        let mut app = app();
+        app.viewport_size = Vec2::new(800.0, 600.0);
+        app.brush.strength = 0.7;
+        for offset in 0..6 {
+            app.on_pointer(PointerEvent::Pressed {
+                button: PointerButton::Left,
+                position: iced::Vector::new(400.0 + offset as f32 * 8.0, 300.0),
+                size: iced::Vector::new(800.0, 600.0),
+            });
+            app.on_pointer(PointerEvent::Released { button: PointerButton::Left });
+        }
+
+        let (_, report) = app.volume.export_mesh();
+        assert!(report.is_printable(), "{}", report.summary());
+    }
+
+    #[test]
+    fn resampling_finer_increases_detail_and_keeps_it_printable() {
+        let mut app = app();
+        let (_, before) = app.volume.export_mesh();
+        let coarse_voxel = app.voxel_size;
+
+        app.update(Message::Resample(coarse_voxel / 2.0));
+
+        assert!((app.voxel_size - coarse_voxel / 2.0).abs() < 1.0e-6);
+        let (_, after) = app.volume.export_mesh();
+        assert!(
+            after.triangles > before.triangles * 2,
+            "finer voxels should give far more triangles: {} against {}",
+            after.triangles,
+            before.triangles
+        );
+        assert!(after.is_printable(), "{}", after.summary());
+        assert!(app.status.contains("resampled"), "the interface should say what happened");
+    }
+
+    #[test]
+    fn resampling_will_not_go_past_the_limits() {
+        // Memory grows as the inverse cube of the voxel size, so the bounds stop
+        // a click walking the model past what the mesh pool has been measured to
+        // hold. Checked on the clamp rather than by resampling, because actually
+        // building a model at the limit is a gigabyte of work.
+        assert_eq!(Brokkr::clamped_voxel_size(0.0000001), FINEST_VOXEL_MM);
+        assert_eq!(Brokkr::clamped_voxel_size(1000.0), COARSEST_VOXEL_MM);
+        assert_eq!(Brokkr::clamped_voxel_size(0.25), 0.25);
+
+        // And the interface offers a step that lands inside the limits: two
+        // halvings from the default are allowed, three are not.
+        const _: () = assert!(FINEST_VOXEL_MM > VOXEL_SIZE_MM / 8.0);
+        const _: () = assert!(FINEST_VOXEL_MM < VOXEL_SIZE_MM / 2.0);
+    }
+
+    #[test]
+    fn resampling_clears_history_and_schedules_a_full_remesh() {
+        let mut app = app();
+        app.viewport_size = Vec2::new(800.0, 600.0);
+        app.on_pointer(PointerEvent::Pressed {
+            button: PointerButton::Left,
+            position: iced::Vector::new(400.0, 300.0),
+            size: iced::Vector::new(800.0, 600.0),
+        });
+        app.on_pointer(PointerEvent::Released { button: PointerButton::Left });
+        assert!(app.history.can_undo());
+
+        let old_coords: Vec<BrickCoord> = app.volume.brick_coords().collect();
+        app.update(Message::Resample(app.voxel_size / 2.0));
+
+        assert!(
+            !app.history.can_undo(),
+            "history refers to bricks at the old resolution and must be dropped"
+        );
+        assert!(app.perf.dirty_bricks > old_coords.len(), "the whole model has to be remeshed");
+    }
+
+    #[test]
+    fn resampling_to_the_current_size_does_nothing() {
+        let mut app = app();
+        let before = app.volume.brick_count();
+        app.update(Message::Resample(app.voxel_size));
+        assert_eq!(app.volume.brick_count(), before);
+        assert!(app.status.is_empty(), "nothing happened, so nothing should be reported");
     }
 }
