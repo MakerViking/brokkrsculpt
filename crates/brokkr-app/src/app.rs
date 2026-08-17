@@ -13,12 +13,12 @@ use brokkr_core::{
     MirrorAxis, Stamp, Stroke, Symmetry, Volume, VolumeStats, lean_normal, raycast,
 };
 use glam::{Vec2, Vec3};
-use iced::Subscription;
+use iced::{Subscription, Task};
 
 use crate::camera::OrbitCamera;
 use crate::cursor;
 use crate::message::{
-    ExportFormat, Message, PanelSection, PointerButton, PointerEvent, SpaceMouseSetting,
+    ExportFormat, Message, PanelSection, PointerButton, PointerEvent, SpaceMouseSetting, TopMenu,
 };
 use crate::navcube;
 use crate::spacemouse::{
@@ -229,6 +229,11 @@ pub struct Brokkr {
     flight: Option<Flight>,
     /// Where the right-click menu is open, in widget pixels.
     menu: Option<Vec2>,
+    /// Which top bar menu is open, if any.
+    pub(crate) top_menu: Option<TopMenu>,
+    /// The file this sculpt was opened from or last saved to. `None` until it
+    /// has one, which is what makes the first Save behave as Save As.
+    project_path: Option<std::path::PathBuf>,
     /// A numeric field in the menu being typed into.
     ///
     /// Held as text rather than parsed on every keystroke, because a half typed
@@ -251,6 +256,70 @@ struct Flight {
 
 /// How long a click on the navigation cube takes to arrive.
 const FLIGHT_MS: f32 = 260.0;
+
+/// Where bug reports go.
+pub const ISSUE_URL: &str = "https://github.com/MakerViking/brokkrsculpt/issues/new";
+
+/// The commit this was built from, when the build system supplied one.
+///
+/// Shown in About, and not only as a nicety: shipping binaries carries an AGPL
+/// obligation to offer the corresponding source, and a commit is what ties an
+/// artifact to it. `unknown` in a local build, which is honest.
+pub fn build_commit() -> &'static str {
+    option_env!("BROKKR_COMMIT").unwrap_or("unknown")
+}
+
+/// The extension a sculpt is saved with.
+pub const PROJECT_EXTENSION: &str = "brokkr";
+
+/// Ask for a sculpt to open.
+///
+/// Async, and driven through a `Task`, because the portal dialog is a round trip
+/// to another process: the blocking form would stall the event loop, which is
+/// the same thread that draws.
+///
+/// The dialog opens unparented. iced 0.14 gives no way to hand `rfd` a window
+/// handle -- the one route, `iced::window::run`, hands back a borrowed handle on
+/// the event loop thread and its return type must be `Send`, so it cannot reach
+/// an async task. In practice the portal still centres the dialog on the right
+/// screen; verify that rather than assume it.
+async fn pick_project_to_open() -> Option<std::path::PathBuf> {
+    rfd::AsyncFileDialog::new()
+        .set_title("Open sculpt")
+        .add_filter("BrokkrSculpt", &[PROJECT_EXTENSION])
+        .pick_file()
+        .await
+        .map(|handle| handle.path().to_path_buf())
+}
+
+async fn pick_project_to_save() -> Option<std::path::PathBuf> {
+    rfd::AsyncFileDialog::new()
+        .set_title("Save sculpt")
+        .add_filter("BrokkrSculpt", &[PROJECT_EXTENSION])
+        .set_file_name(format!("sculpt.{PROJECT_EXTENSION}"))
+        .save_file()
+        .await
+        .map(|handle| {
+            let path = handle.path().to_path_buf();
+            // A portal can hand back a name with no extension. Adding it keeps
+            // the file recognisable to the open dialog's own filter.
+            if path.extension().is_some() { path } else { path.with_extension(PROJECT_EXTENSION) }
+        })
+}
+
+async fn pick_export_target(format: ExportFormat) -> Option<std::path::PathBuf> {
+    let extension = format.extension();
+    rfd::AsyncFileDialog::new()
+        .set_title(format!("Export {}", format.label()))
+        .add_filter(format.label(), &[extension])
+        .set_file_name(format!("sculpt.{extension}"))
+        .save_file()
+        .await
+        .map(|handle| {
+            let path = handle.path().to_path_buf();
+            if path.extension().is_some() { path } else { path.with_extension(extension) }
+        })
+}
 
 /// A hold-and-drag gesture adjusting one brush number.
 ///
@@ -331,6 +400,8 @@ impl Brokkr {
             cube_hover: None,
             flight: None,
             menu: None,
+            top_menu: None,
+            project_path: None,
             menu_edit: None,
         };
         app.remesh_dirty();
@@ -629,6 +700,166 @@ impl Brokkr {
     /// pulling one in is a dependency and a portal setup for something a first
     /// version can do without. The path is shown in the interface so it is never
     /// a guess.
+    /// Everything worth pasting into a bug report.
+    ///
+    /// Deliberately a string on the clipboard rather than an upload: there is no
+    /// server, no endpoint, no telemetry and no consent question. The user can
+    /// read exactly what they are sending before they send it.
+    ///
+    /// The session type is here because it is the single most likely cause of a
+    /// bad report: running on XWayland puts the window outside the X screen's
+    /// bounds and the compositor stops requesting frames, which reads as a 1 fps
+    /// bug and is not one.
+    pub(crate) fn diagnostics(&self) -> String {
+        use std::fmt::Write;
+        let mut out = String::new();
+        let _ = writeln!(out, "BrokkrSculpt {} ({})", env!("CARGO_PKG_VERSION"), build_commit());
+        let _ = writeln!(
+            out,
+            "session: {} on {}",
+            std::env::var("XDG_SESSION_TYPE").unwrap_or_else(|_| "unknown".into()),
+            std::env::var("XDG_CURRENT_DESKTOP").unwrap_or_else(|_| "unknown".into()),
+        );
+        let _ = writeln!(out, "wgpu: {}", self.shared.adapter_summary());
+        let _ = writeln!(
+            out,
+            "model: voxel {:.3} mm, {} dense + {} uniform bricks, {:.1} MB",
+            self.voxel_size,
+            self.volume_stats.dense_bricks,
+            self.volume_stats.uniform_bricks,
+            self.volume_stats.resident_bytes as f64 / (1024.0 * 1024.0),
+        );
+        let pool = self.shared.stats();
+        let _ = writeln!(
+            out,
+            "view: {} triangles, {} drawn / {} culled, {:.1} fps",
+            pool.triangles,
+            pool.drawn,
+            pool.culled,
+            if self.perf.average_frame_ms() > 0.0 {
+                1000.0 / self.perf.average_frame_ms()
+            } else {
+                0.0
+            },
+        );
+        let _ = writeln!(out, "tablet: {}", self.tablet.diagnosis().explain());
+        let _ = writeln!(out, "spacemouse: {}", self.spacemouse.diagnosis().explain());
+        if !self.status.is_empty() {
+            let _ = writeln!(out, "last message: {}", self.status);
+        }
+        out
+    }
+
+    /// Throw the sculpt away and start again from a fresh sphere.
+    ///
+    /// Extracted from the old `ResetSphere` arm so the menu and the panel button
+    /// share one path rather than drifting.
+    fn reset_sculpt(&mut self) {
+        let mut volume = Volume::new(self.voxel_size);
+        volume.seed_sphere(Vec3::ZERO, MODEL_RADIUS_MM);
+        volume.mark_everything_dirty();
+        // The old bricks have to be cleared from the pool too, or their
+        // triangles stay on screen. Marking them dirty meshes them to nothing,
+        // which releases their slices.
+        for coord in self.volume.brick_coords() {
+            volume.mark_dirty(coord);
+        }
+        self.volume = volume;
+        // History refers to bricks of the volume that just went away, so keeping
+        // it would let undo splice pieces of the discarded model into this one.
+        self.history.clear();
+        self.history_stats = self.history.stats();
+        self.camera = OrbitCamera::framing(Vec3::ZERO, MODEL_RADIUS_MM);
+        self.project_path = None;
+        self.status = String::new();
+        self.publish_camera();
+        self.remesh_dirty();
+        self.refresh_overlay();
+    }
+
+    fn open_project(&mut self, path: &std::path::Path) {
+        let file = match std::fs::File::open(path) {
+            Ok(file) => file,
+            Err(error) => {
+                self.status = format!("could not open {}: {error}", path.display());
+                return;
+            }
+        };
+        let mut reader = std::io::BufReader::new(file);
+        let (volume, state) = match brokkr_core::project::read(&mut reader) {
+            Ok(loaded) => loaded,
+            Err(error) => {
+                // The message says what was expected as well as what was found,
+                // because "a file from a different build" and "a partial
+                // download" look identical without it.
+                self.status = format!("could not read {}: {error}", path.display());
+                return;
+            }
+        };
+
+        // Clear the outgoing model from the mesh pool before swapping, exactly
+        // as a reset does.
+        let stale: Vec<BrickCoord> = self.volume.brick_coords().collect();
+        self.volume = volume;
+        for coord in stale {
+            self.volume.mark_dirty(coord);
+        }
+
+        self.voxel_size = self.volume.voxel_size();
+        self.camera = OrbitCamera {
+            target: state.camera_target,
+            distance: state.camera_distance,
+            yaw: state.camera_yaw,
+            pitch: state.camera_pitch,
+            roll: state.camera_roll,
+            ..OrbitCamera::framing(Vec3::ZERO, MODEL_RADIUS_MM)
+        };
+        self.brush.radius = state.brush_radius.clamp(MIN_RADIUS_MM, MAX_RADIUS_MM);
+        self.brush.strength = state.brush_strength.clamp(MIN_STRENGTH, MAX_STRENGTH);
+        self.symmetry = MirrorAxis::ALL
+            .into_iter()
+            .zip(state.mirror)
+            .fold(Symmetry::OFF, |set, (axis, on)| set.with_axis(axis, on));
+
+        // History belongs to the model that just went away.
+        self.history.clear();
+        self.history_stats = self.history.stats();
+        self.project_path = Some(path.to_path_buf());
+        self.status = format!("opened {}", path.display());
+        self.publish_camera();
+        self.remesh_dirty();
+        self.refresh_overlay();
+    }
+
+    fn save_project(&mut self, path: &std::path::Path) {
+        let state = brokkr_core::ProjectState {
+            camera_target: self.camera.target,
+            camera_distance: self.camera.distance,
+            camera_yaw: self.camera.yaw,
+            camera_pitch: self.camera.pitch,
+            camera_roll: self.camera.roll,
+            brush_radius: self.brush.radius,
+            brush_strength: self.brush.strength,
+            mirror: MirrorAxis::ALL.map(|axis| self.symmetry.axis(axis)),
+        };
+
+        let file = match std::fs::File::create(path) {
+            Ok(file) => file,
+            Err(error) => {
+                self.status = format!("could not write {}: {error}", path.display());
+                return;
+            }
+        };
+        let mut writer = std::io::BufWriter::new(file);
+        match brokkr_core::project::write(&mut writer, &self.volume, &state) {
+            Ok(()) => {
+                self.project_path = Some(path.to_path_buf());
+                self.status = format!("saved {}", path.display());
+            }
+            Err(error) => self.status = format!("could not write {}: {error}", path.display()),
+        }
+    }
+
     fn export_directory() -> std::path::PathBuf {
         let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
         home.unwrap_or_else(std::env::temp_dir).join("brokkrsculpt")
@@ -639,7 +870,11 @@ impl Brokkr {
     /// Refuses to write anything that would not print. A slicer given a mesh
     /// with holes either rejects it or fills it wrong, and finding that out
     /// after a failed print is worse than being told here.
-    fn export(&mut self, format: ExportFormat) {
+    /// Write the sculpt out to a chosen path.
+    ///
+    /// The path now comes from a dialog rather than a fixed directory, so there
+    /// is nothing to create and nothing to guess.
+    fn export(&mut self, format: ExportFormat, path: &std::path::Path) {
         let started = Instant::now();
         let (mesh, report) = self.volume.export_mesh();
 
@@ -649,15 +884,8 @@ impl Brokkr {
             return;
         }
 
-        let directory = Self::export_directory();
-        if let Err(error) = std::fs::create_dir_all(&directory) {
-            self.status = format!("could not make {}: {error}", directory.display());
-            return;
-        }
-        let path = directory.join(format!("sculpt.{}", format.extension()));
-
         let write = || -> std::io::Result<()> {
-            let file = std::fs::File::create(&path)?;
+            let file = std::fs::File::create(path)?;
             let mut file = std::io::BufWriter::new(file);
             match format {
                 ExportFormat::Stl => brokkr_core::export::stl::write(&mesh, &mut file)?,
@@ -669,7 +897,7 @@ impl Brokkr {
 
         match write() {
             Ok(()) => {
-                let bytes = std::fs::metadata(&path).map(|data| data.len()).unwrap_or(0);
+                let bytes = std::fs::metadata(path).map(|data| data.len()).unwrap_or(0);
                 self.status = format!(
                     "{} to {} ({:.1} MB, {:.0} ms)",
                     report.summary(),
@@ -906,7 +1134,7 @@ impl Brokkr {
 
                 // An open menu swallows the next press: closing it is what the
                 // click was for, and sculpting as well would be a surprise.
-                if self.menu.take().is_some() {
+                if self.menu.take().is_some() || self.top_menu.take().is_some() {
                     return;
                 }
 
@@ -1032,7 +1260,13 @@ impl Brokkr {
         }
     }
 
-    pub fn update(&mut self, message: Message) {
+    /// Handle one message.
+    ///
+    /// Returns a [`Task`] because anything that touches the filesystem -- a
+    /// dialog, a save, an export -- must not run here. The event loop is the
+    /// same thread that draws, so a blocking call freezes the window, which is
+    /// exactly the export freeze this replaces.
+    pub fn update(&mut self, message: Message) -> Task<Message> {
         match message {
             Message::Pointer(event) => self.on_pointer(event),
             Message::Frame => {
@@ -1068,9 +1302,26 @@ impl Brokkr {
                 }
             }
             Message::SizingEnded => self.sizing = None,
+            Message::TopMenuToggled(which) => {
+                // Clicking the open one closes it, which is what a menu bar
+                // does everywhere.
+                self.top_menu = (self.top_menu != Some(which)).then_some(which);
+            }
+            Message::DiagnosticsCopied => {
+                let report = self.diagnostics();
+                self.status = "diagnostics copied".to_string();
+                self.top_menu = None;
+                return iced::clipboard::write(report);
+            }
+            Message::IssueOpened => {
+                self.top_menu = None;
+                self.status = format!("report bugs at {ISSUE_URL}");
+                log::info!("{}", self.diagnostics());
+            }
             Message::MenuClosed => {
                 self.menu = None;
                 self.menu_edit = None;
+                self.top_menu = None;
             }
             Message::MenuFieldEdited(which, text) => self.edit_menu_field(which, text),
             Message::MenuFieldSubmitted => self.menu_edit = None,
@@ -1085,34 +1336,59 @@ impl Brokkr {
             Message::ResetPressurePeak => self.tablet.reset_peak(),
             Message::Undo => self.undo(),
             Message::Redo => self.redo(),
-            Message::Export(format) => self.export(format),
+            Message::Export(format) => {
+                return Task::perform(pick_export_target(format), move |path| {
+                    Message::ExportChosen(format, path)
+                });
+            }
             Message::Resample(voxel_size) => self.resample(voxel_size),
             Message::SpaceMouse(setting) => self.configure_spacemouse(setting),
             Message::SectionToggled(section) => {
                 let open = &mut self.expanded[section as usize];
                 *open = !*open;
             }
-            Message::ResetSphere => {
-                let mut volume = Volume::new(self.voxel_size);
-                volume.seed_sphere(Vec3::ZERO, MODEL_RADIUS_MM);
-                volume.mark_everything_dirty();
-                // The old bricks must be cleared from the pool too, or their
-                // triangles stay on screen. Marking them dirty makes them
-                // remesh to nothing, which releases their slices.
-                for coord in self.volume.brick_coords() {
-                    volume.mark_dirty(coord);
+            // Both the panel button and File > New come here, so the two
+            // cannot drift apart.
+            Message::ResetSphere | Message::NewSculpt => self.reset_sculpt(),
+
+            // --- files -------------------------------------------------------
+            // Each is two halves: ask for a path off the UI thread, then act on
+            // whatever came back. A `None` means the dialog was dismissed, which
+            // is not an error and must leave everything alone.
+            Message::OpenRequested => {
+                return Task::perform(pick_project_to_open(), Message::OpenChosen);
+            }
+            Message::OpenChosen(path) => {
+                if let Some(path) = path {
+                    self.open_project(&path);
                 }
-                self.volume = volume;
-                // History refers to bricks of the volume that just went away,
-                // so keeping it would let undo splice pieces of the discarded
-                // model into the new one.
-                self.history.clear();
-                self.history_stats = self.history.stats();
-                self.camera = OrbitCamera::framing(Vec3::ZERO, MODEL_RADIUS_MM);
-                self.publish_camera();
-                self.remesh_dirty();
+            }
+            Message::SaveRequested => match self.project_path.clone() {
+                // Save over the file it came from; with no file yet this is a
+                // Save As, which is what a first Save should do.
+                Some(path) => self.save_project(&path),
+                None => return Task::perform(pick_project_to_save(), Message::SaveChosen),
+            },
+            Message::SaveAsRequested => {
+                return Task::perform(pick_project_to_save(), Message::SaveChosen);
+            }
+            Message::SaveChosen(path) => {
+                if let Some(path) = path {
+                    self.save_project(&path);
+                }
+            }
+            Message::ExportRequested(format) => {
+                return Task::perform(pick_export_target(format), move |path| {
+                    Message::ExportChosen(format, path)
+                });
+            }
+            Message::ExportChosen(format, path) => {
+                if let Some(path) = path {
+                    self.export(format, &path);
+                }
             }
         }
+        Task::none()
     }
 }
 
@@ -1125,6 +1401,16 @@ impl Default for Brokkr {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `update` returns a `Task` now. Tests do not run the iced runtime, so
+    /// there is nothing to hand it to and dropping it is correct — but it must
+    /// be dropped deliberately rather than by `#[allow]`, or a test that should
+    /// have driven a dialog would pass silently.
+    fn update(app: &mut Brokkr, message: Message) {
+        let task = app.update(message);
+        drop(task);
+    }
+
     use crate::tablet::PenState;
     use brokkr_core::BrushKind;
     use iced::Vector;
@@ -1263,11 +1549,11 @@ mod tests {
         release(&mut app);
         assert_ne!(app.volume.sample_world(front), before);
 
-        app.update(Message::Undo);
+        update(&mut app, Message::Undo);
         assert_eq!(app.volume.sample_world(front), before, "undo did not restore the field");
         assert!(app.perf.dirty_bricks > 0, "undo must schedule a remesh or the screen goes stale");
 
-        app.update(Message::Redo);
+        update(&mut app, Message::Redo);
         assert_ne!(app.volume.sample_world(front), before, "redo did not reapply the stroke");
     }
 
@@ -1293,7 +1579,7 @@ mod tests {
     #[test]
     fn symmetry_sculpts_both_sides_at_once() {
         let mut app = app();
-        app.update(Message::SymmetryAxisToggled(MirrorAxis::X));
+        update(&mut app, Message::SymmetryAxisToggled(MirrorAxis::X));
         // Nothing has told the application how big the viewport is yet, and
         // the ray depends on it.
         app.viewport_size = Vec2::new(SIZE.x, SIZE.y);
@@ -1319,14 +1605,13 @@ mod tests {
     #[test]
     fn holding_shift_sculpts_with_smooth_without_changing_the_selection() {
         let mut app = app();
-        app.update(Message::BrushKindChanged(BrushKind::Draw));
+        update(&mut app, Message::BrushKindChanged(BrushKind::Draw));
         assert_eq!(app.effective_brush().kind, BrushKind::Draw);
 
-        app.update(Message::Pointer(PointerEvent::Modifiers {
-            shift: true,
-            control: false,
-            alt: false,
-        }));
+        update(
+            &mut app,
+            Message::Pointer(PointerEvent::Modifiers { shift: true, control: false, alt: false }),
+        );
         assert_eq!(app.effective_brush().kind, BrushKind::Smooth, "shift should smooth");
         assert_eq!(
             app.brush.kind,
@@ -1335,11 +1620,10 @@ mod tests {
              and a key released out of focus would strand the wrong brush"
         );
 
-        app.update(Message::Pointer(PointerEvent::Modifiers {
-            shift: false,
-            control: false,
-            alt: false,
-        }));
+        update(
+            &mut app,
+            Message::Pointer(PointerEvent::Modifiers { shift: false, control: false, alt: false }),
+        );
         assert_eq!(app.effective_brush().kind, BrushKind::Draw, "releasing shift should restore");
     }
 
@@ -1356,7 +1640,7 @@ mod tests {
             .expect("the centre of the viewport should hit the sphere");
         let flat = app.volume.sample_world(probe);
 
-        app.update(Message::BrushKindChanged(BrushKind::Draw));
+        update(&mut app, Message::BrushKindChanged(BrushKind::Draw));
         for _ in 0..4 {
             press(&mut app, centre_of_viewport());
             release(&mut app);
@@ -1366,11 +1650,10 @@ mod tests {
 
         // Now the same gesture with shift held. Nothing about the selection
         // changes, but the strokes must smooth rather than pile on more.
-        app.update(Message::Pointer(PointerEvent::Modifiers {
-            shift: true,
-            control: false,
-            alt: false,
-        }));
+        update(
+            &mut app,
+            Message::Pointer(PointerEvent::Modifiers { shift: true, control: false, alt: false }),
+        );
         for _ in 0..12 {
             press(&mut app, centre_of_viewport());
             release(&mut app);
@@ -1403,7 +1686,7 @@ mod tests {
             (MirrorAxis::Z, Vec3::new(1.0, 1.0, -1.0)),
         ] {
             let mut app = app();
-            app.update(Message::SymmetryAxisToggled(axis));
+            update(&mut app, Message::SymmetryAxisToggled(axis));
             assert!(app.symmetry.axis(axis), "{} did not turn on", axis.label());
 
             // On the surface, and off all three planes, so only the axis
@@ -1427,7 +1710,7 @@ mod tests {
             );
 
             // ...and toggling it again turns it back off.
-            app.update(Message::SymmetryAxisToggled(axis));
+            update(&mut app, Message::SymmetryAxisToggled(axis));
             assert!(!app.symmetry.axis(axis));
         }
     }
@@ -1441,7 +1724,7 @@ mod tests {
         app.on_pointer(PointerEvent::Moved { position: centre_of_viewport(), size: SIZE });
         let original = app.brush.radius;
 
-        app.update(Message::SizingStarted(SizingTarget::Radius));
+        update(&mut app, Message::SizingStarted(SizingTarget::Radius));
         assert!(app.sizing.is_some(), "the gesture did not start");
 
         let at = |dx: f32| Vector::new(SIZE.x / 2.0 + dx, SIZE.y / 2.0);
@@ -1460,7 +1743,7 @@ mod tests {
             app.brush.radius
         );
 
-        app.update(Message::SizingEnded);
+        update(&mut app, Message::SizingEnded);
         assert!(app.sizing.is_none());
         // ...and the pointer goes back to sculpting.
         app.on_pointer(PointerEvent::Moved { position: at(200.0), size: SIZE });
@@ -1478,7 +1761,7 @@ mod tests {
             .expect("the centre should hit the sphere");
         let before = app.volume.sample_world(probe);
 
-        app.update(Message::SizingStarted(SizingTarget::Radius));
+        update(&mut app, Message::SizingStarted(SizingTarget::Radius));
         press(&mut app, centre_of_viewport());
         for step in 1..=8 {
             app.on_pointer(PointerEvent::Moved {
@@ -1501,7 +1784,7 @@ mod tests {
             for direction in [-1.0f32, 1.0] {
                 let mut app = app();
                 app.on_pointer(PointerEvent::Moved { position: centre_of_viewport(), size: SIZE });
-                app.update(Message::SizingStarted(target));
+                update(&mut app, Message::SizingStarted(target));
                 app.on_pointer(PointerEvent::Moved {
                     position: Vector::new(SIZE.x / 2.0 + direction * 5000.0, SIZE.y / 2.0),
                     size: SIZE,
@@ -1517,6 +1800,92 @@ mod tests {
 
     /// ZBrush calls this Dynamic. Without it a brush tuned on one model is the
     /// wrong size the moment the model changes scale.
+    /// The whole point of the format: sculpt, save, reopen, and get the same
+    /// thing back. Driven through the application's own open and save rather
+    /// than through the format directly, because the interesting failures are
+    /// in the wiring -- a stale mesh pool, history that outlives its model, a
+    /// camera that does not follow.
+    #[test]
+    fn a_sculpt_survives_a_save_and_a_reopen() {
+        let directory =
+            std::env::temp_dir().join(format!("brokkr-roundtrip-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("sculpt.brokkr");
+
+        let mut app = app();
+        app.on_pointer(PointerEvent::Moved { position: centre_of_viewport(), size: SIZE });
+        let probe = app
+            .surface_under(Vec2::new(SIZE.x / 2.0, SIZE.y / 2.0))
+            .expect("the centre should hit the sphere");
+
+        // Make something worth keeping, and move the camera and settings so the
+        // session state has something to prove.
+        update(&mut app, Message::BrushKindChanged(BrushKind::Draw));
+        for _ in 0..4 {
+            press(&mut app, centre_of_viewport());
+            release(&mut app);
+        }
+        update(&mut app, Message::SymmetryAxisToggled(MirrorAxis::Y));
+        update(&mut app, Message::BrushRadiusChanged(5.5));
+        app.camera.yaw = 1.25;
+        let sculpted = app.volume.sample_world(probe);
+        let expected_bricks: usize = app.volume.brick_coords().count();
+
+        app.save_project(&path);
+        assert!(app.status.starts_with("saved"), "save reported: {}", app.status);
+        assert_eq!(app.project_path.as_deref(), Some(path.as_path()));
+
+        // A different session entirely, as reopening after quitting would be.
+        let mut reopened = Brokkr::with_tablet(crate::tablet::Tablet::inert());
+        reopened.open_project(&path);
+        assert!(reopened.status.starts_with("opened"), "open reported: {}", reopened.status);
+
+        assert_eq!(reopened.volume.sample_world(probe), sculpted, "the field came back different");
+        assert_eq!(reopened.volume.brick_coords().count(), expected_bricks);
+        assert!((reopened.camera.yaw - 1.25).abs() < 1.0e-5, "the camera did not follow");
+        assert!((reopened.brush.radius - 5.5).abs() < 1.0e-5, "the brush did not follow");
+        assert!(reopened.symmetry.axis(MirrorAxis::Y), "the mirror planes did not follow");
+
+        // And it was drawn and is printable, which is what "loaded" means.
+        // Note `open_project` meshes immediately, so the dirty set is already
+        // drained by now -- what proves it happened is how much it meshed.
+        assert!(
+            reopened.perf.dirty_bricks > 0,
+            "the reopened model was never meshed, so it would load into an empty screen"
+        );
+        let (_, report) = reopened.volume.export_mesh();
+        assert!(report.is_printable(), "the reopened model is not printable: {}", report.summary());
+
+        // History belongs to the model that went away.
+        assert!(!reopened.history.can_undo(), "undo outlived the model it belonged to");
+
+        std::fs::remove_dir_all(&directory).ok();
+    }
+
+    /// A file that cannot be read must leave the sculpt on screen alone. Losing
+    /// the current work to a failed open is the worst thing this can do.
+    #[test]
+    fn a_bad_file_reports_and_changes_nothing() {
+        let directory = std::env::temp_dir().join(format!("brokkr-bad-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("not-a-sculpt.brokkr");
+        std::fs::write(&path, b"this is not a sculpt").unwrap();
+
+        let mut app = app();
+        let before = app.volume.brick_coords().count();
+        app.open_project(&path);
+
+        assert!(app.status.contains("not a BrokkrSculpt file"), "reported: {}", app.status);
+        assert_eq!(app.volume.brick_coords().count(), before, "a failed open lost the model");
+        assert!(app.project_path.is_none(), "a failed open claimed the file");
+
+        app.open_project(&directory.join("does-not-exist.brokkr"));
+        assert!(app.status.contains("could not open"), "reported: {}", app.status);
+        assert_eq!(app.volume.brick_coords().count(), before);
+
+        std::fs::remove_dir_all(&directory).ok();
+    }
+
     #[test]
     fn a_dynamic_radius_keeps_its_proportion_to_the_model() {
         let proportion = |state: &Brokkr| state.brush.radius / state.model_radius;
@@ -1525,12 +1894,12 @@ mod tests {
         // leave it alone.
         let mut fixed = app();
         let before = fixed.brush.radius;
-        fixed.update(Message::Resample(VOXEL_SIZE_MM / 2.0));
+        update(&mut fixed, Message::Resample(VOXEL_SIZE_MM / 2.0));
         assert_eq!(fixed.brush.radius, before, "a fixed radius must survive a resample");
 
         // On, and the model doubles: the brush should follow it.
         let mut dynamic = app();
-        dynamic.update(Message::DynamicRadiusToggled(true));
+        update(&mut dynamic, Message::DynamicRadiusToggled(true));
         let before = proportion(&dynamic);
         dynamic.volume.seed_sphere(Vec3::ZERO, MODEL_RADIUS_MM * 2.0);
         dynamic.volume.mark_everything_dirty();
@@ -1631,8 +2000,8 @@ mod tests {
         app.fly_to(crate::navcube::Part { direction: Vec3::X, extremes: 1 });
         // The first frame has no previous one to measure against, so it
         // contributes nothing; the second is the one that moves.
-        app.update(Message::Frame);
-        app.update(Message::Frame);
+        update(&mut app, Message::Frame);
+        update(&mut app, Message::Frame);
         let elapsed = app.flight.expect("the flight ended early").elapsed_ms;
         assert!(elapsed > 0.0, "the frame tick did not advance the flight");
     }
@@ -1699,7 +2068,7 @@ mod tests {
         right_release(&mut app);
         assert!(app.menu.is_some());
 
-        app.update(Message::MenuClosed);
+        update(&mut app, Message::MenuClosed);
         assert!(app.menu.is_none(), "escape did not close it");
 
         // Open again, then click elsewhere: the click closes it and must not
@@ -1727,23 +2096,23 @@ mod tests {
         // Part way through typing "2.5": neither "" nor "2." parses, and
         // snapping the field back mid-edit would make it unusable.
         for text in ["", "2", "2.", "2.5"] {
-            app.update(Message::MenuFieldEdited(SizingTarget::Radius, text.to_string()));
+            update(&mut app, Message::MenuFieldEdited(SizingTarget::Radius, text.to_string()));
             assert_eq!(app.menu_field_text(SizingTarget::Radius), text, "the text was lost");
         }
         assert!((app.brush.radius - 2.5).abs() < 1.0e-5, "the value never arrived");
 
         // Junk leaves the value alone rather than zeroing it.
-        app.update(Message::MenuFieldEdited(SizingTarget::Radius, "banana".into()));
+        update(&mut app, Message::MenuFieldEdited(SizingTarget::Radius, "banana".into()));
         assert!((app.brush.radius - 2.5).abs() < 1.0e-5, "junk moved the value");
 
         // Out of range is clamped, not accepted.
-        app.update(Message::MenuFieldEdited(SizingTarget::Radius, "500".into()));
+        update(&mut app, Message::MenuFieldEdited(SizingTarget::Radius, "500".into()));
         assert_eq!(app.brush.radius, MAX_RADIUS_MM);
-        app.update(Message::MenuFieldEdited(SizingTarget::Strength, "-5".into()));
+        update(&mut app, Message::MenuFieldEdited(SizingTarget::Strength, "-5".into()));
         assert_eq!(app.brush.strength, MIN_STRENGTH);
 
         // Once submitted the field goes back to showing the real value.
-        app.update(Message::MenuFieldSubmitted);
+        update(&mut app, Message::MenuFieldSubmitted);
         assert_eq!(app.menu_field_text(SizingTarget::Radius), format!("{:.2}", app.brush.radius));
     }
 
@@ -1794,11 +2163,11 @@ mod tests {
     fn the_radius_keys_stay_inside_the_range_the_slider_offers() {
         let mut app = app();
         for _ in 0..200 {
-            app.update(Message::BrushRadiusScaled(1.5));
+            update(&mut app, Message::BrushRadiusScaled(1.5));
         }
         assert_eq!(app.brush.radius, MAX_RADIUS_MM);
         for _ in 0..200 {
-            app.update(Message::BrushRadiusScaled(1.0 / 1.5));
+            update(&mut app, Message::BrushRadiusScaled(1.0 / 1.5));
         }
         assert_eq!(app.brush.radius, MIN_RADIUS_MM);
     }
@@ -1808,7 +2177,7 @@ mod tests {
     #[test]
     fn either_modifier_inverts_and_holding_both_is_not_a_double_negative() {
         let mut app = app();
-        app.update(Message::BrushKindChanged(BrushKind::Draw));
+        update(&mut app, Message::BrushKindChanged(BrushKind::Draw));
         assert_eq!(app.stroke_direction(), BrushDirection::Add);
 
         let modifiers = |app: &mut Brokkr, control, alt| {
@@ -1838,7 +2207,7 @@ mod tests {
     fn alt_combines_with_the_eraser_the_way_control_does() {
         for (control, alt) in [(true, false), (false, true)] {
             let mut app = app();
-            app.update(Message::BrushKindChanged(BrushKind::Draw));
+            update(&mut app, Message::BrushKindChanged(BrushKind::Draw));
             app.tablet.simulate(pen(glam::Vec2::ZERO, true));
             assert_eq!(app.stroke_direction(), BrushDirection::Subtract, "the eraser alone");
 
@@ -1856,10 +2225,10 @@ mod tests {
         let mut app = app();
         app.control = true;
 
-        app.update(Message::BrushKindChanged(BrushKind::Draw));
+        update(&mut app, Message::BrushKindChanged(BrushKind::Draw));
         assert_eq!(app.stroke_direction(), BrushDirection::Subtract);
 
-        app.update(Message::BrushKindChanged(BrushKind::Smooth));
+        update(&mut app, Message::BrushKindChanged(BrushKind::Smooth));
         assert_eq!(
             app.stroke_direction(),
             BrushDirection::Add,
@@ -1888,7 +2257,7 @@ mod tests {
     #[test]
     fn the_eraser_does_nothing_to_a_brush_with_no_opposite() {
         let mut app = app();
-        app.update(Message::BrushKindChanged(BrushKind::Smooth));
+        update(&mut app, Message::BrushKindChanged(BrushKind::Smooth));
         app.tablet.simulate(pen(glam::Vec2::ZERO, true));
         assert_eq!(app.stroke_direction(), BrushDirection::Add);
     }
@@ -1921,7 +2290,7 @@ mod tests {
         app.tablet.simulate(pen(glam::Vec2::new(0.0, 1.0), false));
         assert!(app.pen_lean().normalize().dot(app.camera.up()) < -0.999);
 
-        app.update(Message::TiltToggled(false));
+        update(&mut app, Message::TiltToggled(false));
         assert_eq!(app.pen_lean(), Vec3::ZERO, "turning tilt off must disable it entirely");
     }
 
@@ -1987,7 +2356,7 @@ mod tests {
         release(&mut app);
         assert!(app.history.can_undo());
 
-        app.update(Message::ResetSphere);
+        update(&mut app, Message::ResetSphere);
         assert!(!app.history.can_undo(), "reset must clear history");
         assert!(!app.history.can_redo());
     }
@@ -1998,8 +2367,8 @@ mod tests {
         // once, which is where a bad plane or a zero normal would surface.
         for kind in BrushKind::ALL {
             let mut app = app();
-            app.update(Message::BrushKindChanged(kind));
-            app.update(Message::BrushStrengthChanged(0.6));
+            update(&mut app, Message::BrushKindChanged(kind));
+            update(&mut app, Message::BrushStrengthChanged(0.6));
             press(&mut app, centre_of_viewport());
             app.on_pointer(PointerEvent::Moved {
                 position: centre_of_viewport() + Vector::new(30.0, 12.0),
@@ -2014,6 +2383,16 @@ mod tests {
 #[cfg(test)]
 mod export_tests {
     use super::*;
+
+    /// `update` returns a `Task` now. Tests do not run the iced runtime, so
+    /// there is nothing to hand it to and dropping it is correct — but it must
+    /// be dropped deliberately rather than by `#[allow]`, or a test that should
+    /// have driven a dialog would pass silently.
+    fn update(app: &mut Brokkr, message: Message) {
+        let task = app.update(message);
+        drop(task);
+    }
+
     use brokkr_core::BrickCoord;
 
     fn app() -> Brokkr {
@@ -2027,6 +2406,18 @@ mod export_tests {
     /// defaults it depends on (`MODEL_RADIUS_MM`, `VOXEL_SIZE_MM`, and the fact
     /// that voxel index 0 sits exactly on the origin) are three separate things
     /// a future change could move. This is what makes it permanent.
+    #[test]
+    fn the_diagnostics_carry_what_a_bug_report_needs() {
+        let app = app();
+        let report = app.diagnostics();
+        for expected in ["BrokkrSculpt", "session:", "model:", "view:", "tablet:", "spacemouse:"] {
+            assert!(report.contains(expected), "diagnostics are missing {expected}:\n{report}");
+        }
+        // The commit is what ties a binary to its source, which is an AGPL
+        // obligation rather than a nicety.
+        assert!(report.contains(build_commit()));
+    }
+
     #[test]
     fn the_default_model_is_centred_on_every_mirror_plane() {
         let app = app();
@@ -2114,7 +2505,7 @@ mod export_tests {
         let (_, before) = app.volume.export_mesh();
         let coarse_voxel = app.voxel_size;
 
-        app.update(Message::Resample(coarse_voxel / 2.0));
+        update(&mut app, Message::Resample(coarse_voxel / 2.0));
 
         assert!((app.voxel_size - coarse_voxel / 2.0).abs() < 1.0e-6);
         let (_, after) = app.volume.export_mesh();
@@ -2157,7 +2548,8 @@ mod export_tests {
         assert!(app.history.can_undo());
 
         let old_coords: Vec<BrickCoord> = app.volume.brick_coords().collect();
-        app.update(Message::Resample(app.voxel_size / 2.0));
+        let finer = app.voxel_size / 2.0;
+        update(&mut app, Message::Resample(finer));
 
         assert!(
             !app.history.can_undo(),
@@ -2170,7 +2562,8 @@ mod export_tests {
     fn resampling_to_the_current_size_does_nothing() {
         let mut app = app();
         let before = app.volume.brick_count();
-        app.update(Message::Resample(app.voxel_size));
+        let same = app.voxel_size;
+        update(&mut app, Message::Resample(same));
         assert_eq!(app.volume.brick_count(), before);
         assert!(app.status.is_empty(), "nothing happened, so nothing should be reported");
     }

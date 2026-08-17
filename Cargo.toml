@@ -23,6 +23,10 @@ iced_wgpu = "0.14"
 log = "0.4"
 env_logger = "0.11"
 evdev = "0.13"
+# Native file dialogs. On Linux this is the XDG desktop portal, which is what a
+# sandboxed app needs anyway. Its entire dependency set was already in this
+# lockfile before it was added -- see the note in brokkr-app/Cargo.toml.
+rfd = "0.17"
 pollster = "0.4"
 rayon = "1"
 rustc-hash = "2"

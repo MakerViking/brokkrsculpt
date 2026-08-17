@@ -50,6 +50,10 @@ pub struct SharedFrame {
     /// The navigation cube's geometry, in its own batch because it is drawn in
     /// its own pass with its own matrix.
     cube: Mutex<OverlayBatch>,
+    /// Which GPU and backend iced actually chose, recorded the first time the
+    /// pipeline is built. The application cannot ask wgpu directly -- iced owns
+    /// the adapter -- and it is the first thing a bug report needs.
+    adapter: Mutex<Option<String>>,
     /// The brush ring and the mirror planes, rebuilt by the application
     /// whenever something they depend on changes.
     overlay: Mutex<OverlayBatch>,
@@ -92,6 +96,22 @@ impl SharedFrame {
     #[cfg(test)]
     pub fn overlay_snapshot(&self) -> OverlayBatch {
         self.overlay.lock().expect("shared frame poisoned").clone()
+    }
+
+    /// The GPU iced chose, for diagnostics. "unknown" until the first frame.
+    pub fn adapter_summary(&self) -> String {
+        self.adapter
+            .lock()
+            .expect("shared frame poisoned")
+            .clone()
+            .unwrap_or_else(|| "unknown".to_string())
+    }
+
+    fn set_adapter(&self, summary: String) {
+        let mut held = self.adapter.lock().expect("shared frame poisoned");
+        if held.is_none() {
+            *held = Some(summary);
+        }
     }
 
     /// The pool counters as of the last frame, for the debug overlay.
@@ -351,6 +371,7 @@ impl shader::Primitive for SculptPrimitive {
         }
 
         *self.shared.stats.lock().expect("shared frame poisoned") = pipeline.renderer.stats();
+        self.shared.set_adapter(pipeline.renderer.adapter_summary());
     }
 
     fn render(

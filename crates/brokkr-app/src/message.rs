@@ -74,6 +74,24 @@ pub enum PointerEvent {
     },
 }
 
+/// A menu on the bar along the top.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TopMenu {
+    File,
+    Help,
+}
+
+impl TopMenu {
+    pub const ALL: [TopMenu; 2] = [TopMenu::File, TopMenu::Help];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            TopMenu::File => "File",
+            TopMenu::Help => "Help",
+        }
+    }
+}
+
 /// A collapsible block of the properties panel.
 ///
 /// The panel has more in it than fits a 1080 high window, and a scrollable
@@ -177,6 +195,12 @@ pub enum Message {
     DynamicRadiusToggled(bool),
     /// Close the right-click menu.
     MenuClosed,
+    /// Open a top bar menu, or close it if it is the one already open.
+    TopMenuToggled(TopMenu),
+    /// Put the diagnostics on the clipboard, for pasting into a bug report.
+    DiagnosticsCopied,
+    /// Open the issue tracker in a browser, with what we know prefilled.
+    IssueOpened,
     /// A numeric field in the menu was typed into. Carries the raw text, since
     /// a half typed value has to survive until it parses.
     MenuFieldEdited(SizingTarget, String),
@@ -190,8 +214,20 @@ pub enum Message {
     Redo,
     /// Throw the model away and start from a fresh sphere.
     ResetSphere,
-    /// Write the sculpt out.
+    /// Write the sculpt out. Opens a dialog first.
     Export(ExportFormat),
+    /// Start a fresh sculpt.
+    NewSculpt,
+    /// Open a saved sculpt: ask for a file, then load whatever came back.
+    OpenRequested,
+    OpenChosen(Option<std::path::PathBuf>),
+    /// Save. Over the current file if there is one, otherwise as a new one.
+    SaveRequested,
+    SaveAsRequested,
+    SaveChosen(Option<std::path::PathBuf>),
+    /// Export, in two halves for the same reason: ask, then write.
+    ExportRequested(ExportFormat),
+    ExportChosen(ExportFormat, Option<std::path::PathBuf>),
     /// Rebuild the volume at a different voxel size, which is the explicit
     /// operation that increases or reduces detail.
     Resample(f32),

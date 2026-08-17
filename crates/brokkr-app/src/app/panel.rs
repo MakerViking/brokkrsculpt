@@ -25,7 +25,7 @@ use super::{
 use glam::Vec2;
 
 use crate::app::SizingTarget;
-use crate::message::{ExportFormat, Message, PanelSection};
+use crate::message::{ExportFormat, Message, PanelSection, TopMenu};
 use crate::spacemouse::{self, ButtonAction};
 use crate::tablet::Diagnosis;
 use crate::theme;
@@ -47,7 +47,7 @@ impl Brokkr {
             None => stack![well, self.overlay()],
         };
 
-        column![
+        let body = column![
             self.header(),
             row![
                 self.tool_strip(),
@@ -57,25 +57,158 @@ impl Brokkr {
             .spacing(theme::S3)
         ]
         .spacing(theme::S3)
-        .padding(theme::S3)
-        .into()
+        .padding(theme::S3);
+
+        match self.top_menu {
+            // Over everything, and offset down past the bar it drops from.
+            Some(which) => stack![
+                body,
+                container(self.top_menu_panel(which))
+                    .padding(Padding { top: 40.0, ..Padding::ZERO })
+            ]
+            .into(),
+            None => body.into(),
+        }
     }
 
     fn header(&self) -> Element<'_, Message> {
+        let bar = TopMenu::ALL.into_iter().fold(
+            row![text("BROKKRSCULPT").size(theme::CAPTION_SIZE).color(theme::ACCENT),]
+                .spacing(theme::S4)
+                .align_y(Alignment::Center),
+            |assembled, menu| {
+                assembled.push(
+                    button(text(menu.label()).size(theme::TEXT_SIZE_SMALL))
+                        .padding(Padding {
+                            top: 2.0,
+                            bottom: 2.0,
+                            left: theme::S3,
+                            right: theme::S3,
+                        })
+                        .style(if self.top_menu == Some(menu) {
+                            theme::tool_button_active
+                        } else {
+                            theme::section_heading
+                        })
+                        .on_press(Message::TopMenuToggled(menu)),
+                )
+            },
+        );
+
+        // What the sculpt is called, and whether it has a home yet.
+        let title = match &self.project_path {
+            Some(path) => path
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_else(|| path.display().to_string()),
+            None => "untitled".to_string(),
+        };
+
         container(
             row![
-                text("BROKKRSCULPT")
-                    .size(theme::CAPTION_SIZE)
-                    .font(theme::FONT)
-                    .color(theme::ACCENT),
-                text("M1 brush system").size(theme::TEXT_SIZE_SMALL).color(theme::TEXT_MUTE),
+                bar,
+                text(title).size(theme::CAPTION_SIZE).color(theme::TEXT_MUTE).width(Length::Fill),
+                text(self.status.clone()).size(theme::CAPTION_SIZE).color(
+                    if self.status.contains("not exported") || self.status.contains("could not") {
+                        theme::ERROR
+                    } else {
+                        theme::TEXT_MUTE
+                    }
+                ),
             ]
             .spacing(theme::S4)
             .align_y(Alignment::Center),
         )
-        .padding(theme::PANEL_PADDING)
+        .padding(Padding { top: theme::S2, bottom: theme::S2, left: theme::S4, right: theme::S4 })
         .width(Length::Fill)
         .style(theme::panel)
+        .into()
+    }
+
+    /// The panel that drops from an open top bar menu.
+    ///
+    /// Positioned with the same padding trick the right click menu uses, since
+    /// the widget tree is already a `stack!` over the viewport and iced 0.14 has
+    /// no popup of its own. That is also why `iced_aw` is not here: it lags iced
+    /// releases, and this codebase is pinned to iced 0.14 and wgpu 27 for
+    /// reasons that have already cost a session.
+    fn top_menu_panel(&self, which: TopMenu) -> Element<'_, Message> {
+        let entry = |label: &'static str, message: Message| {
+            button(text(label).size(theme::TEXT_SIZE_SMALL))
+                .width(Length::Fill)
+                .padding(Padding { top: 3.0, bottom: 3.0, left: theme::S3, right: theme::S3 })
+                .style(theme::section_heading)
+                .on_press(message)
+        };
+        let separator = || {
+            container(text("").size(1))
+                .width(Length::Fill)
+                .height(Length::Fixed(1.0))
+                .style(theme::panel)
+        };
+
+        let body = match which {
+            TopMenu::File => {
+                let exports = ExportFormat::ALL.into_iter().fold(
+                    column![].spacing(1),
+                    |assembled, format| {
+                        assembled.push(entry(
+                            match format {
+                                ExportFormat::Stl => "Export STL…",
+                                ExportFormat::Obj => "Export OBJ…",
+                                ExportFormat::ThreeMf => "Export 3MF…",
+                            },
+                            Message::ExportRequested(format),
+                        ))
+                    },
+                );
+                column![
+                    entry("New", Message::NewSculpt),
+                    entry("Open…", Message::OpenRequested),
+                    entry("Save", Message::SaveRequested),
+                    entry("Save As…", Message::SaveAsRequested),
+                    separator(),
+                    exports,
+                ]
+                .spacing(1)
+            }
+            // No Import here on purpose. Importing a mesh is a voxeliser, not
+            // file plumbing, so the item appears when that exists rather than
+            // sitting greyed out promising something.
+            //
+            // No Settings either: the properties panel already carries every
+            // setting there is, and a second surface for the same state would
+            // drift from it.
+            TopMenu::Help => column![
+                text(format!("BrokkrSculpt {}", env!("CARGO_PKG_VERSION")))
+                    .size(theme::TEXT_SIZE_SMALL)
+                    .color(theme::TEXT),
+                text(format!("build {}", super::build_commit()))
+                    .size(theme::CAPTION_SIZE)
+                    .color(theme::TEXT_MUTE),
+                text("AGPL-3.0-or-later").size(theme::CAPTION_SIZE).color(theme::TEXT_MUTE),
+                separator(),
+                entry("Copy diagnostics", Message::DiagnosticsCopied),
+                entry("Report a bug…", Message::IssueOpened),
+            ]
+            .spacing(theme::S1),
+        };
+
+        // Under whichever button opened it, roughly. The bar is laid out by
+        // iced so the exact x is not knowable here; left aligned under the
+        // menus is close enough and cannot fall off the edge.
+        let left = match which {
+            TopMenu::File => 96.0,
+            TopMenu::Help => 148.0,
+        };
+
+        container(
+            container(body)
+                .padding(theme::S2)
+                .width(Length::Fixed(190.0))
+                .style(theme::overlay_card),
+        )
+        .padding(Padding { left, top: 0.0, ..Padding::ZERO })
         .into()
     }
 

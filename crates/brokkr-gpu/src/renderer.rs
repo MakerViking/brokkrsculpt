@@ -285,6 +285,19 @@ impl SculptRenderer {
         }
     }
 
+    /// A one line description of the target this renderer draws into.
+    ///
+    /// wgpu's adapter belongs to iced here, so the exact GPU name is not
+    /// reachable; what is reachable is what the pipeline was built against,
+    /// which is still the first thing a bug report needs.
+    pub fn adapter_summary(&self) -> String {
+        format!(
+            "wgpu {}, {} target",
+            env!("CARGO_PKG_VERSION"),
+            if self.srgb_target { "sRGB" } else { "linear" }
+        )
+    }
+
     /// Whether the target format encodes sRGB itself, which the shader needs to
     /// know so it does not encode twice.
     pub fn target_is_srgb(&self) -> bool {

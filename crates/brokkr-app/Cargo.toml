@@ -21,6 +21,7 @@ env_logger.workspace = true
 glam.workspace = true
 iced = { workspace = true, features = ["advanced", "wgpu", "debug"] }
 log.workspace = true
+rfd.workspace = true
 wgpu.workspace = true
 
 # Stylus pressure is read straight from the kernel's evdev interface. That sits
