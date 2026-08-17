@@ -189,6 +189,24 @@ pub fn tool_button_active(
     }
 }
 
+/// A collapsible section heading. Flat and borderless, so it reads as a
+/// heading rather than as a button, but brightens on hover so it is
+/// discoverable as one.
+pub fn section_heading(
+    _theme: &iced::Theme,
+    status: iced::widget::button::Status,
+) -> iced::widget::button::Style {
+    use iced::widget::button::Status;
+    iced::widget::button::Style {
+        background: None,
+        text_color: match status {
+            Status::Hovered | Status::Pressed => TEXT,
+            Status::Active | Status::Disabled => TEXT_MUTE,
+        },
+        ..Default::default()
+    }
+}
+
 /// The strip itself: a narrow docked column against the viewport.
 pub fn tool_strip(_theme: &iced::Theme) -> iced::widget::container::Style {
     iced::widget::container::Style {

@@ -21,7 +21,7 @@ use iced::{Alignment, Element, Length, Padding};
 use super::{
     Brokkr, COARSEST_VOXEL_MM, FINEST_VOXEL_MM, PuckAction, SpaceMouseConfig, SpaceMouseSetting,
 };
-use crate::message::{ExportFormat, Message};
+use crate::message::{ExportFormat, Message, PanelSection};
 use crate::spacemouse::{self, ButtonAction};
 use crate::tablet::Diagnosis;
 use crate::theme;
@@ -273,13 +273,13 @@ impl Brokkr {
                 radius,
                 strength,
                 falloff,
-                self.pattern_panel(),
-                self.pen_panel(),
-                self.spacemouse_panel(),
+                self.section(PanelSection::Pattern, || self.pattern_panel()),
+                self.section(PanelSection::Pen, || self.pen_panel()),
+                self.section(PanelSection::SpaceMouse, || self.spacemouse_panel()),
                 text("HISTORY").size(theme::CAPTION_SIZE).color(theme::TEXT_MUTE),
                 history,
-                self.detail_panel(),
-                self.export_panel(),
+                self.section(PanelSection::Detail, || self.detail_panel()),
+                self.section(PanelSection::Export, || self.export_panel()),
                 button(text("Reset sphere").size(theme::TEXT_SIZE_SMALL))
                     .on_press(Message::ResetSphere),
                 text(
@@ -364,13 +364,16 @@ impl Brokkr {
                                 Message::SpaceMouse(SpaceMouseSetting::Binding(action, axis))
                             })
                             .text_size(theme::CAPTION_SIZE)
-                            .width(Length::Fill),
+                            // Portioned rather than Fill, or the picker eats
+                            // the row and clips the flip label off the edge.
+                            .width(Length::FillPortion(2)),
                             checkbox(binding.invert)
                                 .label("flip")
                                 .on_toggle(move |invert| Message::SpaceMouse(
                                     SpaceMouseSetting::Invert(action, invert)
                                 ))
-                                .text_size(theme::CAPTION_SIZE),
+                                .text_size(theme::CAPTION_SIZE)
+                                .width(Length::FillPortion(1)),
                         ]
                         .spacing(theme::S2)
                         .align_y(Alignment::Center),
@@ -421,9 +424,26 @@ impl Brokkr {
         let defaults = SpaceMouseConfig::default();
 
         column![
-            text("SPACEMOUSE").size(theme::CAPTION_SIZE).color(theme::TEXT_MUTE),
             header,
             readout,
+            // Where the tuned settings end up, so they can be read back and
+            // pasted in as the built in defaults once they are right.
+            text(
+                spacemouse::Config::path()
+                    .map(|path| path.display().to_string())
+                    .unwrap_or_else(|| "settings cannot be saved: no config directory".into())
+            )
+            .size(theme::CAPTION_SIZE)
+            .color(theme::TEXT_MUTE),
+            row![
+                button(text("Invert all").size(theme::CAPTION_SIZE))
+                    .width(Length::Fill)
+                    .on_press(Message::SpaceMouse(SpaceMouseSetting::InvertAll)),
+                button(text("Reset").size(theme::CAPTION_SIZE))
+                    .width(Length::Fill)
+                    .on_press(Message::SpaceMouse(SpaceMouseSetting::Reset)),
+            ]
+            .spacing(theme::S2),
             row![
                 text("Mode").size(theme::CAPTION_SIZE).color(theme::TEXT_DIM),
                 pick_list(
@@ -457,27 +477,38 @@ impl Brokkr {
             ),
             bindings,
             buttons,
-            row![
-                button(text("Invert all").size(theme::CAPTION_SIZE))
-                    .width(Length::Fill)
-                    .on_press(Message::SpaceMouse(SpaceMouseSetting::InvertAll)),
-                button(text("Reset").size(theme::CAPTION_SIZE))
-                    .width(Length::Fill)
-                    .on_press(Message::SpaceMouse(SpaceMouseSetting::Reset)),
-            ]
-            .spacing(theme::S2),
-            // Where the tuned settings end up, so they can be read back and
-            // pasted in as the built in defaults once they are right.
-            text(
-                spacemouse::Config::path()
-                    .map(|path| path.display().to_string())
-                    .unwrap_or_else(|| "settings cannot be saved: no config directory".into())
-            )
-            .size(theme::CAPTION_SIZE)
-            .color(theme::TEXT_MUTE),
         ]
         .spacing(theme::S2)
         .into()
+    }
+
+    /// A collapsible block: a clickable heading, and a body built only when it
+    /// is open.
+    ///
+    /// The body is a closure rather than an `Element` so a closed section
+    /// costs nothing to lay out — `view` runs every frame.
+    fn section<'a>(
+        &'a self,
+        which: PanelSection,
+        body: impl FnOnce() -> Element<'a, Message>,
+    ) -> Element<'a, Message> {
+        let open = self.expanded[which as usize];
+        let heading = button(
+            row![
+                text(if open { "−" } else { "+" })
+                    .size(theme::CAPTION_SIZE)
+                    .color(theme::TEXT_MUTE)
+                    .width(Length::Fixed(10.0)),
+                text(which.title()).size(theme::CAPTION_SIZE).color(theme::TEXT_MUTE),
+            ]
+            .spacing(theme::S2),
+        )
+        .width(Length::Fill)
+        .padding(0)
+        .style(theme::section_heading)
+        .on_press(Message::SectionToggled(which));
+
+        if open { column![heading, body()].spacing(theme::S2).into() } else { heading.into() }
     }
 
     /// The surface pattern, which multiplies into whichever brush is selected.
@@ -543,9 +574,7 @@ impl Brokkr {
             .into()
         };
 
-        column![text("PATTERN").size(theme::CAPTION_SIZE).color(theme::TEXT_MUTE), kinds, settings,]
-            .spacing(theme::S2)
-            .into()
+        column![kinds, settings].spacing(theme::S2).into()
     }
 
     /// Resolution controls.
@@ -559,7 +588,6 @@ impl Brokkr {
         let coarser = self.voxel_size * 2.0;
 
         column![
-            text("DETAIL").size(theme::CAPTION_SIZE).color(theme::TEXT_MUTE),
             text(format!("Voxel  {:.3} mm", self.voxel_size))
                 .size(theme::TEXT_SIZE_SMALL)
                 .color(theme::TEXT_DIM),
@@ -604,9 +632,7 @@ impl Brokkr {
                 .into()
         };
 
-        column![text("EXPORT").size(theme::CAPTION_SIZE).color(theme::TEXT_MUTE), buttons, status,]
-            .spacing(theme::S2)
-            .into()
+        column![buttons, status].spacing(theme::S2).into()
     }
 
     /// Pen controls, plus enough of a live readout that a user can tell whether
@@ -662,7 +688,6 @@ impl Brokkr {
         });
 
         column![
-            text("PEN").size(theme::CAPTION_SIZE).color(theme::TEXT_MUTE),
             status,
             checkbox(self.pressure_enabled)
                 .label("Pressure")

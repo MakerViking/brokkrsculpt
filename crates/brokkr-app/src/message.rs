@@ -72,6 +72,47 @@ pub enum PointerEvent {
     },
 }
 
+/// A collapsible block of the properties panel.
+///
+/// The panel has more in it than fits a 1080 high window, and a scrollable
+/// alone left every settings section below the fold — including the SpaceMouse
+/// bindings, which made a deliberately rebindable puck practically
+/// unrebindable. Collapsing keeps every heading reachable without a scroll.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PanelSection {
+    Pattern,
+    Pen,
+    SpaceMouse,
+    Detail,
+    Export,
+}
+
+impl PanelSection {
+    pub const ALL: [PanelSection; 5] = [
+        PanelSection::Pattern,
+        PanelSection::Pen,
+        PanelSection::SpaceMouse,
+        PanelSection::Detail,
+        PanelSection::Export,
+    ];
+
+    pub fn title(self) -> &'static str {
+        match self {
+            PanelSection::Pattern => "PATTERN",
+            PanelSection::Pen => "PEN",
+            PanelSection::SpaceMouse => "SPACEMOUSE",
+            PanelSection::Detail => "DETAIL",
+            PanelSection::Export => "EXPORT",
+        }
+    }
+
+    /// Whether it starts open. The two long ones start closed so every
+    /// heading is visible without scrolling.
+    pub fn open_by_default(self) -> bool {
+        !matches!(self, PanelSection::Pen | PanelSection::SpaceMouse)
+    }
+}
+
 /// One change to the SpaceMouse settings.
 ///
 /// Gathered into one message rather than a variant each, because there are
@@ -136,4 +177,6 @@ pub enum Message {
     /// operation that increases or reduces detail.
     Resample(f32),
     SpaceMouse(SpaceMouseSetting),
+    /// Open or close one block of the properties panel.
+    SectionToggled(PanelSection),
 }

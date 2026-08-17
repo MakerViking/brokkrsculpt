@@ -16,7 +16,9 @@ use glam::{Vec2, Vec3};
 use iced::Subscription;
 
 use crate::camera::OrbitCamera;
-use crate::message::{ExportFormat, Message, PointerButton, PointerEvent, SpaceMouseSetting};
+use crate::message::{
+    ExportFormat, Message, PanelSection, PointerButton, PointerEvent, SpaceMouseSetting,
+};
 use crate::spacemouse::{
     Action as PuckAction, AxisBinding, ButtonAction, Config as SpaceMouseConfig, SpaceMouse,
 };
@@ -159,6 +161,9 @@ pub struct Brokkr {
     voxel_size: f32,
     /// What the last export or resample did, for the interface to show.
     status: String,
+    /// Which blocks of the properties panel are open, in `PanelSection::ALL`
+    /// order.
+    expanded: [bool; PanelSection::ALL.len()],
 }
 
 impl Brokkr {
@@ -210,6 +215,7 @@ impl Brokkr {
             history_stats: HistoryStats::default(),
             voxel_size: VOXEL_SIZE_MM,
             status: String::new(),
+            expanded: PanelSection::ALL.map(PanelSection::open_by_default),
         };
         app.remesh_dirty();
         // Otherwise the overlay reports a zero byte budget until the first
@@ -698,6 +704,10 @@ impl Brokkr {
             Message::Export(format) => self.export(format),
             Message::Resample(voxel_size) => self.resample(voxel_size),
             Message::SpaceMouse(setting) => self.configure_spacemouse(setting),
+            Message::SectionToggled(section) => {
+                let open = &mut self.expanded[section as usize];
+                *open = !*open;
+            }
             Message::ResetSphere => {
                 let mut volume = Volume::new(self.voxel_size);
                 volume.seed_sphere(Vec3::ZERO, MODEL_RADIUS_MM);
