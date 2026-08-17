@@ -40,8 +40,12 @@ impl Brokkr {
 
         column![
             self.header(),
-            row![container(scene).width(Length::Fill).height(Length::Fill), self.tools()]
-                .spacing(theme::S3)
+            row![
+                self.tool_strip(),
+                container(scene).width(Length::Fill).height(Length::Fill),
+                self.tools(),
+            ]
+            .spacing(theme::S3)
         ]
         .spacing(theme::S3)
         .padding(theme::S3)
@@ -132,6 +136,78 @@ impl Brokkr {
             .into()
     }
 
+    /// The always visible strip of brushes down the left.
+    ///
+    /// A strip rather than the dropdown this replaced: choosing a brush was two
+    /// clicks and a read, for something that should be one glance and one key.
+    /// The numbers match the 1..6 shortcuts, so the key and the button are
+    /// visibly the same thing.
+    ///
+    /// Down the left rather than along the top, which is what SindriCAD's
+    /// ribbon would imply. That is a deliberate departure: a strip costs no
+    /// viewport height, and it keeps the tools on the side the tablet hand is
+    /// already on. The colours are still SindriCAD's tokens, so the two
+    /// applications stay a family.
+    fn tool_strip(&self) -> Element<'_, Message> {
+        let smoothing = self.shift;
+
+        let brushes = BrushKind::ALL.into_iter().enumerate().fold(
+            column![].spacing(theme::S2),
+            |assembled, (index, kind)| {
+                // While shift is held every stroke smooths, so the strip shows
+                // Smooth as live. The selection underneath is untouched.
+                let live =
+                    if smoothing { kind == BrushKind::Smooth } else { kind == self.brush.kind };
+                assembled.push(
+                    button(
+                        column![
+                            text(kind.label()).size(theme::TEXT_SIZE_SMALL),
+                            text(format!("{}", index + 1)).size(theme::CAPTION_SIZE),
+                        ]
+                        .spacing(0)
+                        .align_x(Alignment::Center),
+                    )
+                    .width(Length::Fill)
+                    .style(if live { theme::tool_button_active } else { theme::tool_button })
+                    .on_press(Message::BrushKindChanged(kind)),
+                )
+            },
+        );
+
+        let mirrors =
+            MirrorAxis::ALL.into_iter().fold(column![].spacing(theme::S2), |assembled, axis| {
+                assembled.push(
+                    button(text(axis.label()).size(theme::TEXT_SIZE_SMALL))
+                        .width(Length::Fill)
+                        .style(if self.symmetry.axis(axis) {
+                            theme::tool_button_active
+                        } else {
+                            theme::tool_button
+                        })
+                        .on_press(Message::SymmetryAxisToggled(axis)),
+                )
+            });
+
+        container(
+            column![
+                text("TOOL").size(theme::CAPTION_SIZE).color(theme::TEXT_MUTE),
+                brushes,
+                text(if smoothing { "shift: smoothing" } else { "hold shift: smooth" })
+                    .size(theme::CAPTION_SIZE)
+                    .color(if smoothing { theme::ACCENT } else { theme::TEXT_MUTE }),
+                text("MIRROR").size(theme::CAPTION_SIZE).color(theme::TEXT_MUTE),
+                mirrors,
+            ]
+            .spacing(theme::S3)
+            .align_x(Alignment::Center),
+        )
+        .padding(theme::S3)
+        .width(Length::Fixed(76.0))
+        .height(Length::Fill)
+        .style(theme::tool_strip)
+        .into()
+    }
+
     fn tools(&self) -> Element<'_, Message> {
         let invert_hint = if self.brush.kind.is_directional() {
             "ctrl drag removes"
@@ -173,15 +249,13 @@ impl Brokkr {
 
         container(
             column![
-                text("BRUSH").size(theme::CAPTION_SIZE).color(theme::TEXT_MUTE),
-                pick_list(BrushKind::ALL, Some(self.brush.kind), Message::BrushKindChanged)
-                    .text_size(theme::TEXT_SIZE_SMALL)
-                    .width(Length::Fill),
+                text(self.brush.kind.label().to_uppercase())
+                    .size(theme::CAPTION_SIZE)
+                    .color(theme::TEXT_MUTE),
                 text(invert_hint).size(theme::CAPTION_SIZE).color(theme::TEXT_MUTE),
                 radius,
                 strength,
                 falloff,
-                self.symmetry_row(),
                 self.pen_panel(),
                 self.spacemouse_panel(),
                 text("HISTORY").size(theme::CAPTION_SIZE).color(theme::TEXT_MUTE),
@@ -191,7 +265,7 @@ impl Brokkr {
                 button(text("Reset sphere").size(theme::TEXT_SIZE_SMALL))
                     .on_press(Message::ResetSphere),
                 text(
-                    "drag: sculpt\nctrl drag: invert\nright drag: orbit\nshift right drag: pan\nwheel: zoom\nctrl z, ctrl shift z: undo, redo"
+                    "drag: sculpt\nctrl drag: invert\nshift drag: smooth\nright drag: orbit\nshift right drag: pan\nwheel: zoom\n1-6: brush\nx y z: mirror\n[ ]: radius\nctrl z, ctrl shift z: undo, redo"
                 )
                 .size(theme::CAPTION_SIZE)
                 .color(theme::TEXT_MUTE),
@@ -367,27 +441,6 @@ impl Brokkr {
         ]
         .spacing(theme::S2)
         .into()
-    }
-
-    /// One toggle per mirror plane.
-    ///
-    /// Three checkboxes on one line rather than a picker: the useful settings
-    /// are the combinations, and a picker would hide that x and y can both be
-    /// on at once.
-    fn symmetry_row(&self) -> Element<'_, Message> {
-        let toggles =
-            MirrorAxis::ALL.into_iter().fold(row![].spacing(theme::S3), |assembled, axis| {
-                assembled.push(
-                    checkbox(self.symmetry.axis(axis))
-                        .label(axis.label())
-                        .on_toggle(move |on| Message::SymmetryToggled(axis, on))
-                        .text_size(theme::TEXT_SIZE_SMALL),
-                )
-            });
-
-        column![text("MIRROR").size(theme::CAPTION_SIZE).color(theme::TEXT_MUTE), toggles,]
-            .spacing(theme::S2)
-            .into()
     }
 
     /// Resolution controls.

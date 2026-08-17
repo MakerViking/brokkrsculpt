@@ -675,9 +675,6 @@ impl Brokkr {
             Message::FalloffChanged(curve) => self.brush.falloff = curve,
             Message::BrushRadiusChanged(radius) => self.brush.radius = radius,
             Message::BrushStrengthChanged(strength) => self.brush.strength = strength,
-            Message::SymmetryToggled(axis, on) => {
-                self.symmetry = self.symmetry.with_axis(axis, on);
-            }
             Message::SymmetryAxisToggled(axis) => self.symmetry = self.symmetry.toggled(axis),
             Message::BrushRadiusScaled(factor) => {
                 self.brush.radius =
@@ -878,7 +875,7 @@ mod tests {
     #[test]
     fn symmetry_sculpts_both_sides_at_once() {
         let mut app = app();
-        app.update(Message::SymmetryToggled(MirrorAxis::X, true));
+        app.update(Message::SymmetryAxisToggled(MirrorAxis::X));
         // Nothing has told the application how big the viewport is yet, and
         // the ray depends on it.
         app.viewport_size = Vec2::new(SIZE.x, SIZE.y);

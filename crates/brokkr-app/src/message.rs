@@ -106,9 +106,9 @@ pub enum Message {
     BrushRadiusChanged(f32),
     BrushStrengthChanged(f32),
     FalloffChanged(FalloffCurve),
-    SymmetryToggled(MirrorAxis, bool),
-    /// Flip one mirror plane. The keyboard's version, which unlike the
-    /// checkbox does not know what the current state is.
+    /// Flip one mirror plane. A toggle rather than an explicit on/off,
+    /// because both the strip button and the keyboard act on what is currently
+    /// set rather than knowing it.
     SymmetryAxisToggled(MirrorAxis),
     /// Multiply the brush radius, for the keyboard nudge. Multiplicative
     /// because the radius spans fifty to one and a fixed step would crawl at
