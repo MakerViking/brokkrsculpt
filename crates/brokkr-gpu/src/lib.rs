@@ -10,8 +10,10 @@
 pub mod frustum;
 pub mod matcap;
 pub mod mesh_pool;
+pub mod overlay;
 pub mod renderer;
 
 pub use frustum::Frustum;
 pub use mesh_pool::{INDEX_CAPACITY, MeshPool, PoolStats, VERTEX_CAPACITY};
+pub use overlay::{OverlayBatch, OverlayRenderer, OverlayVertex};
 pub use renderer::{PixelRect, SculptRenderer, Uniforms};

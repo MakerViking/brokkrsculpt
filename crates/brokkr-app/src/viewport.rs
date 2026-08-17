@@ -17,14 +17,16 @@
 
 use std::sync::{Arc, Mutex};
 
-use brokkr_core::{BrickCoord, BrickMesh};
-use brokkr_gpu::{Frustum, PixelRect, PoolStats, SculptRenderer, Uniforms};
+use brokkr_core::{BrickCoord, BrickMesh, BrushKind, MirrorAxis};
+use brokkr_gpu::{Frustum, OverlayBatch, PixelRect, PoolStats, SculptRenderer, Uniforms};
 use iced::mouse;
 use iced::widget::shader;
 use iced::{Rectangle, Vector};
 
+use crate::app::SizingTarget;
 use crate::camera::OrbitCamera;
 use crate::message::{Message, PointerButton, PointerEvent};
+use crate::navcube;
 
 /// One brick's mesh on its way to the GPU.
 #[derive(Debug)]
@@ -45,6 +47,12 @@ pub struct SharedFrame {
     /// instead of allocating. This is what keeps a stroke out of the allocator.
     spare: Mutex<Vec<BrickMesh>>,
     stats: Mutex<PoolStats>,
+    /// The navigation cube's geometry, in its own batch because it is drawn in
+    /// its own pass with its own matrix.
+    cube: Mutex<OverlayBatch>,
+    /// The brush ring and the mirror planes, rebuilt by the application
+    /// whenever something they depend on changes.
+    overlay: Mutex<OverlayBatch>,
 }
 
 impl SharedFrame {
@@ -64,6 +72,26 @@ impl SharedFrame {
 
     pub fn set_camera(&self, camera: OrbitCamera) {
         *self.camera.lock().expect("shared frame poisoned") = camera;
+    }
+
+    /// Hand over this frame's overlay geometry, taking the caller's buffer and
+    /// giving back the previous one so neither side allocates.
+    pub fn swap_overlay(&self, batch: &mut OverlayBatch) {
+        std::mem::swap(&mut *self.overlay.lock().expect("shared frame poisoned"), batch);
+    }
+
+    /// The same hand off for the navigation cube.
+    pub fn swap_cube(&self, batch: &mut OverlayBatch) {
+        std::mem::swap(&mut *self.cube.lock().expect("shared frame poisoned"), batch);
+    }
+
+    /// The overlay geometry currently waiting for the renderer.
+    ///
+    /// The application swaps its buffer in here rather than keeping it, so this
+    /// is the only place the current frame's geometry can be read.
+    #[cfg(test)]
+    pub fn overlay_snapshot(&self) -> OverlayBatch {
+        self.overlay.lock().expect("shared frame poisoned").clone()
     }
 
     /// The pool counters as of the last frame, for the debug overlay.
@@ -102,6 +130,52 @@ fn button_of(button: mouse::Button) -> Option<PointerButton> {
         mouse::Button::Left => Some(PointerButton::Left),
         mouse::Button::Right => Some(PointerButton::Right),
         mouse::Button::Middle => Some(PointerButton::Middle),
+        _ => None,
+    }
+}
+
+/// How much one press of the radius keys changes it.
+///
+/// Multiplicative, because the radius spans fifty to one: a fixed step would
+/// crawl at the coarse end and jump in whole multiples at the fine end.
+const RADIUS_STEP: f32 = 1.15;
+
+/// The message a key press means, if it means anything.
+///
+/// Pulled out of `update` so it can be tested without building a widget tree
+/// or a window, which on this machine is the only way to test input at all:
+/// it is a Wayland session, and XTEST pointer and key synthesis silently does
+/// nothing there.
+fn shortcut(character: &str, command: bool, shift: bool) -> Option<Message> {
+    if command {
+        // The only chorded shortcuts. Anything else with control held belongs
+        // to the toolkit or the window manager.
+        return character.eq_ignore_ascii_case("z").then_some(if shift {
+            Message::Redo
+        } else {
+            Message::Undo
+        });
+    }
+
+    // Brushes are numbered in the order the tool strip shows them, so the key
+    // and the button are always the same thing.
+    if let Ok(digit) = character.parse::<usize>()
+        && let Some(index) = digit.checked_sub(1)
+        && let Some(kind) = BrushKind::ALL.get(index)
+    {
+        return Some(Message::BrushKindChanged(*kind));
+    }
+
+    match character.to_ascii_lowercase().as_str() {
+        // ZBrush's own keys for these two sliders, taken rather than invented so
+        // muscle memory carries over: S is Draw Size, U is Z Intensity.
+        "s" => Some(Message::SizingStarted(SizingTarget::Radius)),
+        "u" => Some(Message::SizingStarted(SizingTarget::Strength)),
+        "x" => Some(Message::SymmetryAxisToggled(MirrorAxis::X)),
+        "y" => Some(Message::SymmetryAxisToggled(MirrorAxis::Y)),
+        "z" => Some(Message::SymmetryAxisToggled(MirrorAxis::Z)),
+        "[" => Some(Message::BrushRadiusScaled(1.0 / RADIUS_STEP)),
+        "]" => Some(Message::BrushRadiusScaled(RADIUS_STEP)),
         _ => None,
     }
 }
@@ -152,20 +226,39 @@ impl shader::Program<Message> for Viewport {
                 PointerEvent::Scrolled { amount }
             }
             iced::Event::Keyboard(keyboard::Event::ModifiersChanged(modifiers)) => {
-                PointerEvent::Modifiers { shift: modifiers.shift(), control: modifiers.control() }
+                PointerEvent::Modifiers {
+                    shift: modifiers.shift(),
+                    control: modifiers.control(),
+                    alt: modifiers.alt(),
+                }
             }
-            // Undo and redo are handled here rather than through a global
-            // shortcut because the shader widget already receives every event,
-            // wherever the cursor happens to be.
+            // Shortcuts are handled here rather than through a global one
+            // because the shader widget already receives every event, wherever
+            // the cursor happens to be.
             iced::Event::Keyboard(keyboard::Event::KeyPressed { key, modifiers, .. }) => {
+                // Escape closes the right-click menu. Handled before the
+                // character keys because it is a named key, not a character.
+                if matches!(key, keyboard::Key::Named(keyboard::key::Named::Escape)) {
+                    return Some(shader::Action::publish(Message::MenuClosed).and_capture());
+                }
                 let keyboard::Key::Character(character) = key else {
                     return None;
                 };
-                if !modifiers.command() || !character.eq_ignore_ascii_case("z") {
+                let message = shortcut(character, modifiers.command(), modifiers.shift())?;
+                return Some(shader::Action::publish(message).and_capture());
+            }
+            // Releasing a sizing key ends the gesture. Without this the pointer
+            // would keep resizing the brush instead of going back to sculpting,
+            // which is the failure the user would report as "it stopped
+            // working".
+            iced::Event::Keyboard(keyboard::Event::KeyReleased { key, .. }) => {
+                let keyboard::Key::Character(character) = key else {
+                    return None;
+                };
+                if !matches!(character.to_ascii_lowercase().as_str(), "s" | "u") {
                     return None;
                 }
-                let message = if modifiers.shift() { Message::Redo } else { Message::Undo };
-                return Some(shader::Action::publish(message).and_capture());
+                return Some(shader::Action::publish(Message::SizingEnded).and_capture());
             }
             _ => return None,
         };
@@ -221,6 +314,26 @@ impl shader::Primitive for SculptPrimitive {
             padding: [0; 3],
         };
         pipeline.renderer.write_uniforms(queue, &uniforms);
+        {
+            let overlay = self.shared.overlay.lock().expect("shared frame poisoned");
+            pipeline.renderer.write_overlay(device, queue, &overlay, view_projection);
+        }
+        {
+            let cube = self.shared.cube.lock().expect("shared frame poisoned");
+            pipeline.renderer.write_cube(device, queue, &cube, navcube::view_projection(&camera));
+        }
+        // The cube's corner box is defined in logical pixels so it stays the
+        // same physical size at any scale factor, but a render pass wants
+        // physical ones. Worked out here because `render` sees neither the
+        // widget's logical bounds nor the scale factor.
+        let scale = viewport.scale_factor();
+        let (corner, size) = navcube::corner_rect(glam::Vec2::new(bounds.width, bounds.height));
+        pipeline.cube_offset = PixelRect {
+            x: (corner.x * scale).max(0.0) as u32,
+            y: (corner.y * scale).max(0.0) as u32,
+            width: (size.x * scale).max(1.0) as u32,
+            height: (size.y * scale).max(1.0) as u32,
+        };
         // Culling has to use the same matrix the vertex shader will, or bricks
         // vanish a frame before or after they should.
         pipeline.frustum = Frustum::from_view_projection(view_projection);
@@ -258,6 +371,16 @@ impl shader::Primitive for SculptPrimitive {
             },
             &pipeline.frustum,
         );
+
+        // The cube's box, offset from the widget into the window. Clamped to the
+        // clip rect so a viewport narrower than the cube cannot scissor outside
+        // its own bounds and paint over the panels.
+        let cube = &pipeline.cube_offset;
+        let x = clip_bounds.x + cube.x;
+        let y = clip_bounds.y + cube.y;
+        let width = cube.width.min(clip_bounds.width.saturating_sub(cube.x));
+        let height = cube.height.min(clip_bounds.height.saturating_sub(cube.y));
+        pipeline.renderer.render_cube(encoder, target, PixelRect { x, y, width, height });
     }
 }
 
@@ -266,6 +389,10 @@ impl shader::Primitive for SculptPrimitive {
 #[derive(Debug)]
 pub struct SculptPipeline {
     renderer: SculptRenderer,
+    /// The cube's corner box in physical pixels, relative to the widget's own
+    /// origin. Worked out in `prepare`, which is the only place the scale factor
+    /// and the logical bounds are both available.
+    cube_offset: PixelRect,
     /// Rebuilt in `prepare` from the same matrix the shader gets, and used in
     /// `render`, which is a separate call and has no access to the camera.
     frustum: Frustum,
@@ -275,6 +402,7 @@ impl shader::Pipeline for SculptPipeline {
     fn new(device: &wgpu::Device, queue: &wgpu::Queue, format: wgpu::TextureFormat) -> Self {
         Self {
             renderer: SculptRenderer::new(device, queue, format),
+            cube_offset: PixelRect { x: 0, y: 0, width: 0, height: 0 },
             frustum: Frustum::from_view_projection(glam::Mat4::IDENTITY),
         }
     }
@@ -364,5 +492,82 @@ mod tests {
 
         let recycled = shared.take_mesh();
         assert_eq!(recycled.vertices.capacity(), capacity, "the buffer was not reused");
+    }
+}
+
+#[cfg(test)]
+mod shortcut_tests {
+    use super::*;
+
+    /// Note the test target: `shortcut`, not a synthesised key event. This is
+    /// a Wayland session, where XTEST key and pointer synthesis silently does
+    /// nothing, so driving the real widget from a test is not an option.
+    fn press(character: &str) -> Option<Message> {
+        shortcut(character, false, false)
+    }
+
+    #[test]
+    fn the_digits_select_brushes_in_the_order_the_tool_strip_shows_them() {
+        for (index, kind) in BrushKind::ALL.into_iter().enumerate() {
+            let key = (index + 1).to_string();
+            assert!(
+                matches!(press(&key), Some(Message::BrushKindChanged(selected)) if selected == kind),
+                "key {key} should select {kind}"
+            );
+        }
+        // One past the last brush, so the mapping cannot silently wrap round.
+        let past_the_end = (BrushKind::ALL.len() + 1).to_string();
+        assert!(press(&past_the_end).is_none());
+        assert!(press("0").is_none(), "there is no brush zero");
+    }
+
+    #[test]
+    fn xyz_toggle_their_own_mirror_plane() {
+        for (key, axis) in [("x", MirrorAxis::X), ("y", MirrorAxis::Y), ("z", MirrorAxis::Z)] {
+            assert!(
+                matches!(press(key), Some(Message::SymmetryAxisToggled(a)) if a == axis),
+                "{key} should toggle {}",
+                axis.label()
+            );
+            // Shift alone must not change what a letter means.
+            assert!(matches!(shortcut(key, false, true), Some(Message::SymmetryAxisToggled(_))));
+        }
+        // Capitals reach the same place.
+        assert!(matches!(press("X"), Some(Message::SymmetryAxisToggled(MirrorAxis::X))));
+    }
+
+    /// `z` is the collision worth pinning: bare it mirrors, with control it
+    /// undoes, and the two must never be confused.
+    #[test]
+    fn control_z_still_undoes_rather_than_mirroring() {
+        assert!(matches!(shortcut("z", true, false), Some(Message::Undo)));
+        assert!(matches!(shortcut("z", true, true), Some(Message::Redo)));
+        assert!(matches!(shortcut("Z", true, false), Some(Message::Undo)));
+        assert!(matches!(press("z"), Some(Message::SymmetryAxisToggled(MirrorAxis::Z))));
+    }
+
+    #[test]
+    fn the_bracket_keys_scale_the_radius_in_opposite_directions() {
+        let Some(Message::BrushRadiusScaled(down)) = press("[") else {
+            panic!("[ did not change the radius");
+        };
+        let Some(Message::BrushRadiusScaled(up)) = press("]") else {
+            panic!("] did not change the radius");
+        };
+        assert!(down < 1.0, "[ should shrink the brush");
+        assert!(up > 1.0, "] should grow it");
+        // One in each direction returns to where it started.
+        assert!((down * up - 1.0).abs() < 1.0e-6);
+    }
+
+    #[test]
+    fn keys_that_mean_nothing_are_left_for_the_toolkit() {
+        assert!(press("q").is_none());
+        assert!(press("").is_none());
+        // Every other control chord belongs to the toolkit or the window
+        // manager, so claiming it here would steal it.
+        assert!(shortcut("s", true, false).is_none());
+        assert!(shortcut("x", true, false).is_none(), "ctrl x is not a mirror toggle");
+        assert!(shortcut("1", true, false).is_none());
     }
 }

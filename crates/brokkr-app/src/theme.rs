@@ -143,3 +143,76 @@ pub fn overlay_card(_theme: &iced::Theme) -> iced::widget::container::Style {
         ..Default::default()
     }
 }
+
+/// A tool in the strip that is not the current one.
+///
+/// Built from the existing tokens rather than new colours, per this file's own
+/// rule: hovering and pressing walk up the raised scale, and the border is the
+/// same hairline every other focusable control uses.
+pub fn tool_button(
+    _theme: &iced::Theme,
+    status: iced::widget::button::Status,
+) -> iced::widget::button::Style {
+    use iced::widget::button::Status;
+    let background = match status {
+        Status::Hovered => RAISED,
+        Status::Pressed => RAISED_2,
+        Status::Active | Status::Disabled => PANEL_2,
+    };
+    iced::widget::button::Style {
+        background: Some(background.into()),
+        text_color: TEXT_DIM,
+        border: iced::Border { color: LINE_STRONG, width: 1.0, radius: RADIUS_SM.into() },
+        ..Default::default()
+    }
+}
+
+/// The tool that is currently selected: filled with the accent.
+///
+/// A fill rather than a border, because at this size a one pixel outline is
+/// not readable at a glance, and knowing which brush is live at a glance is
+/// the entire point of having a strip instead of a dropdown.
+pub fn tool_button_active(
+    _theme: &iced::Theme,
+    status: iced::widget::button::Status,
+) -> iced::widget::button::Style {
+    use iced::widget::button::Status;
+    let background = match status {
+        Status::Hovered | Status::Pressed => ACCENT_HOT,
+        Status::Active | Status::Disabled => ACCENT,
+    };
+    iced::widget::button::Style {
+        background: Some(background.into()),
+        text_color: ON_ACCENT,
+        border: iced::Border { color: ACCENT, width: 1.0, radius: RADIUS_SM.into() },
+        ..Default::default()
+    }
+}
+
+/// A collapsible section heading. Flat and borderless, so it reads as a
+/// heading rather than as a button, but brightens on hover so it is
+/// discoverable as one.
+pub fn section_heading(
+    _theme: &iced::Theme,
+    status: iced::widget::button::Status,
+) -> iced::widget::button::Style {
+    use iced::widget::button::Status;
+    iced::widget::button::Style {
+        background: None,
+        text_color: match status {
+            Status::Hovered | Status::Pressed => TEXT,
+            Status::Active | Status::Disabled => TEXT_MUTE,
+        },
+        ..Default::default()
+    }
+}
+
+/// The strip itself: a narrow docked column against the viewport.
+pub fn tool_strip(_theme: &iced::Theme) -> iced::widget::container::Style {
+    iced::widget::container::Style {
+        background: Some(PANEL.into()),
+        text_color: Some(TEXT),
+        border: iced::Border { color: LINE, width: 1.0, radius: RADIUS_MD.into() },
+        ..Default::default()
+    }
+}

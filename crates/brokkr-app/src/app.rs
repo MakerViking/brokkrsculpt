@@ -2,23 +2,30 @@
 
 //! Application state, input handling and the widget tree.
 
+mod panel;
+
 use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::Instant;
 
 use brokkr_core::{
-    BrickCoord, BrickMesh, Brush, BrushDirection, BrushKind, BrushScratch, FalloffCurve, History,
-    HistoryStats, Stamp, Stroke, Symmetry, Volume, VolumeStats, lean_normal, raycast,
+    BrickCoord, BrickMesh, Brush, BrushDirection, BrushKind, BrushScratch, History, HistoryStats,
+    MirrorAxis, Stamp, Stroke, Symmetry, Volume, VolumeStats, lean_normal, raycast,
 };
 use glam::{Vec2, Vec3};
-use iced::widget::{button, checkbox, column, container, pick_list, row, slider, stack, text};
-use iced::{Alignment, Element, Length, Subscription};
+use iced::Subscription;
 
 use crate::camera::OrbitCamera;
-use crate::message::{ExportFormat, Message, PointerButton, PointerEvent};
-use crate::tablet::{Diagnosis, Tablet};
-use crate::theme;
-use crate::viewport::{SharedFrame, Viewport};
+use crate::cursor;
+use crate::message::{
+    ExportFormat, Message, PanelSection, PointerButton, PointerEvent, SpaceMouseSetting,
+};
+use crate::navcube;
+use crate::spacemouse::{
+    Action as PuckAction, AxisBinding, ButtonAction, Config as SpaceMouseConfig, SpaceMouse,
+};
+use crate::tablet::Tablet;
+use crate::viewport::SharedFrame;
 
 /// World units are millimetres, because the output of this program is meant to
 /// be printed.
@@ -34,6 +41,22 @@ const VOXEL_SIZE_MM: f32 = 0.25;
 /// a 60 mm ball at 0.055 mm comes to 11.2 million triangles and 6.2 million
 /// vertices against a pool of 8 million. Going finer would overflow it and put
 /// an incomplete model on screen, so the interface will not offer it.
+/// Range the brush radius may be nudged to with the keyboard, in millimetres.
+/// The same range the slider offers, so the two cannot disagree.
+pub(crate) const MIN_RADIUS_MM: f32 = 0.25;
+pub(crate) const MAX_RADIUS_MM: f32 = 12.0;
+
+/// Range the brush strength may take, matching the slider.
+pub(crate) const MIN_STRENGTH: f32 = 0.02;
+pub(crate) const MAX_STRENGTH: f32 = 0.80;
+
+/// How fast a hold-and-drag moves the brush numbers.
+///
+/// Radius is in log space so the same drag is the same proportion at any size;
+/// about 250 px covers the whole range, which is a comfortable sweep.
+const RADIUS_PER_PIXEL: f32 = 0.006;
+const STRENGTH_PER_PIXEL: f32 = 0.002;
+
 const FINEST_VOXEL_MM: f32 = 0.06;
 const COARSEST_VOXEL_MM: f32 = 2.0;
 
@@ -48,20 +71,47 @@ const MAX_TILT: f32 = std::f32::consts::PI / 3.0;
 /// about a second, which is long enough to be steady and short enough to react.
 const FRAME_HISTORY: usize = 60;
 
+/// How close a flown-to pitch may come to straight up or down.
+///
+/// The camera clamps this itself, but a flight interpolates the field directly,
+/// so it has to respect the same limit or a top view would collapse the view
+/// matrix on arrival.
+const PITCH_SAFE: f32 = std::f32::consts::FRAC_PI_2 - 0.02;
+
+/// How far the pointer may travel during a right press and still count as a
+/// click rather than an orbit.
+///
+/// Right drag orbits, so this is the whole difficulty of putting a menu on right
+/// click: too tight and a click that wobbles a pixel opens nothing, too loose
+/// and a small deliberate orbit opens a menu over the model. Four pixels and a
+/// quarter second are a starting point to tune by feel, which is why both are
+/// named.
+const CLICK_SLOP_PX: f32 = 4.0;
+const CLICK_MS: u128 = 250;
+
 /// What a held pointer button is currently doing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DragKind {
     Orbit,
     Pan,
     Sculpt(BrushDirection),
+    /// The pointer is resizing the brush, not using it.
+    Sizing,
 }
 
 /// A drag in progress, tagged with the button that started it so that
 /// releasing a different button does not cancel it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 struct Drag {
     button: PointerButton,
     kind: DragKind,
+    /// Where the button went down, and when.
+    origin: Vec2,
+    pressed_at: Instant,
+    /// Whether the pointer has travelled far enough to count as a drag rather
+    /// than a click. Once true it stays true: a drag that returns to where it
+    /// started is still a drag.
+    moved: bool,
 }
 
 /// Timings for the debug overlay.
@@ -83,14 +133,21 @@ struct Perf {
 }
 
 impl Perf {
-    fn record_frame(&mut self) {
+    /// Record a presented frame and return how long it took, in milliseconds.
+    ///
+    /// The SpaceMouse scales its motion by this, so it reads the same clock
+    /// the overlay does rather than keeping a second one that could disagree.
+    fn record_frame(&mut self) -> f32 {
         let now = Instant::now();
-        if let Some(previous) = self.last_frame.replace(now) {
-            if self.frame_ms.len() == FRAME_HISTORY {
-                self.frame_ms.pop_front();
-            }
-            self.frame_ms.push_back(now.duration_since(previous).as_secs_f32() * 1000.0);
+        let Some(previous) = self.last_frame.replace(now) else {
+            return 0.0;
+        };
+        let elapsed_ms = now.duration_since(previous).as_secs_f32() * 1000.0;
+        if self.frame_ms.len() == FRAME_HISTORY {
+            self.frame_ms.pop_front();
         }
+        self.frame_ms.push_back(elapsed_ms);
+        elapsed_ms
     }
 
     fn average_frame_ms(&self) -> f32 {
@@ -111,6 +168,7 @@ pub struct Brokkr {
     brush: Brush,
     symmetry: Symmetry,
     tablet: Tablet,
+    spacemouse: SpaceMouse,
     /// Whether stylus pressure scales the brush. Off means every stamp runs at
     /// full strength, which is also what happens when there is no pen.
     pressure_enabled: bool,
@@ -136,6 +194,8 @@ pub struct Brokkr {
     viewport_size: Vec2,
     shift: bool,
     control: bool,
+    /// Alt, which inverts the brush the same way control does.
+    alt: bool,
     perf: Perf,
     volume_stats: VolumeStats,
     history_stats: HistoryStats,
@@ -143,16 +203,89 @@ pub struct Brokkr {
     voxel_size: f32,
     /// What the last export or resample did, for the interface to show.
     status: String,
+    /// Which blocks of the properties panel are open, in `PanelSection::ALL`
+    /// order.
+    expanded: [bool; PanelSection::ALL.len()],
+    /// The brush ring and mirror planes, handed to the renderer through
+    /// `SharedFrame`. Held here and swapped rather than rebuilt into a fresh
+    /// allocation each time.
+    overlay: brokkr_gpu::OverlayBatch,
+    /// Where the pointer last met the surface, which is where the ring goes.
+    hover: Option<Vec3>,
+    /// A hold-and-drag brush resize in progress.
+    sizing: Option<Sizing>,
+    /// Whether the radius tracks the model's size rather than staying a fixed
+    /// number of millimetres.
+    dynamic_radius: bool,
+    /// The model's bounding radius, refreshed on remesh. `Volume::bounding_radius`
+    /// walks the brick map, so it is not something to call per frame.
+    model_radius: f32,
+    /// The navigation cube's geometry, swapped to the renderer the same way.
+    cube: brokkr_gpu::OverlayBatch,
+    /// The cube part under the pointer, lit so a click's effect is visible
+    /// before the click.
+    cube_hover: Option<navcube::Part>,
+    /// A camera move in progress after clicking the cube.
+    flight: Option<Flight>,
+    /// Where the right-click menu is open, in widget pixels.
+    menu: Option<Vec2>,
+    /// A numeric field in the menu being typed into.
+    ///
+    /// Held as text rather than parsed on every keystroke, because a half typed
+    /// value like `2.` does not parse and snapping the field back to the old
+    /// number mid-edit makes it unusable.
+    menu_edit: Option<(SizingTarget, String)>,
+}
+
+/// An animated camera move to an orientation.
+///
+/// Instant would be disorienting on a sculpt: with nothing but a shaded form to
+/// go on there is no way to tell a jump from a different model. A quarter second
+/// is enough to follow and short enough not to be in the way.
+#[derive(Debug, Clone, Copy)]
+struct Flight {
+    from: (f32, f32, f32),
+    to: (f32, f32, f32),
+    elapsed_ms: f32,
+}
+
+/// How long a click on the navigation cube takes to arrive.
+const FLIGHT_MS: f32 = 260.0;
+
+/// A hold-and-drag gesture adjusting one brush number.
+///
+/// Holds where the pointer started and what the value was, so the gesture is
+/// absolute: a drag out and back returns to exactly where it began, where
+/// accumulating per-event deltas would drift.
+#[derive(Debug, Clone, Copy)]
+struct Sizing {
+    what: SizingTarget,
+    from_pixel: Vec2,
+    original: f32,
+}
+
+/// Which number a sizing drag is moving.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SizingTarget {
+    Radius,
+    Strength,
 }
 
 impl Brokkr {
     pub fn new() -> Self {
-        Self::with_tablet(Tablet::start())
+        Self::with_devices(Tablet::start(), SpaceMouse::start())
     }
 
-    /// Build with a given pressure source, so tests do not go looking through
-    /// `/dev/input` and spawn reader threads.
+    /// Build with a given pressure source and an inert puck, which is what
+    /// almost every test wants.
+    #[cfg(test)]
     fn with_tablet(tablet: Tablet) -> Self {
+        Self::with_devices(tablet, SpaceMouse::inert())
+    }
+
+    /// Build with given input devices, so tests do not go looking through
+    /// `/dev/input` and spawn reader threads.
+    fn with_devices(tablet: Tablet, spacemouse: SpaceMouse) -> Self {
         let shared = SharedFrame::new();
         let mut volume = Volume::new(VOXEL_SIZE_MM);
         volume.seed_sphere(Vec3::ZERO, MODEL_RADIUS_MM);
@@ -164,8 +297,9 @@ impl Brokkr {
             volume,
             camera: OrbitCamera::framing(Vec3::ZERO, MODEL_RADIUS_MM),
             brush: Brush::default(),
-            symmetry: Symmetry::Off,
+            symmetry: Symmetry::OFF,
             tablet,
+            spacemouse,
             pressure_enabled: true,
             pressure_curve: 1.0,
             tilt_enabled: true,
@@ -181,11 +315,23 @@ impl Brokkr {
             viewport_size: Vec2::new(1280.0, 720.0),
             shift: false,
             control: false,
+            alt: false,
             perf: Perf::default(),
             volume_stats: VolumeStats::default(),
             history_stats: HistoryStats::default(),
             voxel_size: VOXEL_SIZE_MM,
             status: String::new(),
+            expanded: PanelSection::ALL.map(PanelSection::open_by_default),
+            overlay: brokkr_gpu::OverlayBatch::default(),
+            hover: None,
+            sizing: None,
+            dynamic_radius: false,
+            model_radius: MODEL_RADIUS_MM,
+            cube: brokkr_gpu::OverlayBatch::default(),
+            cube_hover: None,
+            flight: None,
+            menu: None,
+            menu_edit: None,
         };
         app.remesh_dirty();
         // Otherwise the overlay reports a zero byte budget until the first
@@ -195,6 +341,7 @@ impl Brokkr {
         app.perf.remesh_ms = 0.0;
         app.perf.dirty_bricks = 0;
         app.publish_camera();
+        app.refresh_overlay();
         app
     }
 
@@ -208,8 +355,55 @@ impl Brokkr {
         iced::window::frames().map(|_| Message::Frame)
     }
 
-    fn publish_camera(&self) {
+    fn publish_camera(&mut self) {
         self.shared.set_camera(self.camera);
+        // The cube shows the camera's orientation, so it is stale the moment the
+        // camera moves. This is the one place that knows that happened.
+        self.refresh_cube();
+    }
+
+    /// Rebuild the navigation cube and hand it to the renderer.
+    fn refresh_cube(&mut self) {
+        let mut batch = std::mem::take(&mut self.cube);
+        navcube::build(&mut batch, &self.camera, self.cube_hover);
+        self.shared.swap_cube(&mut batch);
+        self.cube = batch;
+    }
+
+    /// Start an animated move to a cube part's orientation.
+    fn fly_to(&mut self, part: navcube::Part) {
+        let (yaw, pitch) = navcube::orientation(part.direction, self.camera.yaw);
+        // Clamped the way a drag would be, so a top or bottom face lands just
+        // short of the pole rather than collapsing the view matrix.
+        let pitch = pitch.clamp(-PITCH_SAFE, PITCH_SAFE);
+        // The shortest way round, so a click never spins the model several times
+        // to reach a heading a few degrees away.
+        let yaw = self.camera.yaw + OrbitCamera::shortest_angle_delta(self.camera.yaw, yaw);
+        self.flight = Some(Flight {
+            from: (self.camera.yaw, self.camera.pitch, self.camera.roll),
+            to: (yaw, pitch, 0.0),
+            elapsed_ms: 0.0,
+        });
+    }
+
+    /// Advance a camera flight. Returns whether the camera moved.
+    fn advance_flight(&mut self, elapsed_ms: f32) -> bool {
+        let Some(mut flight) = self.flight else {
+            return false;
+        };
+        flight.elapsed_ms += elapsed_ms.clamp(0.0, 50.0);
+        let t = (flight.elapsed_ms / FLIGHT_MS).clamp(0.0, 1.0);
+        // Smoothstep, so it eases out of the old view and into the new one
+        // rather than starting and stopping abruptly.
+        let eased = t * t * (3.0 - 2.0 * t);
+        let lerp = |from: f32, to: f32| from + (to - from) * eased;
+
+        self.camera.yaw = lerp(flight.from.0, flight.to.0);
+        self.camera.pitch = lerp(flight.from.1, flight.to.1);
+        self.camera.roll = lerp(flight.from.2, flight.to.2);
+
+        self.flight = (t < 1.0).then_some(flight);
+        true
     }
 
     /// Mesh every brick the volume has marked dirty and hand the results to the
@@ -234,6 +428,55 @@ impl Brokkr {
         }
         self.perf.remesh_ms = started.elapsed().as_secs_f32() * 1000.0;
         self.volume_stats = self.volume.stats();
+
+        let previous = self.model_radius;
+        self.model_radius = self.volume.bounding_radius().unwrap_or(MODEL_RADIUS_MM);
+        self.rescale_radius(previous);
+    }
+
+    /// Rebuild the brush ring and mirror planes and hand them to the renderer.
+    ///
+    /// Called from the places that change what it looks like -- pointer motion,
+    /// a brush or mirror setting, a resample -- and deliberately NOT from the
+    /// frame handler: the geometry is world space, so a camera moving under it
+    /// needs no rebuild, and a raycast per frame would be waste.
+    fn refresh_overlay(&mut self) {
+        // Moved out and back rather than borrowed in place: `build` also needs
+        // the volume and the brush, which are fields of the same `self`. The
+        // two buffers then rotate -- this frame's goes to the renderer and last
+        // frame's comes back with its capacity -- so nothing allocates once
+        // warm.
+        let mut batch = std::mem::take(&mut self.overlay);
+        cursor::build(
+            &mut batch,
+            &self.volume,
+            &self.effective_brush(),
+            self.symmetry,
+            self.hover,
+            cursor::mood(self.stroke_direction(), self.sizing.is_some()),
+            self.model_radius,
+        );
+        self.shared.swap_overlay(&mut batch);
+        self.overlay = batch;
+    }
+
+    /// Where the pointer meets the surface, remembered for the cursor ring.
+    fn update_hover(&mut self, pixel: Vec2) {
+        self.hover = self.surface_under(pixel);
+    }
+
+    /// Keep the brush a constant fraction of the model when asked to.
+    ///
+    /// ZBrush calls this Dynamic. Without it a brush tuned on a 60 mm ball is
+    /// the wrong size the moment the model is resampled or grows.
+    fn rescale_radius(&mut self, previous_model_radius: f32) {
+        if !self.dynamic_radius || previous_model_radius <= 0.0 || self.model_radius <= 0.0 {
+            return;
+        }
+        let factor = self.model_radius / previous_model_radius;
+        if (factor - 1.0).abs() > 1.0e-4 {
+            self.brush.radius = (self.brush.radius * factor).clamp(MIN_RADIUS_MM, MAX_RADIUS_MM);
+        }
     }
 
     /// The world space ray through a point in widget pixels.
@@ -268,7 +511,7 @@ impl Brokkr {
         if start {
             self.stroke.begin(point, &mut self.stamp_centres);
         } else {
-            let spacing = self.brush.spacing(self.volume.voxel_size());
+            let spacing = self.effective_brush().spacing(self.volume.voxel_size());
             self.stroke.advance(point, spacing, &mut self.stamp_centres);
         }
 
@@ -277,6 +520,11 @@ impl Brokkr {
         // re-reading it would only add jitter.
         let pressure = self.tablet.stamp_pressure(self.pressure_enabled, self.pressure_curve);
         let lean = self.pen_lean();
+        let brush = self.effective_brush();
+        // Which way the drag is going, for the patterns that comb. Zero until
+        // the stroke has moved far enough to have a direction, which the
+        // pattern copes with by picking any direction across the surface.
+        let tangent = self.stroke.direction().unwrap_or(Vec3::ZERO);
 
         for index in 0..self.stamp_centres.len() {
             let centre = self.stamp_centres[index];
@@ -286,19 +534,30 @@ impl Brokkr {
             // Leaning the pen rotates the direction the brush pushes in, which
             // steers every brush at once because they all read this normal.
             let normal = lean_normal(self.volume.gradient_world(centre), lean);
-            let stamp = Stamp::new(centre, normal, direction).with_pressure(pressure);
-            self.brush.apply_symmetric(
-                &mut self.volume,
-                &stamp,
-                self.symmetry,
-                &mut self.brush_scratch,
-            );
+            let stamp =
+                Stamp::new(centre, normal, direction).with_pressure(pressure).with_tangent(tangent);
+            brush.apply_symmetric(&mut self.volume, &stamp, self.symmetry, &mut self.brush_scratch);
         }
         self.perf.stamps = self.stamp_centres.len();
         self.perf.pressure = pressure;
         self.perf.edit_ms = started.elapsed().as_secs_f32() * 1000.0;
 
         self.remesh_dirty();
+    }
+
+    /// The brush a stamp actually runs with.
+    ///
+    /// Holding shift smooths, which is the convention every sculpting tool
+    /// uses and the single biggest ergonomic win available here. Shift already
+    /// modified right drag into a pan, and this is left drag, so there is no
+    /// clash.
+    ///
+    /// Deliberately does NOT swap `self.brush.kind` and swap it back: nothing
+    /// then has to notice a key being released while the window is unfocused,
+    /// and the tool strip does not flicker between two highlights during a
+    /// stroke. The selection is never touched, so there is nothing to restore.
+    fn effective_brush(&self) -> Brush {
+        if self.shift { Brush { kind: BrushKind::Smooth, ..self.brush } } else { self.brush }
     }
 
     /// Direction for a new stroke, honouring the invert modifier, the eraser
@@ -308,7 +567,13 @@ impl Brokkr {
     /// using the eraser gives back the additive brush, which is the same
     /// behaviour every drawing application has.
     fn stroke_direction(&self) -> BrushDirection {
-        let inverted = self.control != self.eraser_in_use();
+        // Either modifier inverts. Alt is what ZBrush and Nomad both use, and
+        // control is what this had first; keeping both costs nothing and means
+        // neither habit is wrong. They do NOT compound -- holding both is still
+        // one inversion, because a user pressing both means "invert", not
+        // "invert twice".
+        let modifier = self.control || self.alt;
+        let inverted = modifier != self.eraser_in_use();
         if inverted && self.brush.kind.is_directional() {
             BrushDirection::Subtract
         } else {
@@ -459,6 +724,157 @@ impl Brokkr {
         log::info!("{}", self.status);
     }
 
+    /// Apply one frame of puck motion, and whatever its buttons asked for.
+    fn drive_from_spacemouse(&mut self, elapsed_ms: f32) {
+        for action in self.spacemouse.take_presses() {
+            match action {
+                ButtonAction::None => {}
+                ButtonAction::Undo => self.undo(),
+                ButtonAction::Redo => self.redo(),
+                // Recentre and refit without losing which way the model is
+                // being looked at, which is what makes this useful mid sculpt.
+                ButtonAction::FrameModel => {
+                    let framed = OrbitCamera::framing(Vec3::ZERO, MODEL_RADIUS_MM);
+                    self.camera = OrbitCamera {
+                        yaw: self.camera.yaw,
+                        pitch: self.camera.pitch,
+                        roll: self.camera.roll,
+                        ..framed
+                    };
+                    self.publish_camera();
+                }
+                // Everything back to the start, roll included. This is the way
+                // out of a view that has been twisted somewhere confusing.
+                ButtonAction::ResetView => {
+                    self.camera = OrbitCamera::framing(Vec3::ZERO, MODEL_RADIUS_MM);
+                    self.publish_camera();
+                }
+                ButtonAction::ToggleSymmetry => {
+                    self.symmetry = self.symmetry.toggled(MirrorAxis::X);
+                }
+            }
+        }
+
+        let motion = self.spacemouse.motion();
+        let moved = self.spacemouse.config.apply(
+            &motion,
+            elapsed_ms,
+            &mut self.camera,
+            self.viewport_size.y,
+        );
+        if moved {
+            self.publish_camera();
+        }
+    }
+
+    fn configure_spacemouse(&mut self, setting: SpaceMouseSetting) {
+        let config = &mut self.spacemouse.config;
+        // Whether this change should reach the disk now. A slider mid drag
+        // should not: it sends a message per step, and `Save` follows on
+        // release.
+        let mut persist = true;
+        match setting {
+            SpaceMouseSetting::Mode(mode) => config.mode = mode,
+            SpaceMouseSetting::Deadzone(value) => {
+                config.deadzone = value;
+                persist = false;
+            }
+            SpaceMouseSetting::PanSens(value) => {
+                config.pan_sens = value;
+                persist = false;
+            }
+            SpaceMouseSetting::ZoomSens(value) => {
+                config.zoom_sens = value;
+                persist = false;
+            }
+            SpaceMouseSetting::OrbitSens(value) => {
+                config.orbit_sens = value;
+                persist = false;
+            }
+            SpaceMouseSetting::Binding(action, source) => {
+                let invert = config.binding(action).invert;
+                config.set_binding(action, AxisBinding { source, invert });
+            }
+            SpaceMouseSetting::Invert(action, invert) => {
+                let source = config.binding(action).source;
+                config.set_binding(action, AxisBinding { source, invert });
+            }
+            SpaceMouseSetting::Button(index, action) => {
+                if let Some(slot) = config.buttons.get_mut(index) {
+                    *slot = action;
+                }
+            }
+            SpaceMouseSetting::InvertAll => config.invert_all(),
+            SpaceMouseSetting::Reset => *config = SpaceMouseConfig::default(),
+            SpaceMouseSetting::Save => {}
+        }
+        if persist {
+            self.spacemouse.config.save();
+        }
+    }
+
+    /// Take a keystroke in one of the menu's numeric fields.
+    ///
+    /// The text is kept whatever it says, so `2.` and an empty field survive
+    /// being typed through. The value only moves when the text parses to
+    /// something inside the same bounds the sliders use -- a field that silently
+    /// accepted 500 mm would be worse than one that ignores it.
+    fn edit_menu_field(&mut self, which: SizingTarget, text: String) {
+        if let Ok(value) = text.trim().parse::<f32>()
+            && value.is_finite()
+        {
+            match which {
+                SizingTarget::Radius => {
+                    self.brush.radius = value.clamp(MIN_RADIUS_MM, MAX_RADIUS_MM);
+                }
+                SizingTarget::Strength => {
+                    self.brush.strength = value.clamp(MIN_STRENGTH, MAX_STRENGTH);
+                }
+            }
+        }
+        self.menu_edit = Some((which, text));
+    }
+
+    /// The text a menu field should show: what is being typed, or the current
+    /// value formatted.
+    pub(crate) fn menu_field_text(&self, which: SizingTarget) -> String {
+        if let Some((editing, text)) = &self.menu_edit
+            && *editing == which
+        {
+            return text.clone();
+        }
+        match which {
+            SizingTarget::Radius => format!("{:.2}", self.brush.radius),
+            SizingTarget::Strength => format!("{:.2}", self.brush.strength),
+        }
+    }
+
+    /// Move the number a sizing gesture is holding, from how far the pointer
+    /// has travelled since it began.
+    ///
+    /// Horizontal only, and absolute against where the drag started, so out and
+    /// back returns to exactly the original value.
+    fn apply_sizing(&mut self, to: Vec2) {
+        let Some(sizing) = self.sizing else {
+            return;
+        };
+        let travel = to.x - sizing.from_pixel.x;
+        match sizing.what {
+            // Multiplicative, matching the [ and ] keys: the radius spans fifty
+            // to one, so a fixed amount per pixel would crawl at one end and
+            // jump at the other.
+            SizingTarget::Radius => {
+                let factor = (travel * RADIUS_PER_PIXEL).exp();
+                self.brush.radius = (sizing.original * factor).clamp(MIN_RADIUS_MM, MAX_RADIUS_MM);
+            }
+            // Additive: strength is already a small linear range.
+            SizingTarget::Strength => {
+                self.brush.strength = (sizing.original + travel * STRENGTH_PER_PIXEL)
+                    .clamp(MIN_STRENGTH, MAX_STRENGTH);
+            }
+        }
+    }
+
     fn undo(&mut self) {
         if self.history.undo(&mut self.volume) {
             self.history_stats = self.history.stats();
@@ -475,18 +891,40 @@ impl Brokkr {
 
     fn on_pointer(&mut self, event: PointerEvent) {
         match event {
-            PointerEvent::Modifiers { shift, control } => {
+            PointerEvent::Modifiers { shift, control, alt } => {
                 self.shift = shift;
                 self.control = control;
+                self.alt = alt;
+                // Both change what a press would do, so the ring has to say so
+                // before the press rather than after.
+                self.refresh_overlay();
             }
             PointerEvent::Pressed { button, position, size } => {
                 self.viewport_size = Vec2::new(size.x, size.y);
                 let position = Vec2::new(position.x, position.y);
                 self.cursor = Some(position);
 
+                // An open menu swallows the next press: closing it is what the
+                // click was for, and sculpting as well would be a surprise.
+                if self.menu.take().is_some() {
+                    return;
+                }
+
+                // A press on the navigation cube belongs to the cube. Checked
+                // before anything else, or clicking it would also carve a divot
+                // out of the model behind it.
+                if button == PointerButton::Left
+                    && let Some(part) = navcube::pick(&self.camera, self.viewport_size, position)
+                {
+                    self.fly_to(part);
+                    return;
+                }
+
                 let kind = match button {
-                    // Left sculpts. Holding control removes instead of adds,
-                    // which is the convention every sculpting tool uses.
+                    // Left sculpts -- unless a hold-and-drag resize is in
+                    // progress, in which case the pointer belongs to that
+                    // gesture and a press must not lay down a stroke.
+                    PointerButton::Left if self.sizing.is_some() => DragKind::Sizing,
                     PointerButton::Left => DragKind::Sculpt(self.stroke_direction()),
                     // Right and middle move the camera. Shift slides instead of
                     // turning.
@@ -498,7 +936,13 @@ impl Brokkr {
                         }
                     }
                 };
-                self.drag = Some(Drag { button, kind });
+                self.drag = Some(Drag {
+                    button,
+                    kind,
+                    origin: position,
+                    pressed_at: Instant::now(),
+                    moved: false,
+                });
 
                 if let DragKind::Sculpt(direction) = kind {
                     // One stroke is one undo entry, so recording opens here and
@@ -506,20 +950,49 @@ impl Brokkr {
                     self.volume.begin_stroke();
                     self.sculpt_to(position, direction, true);
                 }
+                self.update_hover(position);
+                self.refresh_overlay();
             }
             PointerEvent::Released { button } => {
-                if self.drag.is_some_and(|drag| drag.button == button) {
-                    if matches!(self.drag.map(|drag| drag.kind), Some(DragKind::Sculpt(_))) {
+                if let Some(drag) = self.drag.filter(|drag| drag.button == button) {
+                    if matches!(drag.kind, DragKind::Sculpt(_)) {
                         self.finish_stroke();
+                    }
+                    // A right press that neither moved nor lingered was a click,
+                    // and a click opens the tool's own controls where the hand
+                    // already is. Anything else was an orbit or a pan.
+                    if button == PointerButton::Right
+                        && !drag.moved
+                        && drag.pressed_at.elapsed().as_millis() < CLICK_MS
+                    {
+                        self.menu = Some(drag.origin);
                     }
                     self.drag = None;
                 }
+                self.refresh_overlay();
             }
             PointerEvent::Moved { position, size } => {
                 self.viewport_size = Vec2::new(size.x, size.y);
                 let position = Vec2::new(position.x, position.y);
                 let delta = self.cursor.map(|previous| position - previous).unwrap_or(Vec2::ZERO);
                 self.cursor = Some(position);
+
+                // Past the slop this is a drag, not a click, and it stays one
+                // even if it comes back: otherwise an orbit that ends where it
+                // began would open the menu.
+                if let Some(drag) = &mut self.drag
+                    && position.distance(drag.origin) > CLICK_SLOP_PX
+                {
+                    drag.moved = true;
+                }
+
+                // A held sizing key owns the pointer whether or not a button
+                // is down, so this comes before the drag cases.
+                if self.sizing.is_some() {
+                    self.apply_sizing(position);
+                    self.refresh_overlay();
+                    return;
+                }
 
                 match self.drag.map(|drag| drag.kind) {
                     Some(DragKind::Sculpt(direction)) => self.sculpt_to(position, direction, false),
@@ -531,8 +1004,26 @@ impl Brokkr {
                         self.camera.pan(delta, self.viewport_size.y);
                         self.publish_camera();
                     }
-                    None => {}
+                    Some(DragKind::Sizing) | None => {}
                 }
+
+                // Over the cube: light the part under the pointer, and draw no
+                // brush ring, because a press there will not sculpt.
+                let over_cube = navcube::pick(&self.camera, self.viewport_size, position);
+                if over_cube != self.cube_hover {
+                    self.cube_hover = over_cube;
+                    self.refresh_cube();
+                }
+                if over_cube.is_some() {
+                    self.hover = None;
+                    self.refresh_overlay();
+                    return;
+                }
+
+                // The ring follows the pointer, and the surface under it moves
+                // as a stroke cuts into it.
+                self.update_hover(position);
+                self.refresh_overlay();
             }
             PointerEvent::Scrolled { amount } => {
                 self.camera.zoom(amount);
@@ -544,13 +1035,49 @@ impl Brokkr {
     pub fn update(&mut self, message: Message) {
         match message {
             Message::Pointer(event) => self.on_pointer(event),
-            Message::Frame => self.perf.record_frame(),
+            Message::Frame => {
+                let elapsed_ms = self.perf.record_frame();
+                if self.advance_flight(elapsed_ms) {
+                    self.publish_camera();
+                }
+                self.drive_from_spacemouse(elapsed_ms);
+            }
             Message::BrushKindChanged(kind) => self.brush.kind = kind,
             Message::FalloffChanged(curve) => self.brush.falloff = curve,
             Message::BrushRadiusChanged(radius) => self.brush.radius = radius,
             Message::BrushStrengthChanged(strength) => self.brush.strength = strength,
-            Message::SymmetryToggled(on) => {
-                self.symmetry = if on { Symmetry::X } else { Symmetry::Off };
+            Message::SymmetryAxisToggled(axis) => self.symmetry = self.symmetry.toggled(axis),
+            Message::PatternChanged(kind) => self.brush.pattern.kind = kind,
+            Message::PatternScaleChanged(scale) => self.brush.pattern.scale_mm = scale,
+            Message::PatternDepthChanged(depth) => self.brush.pattern.depth = depth,
+            Message::SizingStarted(what) => {
+                // Nothing to anchor the gesture to until the pointer has been
+                // seen; and a gesture already running must not restart, or
+                // holding the key through a drag would reset it every event.
+                if self.sizing.is_none()
+                    && let Some(from_pixel) = self.cursor
+                {
+                    self.sizing = Some(Sizing {
+                        what,
+                        from_pixel,
+                        original: match what {
+                            SizingTarget::Radius => self.brush.radius,
+                            SizingTarget::Strength => self.brush.strength,
+                        },
+                    });
+                }
+            }
+            Message::SizingEnded => self.sizing = None,
+            Message::MenuClosed => {
+                self.menu = None;
+                self.menu_edit = None;
+            }
+            Message::MenuFieldEdited(which, text) => self.edit_menu_field(which, text),
+            Message::MenuFieldSubmitted => self.menu_edit = None,
+            Message::DynamicRadiusToggled(on) => self.dynamic_radius = on,
+            Message::BrushRadiusScaled(factor) => {
+                self.brush.radius =
+                    (self.brush.radius * factor).clamp(MIN_RADIUS_MM, MAX_RADIUS_MM);
             }
             Message::PressureToggled(on) => self.pressure_enabled = on,
             Message::PressureCurveChanged(curve) => self.pressure_curve = curve,
@@ -560,6 +1087,11 @@ impl Brokkr {
             Message::Redo => self.redo(),
             Message::Export(format) => self.export(format),
             Message::Resample(voxel_size) => self.resample(voxel_size),
+            Message::SpaceMouse(setting) => self.configure_spacemouse(setting),
+            Message::SectionToggled(section) => {
+                let open = &mut self.expanded[section as usize];
+                *open = !*open;
+            }
             Message::ResetSphere => {
                 let mut volume = Volume::new(self.voxel_size);
                 volume.seed_sphere(Vec3::ZERO, MODEL_RADIUS_MM);
@@ -582,330 +1114,6 @@ impl Brokkr {
             }
         }
     }
-
-    pub fn view(&self) -> Element<'_, Message> {
-        let viewport = iced::widget::shader(Viewport::new(Arc::clone(&self.shared)))
-            .width(Length::Fill)
-            .height(Length::Fill);
-
-        let well = container(viewport)
-            .width(Length::Fill)
-            .height(Length::Fill)
-            .style(theme::viewport_well);
-
-        let scene = stack![well, self.overlay()];
-
-        column![
-            self.header(),
-            row![container(scene).width(Length::Fill).height(Length::Fill), self.tools()]
-                .spacing(theme::S3)
-        ]
-        .spacing(theme::S3)
-        .padding(theme::S3)
-        .into()
-    }
-
-    fn header(&self) -> Element<'_, Message> {
-        container(
-            row![
-                text("BROKKRSCULPT")
-                    .size(theme::CAPTION_SIZE)
-                    .font(theme::FONT)
-                    .color(theme::ACCENT),
-                text("M1 brush system").size(theme::TEXT_SIZE_SMALL).color(theme::TEXT_MUTE),
-            ]
-            .spacing(theme::S4)
-            .align_y(Alignment::Center),
-        )
-        .padding(theme::PANEL_PADDING)
-        .width(Length::Fill)
-        .style(theme::panel)
-        .into()
-    }
-
-    /// The debug overlay: frame rate, frame time, triangles, bricks, resident
-    /// memory and what history is holding.
-    fn overlay(&self) -> Element<'_, Message> {
-        let pool = self.shared.stats();
-        let frame_ms = self.perf.average_frame_ms();
-        let fps = if frame_ms > 0.0 { 1000.0 / frame_ms } else { 0.0 };
-
-        let volume_mb = self.volume_stats.resident_bytes as f64 / (1024.0 * 1024.0);
-        let pool_mb =
-            (pool.vertices as f64 * 24.0 + pool.triangles as f64 * 12.0) / (1024.0 * 1024.0);
-        let history_mb = self.history_stats.bytes as f64 / (1024.0 * 1024.0);
-
-        let mut lines = vec![
-            format!(
-                "{fps:6.1} fps    {frame_ms:5.2} ms avg   {:5.2} ms worst",
-                self.perf.worst_frame_ms()
-            ),
-            format!(
-                "edit {:5.3} ms   remesh {:5.3} ms   {} stamps   {} dirty   (load {:.0} ms)",
-                self.perf.edit_ms,
-                self.perf.remesh_ms,
-                self.perf.stamps,
-                self.perf.dirty_bricks,
-                self.perf.load_ms
-            ),
-            format!(
-                "{} triangles   {} drawn / {} culled bricks",
-                pool.triangles, pool.drawn, pool.culled
-            ),
-            format!(
-                "{} meshed bricks   pen {}",
-                pool.bricks,
-                match self.tablet.devices().first() {
-                    Some(device) => format!("{:.2} ({})", self.perf.pressure, device.name),
-                    None => self.tablet.diagnosis().explain().to_string(),
-                }
-            ),
-            format!(
-                "{} dense + {} uniform bricks   {volume_mb:.1} MB volume   {pool_mb:.1} MB mesh",
-                self.volume_stats.dense_bricks, self.volume_stats.uniform_bricks
-            ),
-            format!(
-                "history {} undo / {} redo   {history_mb:.1} MB of {} MB{}",
-                self.history_stats.undo_entries,
-                self.history_stats.redo_entries,
-                self.history_stats.budget_bytes / (1024 * 1024),
-                if self.history_stats.dropped > 0 {
-                    format!("   {} dropped", self.history_stats.dropped)
-                } else {
-                    String::new()
-                }
-            ),
-        ];
-        if pool.overflowed > 0 {
-            lines.push(format!("MESH POOL FULL: {} bricks missing from the view", pool.overflowed));
-        }
-
-        let readout = lines.into_iter().fold(column![].spacing(2), |stacked, line| {
-            stacked.push(text(line).size(theme::TEXT_SIZE_SMALL).font(theme::MONO))
-        });
-
-        container(container(readout).padding(theme::S3).style(theme::overlay_card))
-            .padding(theme::S4)
-            .into()
-    }
-
-    fn tools(&self) -> Element<'_, Message> {
-        let invert_hint = if self.brush.kind.is_directional() {
-            "ctrl drag removes"
-        } else {
-            "no opposite: ctrl does nothing"
-        };
-
-        let radius = column![
-            text(format!("Radius  {:.2} mm", self.brush.radius))
-                .size(theme::TEXT_SIZE_SMALL)
-                .color(theme::TEXT_DIM),
-            slider(0.25..=12.0, self.brush.radius, Message::BrushRadiusChanged).step(0.05),
-        ]
-        .spacing(theme::S2);
-
-        let strength = column![
-            text(format!("Strength  {:.2}", self.brush.strength))
-                .size(theme::TEXT_SIZE_SMALL)
-                .color(theme::TEXT_DIM),
-            slider(0.02..=0.80, self.brush.strength, Message::BrushStrengthChanged).step(0.01),
-        ]
-        .spacing(theme::S2);
-
-        let falloff = column![
-            text("Falloff").size(theme::TEXT_SIZE_SMALL).color(theme::TEXT_DIM),
-            pick_list(FalloffCurve::ALL, Some(self.brush.falloff), Message::FalloffChanged)
-                .text_size(theme::TEXT_SIZE_SMALL)
-                .width(Length::Fill),
-        ]
-        .spacing(theme::S2);
-
-        let history = row![
-            button(text("Undo").size(theme::TEXT_SIZE_SMALL))
-                .on_press_maybe(self.history.can_undo().then_some(Message::Undo)),
-            button(text("Redo").size(theme::TEXT_SIZE_SMALL))
-                .on_press_maybe(self.history.can_redo().then_some(Message::Redo)),
-        ]
-        .spacing(theme::S2);
-
-        container(
-            column![
-                text("BRUSH").size(theme::CAPTION_SIZE).color(theme::TEXT_MUTE),
-                pick_list(BrushKind::ALL, Some(self.brush.kind), Message::BrushKindChanged)
-                    .text_size(theme::TEXT_SIZE_SMALL)
-                    .width(Length::Fill),
-                text(invert_hint).size(theme::CAPTION_SIZE).color(theme::TEXT_MUTE),
-                radius,
-                strength,
-                falloff,
-                checkbox(self.symmetry == Symmetry::X)
-                    .label("X symmetry")
-                    .on_toggle(Message::SymmetryToggled)
-                    .text_size(theme::TEXT_SIZE_SMALL),
-                self.pen_panel(),
-                text("HISTORY").size(theme::CAPTION_SIZE).color(theme::TEXT_MUTE),
-                history,
-                self.detail_panel(),
-                self.export_panel(),
-                button(text("Reset sphere").size(theme::TEXT_SIZE_SMALL))
-                    .on_press(Message::ResetSphere),
-                text(
-                    "drag: sculpt\nctrl drag: invert\nright drag: orbit\nshift right drag: pan\nwheel: zoom\nctrl z, ctrl shift z: undo, redo"
-                )
-                .size(theme::CAPTION_SIZE)
-                .color(theme::TEXT_MUTE),
-            ]
-            .spacing(theme::S4),
-        )
-        .padding(theme::PANEL_PADDING)
-        .width(Length::Fixed(240.0))
-        .height(Length::Fill)
-        .style(theme::panel)
-        .into()
-    }
-
-    /// Resolution controls.
-    ///
-    /// Halving and doubling rather than a free slider: the voxel size sets
-    /// memory by its inverse cube, so a dragged slider would walk a model
-    /// straight past what the mesh pool holds. Two steps make the cost of each
-    /// one obvious.
-    fn detail_panel(&self) -> Element<'_, Message> {
-        let finer = self.voxel_size / 2.0;
-        let coarser = self.voxel_size * 2.0;
-
-        column![
-            text("DETAIL").size(theme::CAPTION_SIZE).color(theme::TEXT_MUTE),
-            text(format!("Voxel  {:.3} mm", self.voxel_size))
-                .size(theme::TEXT_SIZE_SMALL)
-                .color(theme::TEXT_DIM),
-            row![
-                button(text("finer").size(theme::TEXT_SIZE_SMALL))
-                    .on_press_maybe((finer >= FINEST_VOXEL_MM).then_some(Message::Resample(finer))),
-                button(text("coarser").size(theme::TEXT_SIZE_SMALL)).on_press_maybe(
-                    (coarser <= COARSEST_VOXEL_MM).then_some(Message::Resample(coarser))
-                ),
-            ]
-            .spacing(theme::S2),
-        ]
-        .spacing(theme::S2)
-        .into()
-    }
-
-    /// Export controls, plus what the last attempt did.
-    fn export_panel(&self) -> Element<'_, Message> {
-        let buttons =
-            ExportFormat::ALL.into_iter().fold(row![].spacing(theme::S2), |assembled, format| {
-                assembled.push(
-                    button(text(format.label()).size(theme::TEXT_SIZE_SMALL))
-                        .on_press(Message::Export(format)),
-                )
-            });
-
-        let status: Element<'_, Message> = if self.status.is_empty() {
-            text(format!("to {}", Self::export_directory().display()))
-                .size(theme::CAPTION_SIZE)
-                .color(theme::TEXT_MUTE)
-                .into()
-        } else {
-            text(self.status.clone())
-                .size(theme::CAPTION_SIZE)
-                .color(
-                    if self.status.contains("not exported") || self.status.contains("could not") {
-                        theme::ERROR
-                    } else {
-                        theme::OK
-                    },
-                )
-                .into()
-        };
-
-        column![text("EXPORT").size(theme::CAPTION_SIZE).color(theme::TEXT_MUTE), buttons, status,]
-            .spacing(theme::S2)
-            .into()
-    }
-
-    /// Pen controls, plus enough of a live readout that a user can tell whether
-    /// their tablet is being seen at all.
-    ///
-    /// Without this, a tablet that is connected but unreadable looks exactly
-    /// like a mouse: strokes work, they just never vary. The device name, the
-    /// device's own pressure range and a live peak turn that into something
-    /// answerable in a few seconds.
-    fn pen_panel(&self) -> Element<'_, Message> {
-        let devices = self.tablet.devices();
-        let status: Element<'_, Message> = match devices.first() {
-            Some(device) => column![
-                text(device.name.clone()).size(theme::CAPTION_SIZE).color(theme::OK),
-                text(format!("{} levels", device.pressure_max))
-                    .size(theme::CAPTION_SIZE)
-                    .color(theme::TEXT_MUTE),
-            ]
-            .spacing(1)
-            .into(),
-            None => text(self.tablet.diagnosis().explain())
-                .size(theme::CAPTION_SIZE)
-                .color(match self.tablet.diagnosis() {
-                    Diagnosis::PermissionDenied => theme::WARN,
-                    _ => theme::TEXT_MUTE,
-                })
-                .into(),
-        };
-
-        let pen = self.tablet.state();
-        let live = if pen.in_proximity {
-            format!(
-                "{} {:.2}  peak {:.2}\ntilt {:+.2} {:+.2}",
-                if pen.eraser { "eraser" } else { "tip   " },
-                pen.pressure,
-                self.tablet.peak(),
-                pen.tilt.x,
-                pen.tilt.y
-            )
-        } else {
-            format!("pen away   peak {:.2}", self.tablet.peak())
-        };
-
-        let capabilities = devices.first().map(|device| {
-            let mut parts = Vec::new();
-            if device.has_tilt {
-                parts.push("tilt");
-            }
-            if device.has_eraser {
-                parts.push("eraser");
-            }
-            if parts.is_empty() { "pressure only".to_string() } else { parts.join(", ") }
-        });
-
-        column![
-            text("PEN").size(theme::CAPTION_SIZE).color(theme::TEXT_MUTE),
-            status,
-            checkbox(self.pressure_enabled)
-                .label("Pressure")
-                .on_toggle(Message::PressureToggled)
-                .text_size(theme::TEXT_SIZE_SMALL),
-            text(format!("Curve  {:.2}", self.pressure_curve))
-                .size(theme::TEXT_SIZE_SMALL)
-                .color(theme::TEXT_DIM),
-            slider(0.30..=3.00, self.pressure_curve, Message::PressureCurveChanged).step(0.05),
-            checkbox(self.tilt_enabled)
-                .label("Tilt steers stroke")
-                .on_toggle(Message::TiltToggled)
-                .text_size(theme::TEXT_SIZE_SMALL),
-            text(capabilities.unwrap_or_default())
-                .size(theme::CAPTION_SIZE)
-                .color(theme::TEXT_MUTE),
-            row![
-                text(live).size(theme::CAPTION_SIZE).font(theme::MONO).color(theme::TEXT_DIM),
-                button(text("reset").size(theme::CAPTION_SIZE))
-                    .on_press(Message::ResetPressurePeak),
-            ]
-            .spacing(theme::S2)
-            .align_y(Alignment::Center),
-        ]
-        .spacing(theme::S2)
-        .into()
-    }
 }
 
 impl Default for Brokkr {
@@ -918,6 +1126,7 @@ impl Default for Brokkr {
 mod tests {
     use super::*;
     use crate::tablet::PenState;
+    use brokkr_core::BrushKind;
     use iced::Vector;
 
     const SIZE: Vector = Vector { x: 800.0, y: 600.0 };
@@ -928,6 +1137,21 @@ mod tests {
 
     fn app() -> Brokkr {
         Brokkr::with_tablet(crate::tablet::Tablet::inert())
+    }
+
+    /// Run a camera flight to completion in controlled time.
+    ///
+    /// `Message::Frame` scales by the real clock, and consecutive calls in a
+    /// test are microseconds apart, so driving it that way would never arrive.
+    fn finish_flight(app: &mut Brokkr) {
+        for _ in 0..200 {
+            if app.flight.is_none() {
+                return;
+            }
+            app.advance_flight(16.0);
+            app.publish_camera();
+        }
+        panic!("the flight never finished");
     }
 
     fn press(app: &mut Brokkr, at: Vector) {
@@ -1069,7 +1293,7 @@ mod tests {
     #[test]
     fn symmetry_sculpts_both_sides_at_once() {
         let mut app = app();
-        app.update(Message::SymmetryToggled(true));
+        app.update(Message::SymmetryAxisToggled(MirrorAxis::X));
         // Nothing has told the application how big the viewport is yet, and
         // the ray depends on it.
         app.viewport_size = Vec2::new(SIZE.x, SIZE.y);
@@ -1089,6 +1313,542 @@ mod tests {
             app.volume.sample_world(mirrored) < before,
             "the mirrored half of the stroke never landed"
         );
+    }
+
+    /// The ZBrush convention, and the biggest ergonomic win in this round.
+    #[test]
+    fn holding_shift_sculpts_with_smooth_without_changing_the_selection() {
+        let mut app = app();
+        app.update(Message::BrushKindChanged(BrushKind::Draw));
+        assert_eq!(app.effective_brush().kind, BrushKind::Draw);
+
+        app.update(Message::Pointer(PointerEvent::Modifiers {
+            shift: true,
+            control: false,
+            alt: false,
+        }));
+        assert_eq!(app.effective_brush().kind, BrushKind::Smooth, "shift should smooth");
+        assert_eq!(
+            app.brush.kind,
+            BrushKind::Draw,
+            "the selection itself must not change, or the tool strip would flicker \
+             and a key released out of focus would strand the wrong brush"
+        );
+
+        app.update(Message::Pointer(PointerEvent::Modifiers {
+            shift: false,
+            control: false,
+            alt: false,
+        }));
+        assert_eq!(app.effective_brush().kind, BrushKind::Draw, "releasing shift should restore");
+    }
+
+    #[test]
+    fn holding_shift_actually_smooths_the_model_rather_than_drawing_on_it() {
+        let mut app = app();
+        // A move first, so the application knows the viewport size and
+        // `surface_under` agrees with where a press will actually land. The
+        // default size is not SIZE, and disagreeing here probes a point the
+        // brush never touches.
+        app.on_pointer(PointerEvent::Moved { position: centre_of_viewport(), size: SIZE });
+        let probe = app
+            .surface_under(Vec2::new(SIZE.x / 2.0, SIZE.y / 2.0))
+            .expect("the centre of the viewport should hit the sphere");
+        let flat = app.volume.sample_world(probe);
+
+        app.update(Message::BrushKindChanged(BrushKind::Draw));
+        for _ in 0..4 {
+            press(&mut app, centre_of_viewport());
+            release(&mut app);
+        }
+        let raised = app.volume.sample_world(probe);
+        assert!(raised < flat, "drawing should have pushed the surface out past the probe");
+
+        // Now the same gesture with shift held. Nothing about the selection
+        // changes, but the strokes must smooth rather than pile on more.
+        app.update(Message::Pointer(PointerEvent::Modifiers {
+            shift: true,
+            control: false,
+            alt: false,
+        }));
+        for _ in 0..12 {
+            press(&mut app, centre_of_viewport());
+            release(&mut app);
+        }
+        let smoothed = app.volume.sample_world(probe);
+
+        assert_ne!(smoothed, raised, "holding shift changed nothing at all");
+        assert!(
+            smoothed > raised,
+            "shift should have flattened the bump back, not built on it: \
+             {flat} flat, {raised} raised, {smoothed} after smoothing"
+        );
+        assert_eq!(app.brush.kind, BrushKind::Draw, "the selection must be untouched");
+    }
+
+    #[test]
+    fn a_fresh_application_starts_with_every_mirror_plane_off() {
+        let app = app();
+        assert!(app.symmetry.is_off(), "symmetry was {:?}", app.symmetry);
+        for axis in MirrorAxis::ALL {
+            assert!(!app.symmetry.axis(axis), "{} was on at startup", axis.label());
+        }
+    }
+
+    #[test]
+    fn each_mirror_axis_reaches_the_opposite_side() {
+        for (axis, probe) in [
+            (MirrorAxis::X, Vec3::new(-1.0, 1.0, 1.0)),
+            (MirrorAxis::Y, Vec3::new(1.0, -1.0, 1.0)),
+            (MirrorAxis::Z, Vec3::new(1.0, 1.0, -1.0)),
+        ] {
+            let mut app = app();
+            app.update(Message::SymmetryAxisToggled(axis));
+            assert!(app.symmetry.axis(axis), "{} did not turn on", axis.label());
+
+            // On the surface, and off all three planes, so only the axis
+            // under test can carry the stroke to the probe point.
+            let at = Vec3::new(14.0, 14.0, 18.0).normalize() * MODEL_RADIUS_MM;
+            let normal = app.volume.gradient_world(at);
+            let before = app.volume.sample_world(at * probe);
+
+            app.volume.begin_stroke();
+            app.brush.apply_symmetric(
+                &mut app.volume,
+                &Stamp::new(at, normal, BrushDirection::Add),
+                app.symmetry,
+                &mut app.brush_scratch,
+            );
+
+            assert!(
+                app.volume.sample_world(at * probe) < before,
+                "{} symmetry never reached the other side",
+                axis.label()
+            );
+
+            // ...and toggling it again turns it back off.
+            app.update(Message::SymmetryAxisToggled(axis));
+            assert!(!app.symmetry.axis(axis));
+        }
+    }
+
+    /// The fast path for radius in every sculpting tool is a drag, not a
+    /// slider. Absolute against where the drag began, so out and back returns
+    /// to exactly the original value rather than drifting.
+    #[test]
+    fn holding_the_sizing_key_and_dragging_scales_the_radius_reversibly() {
+        let mut app = app();
+        app.on_pointer(PointerEvent::Moved { position: centre_of_viewport(), size: SIZE });
+        let original = app.brush.radius;
+
+        app.update(Message::SizingStarted(SizingTarget::Radius));
+        assert!(app.sizing.is_some(), "the gesture did not start");
+
+        let at = |dx: f32| Vector::new(SIZE.x / 2.0 + dx, SIZE.y / 2.0);
+        app.on_pointer(PointerEvent::Moved { position: at(120.0), size: SIZE });
+        let grown = app.brush.radius;
+        assert!(grown > original, "dragging right should grow the brush");
+
+        app.on_pointer(PointerEvent::Moved { position: at(-120.0), size: SIZE });
+        assert!(app.brush.radius < original, "dragging left should shrink it");
+
+        // Back where it started: absolute, not accumulated.
+        app.on_pointer(PointerEvent::Moved { position: at(0.0), size: SIZE });
+        assert!(
+            (app.brush.radius - original).abs() < 1.0e-4,
+            "the gesture drifted: {original} became {}",
+            app.brush.radius
+        );
+
+        app.update(Message::SizingEnded);
+        assert!(app.sizing.is_none());
+        // ...and the pointer goes back to sculpting.
+        app.on_pointer(PointerEvent::Moved { position: at(200.0), size: SIZE });
+        assert!((app.brush.radius - original).abs() < 1.0e-4, "sizing outlived its key");
+    }
+
+    /// The failure this would otherwise cause is the worst kind: a drag that
+    /// silently carves the model while the user thinks they are resizing.
+    #[test]
+    fn a_sizing_drag_does_not_sculpt() {
+        let mut app = app();
+        app.on_pointer(PointerEvent::Moved { position: centre_of_viewport(), size: SIZE });
+        let probe = app
+            .surface_under(Vec2::new(SIZE.x / 2.0, SIZE.y / 2.0))
+            .expect("the centre should hit the sphere");
+        let before = app.volume.sample_world(probe);
+
+        app.update(Message::SizingStarted(SizingTarget::Radius));
+        press(&mut app, centre_of_viewport());
+        for step in 1..=8 {
+            app.on_pointer(PointerEvent::Moved {
+                position: Vector::new(SIZE.x / 2.0 + step as f32 * 10.0, SIZE.y / 2.0),
+                size: SIZE,
+            });
+        }
+        release(&mut app);
+
+        assert_eq!(app.volume.sample_world(probe), before, "a sizing drag cut into the model");
+        assert!(!app.history.can_undo(), "a sizing drag recorded an undo entry");
+    }
+
+    #[test]
+    fn the_sizing_gesture_stays_inside_the_slider_bounds() {
+        for (target, low, high) in [
+            (SizingTarget::Radius, MIN_RADIUS_MM, MAX_RADIUS_MM),
+            (SizingTarget::Strength, MIN_STRENGTH, MAX_STRENGTH),
+        ] {
+            for direction in [-1.0f32, 1.0] {
+                let mut app = app();
+                app.on_pointer(PointerEvent::Moved { position: centre_of_viewport(), size: SIZE });
+                app.update(Message::SizingStarted(target));
+                app.on_pointer(PointerEvent::Moved {
+                    position: Vector::new(SIZE.x / 2.0 + direction * 5000.0, SIZE.y / 2.0),
+                    size: SIZE,
+                });
+                let value = match target {
+                    SizingTarget::Radius => app.brush.radius,
+                    SizingTarget::Strength => app.brush.strength,
+                };
+                assert!((low..=high).contains(&value), "{target:?} left its range at {value}");
+            }
+        }
+    }
+
+    /// ZBrush calls this Dynamic. Without it a brush tuned on one model is the
+    /// wrong size the moment the model changes scale.
+    #[test]
+    fn a_dynamic_radius_keeps_its_proportion_to_the_model() {
+        let proportion = |state: &Brokkr| state.brush.radius / state.model_radius;
+
+        // Off by default: the radius means a physical size, so a resample must
+        // leave it alone.
+        let mut fixed = app();
+        let before = fixed.brush.radius;
+        fixed.update(Message::Resample(VOXEL_SIZE_MM / 2.0));
+        assert_eq!(fixed.brush.radius, before, "a fixed radius must survive a resample");
+
+        // On, and the model doubles: the brush should follow it.
+        let mut dynamic = app();
+        dynamic.update(Message::DynamicRadiusToggled(true));
+        let before = proportion(&dynamic);
+        dynamic.volume.seed_sphere(Vec3::ZERO, MODEL_RADIUS_MM * 2.0);
+        dynamic.volume.mark_everything_dirty();
+        dynamic.remesh_dirty();
+
+        assert!(
+            dynamic.brush.radius > fixed.brush.radius,
+            "a dynamic radius should have grown with the model"
+        );
+        assert!(
+            (proportion(&dynamic) - before).abs() < 0.15 * before,
+            "the brush lost its proportion: {before} became {}",
+            proportion(&dynamic)
+        );
+    }
+
+    /// Clicking the cube must move the camera and must NOT sculpt. Getting that
+    /// wrong takes a divot out of the model every time someone reaches for a
+    /// standard view.
+    #[test]
+    fn clicking_the_navigation_cube_flies_the_camera_without_sculpting() {
+        let mut app = app();
+        app.on_pointer(PointerEvent::Moved { position: centre_of_viewport(), size: SIZE });
+        let probe = app
+            .surface_under(Vec2::new(SIZE.x / 2.0, SIZE.y / 2.0))
+            .expect("the centre should hit the sphere");
+        let before_field = app.volume.sample_world(probe);
+        let before_yaw = app.camera.yaw;
+
+        let (origin, size) = crate::navcube::corner_rect(Vec2::new(SIZE.x, SIZE.y));
+        let middle = origin + size * 0.5;
+        press(&mut app, Vector::new(middle.x, middle.y));
+        release(&mut app);
+
+        assert!(app.flight.is_some(), "clicking the cube did not start a move");
+        assert_eq!(
+            app.volume.sample_world(probe),
+            before_field,
+            "clicking the cube carved the model"
+        );
+        assert!(!app.history.can_undo(), "clicking the cube recorded an undo entry");
+        assert!(app.drag.is_none(), "clicking the cube started a drag");
+
+        finish_flight(&mut app);
+        assert!(app.flight.is_none(), "the move never finished");
+        assert_ne!(app.camera.yaw, before_yaw, "the camera did not actually move");
+        assert!(app.camera.view().to_cols_array().iter().all(|v| v.is_finite()));
+    }
+
+    /// A click on Top asks for a pitch of ninety degrees, which is exactly where
+    /// the view matrix collapses. The flight interpolates the field directly, so
+    /// it has to respect the same limit the drag path does.
+    #[test]
+    fn flying_to_a_pole_stops_short_of_collapsing_the_view() {
+        for direction in [Vec3::Y, Vec3::NEG_Y] {
+            let mut app = app();
+            app.fly_to(crate::navcube::Part { direction, extremes: 1 });
+            finish_flight(&mut app);
+            assert!(app.flight.is_none());
+            assert!(
+                app.camera.pitch.abs() < std::f32::consts::FRAC_PI_2,
+                "{direction:?} reached the pole: pitch {}",
+                app.camera.pitch
+            );
+            assert!(app.camera.view().to_cols_array().iter().all(|v| v.is_finite()));
+            assert!((app.camera.right().length() - 1.0).abs() < 1.0e-4);
+        }
+    }
+
+    /// The camera must not spin several times round to reach a heading a few
+    /// degrees away, which is what interpolating an unwrapped yaw would do.
+    #[test]
+    fn a_flight_takes_the_short_way_round_and_unwinds_any_roll() {
+        let mut app = app();
+        // Many turns of yaw, and a roll from the puck, as a session would
+        // accumulate.
+        app.camera.yaw = std::f32::consts::TAU * 3.0 + 0.2;
+        app.camera.roll = 0.7;
+
+        app.fly_to(crate::navcube::Part { direction: Vec3::Z, extremes: 1 });
+        let flight = app.flight.expect("no flight started");
+        let travel = (flight.to.0 - flight.from.0).abs();
+        assert!(travel <= std::f32::consts::PI + 1.0e-4, "the flight would spin {travel} radians");
+
+        finish_flight(&mut app);
+        assert!(
+            app.camera.roll.abs() < 1.0e-4,
+            "a standard view should be level, roll was {}",
+            app.camera.roll
+        );
+    }
+
+    /// The flight is driven off the frame tick, so that link needs its own
+    /// test: the tests above supply their own time to get a result at all.
+    #[test]
+    fn the_frame_tick_is_what_advances_a_flight() {
+        let mut app = app();
+        app.fly_to(crate::navcube::Part { direction: Vec3::X, extremes: 1 });
+        // The first frame has no previous one to measure against, so it
+        // contributes nothing; the second is the one that moves.
+        app.update(Message::Frame);
+        app.update(Message::Frame);
+        let elapsed = app.flight.expect("the flight ended early").elapsed_ms;
+        assert!(elapsed > 0.0, "the frame tick did not advance the flight");
+    }
+
+    fn right_press(app: &mut Brokkr, at: Vector) {
+        app.on_pointer(PointerEvent::Pressed {
+            button: PointerButton::Right,
+            position: at,
+            size: SIZE,
+        });
+    }
+
+    fn right_release(app: &mut Brokkr) {
+        app.on_pointer(PointerEvent::Released { button: PointerButton::Right });
+    }
+
+    /// Right drag already orbits, so the menu has to be told apart from it by
+    /// movement and time. All three outcomes matter, and getting any of them
+    /// wrong makes either the menu or the orbit unusable.
+    #[test]
+    fn a_right_click_opens_the_menu_but_a_right_drag_orbits() {
+        let centre = centre_of_viewport();
+        let moved_to = |dx: f32| Vector::new(SIZE.x / 2.0 + dx, SIZE.y / 2.0);
+
+        // A click that does not move: the menu.
+        let mut click = app();
+        right_press(&mut click, centre);
+        right_release(&mut click);
+        assert!(click.menu.is_some(), "a right click did not open the menu");
+
+        // A drag: orbits, and opens nothing.
+        let mut orbit = app();
+        let before = orbit.camera.yaw;
+        right_press(&mut orbit, centre);
+        orbit.on_pointer(PointerEvent::Moved { position: moved_to(60.0), size: SIZE });
+        right_release(&mut orbit);
+        assert!(orbit.menu.is_none(), "an orbit opened the menu");
+        assert_ne!(orbit.camera.yaw, before, "the orbit did not happen");
+
+        // A drag that returns to where it started is still a drag.
+        let mut returned = app();
+        right_press(&mut returned, centre);
+        for dx in [40.0, 0.0] {
+            returned.on_pointer(PointerEvent::Moved { position: moved_to(dx), size: SIZE });
+        }
+        right_release(&mut returned);
+        assert!(returned.menu.is_none(), "an orbit that came back opened the menu");
+
+        // Inside the slop is still a click: a hand never holds perfectly still.
+        let mut wobble = app();
+        right_press(&mut wobble, centre);
+        wobble.on_pointer(PointerEvent::Moved {
+            position: moved_to(CLICK_SLOP_PX * 0.5),
+            size: SIZE,
+        });
+        right_release(&mut wobble);
+        assert!(wobble.menu.is_some(), "a click that wobbled a pixel opened nothing");
+    }
+
+    #[test]
+    fn the_menu_closes_on_escape_and_on_a_click_elsewhere() {
+        let mut app = app();
+        right_press(&mut app, centre_of_viewport());
+        right_release(&mut app);
+        assert!(app.menu.is_some());
+
+        app.update(Message::MenuClosed);
+        assert!(app.menu.is_none(), "escape did not close it");
+
+        // Open again, then click elsewhere: the click closes it and must not
+        // also sculpt, or dismissing a menu would carve the model.
+        right_press(&mut app, centre_of_viewport());
+        right_release(&mut app);
+        let probe = app
+            .surface_under(Vec2::new(SIZE.x / 2.0, SIZE.y / 2.0))
+            .expect("the centre should hit the sphere");
+        let before = app.volume.sample_world(probe);
+
+        press(&mut app, centre_of_viewport());
+        release(&mut app);
+        assert!(app.menu.is_none(), "a click elsewhere did not close the menu");
+        assert_eq!(app.volume.sample_world(probe), before, "dismissing the menu sculpted");
+    }
+
+    /// A numeric field is the reason the menu beats the panel, and the reason it
+    /// is fiddly: half typed text has to survive, but a value outside the
+    /// slider's range must not be accepted quietly.
+    #[test]
+    fn a_typed_field_survives_being_half_written_and_still_clamps() {
+        let mut app = app();
+
+        // Part way through typing "2.5": neither "" nor "2." parses, and
+        // snapping the field back mid-edit would make it unusable.
+        for text in ["", "2", "2.", "2.5"] {
+            app.update(Message::MenuFieldEdited(SizingTarget::Radius, text.to_string()));
+            assert_eq!(app.menu_field_text(SizingTarget::Radius), text, "the text was lost");
+        }
+        assert!((app.brush.radius - 2.5).abs() < 1.0e-5, "the value never arrived");
+
+        // Junk leaves the value alone rather than zeroing it.
+        app.update(Message::MenuFieldEdited(SizingTarget::Radius, "banana".into()));
+        assert!((app.brush.radius - 2.5).abs() < 1.0e-5, "junk moved the value");
+
+        // Out of range is clamped, not accepted.
+        app.update(Message::MenuFieldEdited(SizingTarget::Radius, "500".into()));
+        assert_eq!(app.brush.radius, MAX_RADIUS_MM);
+        app.update(Message::MenuFieldEdited(SizingTarget::Strength, "-5".into()));
+        assert_eq!(app.brush.strength, MIN_STRENGTH);
+
+        // Once submitted the field goes back to showing the real value.
+        app.update(Message::MenuFieldSubmitted);
+        assert_eq!(app.menu_field_text(SizingTarget::Radius), format!("{:.2}", app.brush.radius));
+    }
+
+    #[test]
+    fn hovering_the_cube_hides_the_brush_ring() {
+        let mut app = app();
+        app.on_pointer(PointerEvent::Moved { position: centre_of_viewport(), size: SIZE });
+        assert!(app.hover.is_some(), "the model should be under the pointer");
+
+        let (origin, size) = crate::navcube::corner_rect(Vec2::new(SIZE.x, SIZE.y));
+        let middle = origin + size * 0.5;
+        app.on_pointer(PointerEvent::Moved {
+            position: Vector::new(middle.x, middle.y),
+            size: SIZE,
+        });
+
+        assert!(app.cube_hover.is_some(), "the cube should be under the pointer");
+        // No ring: a press here will not sculpt, and drawing one would promise
+        // that it would.
+        assert!(app.hover.is_none());
+        assert!(app.shared.overlay_snapshot().lines.is_empty());
+    }
+
+    #[test]
+    fn the_cursor_ring_appears_where_the_pointer_meets_the_model() {
+        let mut app = app();
+        assert!(app.hover.is_none(), "nothing has been pointed at yet");
+
+        app.on_pointer(PointerEvent::Moved { position: centre_of_viewport(), size: SIZE });
+        assert!(app.hover.is_some(), "the centre of the viewport should hit the sphere");
+        // The geometry lives in the shared frame, not in `self.overlay`: the
+        // application swaps its buffer over to the renderer and keeps the empty
+        // one back, which is what stops either side allocating.
+        let drawn = app.shared.overlay_snapshot();
+        assert!(!drawn.lines.is_empty(), "no ring was handed to the renderer");
+
+        // A corner of the viewport misses the sphere, so there is nothing to
+        // draw and that absence is the signal a press would do nothing.
+        app.on_pointer(PointerEvent::Moved { position: Vector::new(2.0, 2.0), size: SIZE });
+        assert!(app.hover.is_none(), "a corner should miss the model");
+        assert!(
+            app.shared.overlay_snapshot().lines.is_empty(),
+            "a ring was drawn for a pointer that is off the model"
+        );
+    }
+
+    #[test]
+    fn the_radius_keys_stay_inside_the_range_the_slider_offers() {
+        let mut app = app();
+        for _ in 0..200 {
+            app.update(Message::BrushRadiusScaled(1.5));
+        }
+        assert_eq!(app.brush.radius, MAX_RADIUS_MM);
+        for _ in 0..200 {
+            app.update(Message::BrushRadiusScaled(1.0 / 1.5));
+        }
+        assert_eq!(app.brush.radius, MIN_RADIUS_MM);
+    }
+
+    /// ZBrush and Nomad both invert on alt; this had control first. Both work,
+    /// and holding both is still one inversion rather than two.
+    #[test]
+    fn either_modifier_inverts_and_holding_both_is_not_a_double_negative() {
+        let mut app = app();
+        app.update(Message::BrushKindChanged(BrushKind::Draw));
+        assert_eq!(app.stroke_direction(), BrushDirection::Add);
+
+        let modifiers = |app: &mut Brokkr, control, alt| {
+            app.on_pointer(PointerEvent::Modifiers { shift: false, control, alt });
+        };
+
+        modifiers(&mut app, true, false);
+        assert_eq!(app.stroke_direction(), BrushDirection::Subtract, "control should invert");
+
+        modifiers(&mut app, false, true);
+        assert_eq!(app.stroke_direction(), BrushDirection::Subtract, "alt should invert");
+
+        modifiers(&mut app, true, true);
+        assert_eq!(
+            app.stroke_direction(),
+            BrushDirection::Subtract,
+            "both held is one inversion, not two"
+        );
+
+        modifiers(&mut app, false, false);
+        assert_eq!(app.stroke_direction(), BrushDirection::Add, "releasing should restore");
+    }
+
+    /// The eraser end still combines with a modifier the way it always did:
+    /// inverting an inverted stroke gives back the additive brush.
+    #[test]
+    fn alt_combines_with_the_eraser_the_way_control_does() {
+        for (control, alt) in [(true, false), (false, true)] {
+            let mut app = app();
+            app.update(Message::BrushKindChanged(BrushKind::Draw));
+            app.tablet.simulate(pen(glam::Vec2::ZERO, true));
+            assert_eq!(app.stroke_direction(), BrushDirection::Subtract, "the eraser alone");
+
+            app.on_pointer(PointerEvent::Modifiers { shift: false, control, alt });
+            assert_eq!(
+                app.stroke_direction(),
+                BrushDirection::Add,
+                "a modifier over the eraser should give back the additive brush"
+            );
+        }
     }
 
     #[test]
@@ -1258,6 +2018,63 @@ mod export_tests {
 
     fn app() -> Brokkr {
         Brokkr::with_tablet(crate::tablet::Tablet::inert())
+    }
+
+    /// The starting ball has to straddle every mirror plane equally, or turning
+    /// on symmetry works against a model that was never centred.
+    ///
+    /// It always has -- but "I measured it once" is not a guarantee, and the
+    /// defaults it depends on (`MODEL_RADIUS_MM`, `VOXEL_SIZE_MM`, and the fact
+    /// that voxel index 0 sits exactly on the origin) are three separate things
+    /// a future change could move. This is what makes it permanent.
+    #[test]
+    fn the_default_model_is_centred_on_every_mirror_plane() {
+        let app = app();
+        let (mesh, _) = app.volume.export_mesh();
+        assert!(!mesh.positions.is_empty());
+
+        let mut low = Vec3::splat(f32::MAX);
+        let mut high = Vec3::splat(f32::MIN);
+        for position in &mesh.positions {
+            low = low.min(*position);
+            high = high.max(*position);
+        }
+
+        // Well under a voxel: the lattice is symmetric about the origin, so the
+        // only error available is f32 rounding.
+        let tolerance = VOXEL_SIZE_MM * 0.01;
+        let midpoint = (low + high) * 0.5;
+        for (axis, offset) in [("x", midpoint.x), ("y", midpoint.y), ("z", midpoint.z)] {
+            assert!(offset.abs() < tolerance, "the model is off centre on {axis} by {offset} mm");
+        }
+
+        // And it reaches the same distance either way along each axis, which is
+        // what "equal sides of the centreline" actually means.
+        for (axis, lo, hi) in [("x", low.x, high.x), ("y", low.y, high.y), ("z", low.z, high.z)] {
+            assert!(
+                (hi + lo).abs() < tolerance,
+                "the model reaches {hi} one way on {axis} and {lo} the other"
+            );
+        }
+
+        // The field itself, in mirrored pairs, not just the mesh it produced.
+        for step in 0..24 {
+            let probe = Vec3::new(
+                MODEL_RADIUS_MM - 1.0 + step as f32 * 0.05,
+                step as f32 * 0.37,
+                step as f32 * -0.21,
+            );
+            for flip in
+                [Vec3::new(-1.0, 1.0, 1.0), Vec3::new(1.0, -1.0, 1.0), Vec3::new(1.0, 1.0, -1.0)]
+            {
+                let here = app.volume.sample_world(probe);
+                let mirrored = app.volume.sample_world(probe * flip);
+                assert!(
+                    (here - mirrored).abs() < 1.0e-4,
+                    "the field disagrees across {flip:?}: {here} against {mirrored}"
+                );
+            }
+        }
     }
 
     #[test]

@@ -14,10 +14,15 @@ use bytemuck::{Pod, Zeroable};
 use crate::frustum::Frustum;
 use crate::matcap;
 use crate::mesh_pool::{MeshPool, PoolStats};
+use crate::overlay::{OverlayBatch, OverlayRenderer};
 
 /// Depth format. Depth32Float is universally supported and precise enough that
 /// a sculpt at arm's length shows no z fighting.
 const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
+
+/// The depth format overlay pipelines have to be built against, since every
+/// pipeline in a pass must agree with the pass's depth attachment.
+pub const OVERLAY_DEPTH_FORMAT: wgpu::TextureFormat = DEPTH_FORMAT;
 
 /// Per frame shader constants.
 ///
@@ -88,6 +93,14 @@ impl DepthBuffer {
 #[derive(Debug)]
 pub struct SculptRenderer {
     pipeline: wgpu::RenderPipeline,
+    overlay: OverlayRenderer,
+    /// A second overlay for the navigation cube, which needs its own matrix and
+    /// its own geometry in its own pass.
+    ///
+    /// A whole second instance rather than two slots inside one: it costs three
+    /// extra pipeline objects at startup and saves plumbing a slot index through
+    /// every call. Nothing here is hot enough for that trade to matter.
+    cube: OverlayRenderer,
     bind_group: wgpu::BindGroup,
     uniform_buffer: wgpu::Buffer,
     depth: DepthBuffer,
@@ -262,6 +275,8 @@ impl SculptRenderer {
 
         Self {
             pipeline,
+            overlay: OverlayRenderer::new(device, target_format, DEPTH_FORMAT),
+            cube: OverlayRenderer::new(device, target_format, DEPTH_FORMAT),
             bind_group,
             uniform_buffer,
             depth: DepthBuffer::new(device, 1, 1),
@@ -283,6 +298,90 @@ impl SculptRenderer {
 
     pub fn write_uniforms(&self, queue: &wgpu::Queue, uniforms: &Uniforms) {
         queue.write_buffer(&self.uniform_buffer, 0, bytemuck::bytes_of(uniforms));
+    }
+
+    /// Replace this frame's overlay geometry: the brush ring and the mirror
+    /// planes. Drawn at the end of the sculpt pass, so it shares the sculpt's
+    /// viewport, scissor and depth buffer.
+    pub fn write_overlay(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        batch: &OverlayBatch,
+        view_projection: glam::Mat4,
+    ) {
+        self.overlay.upload(device, queue, batch, view_projection);
+    }
+
+    /// Overlay vertices drawn last frame, for the debug readout.
+    pub fn overlay_vertices(&self) -> usize {
+        self.overlay.vertex_count() + self.cube.vertex_count()
+    }
+
+    /// Replace the navigation cube's geometry and the matrix it is drawn with.
+    pub fn write_cube(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        batch: &OverlayBatch,
+        view_projection: glam::Mat4,
+    ) {
+        self.cube.upload(device, queue, batch, view_projection);
+    }
+
+    /// Draw the navigation cube into its corner.
+    ///
+    /// A pass of its own, because the cube has to be depth tested against
+    /// itself and nothing else: it is drawn over the model wherever it sits, and
+    /// the sculpt's depth values in that corner would otherwise clip it.
+    ///
+    /// The depth clear covers the whole attachment rather than the scissor rect,
+    /// which is how wgpu defines it. That is a full screen clear for a 92 pixel
+    /// box, and it is still cheaper and far less fragile than the alternatives
+    /// (a second depth texture cannot be used, since every attachment in a pass
+    /// must share the colour attachment's size).
+    pub fn render_cube(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        target: &wgpu::TextureView,
+        clip: PixelRect,
+    ) {
+        if clip.width == 0 || clip.height == 0 || self.cube.vertex_count() == 0 {
+            return;
+        }
+
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("brokkr navigation cube pass"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: target,
+                depth_slice: None,
+                resolve_target: None,
+                ops: wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store },
+            })],
+            depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                view: &self.depth.view,
+                depth_ops: Some(wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(1.0),
+                    store: wgpu::StoreOp::Store,
+                }),
+                stencil_ops: None,
+            }),
+            timestamp_writes: None,
+            occlusion_query_set: None,
+        });
+
+        pass.set_viewport(
+            clip.x as f32,
+            clip.y as f32,
+            clip.width as f32,
+            clip.height as f32,
+            0.0,
+            1.0,
+        );
+        pass.set_scissor_rect(clip.x, clip.y, clip.width, clip.height);
+        // Solid: the cube is opaque and convex, so it must occlude its own far
+        // faces rather than blending with them.
+        self.cube.draw(&mut pass, true);
     }
 
     /// Make sure the depth buffer matches the render target.
@@ -351,6 +450,11 @@ impl SculptRenderer {
         );
         pass.set_scissor_rect(clip.x, clip.y, clip.width, clip.height);
         self.pool.draw(&mut pass, frustum);
+
+        // Last, and inside the same pass: the ring has to depth test against
+        // the model it is lying on, and a mirror plane against the model it
+        // passes through.
+        self.overlay.draw(&mut pass, false);
     }
 }
 

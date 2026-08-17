@@ -2,8 +2,11 @@
 
 //! Messages exchanged between the widget tree and the application.
 
-use brokkr_core::{BrushKind, FalloffCurve};
+use brokkr_core::{BrushKind, FalloffCurve, MirrorAxis, PatternKind};
 use iced::Vector;
+
+use crate::app::SizingTarget;
+use crate::spacemouse::{Action, Axis, ButtonAction, Mode};
 
 /// A file format the sculpt can be written to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -67,10 +70,80 @@ pub enum PointerEvent {
     Modifiers {
         shift: bool,
         control: bool,
+        alt: bool,
     },
 }
 
-#[derive(Debug, Clone, Copy)]
+/// A collapsible block of the properties panel.
+///
+/// The panel has more in it than fits a 1080 high window, and a scrollable
+/// alone left every settings section below the fold — including the SpaceMouse
+/// bindings, which made a deliberately rebindable puck practically
+/// unrebindable. Collapsing keeps every heading reachable without a scroll.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PanelSection {
+    Pattern,
+    Pen,
+    SpaceMouse,
+    Detail,
+    Export,
+}
+
+impl PanelSection {
+    pub const ALL: [PanelSection; 5] = [
+        PanelSection::Pattern,
+        PanelSection::Pen,
+        PanelSection::SpaceMouse,
+        PanelSection::Detail,
+        PanelSection::Export,
+    ];
+
+    pub fn title(self) -> &'static str {
+        match self {
+            PanelSection::Pattern => "PATTERN",
+            PanelSection::Pen => "PEN",
+            PanelSection::SpaceMouse => "SPACEMOUSE",
+            PanelSection::Detail => "DETAIL",
+            PanelSection::Export => "EXPORT",
+        }
+    }
+
+    /// Whether it starts open. The two long ones start closed so every
+    /// heading is visible without scrolling.
+    pub fn open_by_default(self) -> bool {
+        !matches!(self, PanelSection::Pen | PanelSection::SpaceMouse)
+    }
+}
+
+/// One change to the SpaceMouse settings.
+///
+/// Gathered into one message rather than a variant each, because there are
+/// twelve of them and they all do the same thing: patch the config and, for
+/// the ones that are not mid drag, write it out.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum SpaceMouseSetting {
+    Mode(Mode),
+    Deadzone(f32),
+    PanSens(f32),
+    ZoomSens(f32),
+    OrbitSens(f32),
+    /// Which raw axis drives an action.
+    Binding(Action, Axis),
+    Invert(Action, bool),
+    Button(usize, ButtonAction),
+    /// Flip every axis at once.
+    InvertAll,
+    /// Back to the built in defaults.
+    Reset,
+    /// Persist the current settings. Sent when a slider is released rather
+    /// than on every step of a drag, which would rewrite the file sixty times
+    /// a second.
+    Save,
+}
+
+/// Not `Copy`: one variant carries the raw text of a numeric field being typed
+/// into, which has to be owned so a half typed value survives.
+#[derive(Debug, Clone)]
 pub enum Message {
     Pointer(PointerEvent),
     /// One presented frame, used to drive the frame rate readout and to keep
@@ -80,7 +153,35 @@ pub enum Message {
     BrushRadiusChanged(f32),
     BrushStrengthChanged(f32),
     FalloffChanged(FalloffCurve),
-    SymmetryToggled(bool),
+    /// Which surface pattern multiplies into the brush. See
+    /// `brokkr_core::pattern`: one control that modifies every brush, rather
+    /// than a brush per pattern.
+    PatternChanged(PatternKind),
+    PatternScaleChanged(f32),
+    PatternDepthChanged(f32),
+    /// Flip one mirror plane. A toggle rather than an explicit on/off,
+    /// because both the strip button and the keyboard act on what is currently
+    /// set rather than knowing it.
+    SymmetryAxisToggled(MirrorAxis),
+    /// Multiply the brush radius, for the keyboard nudge. Multiplicative
+    /// because the radius spans fifty to one and a fixed step would crawl at
+    /// the top and jump at the bottom.
+    BrushRadiusScaled(f32),
+    /// A hold-and-drag adjustment of one brush number has begun. ZBrush's `s`
+    /// and `u`: the fast path for radius in every sculpting tool is a drag
+    /// against a live ring, not a slider in a panel.
+    SizingStarted(SizingTarget),
+    SizingEnded,
+    /// Whether the radius tracks the model's size (ZBrush calls it Dynamic)
+    /// rather than staying a fixed number of millimetres.
+    DynamicRadiusToggled(bool),
+    /// Close the right-click menu.
+    MenuClosed,
+    /// A numeric field in the menu was typed into. Carries the raw text, since
+    /// a half typed value has to survive until it parses.
+    MenuFieldEdited(SizingTarget, String),
+    /// Commit whatever is in the field being edited and stop editing it.
+    MenuFieldSubmitted,
     PressureToggled(bool),
     PressureCurveChanged(f32),
     TiltToggled(bool),
@@ -94,4 +195,7 @@ pub enum Message {
     /// Rebuild the volume at a different voxel size, which is the explicit
     /// operation that increases or reduces detail.
     Resample(f32),
+    SpaceMouse(SpaceMouseSetting),
+    /// Open or close one block of the properties panel.
+    SectionToggled(PanelSection),
 }
