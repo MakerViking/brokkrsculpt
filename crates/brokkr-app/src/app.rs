@@ -18,7 +18,8 @@ use iced::{Subscription, Task};
 use crate::camera::OrbitCamera;
 use crate::cursor;
 use crate::message::{
-    ExportFormat, Message, PanelSection, PointerButton, PointerEvent, SpaceMouseSetting, TopMenu,
+    ConfirmChoice, ExportFormat, Message, PanelSection, PointerButton, PointerEvent,
+    SpaceMouseSetting, TopMenu,
 };
 use crate::navcube;
 use crate::spacemouse::{
@@ -234,6 +235,37 @@ pub struct Brokkr {
     /// The file this sculpt was opened from or last saved to. `None` until it
     /// has one, which is what makes the first Save behave as Save As.
     project_path: Option<std::path::PathBuf>,
+    /// Whether the field has changed since it was last written to a file.
+    ///
+    /// Named `unsaved` rather than `dirty` on purpose: `Brokkr::dirty` is the
+    /// remesh scratch list and `Volume` has its own `mark_dirty`/`take_dirty`
+    /// vocabulary, so a second meaning for the word would cost a reader every
+    /// time.
+    ///
+    /// Deliberately tracks the *field* only, not the camera, brush or mirror
+    /// state that a `.brokkr` file also carries. `rescale_radius` mutates
+    /// `brush.radius` from inside `remesh_dirty`, which runs on every stroke,
+    /// undo, redo, resample, open and reset, so a flag covering brush state
+    /// would be set permanently and mean nothing. A save still records the
+    /// newer camera; losing an unsaved camera nudge is not worth a prompt.
+    unsaved: bool,
+    /// An action waiting on the user's answer to "you have unsaved work".
+    ///
+    /// Its own field rather than a variant of `menu`, because the two dismissal
+    /// routes that close a menu -- a press in the viewport and
+    /// `Message::MenuClosed` -- must NOT close this. A prompt that a stray click
+    /// dismisses is worse than no prompt: the user learns to ignore it.
+    confirm: Option<PendingAction>,
+    /// Sculpts opened or saved recently, for the File menu.
+    recent: crate::recent::Recent,
+    /// Where the crash net is written.
+    ///
+    /// Carried rather than recomputed from the environment so a test can point
+    /// it at a temporary directory. Without that, running the suite would
+    /// delete a real autosave belonging to a real session.
+    autosave_file: Option<std::path::PathBuf>,
+    /// When the crash net was last written. See [`Brokkr::maybe_autosave`].
+    last_autosave: Instant,
     /// A numeric field in the menu being typed into.
     ///
     /// Held as text rather than parsed on every keystroke, because a half typed
@@ -256,6 +288,42 @@ struct Flight {
 
 /// How long a click on the navigation cube takes to arrive.
 const FLIGHT_MS: f32 = 260.0;
+
+/// Something the user asked for that would discard unsaved work, held until
+/// they say what to do about it.
+///
+/// Each of these throws the current field away: New reseeds the sphere, Open
+/// swaps a file in, and Quit ends the process. They are the complete set of
+/// ways work can be lost, which is why the gate lives in one place.
+///
+/// `Clone` rather than `Copy` because one variant carries a path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum PendingAction {
+    NewSculpt,
+    /// Open, by way of the file dialog.
+    Open,
+    /// Open a specific file, chosen from the recent list, so no dialog.
+    OpenRecent(std::path::PathBuf),
+    /// Load the crash net. Its own variant rather than an `OpenRecent` of the
+    /// autosave path, because the document that comes back must NOT be owned by
+    /// that path -- see [`Brokkr::recover_autosave`].
+    RecoverAutosave,
+    /// Carries the window, because with `exit_on_close_request(false)` the
+    /// close has to be issued by us against that specific window.
+    Quit(iced::window::Id),
+}
+
+impl PendingAction {
+    /// What the prompt says is about to happen.
+    pub(crate) fn describe(&self) -> &'static str {
+        match self {
+            PendingAction::NewSculpt => "Starting a new sculpt",
+            PendingAction::Open | PendingAction::OpenRecent(_) => "Opening another file",
+            PendingAction::RecoverAutosave => "Recovering the autosave",
+            PendingAction::Quit(_) => "Quitting",
+        }
+    }
+}
 
 /// Where bug reports go.
 pub const ISSUE_URL: &str = "https://github.com/MakerViking/brokkrsculpt/issues/new";
@@ -347,9 +415,24 @@ impl Brokkr {
 
     /// Build with a given pressure source and an inert puck, which is what
     /// almost every test wants.
+    ///
+    /// Points the recent list and the crash net at a per-test temporary
+    /// directory. This is not tidiness: the defaults are the real
+    /// `~/.config/brokkrsculpt/recent` and the real autosave, and `save_project`
+    /// both records into one and deletes the other -- so a plain `cargo test`
+    /// would rewrite someone's recent list and destroy a crash net belonging to
+    /// a live session.
     #[cfg(test)]
     fn with_tablet(tablet: Tablet) -> Self {
-        Self::with_devices(tablet, SpaceMouse::inert())
+        let mut app = Self::with_devices(tablet, SpaceMouse::inert());
+        let scratch = std::env::temp_dir().join(format!(
+            "brokkr-test-state-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        app.recent = crate::recent::Recent::load_from(Some(scratch.join("recent")));
+        app.autosave_file = Some(scratch.join("autosave.brokkr"));
+        app
     }
 
     /// Build with given input devices, so tests do not go looking through
@@ -402,6 +485,11 @@ impl Brokkr {
             menu: None,
             top_menu: None,
             project_path: None,
+            unsaved: false,
+            confirm: None,
+            recent: crate::recent::Recent::load(),
+            autosave_file: Self::default_autosave_path(),
+            last_autosave: Instant::now(),
             menu_edit: None,
         };
         app.remesh_dirty();
@@ -413,17 +501,119 @@ impl Brokkr {
         app.perf.dirty_bricks = 0;
         app.publish_camera();
         app.refresh_overlay();
+        // A crash net left by a previous session is worth nothing if nobody
+        // knows it is there, and the File menu is not somewhere you look
+        // unprompted.
+        if app.has_autosave() {
+            app.status = "an autosave from a previous session is in File > Recover".to_string();
+        }
         app
     }
 
+    /// What the sculpt is called, for the window title and the header.
+    ///
+    /// One function so the two cannot drift: the header used to derive this
+    /// itself.
+    pub(crate) fn document_name(&self) -> String {
+        match &self.project_path {
+            Some(path) => path
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_else(|| path.display().to_string()),
+            None => "untitled".to_string(),
+        }
+    }
+
+    /// The window title, which is where the unsaved marker is most visible.
+    ///
+    /// iced re-evaluates this every frame through `program::with_title`, so the
+    /// star appears the moment a stroke lands with nothing else to wire.
     pub fn title(&self) -> String {
-        "BrokkrSculpt".to_string()
+        let star = if self.unsaved { "*" } else { "" };
+        format!("{}{star} — BrokkrSculpt", self.document_name())
     }
 
     pub fn subscription(&self) -> Subscription<Message> {
-        // Drives the frame rate readout and keeps the viewport presenting while
-        // a stroke is in flight.
-        iced::window::frames().map(|_| Message::Frame)
+        Subscription::batch([
+            // Drives the frame rate readout and keeps the viewport presenting
+            // while a stroke is in flight.
+            iced::window::frames().map(|_| Message::Frame),
+            // The window manager's close button. `main` sets
+            // `exit_on_close_request(false)`, so this is the ONLY thing that
+            // ends the application -- if this subscription is ever dropped the
+            // window becomes unclosable.
+            iced::window::close_requests().map(Message::CloseRequested),
+        ])
+    }
+
+    /// Run an action that discards the document, now that it has been allowed.
+    fn run_pending(&mut self, action: PendingAction) -> Task<Message> {
+        match action {
+            PendingAction::NewSculpt => {
+                self.reset_sculpt();
+                Task::none()
+            }
+            PendingAction::Open => Task::perform(pick_project_to_open(), Message::OpenChosen),
+            PendingAction::OpenRecent(path) => {
+                self.open_project(&path);
+                Task::none()
+            }
+            PendingAction::RecoverAutosave => {
+                self.recover_autosave();
+                Task::none()
+            }
+            // Destroying the last window is what ends a non-daemon iced
+            // application (`iced_winit` sends `Control::Exit` once the window
+            // manager is empty), so this really does quit.
+            PendingAction::Quit(id) => iced::window::close(id),
+        }
+    }
+
+    /// Do `action`, or ask first if there is unsaved work to lose.
+    fn guard(&mut self, action: PendingAction) -> Task<Message> {
+        if self.unsaved {
+            // The prompt is about to draw over the viewport, and a menu left
+            // open would sit on top of it.
+            self.top_menu = None;
+            self.menu = None;
+            self.confirm = Some(action);
+            return Task::none();
+        }
+        self.run_pending(action)
+    }
+
+    /// Act on the answer to the unsaved-work prompt.
+    fn answer_confirm(&mut self, choice: ConfirmChoice) -> Task<Message> {
+        match choice {
+            ConfirmChoice::Cancel => {
+                self.confirm = None;
+                Task::none()
+            }
+            ConfirmChoice::Discard => match self.confirm.take() {
+                Some(action) => self.run_pending(action),
+                None => Task::none(),
+            },
+            ConfirmChoice::Save => match self.project_path.clone() {
+                // It has a file already, so this is a plain write and the
+                // answer is known immediately.
+                Some(path) => {
+                    self.save_project(&path);
+                    if self.unsaved {
+                        // Failed. `status` says why; the prompt stays up so the
+                        // user can still choose to discard or cancel rather
+                        // than losing the work to a write that did not happen.
+                        return Task::none();
+                    }
+                    match self.confirm.take() {
+                        Some(action) => self.run_pending(action),
+                        None => Task::none(),
+                    }
+                }
+                // No file yet, so ask for one. The prompt stays up until the
+                // dialog comes back, which is what `SavedThenContinue` settles.
+                None => Task::perform(pick_project_to_save(), Message::SavedThenContinue),
+            },
+        }
     }
 
     fn publish_camera(&mut self) {
@@ -691,6 +881,10 @@ impl Brokkr {
         if let Some(edit) = self.volume.end_stroke() {
             self.history.push(edit);
             self.history_stats = self.history.stats();
+            // Inside the guard on purpose: a press and release that never
+            // touched the model produces no edit, and must not raise a
+            // "discard your work?" prompt on the way out.
+            self.unsaved = true;
         }
     }
 
@@ -771,10 +965,162 @@ impl Brokkr {
         self.history_stats = self.history.stats();
         self.camera = OrbitCamera::framing(Vec3::ZERO, MODEL_RADIUS_MM);
         self.project_path = None;
+        self.unsaved = false;
         self.status = String::new();
         self.publish_camera();
         self.remesh_dirty();
         self.refresh_overlay();
+    }
+
+    /// How long between crash-net writes.
+    ///
+    /// Two minutes is a compromise against the write itself: a large sculpt is
+    /// tens of megabytes and the write happens on the thread that draws, so
+    /// often enough to be worth having and rare enough that the hitch is not
+    /// something you sculpt against.
+    const AUTOSAVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(120);
+
+    /// Where the crash net lives.
+    ///
+    /// `$XDG_STATE_HOME`, not the config directory: this is recoverable state
+    /// rather than settings, and it must never sit next to the user's own
+    /// files where it could be mistaken for one.
+    pub(crate) fn default_autosave_path() -> Option<std::path::PathBuf> {
+        let base = std::env::var_os("XDG_STATE_HOME")
+            .map(std::path::PathBuf::from)
+            .filter(|path| path.is_absolute())
+            .or_else(|| {
+                std::env::var_os("HOME")
+                    .map(|home| std::path::PathBuf::from(home).join(".local").join("state"))
+            })?;
+        Some(base.join("brokkrsculpt").join("autosave.brokkr"))
+    }
+
+    /// Write the crash net if it is due.
+    ///
+    /// Driven from the frame tick rather than a timer, because iced's `time`
+    /// module is empty under this feature set -- the defaults here include
+    /// `thread-pool`, not `tokio` or `smol`, so `iced::time::every` does not
+    /// exist to be called.
+    ///
+    /// Known limitation: `window::frames()` stops arriving when the compositor
+    /// stops asking for frames, so autosave stalls on a minimised or fully
+    /// occluded window. That is the acceptable direction -- the case worth
+    /// protecting is a crash during active sculpting, and during active
+    /// sculpting there are frames. Revisit if iced gains a timer here.
+    fn maybe_autosave(&mut self) {
+        if !self.unsaved
+            // Never mid-stroke: the write would land in the middle of a drag
+            // and read as a stutter in the brush.
+            || self.stroke.is_active()
+            || self.drag.is_some()
+            || self.last_autosave.elapsed() < Self::AUTOSAVE_INTERVAL
+        {
+            return;
+        }
+        self.write_autosave();
+        self.last_autosave = Instant::now();
+    }
+
+    /// Write the crash net, reporting only to the log.
+    ///
+    /// Deliberately does NOT clear `unsaved` and does NOT touch
+    /// `project_path`: this is not a save, it is something to recover from, and
+    /// treating it as a save would suppress the very prompt that protects the
+    /// real file. It also never writes over the user's own file.
+    ///
+    /// Failures go to the log and nowhere else. `status` is the line the user
+    /// is reading for the action they asked for, and an autosave is not one.
+    fn write_autosave(&mut self) {
+        let Some(path) = self.autosave_file.clone() else {
+            return;
+        };
+        if let Some(parent) = path.parent()
+            && let Err(error) = std::fs::create_dir_all(parent)
+        {
+            log::warn!("could not create {}: {error}", parent.display());
+            return;
+        }
+
+        // Through a temporary and a rename, so a crash during the write cannot
+        // destroy the previous autosave -- which would be the one moment it was
+        // most needed.
+        let temporary = path.with_extension("brokkr.tmp");
+        let state = self.project_state();
+        // `File::create` fails with an `io::Error` and `project::write` with a
+        // `ProjectError`, so neither `?` nor `and_then` will chain them.
+        // Reporting is identical either way -- the log line and nothing else.
+        let write = match std::fs::File::create(&temporary) {
+            Ok(file) => {
+                let mut writer = std::io::BufWriter::new(file);
+                brokkr_core::project::write(&mut writer, &self.volume, &state)
+                    .map_err(|error| error.to_string())
+            }
+            Err(error) => Err(error.to_string()),
+        };
+        match write {
+            Ok(()) => match std::fs::rename(&temporary, &path) {
+                Ok(()) => log::info!("autosaved to {}", path.display()),
+                Err(error) => log::warn!("could not replace {}: {error}", path.display()),
+            },
+            Err(error) => {
+                log::warn!("could not autosave to {}: {error}", temporary.display());
+                std::fs::remove_file(&temporary).ok();
+            }
+        }
+    }
+
+    /// Throw the crash net away, once its work is safely somewhere else.
+    fn clear_autosave(&self) {
+        if let Some(path) = self.autosave_file.as_ref() {
+            std::fs::remove_file(path).ok();
+        }
+    }
+
+    /// The session state a `.brokkr` file carries alongside the field.
+    ///
+    /// Shared by the explicit save and the autosave so the two cannot record
+    /// different things.
+    fn project_state(&self) -> brokkr_core::ProjectState {
+        brokkr_core::ProjectState {
+            camera_target: self.camera.target,
+            camera_distance: self.camera.distance,
+            camera_yaw: self.camera.yaw,
+            camera_pitch: self.camera.pitch,
+            camera_roll: self.camera.roll,
+            brush_radius: self.brush.radius,
+            brush_strength: self.brush.strength,
+            mirror: MirrorAxis::ALL.map(|axis| self.symmetry.axis(axis)),
+        }
+    }
+
+    /// Whether there is a crash net to offer.
+    pub(crate) fn has_autosave(&self) -> bool {
+        self.autosave_file.as_ref().is_some_and(|path| path.is_file())
+    }
+
+    /// Load the crash net, and deliberately do not adopt its path.
+    ///
+    /// `open_project` would leave `project_path` pointing at the autosave file,
+    /// and the next plain Save would then write the user's work back into the
+    /// crash net -- a file under `$XDG_STATE_HOME` that they never chose and
+    /// that the next successful save deletes. So the recovered document is
+    /// deliberately homeless and unsaved: Save behaves as Save As, which is
+    /// what makes them name it somewhere real.
+    fn recover_autosave(&mut self) {
+        let Some(path) = self.autosave_file.clone() else {
+            return;
+        };
+        self.open_project(&path);
+        if self.status.contains("could not") {
+            return;
+        }
+        self.project_path = None;
+        self.unsaved = true;
+        // `open_project` records whatever it opened. The autosave is a crash
+        // net, not a document, and has no business in the recent list.
+        self.recent.forget(&path);
+        self.status = "recovered the autosave — save it somewhere".to_string();
     }
 
     fn open_project(&mut self, path: &std::path::Path) {
@@ -782,6 +1128,9 @@ impl Brokkr {
             Ok(file) => file,
             Err(error) => {
                 self.status = format!("could not open {}: {error}", path.display());
+                // A file that has been moved or deleted since it was last used
+                // should stop being offered.
+                self.recent.forget(path);
                 return;
             }
         };
@@ -825,6 +1174,8 @@ impl Brokkr {
         self.history.clear();
         self.history_stats = self.history.stats();
         self.project_path = Some(path.to_path_buf());
+        self.unsaved = false;
+        self.recent.record(path);
         self.status = format!("opened {}", path.display());
         self.publish_camera();
         self.remesh_dirty();
@@ -832,16 +1183,7 @@ impl Brokkr {
     }
 
     fn save_project(&mut self, path: &std::path::Path) {
-        let state = brokkr_core::ProjectState {
-            camera_target: self.camera.target,
-            camera_distance: self.camera.distance,
-            camera_yaw: self.camera.yaw,
-            camera_pitch: self.camera.pitch,
-            camera_roll: self.camera.roll,
-            brush_radius: self.brush.radius,
-            brush_strength: self.brush.strength,
-            mirror: MirrorAxis::ALL.map(|axis| self.symmetry.axis(axis)),
-        };
+        let state = self.project_state();
 
         let file = match std::fs::File::create(path) {
             Ok(file) => file,
@@ -854,6 +1196,14 @@ impl Brokkr {
         match brokkr_core::project::write(&mut writer, &self.volume, &state) {
             Ok(()) => {
                 self.project_path = Some(path.to_path_buf());
+                // Only here. Both failure arms leave the flag set, or a failed
+                // write would let the next quit go through silently.
+                self.unsaved = false;
+                self.recent.record(path);
+                // The work is safely in a file the user chose, so the crash net
+                // has nothing left to protect and a stale one would only offer
+                // to restore something older than what is on disk.
+                self.clear_autosave();
                 self.status = format!("saved {}", path.display());
             }
             Err(error) => self.status = format!("could not write {}: {error}", path.display()),
@@ -937,6 +1287,9 @@ impl Brokkr {
 
         self.volume = resampled;
         self.voxel_size = voxel_size;
+        // Past the early return above, so resampling to the size already in use
+        // stays the no-op its test asserts it is.
+        self.unsaved = true;
         // History refers to bricks of a volume that no longer exists, and at a
         // different resolution, so keeping it would splice nonsense back in.
         self.history.clear();
@@ -1103,9 +1456,18 @@ impl Brokkr {
         }
     }
 
+    /// Undo and redo both count as changes.
+    ///
+    /// Undoing back to exactly the state that was last saved leaves the flag
+    /// set, so the prompt on the way out is a false positive. Telling that case
+    /// apart needs a save point recorded in the history, and the history is
+    /// cleared by open, resample and reset, so the marker would have to be
+    /// invalidated in three more places. Over-prompting costs a click;
+    /// under-prompting costs the sculpt.
     fn undo(&mut self) {
         if self.history.undo(&mut self.volume) {
             self.history_stats = self.history.stats();
+            self.unsaved = true;
             self.remesh_dirty();
         }
     }
@@ -1113,11 +1475,20 @@ impl Brokkr {
     fn redo(&mut self) {
         if self.history.redo(&mut self.volume) {
             self.history_stats = self.history.stats();
+            self.unsaved = true;
             self.remesh_dirty();
         }
     }
 
     fn on_pointer(&mut self, event: PointerEvent) {
+        // While the unsaved-work prompt is up, the pointer belongs to it. The
+        // capture layer in `view` already swallows presses, but the viewport is
+        // a shader widget that sees events wherever the cursor is, so this is
+        // the guarantee rather than the belt: without it a press behind the
+        // card would sculpt into a document the user is about to discard.
+        if self.confirm.is_some() {
+            return;
+        }
         match event {
             PointerEvent::Modifiers { shift, control, alt } => {
                 self.shift = shift;
@@ -1275,6 +1646,7 @@ impl Brokkr {
                     self.publish_camera();
                 }
                 self.drive_from_spacemouse(elapsed_ms);
+                self.maybe_autosave();
             }
             Message::BrushKindChanged(kind) => self.brush.kind = kind,
             Message::FalloffChanged(curve) => self.brush.falloff = curve,
@@ -1319,6 +1691,13 @@ impl Brokkr {
                 log::info!("{}", self.diagnostics());
             }
             Message::MenuClosed => {
+                // Escape is the only sender. Against an open prompt it means
+                // Cancel, which is the harmless answer -- an explicit arm
+                // rather than letting the clears below reach `confirm`, since
+                // dismissing the prompt by accident is how work gets lost.
+                if self.confirm.is_some() {
+                    return self.answer_confirm(ConfirmChoice::Cancel);
+                }
                 self.menu = None;
                 self.menu_edit = None;
                 self.top_menu = None;
@@ -1348,16 +1727,38 @@ impl Brokkr {
                 *open = !*open;
             }
             // Both the panel button and File > New come here, so the two
-            // cannot drift apart.
-            Message::ResetSphere | Message::NewSculpt => self.reset_sculpt(),
+            // cannot drift apart. Both discard the document, so both ask.
+            Message::ResetSphere | Message::NewSculpt => {
+                return self.guard(PendingAction::NewSculpt);
+            }
+
+            // --- the unsaved-work prompt -------------------------------------
+            Message::CloseRequested(id) => return self.guard(PendingAction::Quit(id)),
+            Message::ConfirmAnswered(choice) => return self.answer_confirm(choice),
+            Message::SavedThenContinue(path) => {
+                let Some(path) = path else {
+                    // The save dialog was dismissed. That is not an answer to
+                    // the prompt, so the prompt stays up.
+                    return Task::none();
+                };
+                self.save_project(&path);
+                if self.unsaved {
+                    // The write failed and `status` says why. Leave the prompt
+                    // up rather than quitting on a file that was never written.
+                    return Task::none();
+                }
+                if let Some(action) = self.confirm.take() {
+                    return self.run_pending(action);
+                }
+            }
 
             // --- files -------------------------------------------------------
             // Each is two halves: ask for a path off the UI thread, then act on
             // whatever came back. A `None` means the dialog was dismissed, which
             // is not an error and must leave everything alone.
-            Message::OpenRequested => {
-                return Task::perform(pick_project_to_open(), Message::OpenChosen);
-            }
+            Message::OpenRequested => return self.guard(PendingAction::Open),
+            Message::OpenRecent(path) => return self.guard(PendingAction::OpenRecent(path)),
+            Message::RecoverAutosave => return self.guard(PendingAction::RecoverAutosave),
             Message::OpenChosen(path) => {
                 if let Some(path) = path {
                     self.open_project(&path);
@@ -1414,6 +1815,7 @@ mod tests {
     use crate::tablet::PenState;
     use brokkr_core::BrushKind;
     use iced::Vector;
+    use std::time::Duration;
 
     const SIZE: Vector = Vector { x: 800.0, y: 600.0 };
 
@@ -1862,8 +2264,457 @@ mod tests {
         std::fs::remove_dir_all(&directory).ok();
     }
 
-    /// A file that cannot be read must leave the sculpt on screen alone. Losing
-    /// the current work to a failed open is the worst thing this can do.
+    // --- the unsaved marker --------------------------------------------------
+    //
+    // Quitting with unsaved work used to lose it silently. These pin the flag
+    // that the confirm prompt reads, and in particular the three places it must
+    // NOT be set, since a flag that is always on is the same as no flag at all.
+
+    #[test]
+    fn a_stroke_marks_the_document_unsaved_and_a_save_clears_it() {
+        let directory = std::env::temp_dir().join(format!("brokkr-unsaved-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("sculpt.brokkr");
+
+        let mut app = app();
+        assert!(!app.unsaved, "a freshly opened sphere is not unsaved work");
+
+        press(&mut app, centre_of_viewport());
+        release(&mut app);
+        assert!(app.unsaved, "a stroke did not mark the document unsaved");
+
+        app.save_project(&path);
+        assert!(app.status.starts_with("saved"), "save reported: {}", app.status);
+        assert!(!app.unsaved, "a successful save did not clear the marker");
+
+        std::fs::remove_dir_all(&directory).ok();
+    }
+
+    /// A press and release that never met the model produces no undo entry, so
+    /// it must produce no prompt either. Without the guard inside
+    /// `finish_stroke` every stray click in empty space would arm the marker.
+    #[test]
+    fn a_press_that_misses_the_model_does_not_mark_it_unsaved() {
+        let mut app = app();
+        press(&mut app, Vector::new(4.0, 4.0));
+        release(&mut app);
+        assert!(
+            !app.unsaved,
+            "a click into empty space armed the unsaved marker, so every stray \
+             click would raise a discard prompt"
+        );
+        assert!(
+            !app.history.can_undo(),
+            "the corner of the viewport hit the model after all, so this test \
+             proves nothing -- move the press"
+        );
+
+        // The control: the same gesture at the centre does arm it, so the
+        // assertion above is about the miss and not about a press path that
+        // silently does nothing.
+        press(&mut app, centre_of_viewport());
+        release(&mut app);
+        assert!(app.unsaved, "the control press missed too, so the test is vacuous");
+    }
+
+    /// A write that failed did not save anything, so the marker has to survive
+    /// it. Clearing it in the wrong place lets the next quit go through with no
+    /// prompt and no file.
+    #[test]
+    fn a_failed_save_leaves_it_unsaved() {
+        let mut app = app();
+        press(&mut app, centre_of_viewport());
+        release(&mut app);
+        assert!(app.unsaved);
+
+        let nowhere = std::env::temp_dir()
+            .join(format!("brokkr-absent-{}", std::process::id()))
+            .join("no")
+            .join("such")
+            .join("directory")
+            .join("sculpt.brokkr");
+        app.save_project(&nowhere);
+
+        assert!(app.status.contains("could not"), "a failed save reported: {}", app.status);
+        assert!(app.unsaved, "a failed save cleared the unsaved marker");
+        assert!(app.project_path.is_none(), "a failed save claimed the file");
+    }
+
+    /// The puck's buttons call `undo`/`redo` directly rather than sending
+    /// `Message::Undo`, so the marker has to be set in the methods. Calling them
+    /// the way `drive_from_spacemouse` does is what proves that.
+    #[test]
+    fn undo_and_redo_mark_it_unsaved_through_the_direct_call_path() {
+        let mut app = app();
+        press(&mut app, centre_of_viewport());
+        release(&mut app);
+        app.unsaved = false;
+
+        app.undo();
+        assert!(app.unsaved, "undo did not mark the document unsaved");
+
+        app.unsaved = false;
+        app.redo();
+        assert!(app.unsaved, "redo did not mark the document unsaved");
+    }
+
+    /// Undo with nothing to undo changes nothing, so it must not arm the marker
+    /// either -- the flag lives inside the `history.undo` guard for this.
+    #[test]
+    fn undo_with_an_empty_history_does_not_mark_it_unsaved() {
+        let mut app = app();
+        app.undo();
+        assert!(!app.unsaved, "an undo that did nothing armed the unsaved marker");
+    }
+
+    /// `resample` returns early when the size is already in use. The marker sits
+    /// past that return, so the no-op stays a no-op.
+    #[test]
+    fn resampling_to_the_current_size_leaves_the_flag_alone() {
+        let mut app = app();
+        app.resample(app.voxel_size);
+        assert!(!app.unsaved, "a resample that did nothing armed the unsaved marker");
+
+        app.resample(app.voxel_size * 2.0);
+        assert!(app.unsaved, "a real resample did not mark the document unsaved");
+    }
+
+    #[test]
+    fn the_title_carries_the_file_name_and_the_unsaved_star() {
+        let mut app = app();
+        assert_eq!(app.title(), "untitled — BrokkrSculpt");
+
+        press(&mut app, centre_of_viewport());
+        release(&mut app);
+        assert_eq!(app.title(), "untitled* — BrokkrSculpt");
+
+        app.project_path = Some(std::path::PathBuf::from("/tmp/dragon.brokkr"));
+        assert_eq!(app.title(), "dragon.brokkr* — BrokkrSculpt");
+
+        app.unsaved = false;
+        assert_eq!(app.title(), "dragon.brokkr — BrokkrSculpt");
+    }
+
+    // --- the confirm-before-discard prompt -----------------------------------
+
+    /// An app with a stroke in it and nowhere to save it, which is the state
+    /// every one of these is about.
+    fn app_with_unsaved_work() -> Brokkr {
+        let mut app = app();
+        press(&mut app, centre_of_viewport());
+        release(&mut app);
+        assert!(app.unsaved, "the fixture did not actually dirty the document");
+        app
+    }
+
+    #[test]
+    fn new_with_unsaved_work_raises_the_prompt_and_does_not_reset() {
+        let mut app = app_with_unsaved_work();
+        let sculpted = app.volume.brick_coords().count();
+
+        update(&mut app, Message::NewSculpt);
+
+        assert_eq!(app.confirm, Some(PendingAction::NewSculpt), "no prompt was raised");
+        assert!(app.unsaved, "the document was reset behind the prompt");
+        assert_eq!(
+            app.volume.brick_coords().count(),
+            sculpted,
+            "New threw the sculpt away before the user had answered"
+        );
+    }
+
+    /// The panel's Reset sphere button shares an arm with File > New, so it
+    /// discards the document identically and must ask identically.
+    #[test]
+    fn reset_sphere_asks_as_well_since_it_shares_the_arm() {
+        let mut app = app_with_unsaved_work();
+        update(&mut app, Message::ResetSphere);
+        assert_eq!(app.confirm, Some(PendingAction::NewSculpt));
+    }
+
+    #[test]
+    fn quitting_with_unsaved_work_raises_the_prompt() {
+        let mut app = app_with_unsaved_work();
+        let id = iced::window::Id::unique();
+        update(&mut app, Message::CloseRequested(id));
+        assert_eq!(
+            app.confirm,
+            Some(PendingAction::Quit(id)),
+            "the close request was not intercepted, so quitting still loses work"
+        );
+    }
+
+    /// With nothing to lose, every gated action must behave exactly as it did
+    /// before the gate existed.
+    #[test]
+    fn a_clean_document_is_not_prompted_at_all() {
+        let mut app = app();
+        update(&mut app, Message::NewSculpt);
+        assert!(app.confirm.is_none(), "a clean document was prompted");
+
+        update(&mut app, Message::CloseRequested(iced::window::Id::unique()));
+        assert!(app.confirm.is_none(), "a clean document was prompted on quit");
+
+        update(&mut app, Message::OpenRequested);
+        assert!(app.confirm.is_none(), "a clean document was prompted on open");
+    }
+
+    /// The prompt draws over the viewport but the shader widget still sees
+    /// events wherever the cursor is. A press behind the card must neither
+    /// dismiss the prompt nor sculpt into a document about to be discarded.
+    #[test]
+    fn a_viewport_press_does_not_dismiss_the_prompt_or_sculpt() {
+        let mut app = app_with_unsaved_work();
+        update(&mut app, Message::NewSculpt);
+        let before = app.volume.sample_world(Vec3::ZERO);
+        let entries = app.history_stats.undo_entries;
+
+        press(&mut app, centre_of_viewport());
+        release(&mut app);
+
+        assert_eq!(app.confirm, Some(PendingAction::NewSculpt), "a stray click dismissed it");
+        assert_eq!(app.volume.sample_world(Vec3::ZERO), before, "it sculpted behind the prompt");
+        assert_eq!(
+            app.history_stats.undo_entries, entries,
+            "it recorded a stroke behind the prompt"
+        );
+    }
+
+    /// Escape answers Cancel. It must not fall through to the menu clears,
+    /// which would drop the prompt without answering it.
+    #[test]
+    fn escape_cancels_the_prompt_rather_than_dropping_it() {
+        let mut app = app_with_unsaved_work();
+        update(&mut app, Message::NewSculpt);
+
+        update(&mut app, Message::MenuClosed);
+
+        assert!(app.confirm.is_none(), "escape left the prompt up");
+        assert!(app.unsaved, "escape discarded the work it was asking about");
+        assert!(app.history.can_undo(), "escape reset the sculpt");
+    }
+
+    #[test]
+    fn discard_runs_the_pending_action() {
+        let mut app = app_with_unsaved_work();
+        update(&mut app, Message::NewSculpt);
+        update(&mut app, Message::ConfirmAnswered(ConfirmChoice::Discard));
+
+        assert!(app.confirm.is_none());
+        assert!(!app.unsaved, "the fresh sphere is not unsaved work");
+        assert!(!app.history.can_undo(), "the reset did not happen");
+    }
+
+    #[test]
+    fn cancel_leaves_everything_exactly_as_it_was() {
+        let mut app = app_with_unsaved_work();
+        let bricks = app.volume.brick_coords().count();
+        update(&mut app, Message::NewSculpt);
+        update(&mut app, Message::ConfirmAnswered(ConfirmChoice::Cancel));
+
+        assert!(app.confirm.is_none());
+        assert!(app.unsaved, "cancel cleared the unsaved marker");
+        assert_eq!(app.volume.brick_coords().count(), bricks, "cancel reset the sculpt anyway");
+    }
+
+    /// Save-then-continue, for a document that already has a file.
+    #[test]
+    fn saving_from_the_prompt_writes_the_file_and_then_acts() {
+        let directory =
+            std::env::temp_dir().join(format!("brokkr-confirm-save-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("sculpt.brokkr");
+
+        let mut app = app_with_unsaved_work();
+        app.save_project(&path);
+        assert!(!app.unsaved);
+
+        // Dirty it again so the prompt has something to be about.
+        press(&mut app, Vector::new(SIZE.x / 2.0 + 12.0, SIZE.y / 2.0));
+        release(&mut app);
+        assert!(app.unsaved);
+
+        update(&mut app, Message::NewSculpt);
+        update(&mut app, Message::ConfirmAnswered(ConfirmChoice::Save));
+
+        assert!(app.confirm.is_none(), "the prompt stayed up after a good save");
+        assert!(!app.history.can_undo(), "the pending New did not run after the save");
+        // And the file on disk is the sculpt as it was, not the fresh sphere.
+        let mut reopened = Brokkr::with_tablet(crate::tablet::Tablet::inert());
+        reopened.open_project(&path);
+        assert!(reopened.status.starts_with("opened"), "open reported: {}", reopened.status);
+
+        std::fs::remove_dir_all(&directory).ok();
+    }
+
+    /// A save that fails must not be treated as a save. Continuing here would
+    /// quit on a file that was never written, which is the exact loss the
+    /// prompt exists to prevent.
+    #[test]
+    fn a_failed_save_from_the_prompt_does_not_continue() {
+        let mut app = app_with_unsaved_work();
+        app.project_path = Some(
+            std::env::temp_dir()
+                .join(format!("brokkr-absent-{}", std::process::id()))
+                .join("nope")
+                .join("sculpt.brokkr"),
+        );
+
+        update(&mut app, Message::NewSculpt);
+        update(&mut app, Message::ConfirmAnswered(ConfirmChoice::Save));
+
+        assert!(app.status.contains("could not"), "reported: {}", app.status);
+        assert_eq!(
+            app.confirm,
+            Some(PendingAction::NewSculpt),
+            "the prompt was dismissed by a save that did not happen"
+        );
+        assert!(app.unsaved, "a failed save cleared the marker");
+        assert!(app.history.can_undo(), "the sculpt was discarded on a failed save");
+    }
+
+    /// Dismissing the file dialog is not an answer to the prompt.
+    #[test]
+    fn dismissing_the_save_dialog_leaves_the_prompt_up() {
+        let mut app = app_with_unsaved_work();
+        update(&mut app, Message::NewSculpt);
+        update(&mut app, Message::SavedThenContinue(None));
+
+        assert_eq!(app.confirm, Some(PendingAction::NewSculpt));
+        assert!(app.history.can_undo(), "the sculpt was discarded");
+    }
+
+    // --- the recent list and the crash net -----------------------------------
+
+    /// A scratch directory for one test's recent list and autosave, so nothing
+    /// here can reach the real ones.
+    fn scratch(name: &str) -> std::path::PathBuf {
+        let directory = std::env::temp_dir().join(format!("brokkr-{name}-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).unwrap();
+        directory
+    }
+
+    #[test]
+    fn saving_and_opening_both_record_into_the_recent_list() {
+        let directory = scratch("recent-record");
+        let path = directory.join("sculpt.brokkr");
+
+        let mut app = app_with_unsaved_work();
+        app.recent = crate::recent::Recent::load_from(Some(directory.join("recent")));
+        app.save_project(&path);
+        assert_eq!(app.recent.paths().len(), 1, "a save did not record the file");
+
+        let mut reopened = Brokkr::with_tablet(crate::tablet::Tablet::inert());
+        reopened.recent = crate::recent::Recent::load_from(Some(directory.join("recent")));
+        reopened.open_project(&path);
+        assert!(reopened.status.starts_with("opened"), "open reported: {}", reopened.status);
+        assert_eq!(reopened.recent.paths()[0], std::path::absolute(&path).unwrap());
+
+        std::fs::remove_dir_all(&directory).ok();
+    }
+
+    /// A file that has been moved or deleted should stop being offered, rather
+    /// than sitting in the menu failing every time it is clicked.
+    #[test]
+    fn opening_a_missing_recent_file_drops_it_from_the_list() {
+        let directory = scratch("recent-missing");
+        let gone = directory.join("gone.brokkr");
+
+        let mut app = app();
+        app.recent = crate::recent::Recent::load_from(Some(directory.join("recent")));
+        app.recent.record(&gone);
+        assert_eq!(app.recent.paths().len(), 1);
+
+        app.open_project(&gone);
+        assert!(app.status.contains("could not"), "reported: {}", app.status);
+        assert!(app.recent.is_empty(), "a file that cannot be opened stayed in the list");
+
+        std::fs::remove_dir_all(&directory).ok();
+    }
+
+    #[test]
+    fn the_autosave_round_trips_but_is_not_a_save() {
+        let directory = scratch("autosave");
+        let mut app = app_with_unsaved_work();
+        app.autosave_file = Some(directory.join("autosave.brokkr"));
+        let probe = Vec3::ZERO;
+        let sculpted = app.volume.sample_world(probe);
+
+        app.write_autosave();
+
+        assert!(app.has_autosave(), "nothing was written");
+        assert!(app.unsaved, "the autosave cleared the unsaved marker, so quitting would not ask");
+        assert!(app.project_path.is_none(), "the autosave claimed to be the document's file");
+
+        let mut recovered = Brokkr::with_tablet(crate::tablet::Tablet::inert());
+        recovered.autosave_file = app.autosave_file.clone();
+        recovered.recover_autosave();
+
+        assert_eq!(recovered.volume.sample_world(probe), sculpted, "the field came back different");
+        assert!(
+            recovered.project_path.is_none(),
+            "a recovered autosave adopted its own path, so the next Save would write back into \
+             the crash net instead of asking for a real file"
+        );
+        assert!(recovered.unsaved, "a recovered autosave must still want saving somewhere real");
+        assert!(recovered.recent.is_empty(), "the crash net was listed as a recent document");
+
+        std::fs::remove_dir_all(&directory).ok();
+    }
+
+    #[test]
+    fn an_explicit_save_throws_the_crash_net_away() {
+        let directory = scratch("autosave-cleared");
+        let mut app = app_with_unsaved_work();
+        app.autosave_file = Some(directory.join("autosave.brokkr"));
+        app.recent = crate::recent::Recent::load_from(Some(directory.join("recent")));
+        app.write_autosave();
+        assert!(app.has_autosave());
+
+        app.save_project(&directory.join("sculpt.brokkr"));
+        assert!(app.status.starts_with("saved"), "save reported: {}", app.status);
+        assert!(
+            !app.has_autosave(),
+            "a stale crash net survived a real save, so File > Recover would offer to restore \
+             something older than the file on disk"
+        );
+
+        std::fs::remove_dir_all(&directory).ok();
+    }
+
+    #[test]
+    fn the_autosave_tick_waits_for_the_interval_and_for_the_stroke_to_end() {
+        let directory = scratch("autosave-tick");
+        let mut app = app();
+        app.autosave_file = Some(directory.join("autosave.brokkr"));
+
+        // Clean document: nothing to protect, so nothing is written however
+        // long it has been.
+        app.last_autosave = Instant::now() - Duration::from_secs(600);
+        app.maybe_autosave();
+        assert!(!app.has_autosave(), "a clean document was autosaved");
+
+        // Dirty, but the interval has not elapsed.
+        press(&mut app, centre_of_viewport());
+        release(&mut app);
+        app.last_autosave = Instant::now();
+        app.maybe_autosave();
+        assert!(!app.has_autosave(), "it autosaved before the interval was up");
+
+        // Dirty and overdue, but mid-drag: a write here reads as a stutter in
+        // the brush.
+        app.last_autosave = Instant::now() - Duration::from_secs(600);
+        press(&mut app, centre_of_viewport());
+        app.maybe_autosave();
+        assert!(!app.has_autosave(), "it autosaved in the middle of a stroke");
+
+        // Released, dirty and overdue.
+        release(&mut app);
+        app.maybe_autosave();
+        assert!(app.has_autosave(), "an overdue autosave never happened");
+
+        std::fs::remove_dir_all(&directory).ok();
+    }
     #[test]
     fn a_bad_file_reports_and_changes_nothing() {
         let directory = std::env::temp_dir().join(format!("brokkr-bad-{}", std::process::id()));
@@ -2356,7 +3207,12 @@ mod tests {
         release(&mut app);
         assert!(app.history.can_undo());
 
+        // Reset now goes through the unsaved-work prompt, because it discards
+        // the document. Answering Discard is what the button used to do on its
+        // own; the history assertions below are unchanged.
         update(&mut app, Message::ResetSphere);
+        update(&mut app, Message::ConfirmAnswered(ConfirmChoice::Discard));
+
         assert!(!app.history.can_undo(), "reset must clear history");
         assert!(!app.history.can_redo());
     }

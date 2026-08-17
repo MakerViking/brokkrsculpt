@@ -25,7 +25,7 @@ use super::{
 use glam::Vec2;
 
 use crate::app::SizingTarget;
-use crate::message::{ExportFormat, Message, PanelSection, TopMenu};
+use crate::message::{ConfirmChoice, ExportFormat, Message, PanelSection, TopMenu};
 use crate::spacemouse::{self, ButtonAction};
 use crate::tablet::Diagnosis;
 use crate::theme;
@@ -58,6 +58,12 @@ impl Brokkr {
         ]
         .spacing(theme::S3)
         .padding(theme::S3);
+
+        // The unsaved-work prompt outranks an open menu: it is modal, and a
+        // menu drawn over it would be reachable while the prompt is not.
+        if let Some(pending) = &self.confirm {
+            return stack![body, self.confirm_card(pending)].into();
+        }
 
         match self.top_menu {
             // Over everything, and offset down past the bar it drops from.
@@ -95,14 +101,9 @@ impl Brokkr {
             },
         );
 
-        // What the sculpt is called, and whether it has a home yet.
-        let title = match &self.project_path {
-            Some(path) => path
-                .file_name()
-                .map(|name| name.to_string_lossy().into_owned())
-                .unwrap_or_else(|| path.display().to_string()),
-            None => "untitled".to_string(),
-        };
+        // What the sculpt is called, and whether it has unwritten changes. The
+        // star matches the window title, which shares `document_name`.
+        let title = format!("{}{}", self.document_name(), if self.unsaved { "*" } else { "" });
 
         container(
             row![
@@ -123,6 +124,65 @@ impl Brokkr {
         .width(Length::Fill)
         .style(theme::panel)
         .into()
+    }
+
+    /// The modal prompt shown when an action would discard unsaved work.
+    ///
+    /// Two layers, and both are load bearing. The scrim is full size and
+    /// swallows presses, because iced 0.14 has no modal and a bare `stack!`
+    /// layer lets clicks through to the sliders and the Reset button
+    /// underneath. The card sits on it, centred, using `menu_card` rather than
+    /// `overlay_card`: at 0.82 alpha over the translucent debug overlay neither
+    /// was readable.
+    fn confirm_card(&self, pending: &super::PendingAction) -> Element<'_, Message> {
+        // The three styles are all plain `fn`s of the same shape, so the
+        // parameter is spelled out rather than left to inference -- otherwise
+        // the first call fixes the closure to one specific function's type and
+        // the other two stop compiling.
+        type ButtonStyle = fn(&iced::Theme, button::Status) -> button::Style;
+        let answer = |label: &'static str, choice: ConfirmChoice, style: ButtonStyle| {
+            button(text(label).size(theme::TEXT_SIZE))
+                .padding(Padding {
+                    top: theme::S2,
+                    bottom: theme::S2,
+                    left: theme::S5,
+                    right: theme::S5,
+                })
+                .style(style)
+                .on_press(Message::ConfirmAnswered(choice))
+        };
+
+        let card = container(
+            column![
+                text("Unsaved changes").size(theme::TEXT_SIZE).color(theme::TEXT),
+                // Names the document and the action, because "are you sure?" on
+                // its own does not say what is about to be lost.
+                text(format!(
+                    "{} will discard the changes to {}.",
+                    pending.describe(),
+                    self.document_name()
+                ))
+                .size(theme::TEXT_SIZE_SMALL)
+                .color(theme::TEXT_DIM),
+                row![
+                    answer("Save", ConfirmChoice::Save, theme::tool_button_active),
+                    answer("Discard", ConfirmChoice::Discard, theme::danger_button),
+                    answer("Cancel", ConfirmChoice::Cancel, theme::tool_button),
+                ]
+                .spacing(theme::S3),
+            ]
+            .spacing(theme::S4),
+        )
+        .padding(theme::S5)
+        .style(theme::menu_card);
+
+        container(card)
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .align_x(Alignment::Center)
+            .align_y(Alignment::Center)
+            .style(theme::scrim)
+            .into()
     }
 
     /// The panel that drops from an open top bar menu.
@@ -162,15 +222,56 @@ impl Brokkr {
                         ))
                     },
                 );
-                column![
+                // Recent files, if there are any. Shown by file name, since the
+                // full path is usually far wider than the menu -- but a name on
+                // its own is ambiguous across directories, so the path goes in
+                // the status line when one is chosen.
+                let recent =
+                    self.recent.paths().iter().fold(column![].spacing(1), |assembled, path| {
+                        let label = path
+                            .file_name()
+                            .map(|name| name.to_string_lossy().into_owned())
+                            .unwrap_or_else(|| path.display().to_string());
+                        assembled.push(
+                            button(text(label).size(theme::TEXT_SIZE_SMALL))
+                                .width(Length::Fill)
+                                .padding(Padding {
+                                    top: 3.0,
+                                    bottom: 3.0,
+                                    left: theme::S3,
+                                    right: theme::S3,
+                                })
+                                .style(theme::section_heading)
+                                .on_press(Message::OpenRecent(path.clone())),
+                        )
+                    });
+
+                let mut items = column![
                     entry("New", Message::NewSculpt),
                     entry("Open…", Message::OpenRequested),
-                    entry("Save", Message::SaveRequested),
-                    entry("Save As…", Message::SaveAsRequested),
-                    separator(),
-                    exports,
                 ]
-                .spacing(1)
+                .spacing(1);
+                // Only when there is one to recover. A permanently greyed item
+                // would say "this application crashes" every time the menu is
+                // opened.
+                if self.has_autosave() {
+                    items = items.push(entry("Recover autosave", Message::RecoverAutosave));
+                }
+                if !self.recent.is_empty() {
+                    items = items.push(separator()).push(
+                        text("RECENT")
+                            .size(theme::CAPTION_SIZE)
+                            .color(theme::TEXT_MUTE)
+                            .width(Length::Fill),
+                    );
+                    items = items.push(recent);
+                    items = items.push(separator());
+                }
+                items
+                    .push(entry("Save", Message::SaveRequested))
+                    .push(entry("Save As…", Message::SaveAsRequested))
+                    .push(separator())
+                    .push(exports)
             }
             // No Import here on purpose. Importing a mesh is a voxeliser, not
             // file plumbing, so the item appears when that exists rather than

@@ -9,6 +9,7 @@ mod cursor;
 mod input_watch;
 mod message;
 mod navcube;
+mod recent;
 mod spacemouse;
 mod tablet;
 mod theme;
@@ -48,5 +49,10 @@ fn main() -> iced::Result {
         .theme(app_theme)
         .default_font(theme::FONT)
         .antialiasing(true)
+        // The close button must not end the process on its own: unsaved work
+        // needs a prompt first. `Brokkr::subscription` picks the request up as
+        // `Message::CloseRequested` and is the only thing that closes the
+        // window from here on, so the two must be changed together.
+        .exit_on_close_request(false)
         .run()
 }

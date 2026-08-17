@@ -189,6 +189,43 @@ pub fn tool_button_active(
     }
 }
 
+/// The destructive answer in a prompt: throwing work away.
+///
+/// Outlined rather than filled, so the accent-filled safe answer stays the one
+/// the eye lands on. A filled red button next to a filled orange one reads as
+/// two equally weighted choices, which is the wrong shape for "save" versus
+/// "lose it".
+pub fn danger_button(
+    _theme: &iced::Theme,
+    status: iced::widget::button::Status,
+) -> iced::widget::button::Style {
+    use iced::widget::button::Status;
+    let background = match status {
+        Status::Hovered => RAISED,
+        Status::Pressed => RAISED_2,
+        Status::Active | Status::Disabled => PANEL_2,
+    };
+    iced::widget::button::Style {
+        background: Some(background.into()),
+        text_color: ERROR,
+        border: iced::Border { color: ERROR, width: 1.0, radius: RADIUS_SM.into() },
+        ..Default::default()
+    }
+}
+
+/// The dimming layer behind a modal prompt.
+///
+/// Dark but translucent: the question is about the sculpt, so the sculpt has to
+/// stay visible behind it. Its real job is not decoration -- it is the widget
+/// that swallows presses, because the `stack!` layers this interface already
+/// uses do not block the widgets underneath them.
+pub fn scrim(_theme: &iced::Theme) -> iced::widget::container::Style {
+    iced::widget::container::Style {
+        background: Some(rgba(0x00, 0x00, 0x00, 0.55).into()),
+        ..Default::default()
+    }
+}
+
 /// A menu that drops from the bar, or any surface you must be able to read.
 ///
 /// Opaque, unlike [`overlay_card`]. That card is 0.82 alpha because it floats

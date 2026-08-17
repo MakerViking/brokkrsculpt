@@ -92,6 +92,17 @@ impl TopMenu {
     }
 }
 
+/// What the user answered to the unsaved-work prompt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfirmChoice {
+    /// Write the file first, then go on with whatever was asked for.
+    Save,
+    /// Throw the changes away and go on.
+    Discard,
+    /// Stay where we are and do nothing.
+    Cancel,
+}
+
 /// A collapsible block of the properties panel.
 ///
 /// The panel has more in it than fits a 1080 high window, and a scrollable
@@ -221,6 +232,10 @@ pub enum Message {
     /// Open a saved sculpt: ask for a file, then load whatever came back.
     OpenRequested,
     OpenChosen(Option<std::path::PathBuf>),
+    /// Open a named file straight from the recent list, with no dialog.
+    OpenRecent(std::path::PathBuf),
+    /// Load the crash net left behind by a session that did not save.
+    RecoverAutosave,
     /// Save. Over the current file if there is one, otherwise as a new one.
     SaveRequested,
     SaveAsRequested,
@@ -231,6 +246,15 @@ pub enum Message {
     /// Rebuild the volume at a different voxel size, which is the explicit
     /// operation that increases or reduces detail.
     Resample(f32),
+    /// The window manager asked to close. Carries the window, because
+    /// `exit_on_close_request(false)` means nothing closes it but us.
+    CloseRequested(iced::window::Id),
+    /// An answer to the unsaved-work prompt.
+    ConfirmAnswered(ConfirmChoice),
+    /// A path chosen by the Save button *inside* the prompt. Separate from
+    /// `SaveChosen` because this one continues to the pending action after a
+    /// successful write, and must not after a failed one.
+    SavedThenContinue(Option<std::path::PathBuf>),
     SpaceMouse(SpaceMouseSetting),
     /// Open or close one block of the properties panel.
     SectionToggled(PanelSection),
