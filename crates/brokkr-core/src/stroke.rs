@@ -26,6 +26,14 @@ pub const MAX_STAMPS_PER_EVENT: usize = 64;
 #[derive(Debug, Default, Clone)]
 pub struct Stroke {
     last: Option<Vec3>,
+    /// Unit vector along the last segment walked, or zero before the stroke
+    /// has moved far enough to have one.
+    ///
+    /// Kept as a field rather than returned alongside the stamps because every
+    /// stamp one `advance` produces shares it: the walk is a straight line, so
+    /// one direction covers the lot and the output stays a plain list of
+    /// points.
+    direction: Vec3,
 }
 
 impl Stroke {
@@ -36,6 +44,9 @@ impl Stroke {
     /// Start a stroke, which always stamps once at the starting point.
     pub fn begin(&mut self, at: Vec3, out: &mut Vec<Vec3>) {
         self.last = Some(at);
+        // A stroke that has not moved has no direction yet. Guessing one would
+        // comb the first stamp of every stroke an arbitrary way.
+        self.direction = Vec3::ZERO;
         out.push(at);
     }
 
@@ -47,6 +58,17 @@ impl Stroke {
 
     pub fn end(&mut self) {
         self.last = None;
+        self.direction = Vec3::ZERO;
+    }
+
+    /// Which way the stroke is travelling, once it has moved far enough to
+    /// know. `None` at the start of a stroke and after it ends.
+    ///
+    /// Patterns that comb read this, so hair lies the way the brush was
+    /// dragged rather than along a fixed world axis.
+    #[inline]
+    pub fn direction(&self) -> Option<Vec3> {
+        (self.direction != Vec3::ZERO).then_some(self.direction)
     }
 
     /// Walk from the last stamp to `to`, appending a stamp centre every
@@ -68,7 +90,9 @@ impl Stroke {
         }
 
         let steps = ((distance / spacing).floor() as usize).min(MAX_STAMPS_PER_EVENT);
-        let step = delta / distance * spacing;
+        let unit = delta / distance;
+        self.direction = unit;
+        let step = unit * spacing;
         let mut at = from;
         for _ in 0..steps {
             at += step;

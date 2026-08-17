@@ -2,7 +2,7 @@
 
 //! Messages exchanged between the widget tree and the application.
 
-use brokkr_core::{BrushKind, FalloffCurve, MirrorAxis};
+use brokkr_core::{BrushKind, FalloffCurve, MirrorAxis, PatternKind};
 use iced::Vector;
 
 use crate::spacemouse::{Action, Axis, ButtonAction, Mode};
@@ -106,6 +106,12 @@ pub enum Message {
     BrushRadiusChanged(f32),
     BrushStrengthChanged(f32),
     FalloffChanged(FalloffCurve),
+    /// Which surface pattern multiplies into the brush. See
+    /// `brokkr_core::pattern`: one control that modifies every brush, rather
+    /// than a brush per pattern.
+    PatternChanged(PatternKind),
+    PatternScaleChanged(f32),
+    PatternDepthChanged(f32),
     /// Flip one mirror plane. A toggle rather than an explicit on/off,
     /// because both the strip button and the keyboard act on what is currently
     /// set rather than knowing it.

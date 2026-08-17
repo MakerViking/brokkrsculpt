@@ -302,6 +302,10 @@ impl Brokkr {
         let pressure = self.tablet.stamp_pressure(self.pressure_enabled, self.pressure_curve);
         let lean = self.pen_lean();
         let brush = self.effective_brush();
+        // Which way the drag is going, for the patterns that comb. Zero until
+        // the stroke has moved far enough to have a direction, which the
+        // pattern copes with by picking any direction across the surface.
+        let tangent = self.stroke.direction().unwrap_or(Vec3::ZERO);
 
         for index in 0..self.stamp_centres.len() {
             let centre = self.stamp_centres[index];
@@ -311,7 +315,8 @@ impl Brokkr {
             // Leaning the pen rotates the direction the brush pushes in, which
             // steers every brush at once because they all read this normal.
             let normal = lean_normal(self.volume.gradient_world(centre), lean);
-            let stamp = Stamp::new(centre, normal, direction).with_pressure(pressure);
+            let stamp =
+                Stamp::new(centre, normal, direction).with_pressure(pressure).with_tangent(tangent);
             brush.apply_symmetric(&mut self.volume, &stamp, self.symmetry, &mut self.brush_scratch);
         }
         self.perf.stamps = self.stamp_centres.len();
@@ -676,6 +681,9 @@ impl Brokkr {
             Message::BrushRadiusChanged(radius) => self.brush.radius = radius,
             Message::BrushStrengthChanged(strength) => self.brush.strength = strength,
             Message::SymmetryAxisToggled(axis) => self.symmetry = self.symmetry.toggled(axis),
+            Message::PatternChanged(kind) => self.brush.pattern.kind = kind,
+            Message::PatternScaleChanged(scale) => self.brush.pattern.scale_mm = scale,
+            Message::PatternDepthChanged(depth) => self.brush.pattern.depth = depth,
             Message::BrushRadiusScaled(factor) => {
                 self.brush.radius =
                     (self.brush.radius * factor).clamp(MIN_RADIUS_MM, MAX_RADIUS_MM);

@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 
 use brokkr_core::{
     BrickCoord, BrickMesh, Brush, BrushDirection, BrushKind, BrushScratch, FalloffCurve, History,
-    MeshScratch, Stamp, Stroke, Symmetry, Volume,
+    MeshScratch, Pattern, PatternKind, Stamp, Stroke, Symmetry, Volume,
 };
 use glam::Vec3;
 
@@ -147,6 +147,7 @@ fn main() {
         radius: 12.0 * voxel_size,
         strength: 0.25,
         falloff: FalloffCurve::Smooth,
+        ..Brush::default()
     };
     let spacing = brush.spacing(voxel_size);
 
@@ -158,7 +159,17 @@ fn main() {
     // Slow and fast drags over the same path. The fast one is the case the
     // per event budget really has to survive: fewer pointer samples means more
     // interpolated stamps per event.
-    for (label, events) in [("slow drag", STEPS), ("fast drag", STEPS / 5)] {
+    for (label, events, pattern) in [
+        ("slow drag", STEPS, PatternKind::None),
+        ("fast drag", STEPS / 5, PatternKind::None),
+        // Hair measured as the worst of the six in the per pattern table
+        // below. A pattern multiplies into the hottest loop in the project, so
+        // the case that has to hold is the fast drag with one switched on --
+        // not a single stamp in isolation.
+        ("fast drag, hair pattern", STEPS / 5, PatternKind::Hair),
+    ] {
+        let brush =
+            Brush { pattern: Pattern { kind: pattern, scale_mm: 2.0, depth: 1.0 }, ..brush };
         let mut edit_samples = Samples::new();
         let mut remesh_samples = Samples::new();
         let mut combined_samples = Samples::new();
@@ -183,7 +194,8 @@ fn main() {
                 let normal = volume.gradient_world(at);
                 brush.apply_symmetric(
                     &mut volume,
-                    &Stamp::new(at, normal, BrushDirection::Add),
+                    &Stamp::new(at, normal, BrushDirection::Add)
+                        .with_tangent(stroke.direction().unwrap_or(Vec3::ZERO)),
                     Symmetry::X,
                     &mut brush_scratch,
                 );
@@ -263,6 +275,38 @@ fn main() {
             each.apply(
                 &mut volume,
                 &Stamp::new(at, normal, BrushDirection::Add),
+                &mut brush_scratch,
+            );
+            samples.0.push(started.elapsed());
+            volume.take_dirty(&mut dirty);
+        }
+        passed &= report(&format!("  {kind}"), &mut samples, EDIT_BUDGET);
+    }
+    println!();
+
+    // Per pattern comparison. A pattern is a multiply inside the hottest loop
+    // in the project, evaluated per voxel, so it gets its own gate: the plan
+    // that added them named noise as the risk, and the honest answer to a
+    // blown budget here is a cheaper hash rather than a bigger budget.
+    println!("  cost of one stamp by pattern, on top of a draw brush:");
+    for kind in PatternKind::ALL {
+        let each = Brush {
+            pattern: Pattern { kind, scale_mm: 2.0, depth: 1.0 },
+            ..Brush { kind: BrushKind::Draw, ..brush }
+        };
+        let mut samples = Samples::new();
+        for step in 0..60 {
+            let angle = step as f32 / 60.0 * std::f32::consts::TAU;
+            let at = centre + Vec3::new(angle.cos(), 0.0, angle.sin()) * radius;
+            let normal = volume.gradient_world(at);
+            let started = Instant::now();
+            each.apply(
+                &mut volume,
+                &Stamp::new(at, normal, BrushDirection::Add).with_tangent(Vec3::new(
+                    -angle.sin(),
+                    0.0,
+                    angle.cos(),
+                )),
                 &mut brush_scratch,
             );
             samples.0.push(started.elapsed());

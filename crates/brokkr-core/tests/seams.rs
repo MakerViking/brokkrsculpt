@@ -228,3 +228,58 @@ fn remeshing_only_dirty_bricks_matches_remeshing_everything() {
         );
     }
 }
+
+#[test]
+fn patterned_sculpting_keeps_the_surface_closed() {
+    // Deliberately asks for a feature finer than the field can carry. The
+    // engine clamps it up to MIN_SCALE_VOXELS, and this test is what proves
+    // the clamp is doing its job: without it, one edge comes back shared by
+    // four triangles and the export validator would refuse the model.
+    const SCALE_UNDER_TEST: f32 = 0.01;
+    // A pattern is the one thing that varies *within* a stamp rather than
+    // between stamps, so if anything could put a discontinuity across a brick
+    // boundary it is this. Full depth, and a feature size of a couple of
+    // voxels, which is the harshest setting the interface offers.
+    use brokkr_core::{
+        Brush, BrushDirection, BrushKind, BrushScratch, Pattern, PatternKind, Stamp,
+    };
+
+    let mut volume = sphere_spanning_several_bricks();
+    let mut scratch = BrushScratch::new();
+
+    for (index, kind) in PatternKind::ALL.into_iter().enumerate() {
+        let brush = Brush {
+            kind: BrushKind::Draw,
+            radius: 9.0,
+            strength: 0.6,
+            pattern: Pattern { kind, scale_mm: SCALE_UNDER_TEST, depth: 1.0 },
+            ..Brush::default()
+        };
+        // Right on brick corners, which is the worst case for tiling.
+        for (centre, direction) in [
+            (Vec3::new(64.0, 64.0, 64.0), BrushDirection::Add),
+            (Vec3::new(32.0, 32.0, 48.0), BrushDirection::Subtract),
+            (Vec3::new(48.0, 8.0, 48.0 + index as f32), BrushDirection::Add),
+        ] {
+            let normal = volume.gradient_world(centre);
+            brush.apply(
+                &mut volume,
+                &Stamp::new(centre, normal, direction).with_tangent(Vec3::X),
+                &mut scratch,
+            );
+        }
+    }
+
+    let coords = brick_range(&volume);
+    let (edges, triangles) = edge_use_counts(&volume, &coords);
+    assert!(triangles > 10_000);
+
+    let open: Vec<_> = edges.iter().filter(|(_, count)| **count != 2).collect();
+    assert!(
+        open.is_empty(),
+        "patterned sculpting opened {} of {} edges. First few: {:?}",
+        open.len(),
+        edges.len(),
+        &open.iter().take(5).collect::<Vec<_>>()
+    );
+}

@@ -45,6 +45,7 @@
 
 use glam::Vec3;
 
+use crate::pattern::{Pattern, Prepared};
 use crate::region::FieldRegion;
 use crate::volume::Volume;
 
@@ -383,16 +384,27 @@ pub struct Stamp {
     /// Stylus pressure from 0 to 1, scaling strength. Defaults to 1, which is
     /// what a mouse always reports.
     pub pressure: f32,
+    /// Which way the stroke is travelling, in world space. Only the patterns
+    /// that comb read it, and a zero vector means "not known", which they cope
+    /// with by picking any direction across the surface.
+    pub tangent: Vec3,
     pub direction: BrushDirection,
 }
 
 impl Stamp {
     pub fn new(centre: Vec3, normal: Vec3, direction: BrushDirection) -> Self {
-        Self { centre, normal, pressure: 1.0, direction }
+        Self { centre, normal, pressure: 1.0, tangent: Vec3::ZERO, direction }
     }
 
     pub fn with_pressure(mut self, pressure: f32) -> Self {
         self.pressure = pressure.clamp(0.0, 1.0);
+        self
+    }
+
+    /// Set the stroke's direction of travel, which is what combs a hair
+    /// pattern along the drag.
+    pub fn with_tangent(mut self, tangent: Vec3) -> Self {
+        self.tangent = tangent;
         self
     }
 }
@@ -421,11 +433,21 @@ pub struct Brush {
     /// overlapping stamps, so this is per stamp and not per stroke.
     pub strength: f32,
     pub falloff: FalloffCurve,
+    /// A surface pattern multiplied into the weight. See [`crate::pattern`]:
+    /// it modifies whichever brush is selected rather than being a brush of
+    /// its own.
+    pub pattern: Pattern,
 }
 
 impl Default for Brush {
     fn default() -> Self {
-        Self { kind: BrushKind::Draw, radius: 3.0, strength: 0.15, falloff: FalloffCurve::Smooth }
+        Self {
+            kind: BrushKind::Draw,
+            radius: 3.0,
+            strength: 0.15,
+            falloff: FalloffCurve::Smooth,
+            pattern: Pattern::default(),
+        }
     }
 }
 
@@ -493,6 +515,14 @@ impl Brush {
             _ => stamp.centre,
         };
 
+        // Resolved once per stamp rather than per voxel: the projection axes
+        // and the reciprocal scale do not vary inside one stamp.
+        let pattern = if self.pattern.is_off() {
+            Prepared::OFF
+        } else {
+            self.pattern.prepare(voxel_size, stamp.normal, stamp.tangent)
+        };
+
         let kind = self.kind;
         let falloff = self.falloff;
         let centre = stamp.centre;
@@ -504,7 +534,14 @@ impl Brush {
             if distance >= 1.0 {
                 return value;
             }
-            let weight = falloff.weight(distance) * gain;
+            let shaped = falloff.weight(distance) * gain;
+            if shaped <= 0.0 {
+                return value;
+            }
+            // The pattern is one extra multiply, and it is evaluated only for
+            // voxels the falloff has not already zeroed. It stays in 0..=1, so
+            // the blending brushes below keep a legal lerp factor.
+            let weight = shaped * pattern.weight(position);
             if weight <= 0.0 {
                 return value;
             }
@@ -597,7 +634,7 @@ mod tests {
     }
 
     fn brush(kind: BrushKind) -> Brush {
-        Brush { kind, radius: 8.0, strength: 0.4, falloff: FalloffCurve::Smooth }
+        Brush { kind, radius: 8.0, strength: 0.4, ..Brush::default() }
     }
 
     #[test]
@@ -658,7 +695,7 @@ mod tests {
             let mut volume = sphere();
             let (point, normal) = surface(&volume);
             let mut scratch = BrushScratch::new();
-            let brush = Brush { kind, radius: 8.0, strength: 0.9, falloff: FalloffCurve::Smooth };
+            let brush = Brush { kind, radius: 8.0, strength: 0.9, ..Brush::default() };
 
             for _ in 0..40 {
                 brush.apply(
@@ -692,6 +729,7 @@ mod tests {
             radius: 3.0,
             strength: 0.8,
             falloff: FalloffCurve::Sharp,
+            ..Brush::default()
         };
         for offset in [-6.0_f32, -2.0, 2.0, 6.0] {
             let at = point + Vec3::new(0.0, offset, 0.0);
@@ -714,6 +752,7 @@ mod tests {
             radius: 10.0,
             strength: 0.9,
             falloff: FalloffCurve::Wide,
+            ..Brush::default()
         };
         for _ in 0..12 {
             smooth.apply(
@@ -773,6 +812,7 @@ mod tests {
             radius: 4.0,
             strength: 0.9,
             falloff: FalloffCurve::Sharp,
+            ..Brush::default()
         };
         for _ in 0..4 {
             bump.apply(&mut volume, &Stamp::new(point, normal, BrushDirection::Add), &mut scratch);
@@ -797,6 +837,7 @@ mod tests {
             radius: 8.0,
             strength: 0.8,
             falloff: FalloffCurve::Wide,
+            ..Brush::default()
         };
         for _ in 0..10 {
             flatten.apply(
@@ -821,6 +862,7 @@ mod tests {
             radius: 2.5,
             strength: 1.0,
             falloff: FalloffCurve::Sharp,
+            ..Brush::default()
         };
         for _ in 0..6 {
             spike.apply(&mut volume, &Stamp::new(point, normal, BrushDirection::Add), &mut scratch);
@@ -858,7 +900,7 @@ mod tests {
         let mut bite = |kind: BrushKind, stroke_normal: Vec3| {
             let mut volume = sphere();
             let before = volume.sample_world(point);
-            let brush = Brush { kind, radius: 8.0, strength: 1.0, falloff: FalloffCurve::Smooth };
+            let brush = Brush { kind, radius: 8.0, strength: 1.0, ..Brush::default() };
             brush.apply(
                 &mut volume,
                 &Stamp::new(point, stroke_normal, BrushDirection::Add),
@@ -904,7 +946,7 @@ mod tests {
             let mut volume = sphere();
             let mut scratch = BrushScratch::new();
             let (point, normal) = surface(&volume);
-            let brush = Brush { kind, radius: 8.0, strength: 0.9, falloff: FalloffCurve::Smooth };
+            let brush = Brush { kind, radius: 8.0, strength: 0.9, ..Brush::default() };
 
             for step in -4..=4 {
                 let at = point + Vec3::new(0.0, step as f32 * 2.0, 0.0);

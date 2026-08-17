@@ -16,8 +16,8 @@
 //! PPM for a human to look at.
 
 use brokkr_core::{
-    BrickCoord, BrickMesh, Brush, BrushDirection, BrushKind, BrushScratch, MeshScratch, Stamp,
-    Volume,
+    BrickCoord, BrickMesh, Brush, BrushDirection, BrushKind, BrushScratch, MeshScratch, Pattern,
+    PatternKind, Stamp, Volume,
 };
 use brokkr_gpu::{Frustum, PixelRect, SculptRenderer, Uniforms};
 use glam::{IVec3, Vec3};
@@ -501,4 +501,94 @@ fn a_leaned_stroke_looks_different_from_an_upright_one() {
         changed > 1_000,
         "leaning the pen changed only {changed} pixels, so it is not steering the stroke"
     );
+}
+
+/// Every pattern, rendered so a human can look at it.
+///
+/// This is the whole reason the offscreen harness exists. Twice in this
+/// project a brush has been numerically fine, passed every assertion and been
+/// visibly wrong, and a pattern is exactly that class of thing: "is this
+/// hair or is it corduroy" is not a question any number answers.
+///
+///     env BROKKR_DUMP_FRAMES=/tmp/patterns cargo test -p brokkr-gpu --test offscreen
+///
+/// then convert the PPMs and look at them.
+#[test]
+fn every_pattern_leaves_a_visible_and_distinct_mark() {
+    let Some(harness) = Harness::new() else {
+        eprintln!("no usable wgpu adapter, skipping the pattern render test");
+        return;
+    };
+
+    let distance = MODEL_RADIUS * 3.0;
+    let front = Vec3::new(0.45, 0.35, 1.0).normalize() * MODEL_RADIUS;
+    let mut frames: Vec<(PatternKind, Vec<u8>)> = Vec::new();
+
+    for kind in PatternKind::ALL {
+        let mut renderer = SculptRenderer::new(&harness.device, &harness.queue, TARGET_FORMAT);
+        renderer.resize(&harness.device, WIDTH, HEIGHT);
+        renderer.write_uniforms(&harness.queue, &uniforms(distance));
+
+        let mut volume = Volume::new(VOXEL_SIZE);
+        volume.seed_sphere(Vec3::ZERO, MODEL_RADIUS);
+        upload_all(&mut renderer, &harness.queue, &mut volume);
+        let before = harness.frame(&renderer);
+
+        let mut brush_scratch = BrushScratch::new();
+        let brush = Brush {
+            kind: BrushKind::Draw,
+            radius: 12.0,
+            strength: 0.8,
+            pattern: Pattern { kind, scale_mm: 2.5, depth: 1.0 },
+            ..Brush::default()
+        };
+
+        // Drag across the front of the sphere, so a combing pattern has a
+        // direction to comb along.
+        for step in -4..=4 {
+            let at = front + Vec3::new(step as f32 * 2.5, 0.0, 0.0);
+            let at = at.normalize() * MODEL_RADIUS;
+            let normal = volume.gradient_world(at);
+            for _ in 0..3 {
+                brush.apply(
+                    &mut volume,
+                    &Stamp::new(at, normal, BrushDirection::Add).with_tangent(Vec3::X),
+                    &mut brush_scratch,
+                );
+            }
+        }
+
+        let dirty = upload_dirty(&mut renderer, &harness.queue, &mut volume);
+        assert!(dirty > 0, "{kind} dirtied nothing");
+
+        let after = harness.frame(&renderer);
+        dump(&format!("pattern-{}", kind.label().to_lowercase()), &after);
+
+        if kind != PatternKind::None {
+            let changed = before
+                .chunks_exact(4)
+                .zip(after.chunks_exact(4))
+                .filter(|(a, b)| a[..3] != b[..3])
+                .count();
+            assert!(changed > 200, "{kind} left almost nothing on screen: {changed} pixels");
+        }
+        frames.push((kind, after));
+    }
+
+    // Two patterns that rendered identically would mean one of them is not
+    // reaching the field at all -- which is precisely the bug that looks fine
+    // in every numeric test.
+    for (index, (kind, frame)) in frames.iter().enumerate() {
+        for (other_kind, other) in &frames[index + 1..] {
+            let differing = frame
+                .chunks_exact(4)
+                .zip(other.chunks_exact(4))
+                .filter(|(a, b)| a[..3] != b[..3])
+                .count();
+            assert!(
+                differing > 100,
+                "{kind} and {other_kind} rendered almost identically: {differing} pixels differ"
+            );
+        }
+    }
 }

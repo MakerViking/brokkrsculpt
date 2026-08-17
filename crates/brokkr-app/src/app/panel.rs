@@ -12,7 +12,7 @@
 
 use std::sync::Arc;
 
-use brokkr_core::{BrushKind, FalloffCurve, MirrorAxis};
+use brokkr_core::{BrushKind, FalloffCurve, MirrorAxis, PatternKind};
 use iced::widget::{
     button, checkbox, column, container, pick_list, row, scrollable, slider, stack, text,
 };
@@ -273,6 +273,7 @@ impl Brokkr {
                 radius,
                 strength,
                 falloff,
+                self.pattern_panel(),
                 self.pen_panel(),
                 self.spacemouse_panel(),
                 text("HISTORY").size(theme::CAPTION_SIZE).color(theme::TEXT_MUTE),
@@ -461,6 +462,74 @@ impl Brokkr {
         ]
         .spacing(theme::S2)
         .into()
+    }
+
+    /// The surface pattern, which multiplies into whichever brush is selected.
+    ///
+    /// One control rather than a brush per pattern: Clay plus Scales and
+    /// Inflate plus Hair are both useful, and enumerating the product of two
+    /// lists is exactly the complexity the brief asks to avoid.
+    fn pattern_panel(&self) -> Element<'_, Message> {
+        let pattern = self.brush.pattern;
+
+        let kinds =
+            PatternKind::ALL.into_iter().fold(column![].spacing(theme::S1), |assembled, kind| {
+                assembled.push(
+                    button(text(kind.label()).size(theme::CAPTION_SIZE))
+                        .width(Length::Fill)
+                        .style(if kind == pattern.kind {
+                            theme::tool_button_active
+                        } else {
+                            theme::tool_button
+                        })
+                        .on_press(Message::PatternChanged(kind)),
+                )
+            });
+
+        // The size and depth sliders only mean anything once a pattern is
+        // chosen, so they are hidden rather than shown greyed: an empty row is
+        // less to read than a disabled one.
+        let settings: Element<'_, Message> = if pattern.kind == PatternKind::None {
+            text("carve a pattern in with ctrl")
+                .size(theme::CAPTION_SIZE)
+                .color(theme::TEXT_MUTE)
+                .into()
+        } else {
+            column![
+                text(format!("Feature size  {:.2} mm", pattern.scale_mm))
+                    .size(theme::CAPTION_SIZE)
+                    .color(theme::TEXT_DIM),
+                // The lower bound follows the voxel size: a feature finer
+                // than a few voxels cannot be represented, and offering it
+                // would only produce a model the exporter then refuses.
+                slider(
+                    (self.voxel_size * brokkr_core::MIN_SCALE_VOXELS)..=brokkr_core::MAX_SCALE_MM,
+                    pattern.scale_mm.clamp(
+                        self.voxel_size * brokkr_core::MIN_SCALE_VOXELS,
+                        brokkr_core::MAX_SCALE_MM
+                    ),
+                    Message::PatternScaleChanged
+                )
+                .step(0.05),
+                text(format!("Depth  {:.2}", pattern.depth))
+                    .size(theme::CAPTION_SIZE)
+                    .color(theme::TEXT_DIM),
+                slider(0.0..=1.0, pattern.depth, Message::PatternDepthChanged).step(0.02),
+                text(if pattern.kind.follows_the_stroke() {
+                    "combs along the drag"
+                } else {
+                    "fixed in world space, so strokes reinforce"
+                })
+                .size(theme::CAPTION_SIZE)
+                .color(theme::TEXT_MUTE),
+            ]
+            .spacing(theme::S1)
+            .into()
+        };
+
+        column![text("PATTERN").size(theme::CAPTION_SIZE).color(theme::TEXT_MUTE), kinds, settings,]
+            .spacing(theme::S2)
+            .into()
     }
 
     /// Resolution controls.

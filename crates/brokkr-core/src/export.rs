@@ -264,6 +264,47 @@ mod tests {
     }
 
     #[test]
+    fn a_patterned_model_exports_watertight() {
+        // Patterns are the one thing that varies inside a single stamp, so
+        // they are also the one thing that can pinch the surface into a
+        // non-manifold edge. `is_printable` checks manifoldness as well as
+        // closure, which is exactly what a pinch would fail.
+        use crate::pattern::{Pattern, PatternKind};
+
+        for kind in PatternKind::ALL {
+            let mut volume = sphere(1.0, 24.0);
+            let mut scratch = BrushScratch::new();
+            let brush = Brush {
+                kind: BrushKind::Draw,
+                radius: 7.0,
+                strength: 0.6,
+                // Finer than the field can carry, so the engine's clamp is
+                // what keeps this printable.
+                pattern: Pattern { kind, scale_mm: 0.01, depth: 1.0 },
+                ..Brush::default()
+            };
+
+            for at in
+                [Vec3::new(24.0, 0.0, 0.0), Vec3::new(0.0, 32.0, 0.0), Vec3::new(-32.0, 0.0, 32.0)]
+            {
+                let normal = volume.gradient_world(at);
+                brush.apply(
+                    &mut volume,
+                    &Stamp::new(at, normal, BrushDirection::Add).with_tangent(Vec3::X),
+                    &mut scratch,
+                );
+            }
+
+            let (_, report) = volume.export_mesh();
+            assert!(
+                report.is_printable(),
+                "a model patterned with {kind} must still print: {}",
+                report.summary()
+            );
+        }
+    }
+
+    #[test]
     fn a_sculpted_model_exports_watertight() {
         // The case that matters: an edited model, including strokes placed on
         // brick corners where the tiling is hardest.
