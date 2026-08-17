@@ -361,7 +361,6 @@ pub fn report() -> String {
 #[cfg(target_os = "linux")]
 mod backend {
     use super::{Shared, TabletDevice, normalise, normalise_signed};
-    use std::collections::HashSet;
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
     use std::sync::atomic::Ordering;
@@ -407,15 +406,9 @@ mod backend {
         let mut out = String::new();
         let _ = writeln!(out, "Input devices, as the tablet scanner sees them.\n");
 
-        let mut entries: Vec<PathBuf> = std::fs::read_dir("/dev/input")
-            .into_iter()
-            .flatten()
-            .flatten()
-            .map(|entry| entry.path())
-            .filter(|path| {
-                path.file_name().is_some_and(|name| name.to_string_lossy().starts_with("event"))
-            })
-            .collect();
+        // The same set the scanner walks, so the report and the scanner can
+        // never disagree about which devices exist.
+        let mut entries: Vec<PathBuf> = crate::input_watch::event_nodes();
         entries.sort();
 
         if entries.is_empty() {
@@ -515,80 +508,43 @@ mod backend {
     }
 
     pub fn spawn(shared: Arc<Shared>) {
-        std::thread::Builder::new()
-            .name("brokkr-tablet-scan".into())
-            .spawn(move || scan_loop(shared))
-            .map_err(|error| log::warn!("could not start the tablet scanner: {error}"))
-            .ok();
+        crate::input_watch::spawn("brokkr-tablet-scan", RESCAN, Stylus { shared });
     }
 
-    fn scan_loop(shared: Arc<Shared>) {
-        let mut open: HashSet<PathBuf> = HashSet::new();
-        // Keyboards, mice and the rest never become styluses, and there are
-        // typically thirty of them. Remembering the verdict keeps the scan from
-        // reopening every input device on the machine twice a second for the
-        // life of the process.
-        let mut rejected: HashSet<PathBuf> = HashSet::new();
-        loop {
-            // Forget devices whose reader has exited, so a tablet that is
-            // unplugged and plugged back in is picked up again.
-            {
-                let live = shared.devices.lock().expect("tablet state poisoned");
-                open.retain(|path| live.iter().any(|device| device.path == path.to_string_lossy()));
-            }
+    /// The tablet's half of the shared `/dev/input` scanner. The scanning,
+    /// caching and permission bookkeeping live in [`crate::input_watch`],
+    /// because the SpaceMouse needs exactly the same thing.
+    struct Stylus {
+        shared: Arc<Shared>,
+    }
 
-            let mut denied = false;
-            let mut anything_readable = false;
-            let mut present: HashSet<PathBuf> = HashSet::new();
+    impl crate::input_watch::Adopter for Stylus {
+        fn wants(&self, device: &Device) -> bool {
+            is_stylus(device)
+        }
 
-            for entry in std::fs::read_dir("/dev/input").into_iter().flatten().flatten() {
-                let path = entry.path();
-                if !path.file_name().is_some_and(|name| name.to_string_lossy().starts_with("event"))
-                {
-                    continue;
-                }
-                present.insert(path.clone());
-                if open.contains(&path) || rejected.contains(&path) {
-                    anything_readable = true;
-                    continue;
-                }
+        fn adopt(&self, path: &Path, device: Device) -> bool {
+            let Some(info) = adopt(&self.shared, path, device) else {
+                return false;
+            };
+            log::info!(
+                "tablet: reading {} at {} with {} pressure levels{}{}",
+                info.name,
+                info.path,
+                info.pressure_max,
+                if info.has_tilt { ", tilt" } else { "" },
+                if info.has_eraser { ", eraser" } else { "" },
+            );
+            true
+        }
 
-                match Device::open(&path) {
-                    Ok(device) => {
-                        anything_readable = true;
-                        if !is_stylus(&device) {
-                            rejected.insert(path);
-                            continue;
-                        }
-                        if let Some(info) = adopt(&shared, &path, device) {
-                            open.insert(path);
-                            log::info!(
-                                "tablet: reading {} at {} with {} pressure levels{}{}",
-                                info.name,
-                                info.path,
-                                info.pressure_max,
-                                if info.has_tilt { ", tilt" } else { "" },
-                                if info.has_eraser { ", eraser" } else { "" },
-                            );
-                        }
-                    }
-                    Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
-                        denied = true;
-                    }
-                    Err(_) => {}
-                }
-            }
+        fn still_reading(&self, path: &Path) -> bool {
+            let live = self.shared.devices.lock().expect("tablet state poisoned");
+            live.iter().any(|device| device.path == path.to_string_lossy())
+        }
 
-            // A node that has gone away may come back as different hardware
-            // under the same name, so its verdict must not be remembered.
-            rejected.retain(|path| present.contains(path));
-
-            // Only report a permissions problem when nothing at all could be
-            // opened. A single unreadable device among many readable ones is
-            // normal and says nothing about the user's groups.
-            shared.permission_denied.store(denied && !anything_readable, Ordering::Relaxed);
-
-            std::thread::sleep(RESCAN);
+        fn set_permission_denied(&self, denied: bool) {
+            self.shared.permission_denied.store(denied, Ordering::Relaxed);
         }
     }
 

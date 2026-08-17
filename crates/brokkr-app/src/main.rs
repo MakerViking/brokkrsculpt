@@ -4,6 +4,8 @@
 
 mod app;
 mod camera;
+#[cfg(target_os = "linux")]
+mod input_watch;
 mod message;
 mod tablet;
 mod theme;
