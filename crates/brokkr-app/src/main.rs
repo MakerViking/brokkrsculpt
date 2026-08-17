@@ -4,6 +4,7 @@
 
 mod app;
 mod camera;
+mod cursor;
 #[cfg(target_os = "linux")]
 mod input_watch;
 mod message;

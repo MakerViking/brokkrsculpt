@@ -5,6 +5,7 @@
 use brokkr_core::{BrushKind, FalloffCurve, MirrorAxis, PatternKind};
 use iced::Vector;
 
+use crate::app::SizingTarget;
 use crate::spacemouse::{Action, Axis, ButtonAction, Mode};
 
 /// A file format the sculpt can be written to.
@@ -163,6 +164,14 @@ pub enum Message {
     /// because the radius spans fifty to one and a fixed step would crawl at
     /// the top and jump at the bottom.
     BrushRadiusScaled(f32),
+    /// A hold-and-drag adjustment of one brush number has begun. ZBrush's `s`
+    /// and `u`: the fast path for radius in every sculpting tool is a drag
+    /// against a live ring, not a slider in a panel.
+    SizingStarted(SizingTarget),
+    SizingEnded,
+    /// Whether the radius tracks the model's size (ZBrush calls it Dynamic)
+    /// rather than staying a fixed number of millimetres.
+    DynamicRadiusToggled(bool),
     PressureToggled(bool),
     PressureCurveChanged(f32),
     TiltToggled(bool),

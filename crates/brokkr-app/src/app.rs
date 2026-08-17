@@ -16,6 +16,7 @@ use glam::{Vec2, Vec3};
 use iced::Subscription;
 
 use crate::camera::OrbitCamera;
+use crate::cursor;
 use crate::message::{
     ExportFormat, Message, PanelSection, PointerButton, PointerEvent, SpaceMouseSetting,
 };
@@ -44,6 +45,17 @@ const VOXEL_SIZE_MM: f32 = 0.25;
 pub(crate) const MIN_RADIUS_MM: f32 = 0.25;
 pub(crate) const MAX_RADIUS_MM: f32 = 12.0;
 
+/// Range the brush strength may take, matching the slider.
+pub(crate) const MIN_STRENGTH: f32 = 0.02;
+pub(crate) const MAX_STRENGTH: f32 = 0.80;
+
+/// How fast a hold-and-drag moves the brush numbers.
+///
+/// Radius is in log space so the same drag is the same proportion at any size;
+/// about 250 px covers the whole range, which is a comfortable sweep.
+const RADIUS_PER_PIXEL: f32 = 0.006;
+const STRENGTH_PER_PIXEL: f32 = 0.002;
+
 const FINEST_VOXEL_MM: f32 = 0.06;
 const COARSEST_VOXEL_MM: f32 = 2.0;
 
@@ -64,6 +76,8 @@ enum DragKind {
     Orbit,
     Pan,
     Sculpt(BrushDirection),
+    /// The pointer is resizing the brush, not using it.
+    Sizing,
 }
 
 /// A drag in progress, tagged with the button that started it so that
@@ -164,6 +178,39 @@ pub struct Brokkr {
     /// Which blocks of the properties panel are open, in `PanelSection::ALL`
     /// order.
     expanded: [bool; PanelSection::ALL.len()],
+    /// The brush ring and mirror planes, handed to the renderer through
+    /// `SharedFrame`. Held here and swapped rather than rebuilt into a fresh
+    /// allocation each time.
+    overlay: brokkr_gpu::OverlayBatch,
+    /// Where the pointer last met the surface, which is where the ring goes.
+    hover: Option<Vec3>,
+    /// A hold-and-drag brush resize in progress.
+    sizing: Option<Sizing>,
+    /// Whether the radius tracks the model's size rather than staying a fixed
+    /// number of millimetres.
+    dynamic_radius: bool,
+    /// The model's bounding radius, refreshed on remesh. `Volume::bounding_radius`
+    /// walks the brick map, so it is not something to call per frame.
+    model_radius: f32,
+}
+
+/// A hold-and-drag gesture adjusting one brush number.
+///
+/// Holds where the pointer started and what the value was, so the gesture is
+/// absolute: a drag out and back returns to exactly where it began, where
+/// accumulating per-event deltas would drift.
+#[derive(Debug, Clone, Copy)]
+struct Sizing {
+    what: SizingTarget,
+    from_pixel: Vec2,
+    original: f32,
+}
+
+/// Which number a sizing drag is moving.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SizingTarget {
+    Radius,
+    Strength,
 }
 
 impl Brokkr {
@@ -216,6 +263,11 @@ impl Brokkr {
             voxel_size: VOXEL_SIZE_MM,
             status: String::new(),
             expanded: PanelSection::ALL.map(PanelSection::open_by_default),
+            overlay: brokkr_gpu::OverlayBatch::default(),
+            hover: None,
+            sizing: None,
+            dynamic_radius: false,
+            model_radius: MODEL_RADIUS_MM,
         };
         app.remesh_dirty();
         // Otherwise the overlay reports a zero byte budget until the first
@@ -225,6 +277,7 @@ impl Brokkr {
         app.perf.remesh_ms = 0.0;
         app.perf.dirty_bricks = 0;
         app.publish_camera();
+        app.refresh_overlay();
         app
     }
 
@@ -264,6 +317,55 @@ impl Brokkr {
         }
         self.perf.remesh_ms = started.elapsed().as_secs_f32() * 1000.0;
         self.volume_stats = self.volume.stats();
+
+        let previous = self.model_radius;
+        self.model_radius = self.volume.bounding_radius().unwrap_or(MODEL_RADIUS_MM);
+        self.rescale_radius(previous);
+    }
+
+    /// Rebuild the brush ring and mirror planes and hand them to the renderer.
+    ///
+    /// Called from the places that change what it looks like -- pointer motion,
+    /// a brush or mirror setting, a resample -- and deliberately NOT from the
+    /// frame handler: the geometry is world space, so a camera moving under it
+    /// needs no rebuild, and a raycast per frame would be waste.
+    fn refresh_overlay(&mut self) {
+        // Moved out and back rather than borrowed in place: `build` also needs
+        // the volume and the brush, which are fields of the same `self`. The
+        // two buffers then rotate -- this frame's goes to the renderer and last
+        // frame's comes back with its capacity -- so nothing allocates once
+        // warm.
+        let mut batch = std::mem::take(&mut self.overlay);
+        cursor::build(
+            &mut batch,
+            &self.volume,
+            &self.effective_brush(),
+            self.symmetry,
+            self.hover,
+            cursor::mood(self.stroke_direction(), self.sizing.is_some()),
+            self.model_radius,
+        );
+        self.shared.swap_overlay(&mut batch);
+        self.overlay = batch;
+    }
+
+    /// Where the pointer meets the surface, remembered for the cursor ring.
+    fn update_hover(&mut self, pixel: Vec2) {
+        self.hover = self.surface_under(pixel);
+    }
+
+    /// Keep the brush a constant fraction of the model when asked to.
+    ///
+    /// ZBrush calls this Dynamic. Without it a brush tuned on a 60 mm ball is
+    /// the wrong size the moment the model is resampled or grows.
+    fn rescale_radius(&mut self, previous_model_radius: f32) {
+        if !self.dynamic_radius || previous_model_radius <= 0.0 || self.model_radius <= 0.0 {
+            return;
+        }
+        let factor = self.model_radius / previous_model_radius;
+        if (factor - 1.0).abs() > 1.0e-4 {
+            self.brush.radius = (self.brush.radius * factor).clamp(MIN_RADIUS_MM, MAX_RADIUS_MM);
+        }
     }
 
     /// The world space ray through a point in widget pixels.
@@ -594,6 +696,32 @@ impl Brokkr {
         }
     }
 
+    /// Move the number a sizing gesture is holding, from how far the pointer
+    /// has travelled since it began.
+    ///
+    /// Horizontal only, and absolute against where the drag started, so out and
+    /// back returns to exactly the original value.
+    fn apply_sizing(&mut self, to: Vec2) {
+        let Some(sizing) = self.sizing else {
+            return;
+        };
+        let travel = to.x - sizing.from_pixel.x;
+        match sizing.what {
+            // Multiplicative, matching the [ and ] keys: the radius spans fifty
+            // to one, so a fixed amount per pixel would crawl at one end and
+            // jump at the other.
+            SizingTarget::Radius => {
+                let factor = (travel * RADIUS_PER_PIXEL).exp();
+                self.brush.radius = (sizing.original * factor).clamp(MIN_RADIUS_MM, MAX_RADIUS_MM);
+            }
+            // Additive: strength is already a small linear range.
+            SizingTarget::Strength => {
+                self.brush.strength = (sizing.original + travel * STRENGTH_PER_PIXEL)
+                    .clamp(MIN_STRENGTH, MAX_STRENGTH);
+            }
+        }
+    }
+
     fn undo(&mut self) {
         if self.history.undo(&mut self.volume) {
             self.history_stats = self.history.stats();
@@ -613,6 +741,9 @@ impl Brokkr {
             PointerEvent::Modifiers { shift, control } => {
                 self.shift = shift;
                 self.control = control;
+                // Both change what a press would do, so the ring has to say so
+                // before the press rather than after.
+                self.refresh_overlay();
             }
             PointerEvent::Pressed { button, position, size } => {
                 self.viewport_size = Vec2::new(size.x, size.y);
@@ -620,8 +751,10 @@ impl Brokkr {
                 self.cursor = Some(position);
 
                 let kind = match button {
-                    // Left sculpts. Holding control removes instead of adds,
-                    // which is the convention every sculpting tool uses.
+                    // Left sculpts -- unless a hold-and-drag resize is in
+                    // progress, in which case the pointer belongs to that
+                    // gesture and a press must not lay down a stroke.
+                    PointerButton::Left if self.sizing.is_some() => DragKind::Sizing,
                     PointerButton::Left => DragKind::Sculpt(self.stroke_direction()),
                     // Right and middle move the camera. Shift slides instead of
                     // turning.
@@ -641,6 +774,8 @@ impl Brokkr {
                     self.volume.begin_stroke();
                     self.sculpt_to(position, direction, true);
                 }
+                self.update_hover(position);
+                self.refresh_overlay();
             }
             PointerEvent::Released { button } => {
                 if self.drag.is_some_and(|drag| drag.button == button) {
@@ -649,12 +784,21 @@ impl Brokkr {
                     }
                     self.drag = None;
                 }
+                self.refresh_overlay();
             }
             PointerEvent::Moved { position, size } => {
                 self.viewport_size = Vec2::new(size.x, size.y);
                 let position = Vec2::new(position.x, position.y);
                 let delta = self.cursor.map(|previous| position - previous).unwrap_or(Vec2::ZERO);
                 self.cursor = Some(position);
+
+                // A held sizing key owns the pointer whether or not a button
+                // is down, so this comes before the drag cases.
+                if self.sizing.is_some() {
+                    self.apply_sizing(position);
+                    self.refresh_overlay();
+                    return;
+                }
 
                 match self.drag.map(|drag| drag.kind) {
                     Some(DragKind::Sculpt(direction)) => self.sculpt_to(position, direction, false),
@@ -666,8 +810,13 @@ impl Brokkr {
                         self.camera.pan(delta, self.viewport_size.y);
                         self.publish_camera();
                     }
-                    None => {}
+                    Some(DragKind::Sizing) | None => {}
                 }
+
+                // The ring follows the pointer, and the surface under it moves
+                // as a stroke cuts into it.
+                self.update_hover(position);
+                self.refresh_overlay();
             }
             PointerEvent::Scrolled { amount } => {
                 self.camera.zoom(amount);
@@ -691,6 +840,25 @@ impl Brokkr {
             Message::PatternChanged(kind) => self.brush.pattern.kind = kind,
             Message::PatternScaleChanged(scale) => self.brush.pattern.scale_mm = scale,
             Message::PatternDepthChanged(depth) => self.brush.pattern.depth = depth,
+            Message::SizingStarted(what) => {
+                // Nothing to anchor the gesture to until the pointer has been
+                // seen; and a gesture already running must not restart, or
+                // holding the key through a drag would reset it every event.
+                if self.sizing.is_none()
+                    && let Some(from_pixel) = self.cursor
+                {
+                    self.sizing = Some(Sizing {
+                        what,
+                        from_pixel,
+                        original: match what {
+                            SizingTarget::Radius => self.brush.radius,
+                            SizingTarget::Strength => self.brush.strength,
+                        },
+                    });
+                }
+            }
+            Message::SizingEnded => self.sizing = None,
+            Message::DynamicRadiusToggled(on) => self.dynamic_radius = on,
             Message::BrushRadiusScaled(factor) => {
                 self.brush.radius =
                     (self.brush.radius * factor).clamp(MIN_RADIUS_MM, MAX_RADIUS_MM);
@@ -1019,6 +1187,144 @@ mod tests {
             app.update(Message::SymmetryAxisToggled(axis));
             assert!(!app.symmetry.axis(axis));
         }
+    }
+
+    /// The fast path for radius in every sculpting tool is a drag, not a
+    /// slider. Absolute against where the drag began, so out and back returns
+    /// to exactly the original value rather than drifting.
+    #[test]
+    fn holding_the_sizing_key_and_dragging_scales_the_radius_reversibly() {
+        let mut app = app();
+        app.on_pointer(PointerEvent::Moved { position: centre_of_viewport(), size: SIZE });
+        let original = app.brush.radius;
+
+        app.update(Message::SizingStarted(SizingTarget::Radius));
+        assert!(app.sizing.is_some(), "the gesture did not start");
+
+        let at = |dx: f32| Vector::new(SIZE.x / 2.0 + dx, SIZE.y / 2.0);
+        app.on_pointer(PointerEvent::Moved { position: at(120.0), size: SIZE });
+        let grown = app.brush.radius;
+        assert!(grown > original, "dragging right should grow the brush");
+
+        app.on_pointer(PointerEvent::Moved { position: at(-120.0), size: SIZE });
+        assert!(app.brush.radius < original, "dragging left should shrink it");
+
+        // Back where it started: absolute, not accumulated.
+        app.on_pointer(PointerEvent::Moved { position: at(0.0), size: SIZE });
+        assert!(
+            (app.brush.radius - original).abs() < 1.0e-4,
+            "the gesture drifted: {original} became {}",
+            app.brush.radius
+        );
+
+        app.update(Message::SizingEnded);
+        assert!(app.sizing.is_none());
+        // ...and the pointer goes back to sculpting.
+        app.on_pointer(PointerEvent::Moved { position: at(200.0), size: SIZE });
+        assert!((app.brush.radius - original).abs() < 1.0e-4, "sizing outlived its key");
+    }
+
+    /// The failure this would otherwise cause is the worst kind: a drag that
+    /// silently carves the model while the user thinks they are resizing.
+    #[test]
+    fn a_sizing_drag_does_not_sculpt() {
+        let mut app = app();
+        app.on_pointer(PointerEvent::Moved { position: centre_of_viewport(), size: SIZE });
+        let probe = app
+            .surface_under(Vec2::new(SIZE.x / 2.0, SIZE.y / 2.0))
+            .expect("the centre should hit the sphere");
+        let before = app.volume.sample_world(probe);
+
+        app.update(Message::SizingStarted(SizingTarget::Radius));
+        press(&mut app, centre_of_viewport());
+        for step in 1..=8 {
+            app.on_pointer(PointerEvent::Moved {
+                position: Vector::new(SIZE.x / 2.0 + step as f32 * 10.0, SIZE.y / 2.0),
+                size: SIZE,
+            });
+        }
+        release(&mut app);
+
+        assert_eq!(app.volume.sample_world(probe), before, "a sizing drag cut into the model");
+        assert!(!app.history.can_undo(), "a sizing drag recorded an undo entry");
+    }
+
+    #[test]
+    fn the_sizing_gesture_stays_inside_the_slider_bounds() {
+        for (target, low, high) in [
+            (SizingTarget::Radius, MIN_RADIUS_MM, MAX_RADIUS_MM),
+            (SizingTarget::Strength, MIN_STRENGTH, MAX_STRENGTH),
+        ] {
+            for direction in [-1.0f32, 1.0] {
+                let mut app = app();
+                app.on_pointer(PointerEvent::Moved { position: centre_of_viewport(), size: SIZE });
+                app.update(Message::SizingStarted(target));
+                app.on_pointer(PointerEvent::Moved {
+                    position: Vector::new(SIZE.x / 2.0 + direction * 5000.0, SIZE.y / 2.0),
+                    size: SIZE,
+                });
+                let value = match target {
+                    SizingTarget::Radius => app.brush.radius,
+                    SizingTarget::Strength => app.brush.strength,
+                };
+                assert!((low..=high).contains(&value), "{target:?} left its range at {value}");
+            }
+        }
+    }
+
+    /// ZBrush calls this Dynamic. Without it a brush tuned on one model is the
+    /// wrong size the moment the model changes scale.
+    #[test]
+    fn a_dynamic_radius_keeps_its_proportion_to_the_model() {
+        let proportion = |state: &Brokkr| state.brush.radius / state.model_radius;
+
+        // Off by default: the radius means a physical size, so a resample must
+        // leave it alone.
+        let mut fixed = app();
+        let before = fixed.brush.radius;
+        fixed.update(Message::Resample(VOXEL_SIZE_MM / 2.0));
+        assert_eq!(fixed.brush.radius, before, "a fixed radius must survive a resample");
+
+        // On, and the model doubles: the brush should follow it.
+        let mut dynamic = app();
+        dynamic.update(Message::DynamicRadiusToggled(true));
+        let before = proportion(&dynamic);
+        dynamic.volume.seed_sphere(Vec3::ZERO, MODEL_RADIUS_MM * 2.0);
+        dynamic.volume.mark_everything_dirty();
+        dynamic.remesh_dirty();
+
+        assert!(
+            dynamic.brush.radius > fixed.brush.radius,
+            "a dynamic radius should have grown with the model"
+        );
+        assert!(
+            (proportion(&dynamic) - before).abs() < 0.15 * before,
+            "the brush lost its proportion: {before} became {}",
+            proportion(&dynamic)
+        );
+    }
+
+    #[test]
+    fn the_cursor_ring_appears_where_the_pointer_meets_the_model() {
+        let mut app = app();
+        assert!(app.hover.is_none(), "nothing has been pointed at yet");
+
+        app.on_pointer(PointerEvent::Moved { position: centre_of_viewport(), size: SIZE });
+        assert!(app.hover.is_some(), "the centre of the viewport should hit the sphere");
+        // The geometry lives in the shared frame, not in `self.overlay`: the
+        // application swaps its buffer over to the renderer and keeps the empty
+        // one back, which is what stops either side allocating.
+        let drawn = app.shared.overlay_snapshot();
+        assert!(!drawn.lines.is_empty(), "no ring was handed to the renderer");
+
+        // A corner of the viewport misses the sphere, so there is nothing to
+        // draw and that absence is the signal a press would do nothing.
+        app.on_pointer(PointerEvent::Moved { position: Vector::new(2.0, 2.0), size: SIZE });
+        assert!(app.hover.is_none(), "a corner should miss the model");
+        assert!(
+            app.shared.overlay_snapshot().lines.is_empty(),
+            "a ring was drawn for a pointer that is off the model"
+        );
     }
 
     #[test]

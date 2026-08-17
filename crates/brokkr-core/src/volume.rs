@@ -755,6 +755,30 @@ impl Volume {
 
     /// Iterate the coordinates of every stored brick. Used by tests and by the
     /// initial full mesh after seeding.
+    /// A world space bounding radius for whatever the volume holds, measured
+    /// from the origin.
+    ///
+    /// Derived from the brick extents rather than from the surface, so it costs
+    /// a walk of the map's keys instead of a mesh: it is used to size interface
+    /// affordances -- how far a mirror plane should reach, what a brush radius
+    /// means as a fraction of the model -- and those need "about how big" rather
+    /// than a tight bound.
+    ///
+    /// `None` when the volume is empty, which is the caller's cue to fall back
+    /// rather than divide by zero.
+    pub fn bounding_radius(&self) -> Option<f32> {
+        let mut furthest: f32 = 0.0;
+        let mut any = false;
+        for coord in self.bricks.keys() {
+            any = true;
+            // The corner of the brick that is furthest from the origin.
+            let low = coord.origin().as_vec3() * self.voxel_size;
+            let high = coord.max_voxel().as_vec3() * self.voxel_size;
+            furthest = furthest.max(low.abs().max(high.abs()).length());
+        }
+        any.then_some(furthest)
+    }
+
     pub fn brick_coords(&self) -> impl Iterator<Item = BrickCoord> + '_ {
         self.bricks.keys().copied()
     }

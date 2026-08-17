@@ -18,11 +18,12 @@
 use std::sync::{Arc, Mutex};
 
 use brokkr_core::{BrickCoord, BrickMesh, BrushKind, MirrorAxis};
-use brokkr_gpu::{Frustum, PixelRect, PoolStats, SculptRenderer, Uniforms};
+use brokkr_gpu::{Frustum, OverlayBatch, PixelRect, PoolStats, SculptRenderer, Uniforms};
 use iced::mouse;
 use iced::widget::shader;
 use iced::{Rectangle, Vector};
 
+use crate::app::SizingTarget;
 use crate::camera::OrbitCamera;
 use crate::message::{Message, PointerButton, PointerEvent};
 
@@ -45,6 +46,9 @@ pub struct SharedFrame {
     /// instead of allocating. This is what keeps a stroke out of the allocator.
     spare: Mutex<Vec<BrickMesh>>,
     stats: Mutex<PoolStats>,
+    /// The brush ring and the mirror planes, rebuilt by the application
+    /// whenever something they depend on changes.
+    overlay: Mutex<OverlayBatch>,
 }
 
 impl SharedFrame {
@@ -64,6 +68,21 @@ impl SharedFrame {
 
     pub fn set_camera(&self, camera: OrbitCamera) {
         *self.camera.lock().expect("shared frame poisoned") = camera;
+    }
+
+    /// Hand over this frame's overlay geometry, taking the caller's buffer and
+    /// giving back the previous one so neither side allocates.
+    pub fn swap_overlay(&self, batch: &mut OverlayBatch) {
+        std::mem::swap(&mut *self.overlay.lock().expect("shared frame poisoned"), batch);
+    }
+
+    /// The overlay geometry currently waiting for the renderer.
+    ///
+    /// The application swaps its buffer in here rather than keeping it, so this
+    /// is the only place the current frame's geometry can be read.
+    #[cfg(test)]
+    pub fn overlay_snapshot(&self) -> OverlayBatch {
+        self.overlay.lock().expect("shared frame poisoned").clone()
     }
 
     /// The pool counters as of the last frame, for the debug overlay.
@@ -139,6 +158,10 @@ fn shortcut(character: &str, command: bool, shift: bool) -> Option<Message> {
     }
 
     match character.to_ascii_lowercase().as_str() {
+        // ZBrush's own keys for these two sliders, taken rather than invented so
+        // muscle memory carries over: S is Draw Size, U is Z Intensity.
+        "s" => Some(Message::SizingStarted(SizingTarget::Radius)),
+        "u" => Some(Message::SizingStarted(SizingTarget::Strength)),
         "x" => Some(Message::SymmetryAxisToggled(MirrorAxis::X)),
         "y" => Some(Message::SymmetryAxisToggled(MirrorAxis::Y)),
         "z" => Some(Message::SymmetryAxisToggled(MirrorAxis::Z)),
@@ -206,6 +229,19 @@ impl shader::Program<Message> for Viewport {
                 let message = shortcut(character, modifiers.command(), modifiers.shift())?;
                 return Some(shader::Action::publish(message).and_capture());
             }
+            // Releasing a sizing key ends the gesture. Without this the pointer
+            // would keep resizing the brush instead of going back to sculpting,
+            // which is the failure the user would report as "it stopped
+            // working".
+            iced::Event::Keyboard(keyboard::Event::KeyReleased { key, .. }) => {
+                let keyboard::Key::Character(character) = key else {
+                    return None;
+                };
+                if !matches!(character.to_ascii_lowercase().as_str(), "s" | "u") {
+                    return None;
+                }
+                return Some(shader::Action::publish(Message::SizingEnded).and_capture());
+            }
             _ => return None,
         };
 
@@ -260,6 +296,10 @@ impl shader::Primitive for SculptPrimitive {
             padding: [0; 3],
         };
         pipeline.renderer.write_uniforms(queue, &uniforms);
+        {
+            let overlay = self.shared.overlay.lock().expect("shared frame poisoned");
+            pipeline.renderer.write_overlay(device, queue, &overlay, view_projection);
+        }
         // Culling has to use the same matrix the vertex shader will, or bricks
         // vanish a frame before or after they should.
         pipeline.frustum = Frustum::from_view_projection(view_projection);

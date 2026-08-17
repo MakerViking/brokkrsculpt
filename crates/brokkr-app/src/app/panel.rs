@@ -227,7 +227,19 @@ impl Brokkr {
             text(format!("Radius  {:.2} mm", self.brush.radius))
                 .size(theme::TEXT_SIZE_SMALL)
                 .color(theme::TEXT_DIM),
-            slider(0.25..=12.0, self.brush.radius, Message::BrushRadiusChanged).step(0.05),
+            slider(
+                super::MIN_RADIUS_MM..=super::MAX_RADIUS_MM,
+                self.brush.radius,
+                Message::BrushRadiusChanged
+            )
+            .step(0.05),
+            checkbox(self.dynamic_radius)
+                .label("scale with model")
+                .on_toggle(Message::DynamicRadiusToggled)
+                .text_size(theme::CAPTION_SIZE),
+            text("hold s and drag to resize, u for strength")
+                .size(theme::CAPTION_SIZE)
+                .color(theme::TEXT_MUTE),
         ]
         .spacing(theme::S2);
 
@@ -235,7 +247,12 @@ impl Brokkr {
             text(format!("Strength  {:.2}", self.brush.strength))
                 .size(theme::TEXT_SIZE_SMALL)
                 .color(theme::TEXT_DIM),
-            slider(0.02..=0.80, self.brush.strength, Message::BrushStrengthChanged).step(0.01),
+            slider(
+                super::MIN_STRENGTH..=super::MAX_STRENGTH,
+                self.brush.strength,
+                Message::BrushStrengthChanged
+            )
+            .step(0.01),
         ]
         .spacing(theme::S2);
 
