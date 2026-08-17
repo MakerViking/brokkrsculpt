@@ -14,10 +14,15 @@ use bytemuck::{Pod, Zeroable};
 use crate::frustum::Frustum;
 use crate::matcap;
 use crate::mesh_pool::{MeshPool, PoolStats};
+use crate::overlay::{OverlayBatch, OverlayRenderer};
 
 /// Depth format. Depth32Float is universally supported and precise enough that
 /// a sculpt at arm's length shows no z fighting.
 const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
+
+/// The depth format overlay pipelines have to be built against, since every
+/// pipeline in a pass must agree with the pass's depth attachment.
+pub const OVERLAY_DEPTH_FORMAT: wgpu::TextureFormat = DEPTH_FORMAT;
 
 /// Per frame shader constants.
 ///
@@ -88,6 +93,7 @@ impl DepthBuffer {
 #[derive(Debug)]
 pub struct SculptRenderer {
     pipeline: wgpu::RenderPipeline,
+    overlay: OverlayRenderer,
     bind_group: wgpu::BindGroup,
     uniform_buffer: wgpu::Buffer,
     depth: DepthBuffer,
@@ -262,6 +268,7 @@ impl SculptRenderer {
 
         Self {
             pipeline,
+            overlay: OverlayRenderer::new(device, target_format, DEPTH_FORMAT),
             bind_group,
             uniform_buffer,
             depth: DepthBuffer::new(device, 1, 1),
@@ -283,6 +290,24 @@ impl SculptRenderer {
 
     pub fn write_uniforms(&self, queue: &wgpu::Queue, uniforms: &Uniforms) {
         queue.write_buffer(&self.uniform_buffer, 0, bytemuck::bytes_of(uniforms));
+    }
+
+    /// Replace this frame's overlay geometry: the brush ring and the mirror
+    /// planes. Drawn at the end of the sculpt pass, so it shares the sculpt's
+    /// viewport, scissor and depth buffer.
+    pub fn write_overlay(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        batch: &OverlayBatch,
+        view_projection: glam::Mat4,
+    ) {
+        self.overlay.upload(device, queue, batch, view_projection);
+    }
+
+    /// Overlay vertices drawn last frame, for the debug readout.
+    pub fn overlay_vertices(&self) -> usize {
+        self.overlay.vertex_count()
     }
 
     /// Make sure the depth buffer matches the render target.
@@ -351,6 +376,11 @@ impl SculptRenderer {
         );
         pass.set_scissor_rect(clip.x, clip.y, clip.width, clip.height);
         self.pool.draw(&mut pass, frustum);
+
+        // Last, and inside the same pass: the ring has to depth test against
+        // the model it is lying on, and a mirror plane against the model it
+        // passes through.
+        self.overlay.draw(&mut pass, false);
     }
 }
 

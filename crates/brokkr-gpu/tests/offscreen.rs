@@ -19,7 +19,7 @@ use brokkr_core::{
     BrickCoord, BrickMesh, Brush, BrushDirection, BrushKind, BrushScratch, MeshScratch, Pattern,
     PatternKind, Stamp, Volume,
 };
-use brokkr_gpu::{Frustum, PixelRect, SculptRenderer, Uniforms};
+use brokkr_gpu::{Frustum, OverlayBatch, PixelRect, SculptRenderer, Uniforms};
 use glam::{IVec3, Vec3};
 
 const WIDTH: u32 = 480;
@@ -591,4 +591,127 @@ fn every_pattern_leaves_a_visible_and_distinct_mark() {
             );
         }
     }
+}
+
+/// The overlay pipeline: does it draw, and does it respect depth?
+///
+/// Depth and blending are the whole difficulty of the overlay — the geometry is
+/// circles and quads. Three things have to hold, and all three are invisible to
+/// any test that only checks "some pixels changed":
+///
+///   * geometry in front of the model draws,
+///   * geometry behind the model does not,
+///   * a translucent surface tints the model rather than erasing it.
+#[test]
+fn overlay_geometry_draws_in_front_and_is_hidden_behind() {
+    let Some(harness) = Harness::new() else {
+        eprintln!("no usable wgpu adapter, skipping the overlay render test");
+        return;
+    };
+
+    let distance = MODEL_RADIUS * 3.0;
+    let mut renderer = SculptRenderer::new(&harness.device, &harness.queue, TARGET_FORMAT);
+    renderer.resize(&harness.device, WIDTH, HEIGHT);
+    renderer.write_uniforms(&harness.queue, &uniforms(distance));
+
+    let mut volume = Volume::new(VOXEL_SIZE);
+    volume.seed_sphere(Vec3::ZERO, MODEL_RADIUS);
+    upload_all(&mut renderer, &harness.queue, &mut volume);
+
+    let bare = harness.frame(&renderer);
+
+    // The camera sits along this direction, so "toward the eye" is +normal and
+    // "behind the model" is -normal.
+    let toward_eye = Vec3::new(0.45, 0.35, 1.0).normalize();
+    let quad = |centre: Vec3, half: f32, colour: [f32; 4]| {
+        // A quad facing the camera, spanned by two axes across the view.
+        let right = toward_eye.cross(Vec3::Y).normalize();
+        let up = right.cross(toward_eye).normalize();
+        let mut batch = OverlayBatch::default();
+        batch.push_quad(
+            centre - right * half - up * half,
+            centre + right * half - up * half,
+            centre + right * half + up * half,
+            centre - right * half + up * half,
+            colour,
+        );
+        batch
+    };
+
+    // --- in front of the model: must draw --------------------------------
+    let in_front = quad(toward_eye * (MODEL_RADIUS + 10.0), 12.0, [1.0, 0.2, 0.05, 1.0]);
+    renderer.write_overlay(&harness.device, &harness.queue, &in_front, view_projection(distance));
+    let front = harness.frame(&renderer);
+    dump("overlay-in-front", &front);
+
+    let changed =
+        bare.chunks_exact(4).zip(front.chunks_exact(4)).filter(|(a, b)| a[..3] != b[..3]).count();
+    assert!(changed > 2_000, "an overlay in front of the model barely drew: {changed} pixels");
+
+    // --- behind the model: must be hidden --------------------------------
+    let behind = quad(-toward_eye * (MODEL_RADIUS + 10.0), 12.0, [1.0, 0.2, 0.05, 1.0]);
+    renderer.write_overlay(&harness.device, &harness.queue, &behind, view_projection(distance));
+    let hidden = harness.frame(&renderer);
+    dump("overlay-behind", &hidden);
+
+    let leaked =
+        bare.chunks_exact(4).zip(hidden.chunks_exact(4)).filter(|(a, b)| a[..3] != b[..3]).count();
+    // Not zero: the quad is wider than the sphere is at that depth, so its rim
+    // legitimately shows past the silhouette. What must not happen is it
+    // painting over the model itself.
+    assert!(
+        leaked < changed / 4,
+        "an overlay behind the model was not occluded: {leaked} pixels against {changed} in front"
+    );
+
+    // --- translucent: must tint, not erase -------------------------------
+    // In front of the model, and barely opaque. Note a plane at the model's
+    // CENTRE would be correctly hidden by the model's front half, which is the
+    // depth test doing its job, not a bug — so translucency has to be measured
+    // where the surface is genuinely in front.
+    let veil = quad(toward_eye * (MODEL_RADIUS + 10.0), MODEL_RADIUS, [0.2, 0.5, 1.0, 0.25]);
+    renderer.write_overlay(&harness.device, &harness.queue, &veil, view_projection(distance));
+    let tinted = harness.frame(&renderer);
+    dump("overlay-translucent", &tinted);
+
+    let middle = (((HEIGHT / 2) * WIDTH + WIDTH / 2) * 4) as usize;
+    let (before, after) = (&bare[middle..middle + 3], &tinted[middle..middle + 3]);
+    assert_ne!(before, after, "a translucent plane over the model changed nothing");
+
+    // Tinted, not replaced: at a quarter alpha the model underneath still
+    // dominates. An opaque draw would land near the quad's own colour.
+    let opaque = quad(toward_eye * (MODEL_RADIUS + 10.0), MODEL_RADIUS, [0.2, 0.5, 1.0, 1.0]);
+    renderer.write_overlay(&harness.device, &harness.queue, &opaque, view_projection(distance));
+    let solid = harness.frame(&renderer);
+    let drift = |a: &[u8], b: &[u8]| -> i32 {
+        a.iter().zip(b).map(|(x, y)| (*x as i32 - *y as i32).abs()).sum()
+    };
+    assert!(
+        drift(after, &bare[middle..middle + 3]) < drift(after, &solid[middle..middle + 3]),
+        "a quarter alpha plane should stay nearer the model than the opaque one: \
+         model {:?}, tinted {after:?}, opaque {:?}",
+        &bare[middle..middle + 3],
+        &solid[middle..middle + 3]
+    );
+
+    // --- lines ------------------------------------------------------------
+    let mut ring = OverlayBatch::default();
+    let centre = toward_eye * MODEL_RADIUS;
+    let right = toward_eye.cross(Vec3::Y).normalize();
+    let up = right.cross(toward_eye).normalize();
+    for step in 0..64 {
+        let a = step as f32 / 64.0 * std::f32::consts::TAU;
+        let b = (step + 1) as f32 / 64.0 * std::f32::consts::TAU;
+        let at = |t: f32| centre + (right * t.cos() + up * t.sin()) * 14.0;
+        ring.push_line(at(a), at(b), [1.0, 0.48, 0.24, 1.0]);
+    }
+    renderer.write_overlay(&harness.device, &harness.queue, &ring, view_projection(distance));
+    let ringed = harness.frame(&renderer);
+    dump("overlay-ring", &ringed);
+
+    let ring_pixels =
+        bare.chunks_exact(4).zip(ringed.chunks_exact(4)).filter(|(a, b)| a[..3] != b[..3]).count();
+    assert!(ring_pixels > 200, "the ring barely drew: {ring_pixels} pixels");
+    // A ring is a rim, not a disc: it must cover far less than a filled quad.
+    assert!(ring_pixels < changed, "the ring covered as much as a filled quad");
 }
