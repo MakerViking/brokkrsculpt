@@ -103,12 +103,35 @@ pub fn read_path(path: &Path) -> Result<ExportMesh, ImportError> {
     }
     let bytes = std::fs::read(path)?;
 
-    match extension.as_str() {
-        "stl" => stl::read(&bytes),
-        "obj" => obj::read(&bytes),
-        "3mf" => threemf::read(&bytes),
-        other => Err(ImportError::Unsupported(format!("there is no reader for a .{other} file"))),
+    let mut mesh = match extension.as_str() {
+        "stl" => stl::read(&bytes)?,
+        "obj" => obj::read(&bytes)?,
+        "3mf" => threemf::read(&bytes)?,
+        other => {
+            return Err(ImportError::Unsupported(format!(
+                "there is no reader for a .{other} file"
+            )));
+        }
+    };
+
+    // Rotate into sculpt space. Every format read here is Z-up by the printing
+    // world's convention while the sculpt is Y-up, and the writers apply the
+    // matching rotation on the way out -- so this is the half that makes an
+    // export and a re-import land exactly where they started. Doing only one of
+    // the two would be worse than doing neither: a foreign file would arrive
+    // upright, and re-exporting it would silently un-correct it.
+    //
+    // It happens here rather than inside each reader on purpose. A reader's
+    // contract is to report the numbers exactly as the file states them; what
+    // those numbers *mean* is this layer's decision, and keeping the two apart
+    // is what lets a reader be tested against bytes alone.
+    for position in &mut mesh.positions {
+        *position = crate::orientation::from_print_space(*position);
     }
+    for normal in &mut mesh.normals {
+        *normal = crate::orientation::from_print_space(*normal);
+    }
+    Ok(mesh)
 }
 
 /// Collapse a triangle soup into an indexed mesh, welding on exact bits.
@@ -177,5 +200,134 @@ pub(crate) fn finite(position: glam::Vec3, what: &str) -> Result<glam::Vec3, Imp
         Ok(position)
     } else {
         Err(ImportError::Malformed(format!("{what} has a coordinate that is not a number")))
+    }
+}
+
+#[cfg(test)]
+mod round_trip_tests {
+    use super::*;
+    use crate::volume::Volume;
+    use glam::Vec3;
+
+    /// Export and re-import must be the identity, in all three formats.
+    ///
+    /// This is the test that keeps the two halves of the Z-up decision honest.
+    /// Export rotates Y-up to Z-up so slicers stand the model upright;
+    /// `read_path` rotates back. Either one alone leaves the round trip
+    /// mirrored about a diagonal, and a model that has been through it comes
+    /// back lying down -- which is exactly the state the change was made to fix,
+    /// only now harder to see because it takes two operations to show up.
+    ///
+    /// Deliberately through real files on disk rather than through the
+    /// in-memory readers, because `read_path` is where the rotation lives and
+    /// calling the readers directly would skip the thing under test.
+    #[test]
+    fn a_model_exported_and_read_back_lands_exactly_where_it_started() {
+        let directory = std::env::temp_dir().join(format!("brokkr-orient-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).unwrap();
+
+        // Deliberately lopsided, so a swapped pair of axes cannot hide.
+        let mut volume = Volume::new(0.5);
+        volume.seed_sphere(Vec3::new(0.0, 6.0, 0.0), 9.0);
+        volume.mark_everything_dirty();
+        let (original, report) = volume.export_mesh();
+        assert!(report.is_printable(), "the fixture is not printable");
+
+        let tallest = |mesh: &ExportMesh| {
+            let mut low = Vec3::splat(f32::INFINITY);
+            let mut high = Vec3::splat(f32::NEG_INFINITY);
+            for position in &mesh.positions {
+                low = low.min(*position);
+                high = high.max(*position);
+            }
+            (low, high)
+        };
+        let (low, high) = tallest(&original);
+
+        for (name, write) in [
+            (
+                "round.stl",
+                Box::new(|mesh: &ExportMesh, out: &mut Vec<u8>| {
+                    crate::export::stl::write(mesh, out)
+                }) as Box<dyn Fn(&ExportMesh, &mut Vec<u8>) -> std::io::Result<()>>,
+            ),
+            (
+                "round.obj",
+                Box::new(|mesh: &ExportMesh, out: &mut Vec<u8>| {
+                    crate::export::obj::write(mesh, out)
+                }),
+            ),
+            (
+                "round.3mf",
+                Box::new(|mesh: &ExportMesh, out: &mut Vec<u8>| {
+                    crate::export::threemf::write(mesh, out)
+                }),
+            ),
+        ] {
+            let path = directory.join(name);
+            let mut bytes = Vec::new();
+            write(&original, &mut bytes).unwrap();
+            std::fs::write(&path, &bytes).unwrap();
+
+            let back = read_path(&path).unwrap_or_else(|error| panic!("{name}: {error}"));
+            let (back_low, back_high) = tallest(&back);
+
+            assert!(
+                (back_low - low).length() < 1.0e-3 && (back_high - high).length() < 1.0e-3,
+                "{name} came back at {back_low:?}..{back_high:?} instead of {low:?}..{high:?} -- \
+                 the export and import rotations do not cancel"
+            );
+        }
+
+        std::fs::remove_dir_all(&directory).ok();
+    }
+
+    /// And the file itself really is Z-up, so a slicer stands it upright. The
+    /// round trip above would also pass if neither side rotated at all.
+    #[test]
+    fn the_written_file_is_z_up_even_though_the_sculpt_is_y_up() {
+        let directory =
+            std::env::temp_dir().join(format!("brokkr-orient-zup-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).unwrap();
+
+        // A shape whose tallest axis in sculpt space is Y.
+        let mut volume = Volume::new(0.5);
+        volume.seed_sphere(Vec3::new(0.0, 14.0, 0.0), 6.0);
+        volume.seed_sphere(Vec3::new(0.0, -14.0, 0.0), 6.0);
+        volume.mark_everything_dirty();
+        let (mesh, _) = volume.export_mesh();
+
+        let sculpt_extent = {
+            let mut low = Vec3::splat(f32::INFINITY);
+            let mut high = Vec3::splat(f32::NEG_INFINITY);
+            for position in &mesh.positions {
+                low = low.min(*position);
+                high = high.max(*position);
+            }
+            high - low
+        };
+        assert!(sculpt_extent.y > sculpt_extent.z, "the fixture is not tallest in Y");
+
+        let path = directory.join("upright.stl");
+        let mut bytes = Vec::new();
+        crate::export::stl::write(&mesh, &mut bytes).unwrap();
+        std::fs::write(&path, &bytes).unwrap();
+
+        // Read the file WITHOUT the rotation `read_path` applies, so this sees
+        // the bytes as a slicer would.
+        let raw = stl::read(&std::fs::read(&path).unwrap()).unwrap();
+        let mut low = Vec3::splat(f32::INFINITY);
+        let mut high = Vec3::splat(f32::NEG_INFINITY);
+        for position in &raw.positions {
+            low = low.min(*position);
+            high = high.max(*position);
+        }
+        let file_extent = high - low;
+        assert!(
+            file_extent.z > file_extent.y,
+            "the exported file is tallest in {file_extent:?} -- a slicer would lay it on its back"
+        );
+
+        std::fs::remove_dir_all(&directory).ok();
     }
 }
