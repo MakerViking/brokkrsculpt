@@ -74,6 +74,15 @@ impl FieldRegion {
         &mut self.values[..count]
     }
 
+    /// Inclusive voxel box the copy actually stores, padding included.
+    ///
+    /// A read outside it is answered by [`FieldRegion::get`]'s clamp rather
+    /// than from the copy, so a caller reasoning about what a sample can have
+    /// come from needs to know where that edge is rather than assume it.
+    pub(crate) fn bounds(&self) -> (IVec3, IVec3) {
+        (self.lo, self.hi)
+    }
+
     /// Value at a world voxel coordinate.
     ///
     /// Coordinates outside the stored box clamp to its edge rather than

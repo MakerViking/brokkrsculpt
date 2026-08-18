@@ -68,6 +68,17 @@ pub enum BrickVerdict {
     /// across and a stamp reads two, so a tile sitting against the surface
     /// still has 96 percent of itself out of reach.
     OnlyNearDifferentNeighbours,
+    /// It holds one value everywhere, and the edit has worked out for itself
+    /// which part of it can change. Only that inclusive voxel range is
+    /// resolved, and the rest is left exactly as it was.
+    ///
+    /// [`BrickVerdict::OnlyNearDifferentNeighbours`] is this with the volume
+    /// doing the working out, which it can only do for an edit whose reads come
+    /// from the volume. A warping gesture reads a copy locked before the
+    /// gesture started and displaces by tens of voxels along the drag, so
+    /// neither the grid nor the shape of the reach is the volume's to reason
+    /// about, and it answers for itself. See [`crate::brush::MoveStroke`].
+    OnlyWithin(IVec3, IVec3),
 }
 
 /// One brick an edit has decided to visit, and where inside it.
@@ -675,12 +686,7 @@ impl Volume {
         for z in 0..grid_size.z {
             for y in 0..grid_size.y {
                 for x in 0..grid_size.x {
-                    let coord = BrickCoord(grid_min + IVec3::new(x, y, z));
-                    scratch.fills.push(match self.bricks.get(&coord) {
-                        None => Some(OUTSIDE),
-                        Some(Brick::Uniform(value)) => Some(*value),
-                        Some(Brick::Dense(_)) => None,
-                    });
+                    scratch.fills.push(self.brick_fill(BrickCoord(grid_min + IVec3::new(x, y, z))));
                 }
             }
         }
@@ -729,6 +735,17 @@ impl Volume {
                                 // the whole brick stays the value it is.
                                 continue;
                             };
+                            lo = lo.max(near_lo);
+                            hi = hi.min(near_hi);
+                            if lo.cmpgt(hi).any() {
+                                continue;
+                            }
+                        }
+                        BrickVerdict::OnlyWithin(near_lo, near_hi) => {
+                            debug_assert!(
+                                uniform.is_some(),
+                                "a brick with detail in it has no constant to leave alone"
+                            );
                             lo = lo.max(near_lo);
                             hi = hi.min(near_hi);
                             if lo.cmpgt(hi).any() {
@@ -838,8 +855,7 @@ impl Volume {
     /// For tests that need to see the skipping actually happening rather than
     /// just agreeing with the unskipped path, which it would also do if it
     /// skipped nothing.
-    #[cfg(test)]
-    pub(crate) fn last_visited_bricks(&self) -> usize {
+    pub fn last_visited_bricks(&self) -> usize {
         self.scratch.visits.len()
     }
 
@@ -1064,6 +1080,21 @@ impl Volume {
     #[inline]
     pub(crate) fn brick(&self, coord: BrickCoord) -> Option<&Brick> {
         self.bricks.get(&coord)
+    }
+
+    /// The single value every voxel of a brick holds, or `None` when it carries
+    /// detail.
+    ///
+    /// An absent brick counts as [`OUTSIDE`], which is what it reads as. One
+    /// map lookup, and it is the whole basis of the skipping: an edit that
+    /// cannot change a constant only has to be told which bricks are one.
+    #[inline]
+    pub(crate) fn brick_fill(&self, coord: BrickCoord) -> Option<f32> {
+        match self.bricks.get(&coord) {
+            None => Some(OUTSIDE),
+            Some(Brick::Uniform(value)) => Some(*value),
+            Some(Brick::Dense(_)) => None,
+        }
     }
 
     /// Put a brick in directly. Used when building a volume from another one.

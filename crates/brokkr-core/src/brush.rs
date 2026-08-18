@@ -63,7 +63,7 @@
 
 use glam::{IVec3, Vec3};
 
-use crate::brick::{INSIDE, OUTSIDE};
+use crate::brick::{BRICK_DIM, BrickCoord, INSIDE, OUTSIDE};
 use crate::pattern::{Pattern, Prepared};
 use crate::region::FieldRegion;
 use crate::volume::{BrickPreview, BrickVerdict, Volume};
@@ -647,7 +647,7 @@ impl Brush {
         // own locked copy, so applying them in turn would have the second
         // rewrite the first's work with the field as it stood before it.
         if self.kind == BrushKind::Move {
-            self.drag_once(volume, stamp, symmetry, scratch);
+            self.drag_once(volume, stamp, symmetry, scratch, Skipping::On);
             return;
         }
 
@@ -675,12 +675,18 @@ impl Brush {
         stamp: &Stamp,
         symmetry: Symmetry,
         scratch: &mut BrushScratch,
+        skipping: Skipping,
     ) {
         if stamp.tangent == Vec3::ZERO {
             return;
         }
         scratch.locked.begin(volume, self, stamp.centre, symmetry);
-        scratch.locked.drag_to(volume, stamp.centre + stamp.tangent, stamp.pressure);
+        scratch.locked.drag_to_where(
+            volume,
+            stamp.centre + stamp.tangent,
+            stamp.pressure,
+            skipping,
+        );
         scratch.locked.end();
     }
 
@@ -804,7 +810,7 @@ impl Brush {
         // has nothing to tell it. Answered once per stamp rather than per
         // voxel, and before any of the work below.
         if self.kind == BrushKind::Move {
-            self.drag_once(volume, stamp, Symmetry::OFF, scratch);
+            self.drag_once(volume, stamp, Symmetry::OFF, scratch, skipping);
             return;
         }
 
@@ -1004,6 +1010,126 @@ struct MoveAnchor {
     hi: IVec3,
 }
 
+pub static PROBE_CULL: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+pub static PROBE_DENSE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+pub static PROBE_SAT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+pub static PROBE_UNSAT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Which bricks of one locked copy hold a single value everywhere.
+///
+/// The warp resamples from the copy, so what a voxel ends up holding is decided
+/// by the copy and not by the volume being written. Answering "was everything
+/// this brick could pull from already the same value" needs the copy classified
+/// the way [`Volume::edit_voxels_where`] classifies the volume, and it is
+/// classified once per lock rather than once per pointer event.
+#[derive(Debug, Default)]
+struct LockedFills {
+    /// Inclusive voxel box the copy stores, taken from it rather than
+    /// reconstructed, because a read outside it clamps to its rim.
+    lo: IVec3,
+    hi: IVec3,
+    /// Minimum brick of the grid, and its extent in bricks.
+    min: IVec3,
+    size: IVec3,
+    /// `Some(v)` when every voxel of that brick held `v` at the lock, laid out
+    /// with X fastest from `min`.
+    fills: Vec<Option<f32>>,
+}
+
+impl LockedFills {
+    /// Classify every brick the copy covers. Reuses the last lock's storage.
+    fn build(&mut self, volume: &Volume, lo: IVec3, hi: IVec3) {
+        self.lo = lo;
+        self.hi = hi;
+        self.min = BrickCoord::containing(lo).0;
+        self.size = BrickCoord::containing(hi).0 - self.min + IVec3::ONE;
+
+        self.fills.clear();
+        self.fills.reserve(self.size.as_i64vec3().element_product().max(0) as usize);
+        for z in 0..self.size.z {
+            for y in 0..self.size.y {
+                for x in 0..self.size.x {
+                    let coord = BrickCoord(self.min + IVec3::new(x, y, z));
+                    self.fills.push(volume.brick_fill(coord));
+                }
+            }
+        }
+    }
+
+    /// Which part of an inclusive voxel range could read something other than
+    /// `value` out of the copy, given that the warp displaces a voxel by
+    /// somewhere in the voxel box `back_min..=back_max`.
+    ///
+    /// `None` when everything the range can reach held `value`, so it is
+    /// untouchable. Otherwise a bounding box of the part that is not, which is
+    /// exact whenever the differing bricks all lie on one side -- the usual
+    /// case, because what makes one differ is the surface passing through it.
+    ///
+    /// [`Volume::edit_voxels_where`] answers the same question for the brushes
+    /// that read the volume they write. This is the version for a warp, and it
+    /// differs in the two ways that matter: the grid is the locked copy rather
+    /// than the volume, and the reach is a box offset along the drag rather
+    /// than a couple of voxels in every direction.
+    fn reachable_from_elsewhere(
+        &self,
+        lo: IVec3,
+        hi: IVec3,
+        back_min: IVec3,
+        back_max: IVec3,
+        value: f32,
+    ) -> Option<(IVec3, IVec3)> {
+        let read_lo = lo - back_max;
+        let read_hi = hi - back_min;
+        // A read past the stored box is answered by its rim rather than by the
+        // brick it nominally lands in, so rather than reason about that, give
+        // up and let the whole range be resolved. It only arises at the outer
+        // rim of the box, where the falloff has gone to nothing and the warp is
+        // barely displacing anything anyway.
+        if read_lo.cmplt(self.lo).any() || read_hi.cmpgt(self.hi).any() {
+            return Some((lo, hi));
+        }
+
+        let dim = BRICK_DIM as i32;
+        let b_min = BrickCoord::containing(read_lo).0;
+        let b_max = BrickCoord::containing(read_hi).0;
+        let mut bad_lo = IVec3::MAX;
+        let mut bad_hi = IVec3::MIN;
+        for bz in b_min.z..=b_max.z {
+            for by in b_min.y..=b_max.y {
+                for bx in b_min.x..=b_max.x {
+                    let brick = IVec3::new(bx, by, bz) - self.min;
+                    let index =
+                        brick.x + brick.y * self.size.x + brick.z * self.size.x * self.size.y;
+                    if self.fills[index as usize] == Some(value) {
+                        continue;
+                    }
+                    // The part of that brick the range actually reads.
+                    let origin = IVec3::new(bx, by, bz) * dim;
+                    bad_lo = bad_lo.min(origin.max(read_lo));
+                    bad_hi = bad_hi.max((origin + IVec3::splat(dim - 1)).min(read_hi));
+                }
+            }
+        }
+        if bad_lo.cmpgt(bad_hi).any() {
+            return None;
+        }
+
+        // A voxel reads from itself minus the displacement, so the ones that
+        // could have read the differing material are that material shifted
+        // forward by the same box.
+        let touched_lo = (bad_lo + back_min).max(lo);
+        let touched_hi = (bad_hi + back_max).min(hi);
+        touched_lo.cmple(touched_hi).all().then_some((touched_lo, touched_hi))
+    }
+}
+
+/// One anchor's locked copy of the field, and what is known about its bricks.
+#[derive(Debug, Default)]
+struct Locked {
+    field: FieldRegion,
+    fills: LockedFills,
+}
+
 /// A Move gesture, holding the field as it stood when the button went down.
 ///
 /// # Why the field is locked rather than warped a little at a time
@@ -1071,12 +1197,37 @@ struct MoveAnchor {
 /// bound above true when a voxel is inside two brushes at once -- and the
 /// copies are only grown to cover that when two anchors are close enough for
 /// it to arise, so symmetry used away from a mirror plane costs nothing extra.
+///
+/// # What a pointer event is allowed to leave out
+///
+/// The box is the brush's whole bounding cube and the ball fills only half of
+/// it, and inside the ball most of what a large brush covers is deep interior
+/// or empty space. Neither can change, and the argument is the one every other
+/// brush uses with one extra term for the warp.
+///
+/// - Outside every falloff the warp hands a voxel its own value straight back,
+///   so a brick the ball never reaches is untouchable. That is half the cube.
+/// - A brick holding one value everywhere gets that value back **if everything
+///   the warp could pull into it held that value too**. Resampling a constant
+///   region gives the constant, whatever the weight and wherever inside it the
+///   read lands. The region it can pull from is the brick grown by the largest
+///   displacement the warp applies anywhere in it, which is the drag scaled by
+///   the falloff weight at the brick's nearest point -- so the bricks furthest
+///   from the origin, where the weight has fallen away, barely reach past
+///   themselves at all, and those are exactly the ones deepest in the material.
+///
+/// The second is why Move could not simply be handed the volume's own constant
+/// test. That test asks about a brick and its 26 neighbours; the warp reads
+/// from the LOCKED COPY, tens of voxels away, and it is the copy that has to be
+/// saturated. So the copy is classified when it is taken -- once per lock,
+/// which is a few hundred map lookups against a pass over four million voxels
+/// -- and [`LockedFills`] is what answers it.
 #[derive(Debug, Default)]
 pub struct MoveStroke {
-    /// Empty when no gesture is in progress. `fields` is kept allocated across
+    /// Empty when no gesture is in progress. `locked` is kept allocated across
     /// gestures and is only ever read at indices below this length.
     anchors: Vec<MoveAnchor>,
-    fields: Vec<FieldRegion>,
+    locked: Vec<Locked>,
     /// Locked with the anchors, so dragging the radius slider mid-gesture
     /// cannot invalidate the boxes that were snapshotted for it.
     brush: Brush,
@@ -1139,12 +1290,15 @@ impl MoveStroke {
         let read = Vec3::splat(brush.radius + if crowded { self.max_drag } else { 0.0 });
 
         for (index, anchor) in self.anchors.iter().enumerate() {
-            if self.fields.len() <= index {
-                self.fields.push(FieldRegion::new());
+            if self.locked.len() <= index {
+                self.locked.push(Locked::default());
             }
             let (read_lo, read_hi) =
                 volume.voxel_bounds(anchor.origin - read, anchor.origin + read);
-            volume.snapshot(read_lo, read_hi, &mut self.fields[index]);
+            let locked = &mut self.locked[index];
+            volume.snapshot(read_lo, read_hi, &mut locked.field);
+            let (stored_lo, stored_hi) = locked.field.bounds();
+            locked.fills.build(volume, stored_lo, stored_hi);
         }
     }
 
@@ -1156,6 +1310,17 @@ impl MoveStroke {
     /// this writes the same answer whether it is the first event of the gesture
     /// or the thousandth.
     pub fn drag_to(&mut self, volume: &mut Volume, to: Vec3, pressure: f32) {
+        self.drag_to_where(volume, to, pressure, Skipping::On);
+    }
+
+    /// One pointer event, with the option of visiting every brick of the box
+    /// whether it can change or not.
+    ///
+    /// The two are meant to produce identical fields and identical undo
+    /// entries, and `skipping_leaves_the_same_field_and_the_same_undo_entry`
+    /// holds Move to that alongside every other brush. Nothing outside the
+    /// tests asks for [`Skipping::Off`].
+    fn drag_to_where(&mut self, volume: &mut Volume, to: Vec3, pressure: f32, skipping: Skipping) {
         let Some(anchor) = self.anchors.first() else {
             return;
         };
@@ -1176,8 +1341,88 @@ impl MoveStroke {
         let cap = self.max_drag;
         let anchors = self.anchors.as_slice();
 
-        for (anchor, field) in anchors.iter().zip(&self.fields) {
-            volume.edit_voxels(anchor.lo, anchor.hi, |_, position, value| {
+        for (anchor, locked) in anchors.iter().zip(&self.locked) {
+            let field = &locked.field;
+            let fills = &locked.fills;
+            // Which bricks of the box this event could change at all. See the
+            // type docs: the ball misses half the cube, and of what is left the
+            // bricks that already hold one value can only change if the region
+            // the warp pulls them from held something else.
+            let decide = |preview: &BrickPreview| {
+                if skipping == Skipping::Off {
+                    return BrickVerdict::Whole;
+                }
+                // Grown by a voxel so this bounds the per voxel test rather
+                // than racing the last bit of its rounding.
+                let slack = Vec3::splat(voxel_size);
+                let box_min = preview.lo.as_vec3() * voxel_size - slack;
+                let box_max = preview.hi.as_vec3() * voxel_size + slack;
+
+                // How far the warp displaces anything in this brick, as a box
+                // rather than a radius. Every anchor's contribution is the drag
+                // scaled by a weight between zero and its largest here, so the
+                // total lies inside the box spanned by those segments -- and
+                // the final clamp to the cap only shrinks it. Direction is the
+                // whole point: the source region is this brick swept BACK along
+                // the drag, and at a 20 mm radius that is a couple of bricks
+                // against the hundred an isotropic grow by the same distance
+                // would have to look at.
+                //
+                // The falloff never rises with distance, so evaluating it at
+                // the brick's nearest point to each anchor bounds it over the
+                // whole brick.
+                //
+                // The cull is the WEIGHT and not the displacement, for the same
+                // reason the per voxel test is: a drag that has come back to
+                // where it started displaces nothing anywhere, and those voxels
+                // are precisely the ones that have to be rewritten from the
+                // locked copy to put the form back.
+                let mut back_min = Vec3::ZERO;
+                let mut back_max = Vec3::ZERO;
+                let mut reached = false;
+                for one in anchors {
+                    let near = one.origin.clamp(box_min, box_max).distance(one.origin);
+                    let weight = falloff.weight(near * inverse_radius);
+                    if weight <= 0.0 {
+                        continue;
+                    }
+                    reached = true;
+                    let far = drag * one.flip * weight;
+                    back_min += far.min(Vec3::ZERO);
+                    back_max += far.max(Vec3::ZERO);
+                }
+                if !reached {
+                    PROBE_CULL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    return BrickVerdict::Skip;
+                }
+
+                let Some(value) = preview.uniform else {
+                    PROBE_DENSE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    return BrickVerdict::Whole;
+                };
+                // A voxel at `p` reads from `p - displacement`, rounded outward
+                // and then by the one further voxel the trilinear cell
+                // straddles.
+                let back_min = (back_min / voxel_size).floor().as_ivec3() - IVec3::ONE;
+                let back_max = (back_max / voxel_size).ceil().as_ivec3() + IVec3::ONE;
+                match fills
+                    .reachable_from_elsewhere(preview.lo, preview.hi, back_min, back_max, value)
+                {
+                    None => {
+                        PROBE_SAT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        BrickVerdict::Skip
+                    }
+                    Some((near_lo, near_hi)) => {
+                        PROBE_UNSAT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        BrickVerdict::OnlyWithin(near_lo, near_hi)
+                    }
+                }
+            };
+
+            // Zero reach: this never answers `OnlyNearDifferentNeighbours`,
+            // because what it has to prove is about the locked copy and not
+            // about the brick's neighbours in the volume.
+            volume.edit_voxels_where(anchor.lo, anchor.hi, 0, decide, |_, position, value| {
                 let Some(displacement) =
                     move_displacement(anchors, drag, position, inverse_radius, falloff, cap)
                 else {
@@ -2067,18 +2312,6 @@ mod skipping_tests {
             // checking the cheap-but-less-important property first would hide
             // the expensive-but-vital one.
             assert_same_field(&skipped, &whole, &format!("{kind} {direction:?}"));
-            // Move is the exception, and it is recorded rather than hidden.
-            // Its locked formulation reads from a stroke-start snapshot and
-            // displaces by the TOTAL drag, so the region it can pull material
-            // out of is the brush plus the whole reach cap -- far too much for
-            // the cheap per-brick test to prove anything untouched. The field
-            // it produces is still correct, which is what the assertion above
-            // checks; it simply costs what it costs. That makes Move the most
-            // expensive brush by some way and the obvious next piece of
-            // performance work.
-            if kind == BrushKind::Move {
-                continue;
-            }
             assert!(
                 visited_when_skipping < visited_when_not,
                 "{kind} {direction:?} skipped nothing: {visited_when_skipping} bricks either way"
@@ -2161,16 +2394,12 @@ mod skipping_tests {
             let (control, whole) = visits(brush(BrushKind::Flatten), at, saturating);
             assert!(control < whole, "the radius cull did nothing, so there is no control here");
 
-            // Move is deliberately absent. It reads from a stroke-start
-            // snapshot and displaces by the total drag, so the region it can
-            // pull material out of is the brush plus the whole reach cap, and
-            // the cheap constant test cannot prove anything in there untouched.
-            // Its field is still correct -- `skipping_leaves_the_same_field_and
-            // _the_same_undo_entry` checks that for every brush including this
-            // one -- it is simply the expensive brush, at about 7.7 ms for a
-            // 20 mm radius against a 4 ms budget, and the next thing worth
-            // optimising.
-            for kind in [BrushKind::Draw, BrushKind::Smooth, BrushKind::Pinch] {
+            // Move is in here too. It proves its constants against the locked
+            // copy rather than against the brick's neighbours -- see
+            // `MoveStroke` -- but the property being asserted is the same one:
+            // a brush that can leave a saturated region alone has to visit
+            // strictly fewer bricks than the radius cull alone leaves behind.
+            for kind in [BrushKind::Draw, BrushKind::Smooth, BrushKind::Pinch, BrushKind::Move] {
                 let (skipped, _) = visits(brush(kind), at, saturating);
                 assert!(
                     skipped < control,
