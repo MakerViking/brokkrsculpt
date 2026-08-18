@@ -140,12 +140,19 @@ impl Volume {
                 // would cost a dense promotion and an undo entry for no change.
                 Cut::Keeps => {}
                 Cut::Crosses => {
-                    let Some(existing) = self.brick(coord) else {
+                    if self.brick(coord).is_none() {
                         // Absent already reads as OUTSIDE, and `max` cannot
                         // lower it, so there is nothing a cut can do here.
                         continue;
+                    }
+                    // Recorded before the brick is taken, because the recorder
+                    // reads the prior contents out of the map. That copy is the
+                    // one undo needs; taking rather than cloning avoids making a
+                    // second one of every brick along the cut.
+                    self.record_for_undo(coord);
+                    let Some(mut brick) = self.take_brick(coord) else {
+                        continue;
                     };
-                    let mut brick = existing.clone();
                     let data = brick.make_dense();
                     for z in 0..BRICK_DIM {
                         for y in 0..BRICK_DIM {
@@ -165,19 +172,12 @@ impl Volume {
                     // A brick the plane merely grazed can come out entirely
                     // empty, and one it barely entered can come out unchanged.
                     // Collapsing releases the 128 KB either way.
+                    // Already recorded and already taken out of the map, so
+                    // these only decide what goes back in.
                     match brick.is_collapsible() {
-                        Some(value) if value >= OUTSIDE => {
-                            self.record_for_undo(coord);
-                            self.remove_brick(coord);
-                        }
-                        Some(value) => {
-                            self.record_for_undo(coord);
-                            self.insert_brick(coord, Brick::Uniform(value));
-                        }
-                        None => {
-                            self.record_for_undo(coord);
-                            self.insert_brick(coord, brick);
-                        }
+                        Some(value) if value >= OUTSIDE => {}
+                        Some(value) => self.insert_brick(coord, Brick::Uniform(value)),
+                        None => self.insert_brick(coord, brick),
                     }
                     changed += 1;
                     touched.push(coord);

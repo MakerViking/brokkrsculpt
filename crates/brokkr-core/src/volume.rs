@@ -1102,6 +1102,16 @@ impl Volume {
         self.bricks.insert(coord, brick);
     }
 
+    /// Take a brick out, handing over its storage.
+    ///
+    /// For an operation that rewrites a brick in place: cloning it out and
+    /// inserting the copy back costs a second 128 KB copy on top of the one
+    /// `record_for_undo` already makes, and the original is about to be
+    /// discarded anyway.
+    pub(crate) fn take_brick(&mut self, coord: BrickCoord) -> Option<Brick> {
+        self.bricks.remove(&coord)
+    }
+
     /// Drop a brick entirely, so it reads as empty space again.
     ///
     /// Used by the plane cut: a brick wholly past the cut is `OUTSIDE`

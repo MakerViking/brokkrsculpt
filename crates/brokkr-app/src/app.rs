@@ -282,8 +282,6 @@ pub struct Brokkr {
     /// irreversible-looking: arming it deliberately is worth one click, and the
     /// tool strip shows the armed state so it can never be a surprise.
     cut_armed: bool,
-    /// Where a cut line started, while it is being dragged.
-    cut_from: Option<Vec2>,
     /// Sculpts opened or saved recently, for the File menu.
     recent: crate::recent::Recent,
     /// Where the crash net is written.
@@ -543,7 +541,6 @@ impl Brokkr {
             unsaved: false,
             confirm: None,
             cut_armed: false,
-            cut_from: None,
             recent: crate::recent::Recent::load(),
             autosave_file: Self::default_autosave_path(),
             last_autosave: Instant::now(),
@@ -1072,10 +1069,7 @@ impl Brokkr {
     /// order, the handedness of the camera basis and whether the pixel-to-NDC
     /// step flips Y, and getting it backwards means the tool removes the half
     /// the user meant to keep.
-    fn finish_cut(&mut self) {
-        let Some(from) = self.cut_from.take() else {
-            return;
-        };
+    fn finish_cut(&mut self, from: Vec2) {
         let Some(to) = self.cursor else {
             return;
         };
@@ -1843,10 +1837,7 @@ impl Brokkr {
                 let kind = match button {
                     // A cut outranks sculpting: the mode was armed deliberately
                     // and the next left drag is the line, not a stroke.
-                    PointerButton::Left if self.cut_armed => {
-                        self.cut_from = Some(position);
-                        DragKind::Cutting
-                    }
+                    PointerButton::Left if self.cut_armed => DragKind::Cutting,
                     // Left sculpts -- unless a hold-and-drag resize is in
                     // progress, in which case the pointer belongs to that
                     // gesture and a press must not lay down a stroke.
@@ -1882,7 +1873,8 @@ impl Brokkr {
             PointerEvent::Released { button } => {
                 if let Some(drag) = self.drag.filter(|drag| drag.button == button) {
                     if matches!(drag.kind, DragKind::Cutting) {
-                        self.finish_cut();
+                        // The drag already recorded where the button went down.
+                        self.finish_cut(drag.origin);
                     }
                     if matches!(drag.kind, DragKind::Sculpt(_)) {
                         self.finish_stroke();
@@ -2043,7 +2035,6 @@ impl Brokkr {
                 // Escape is also the way out of an armed cut, which is the only
                 // mode in the application that changes what a click does.
                 self.cut_armed = false;
-                self.cut_from = None;
                 self.menu = None;
                 self.menu_edit = None;
                 self.top_menu = None;
@@ -2052,7 +2043,6 @@ impl Brokkr {
             Message::MenuFieldSubmitted => self.menu_edit = None,
             Message::CutToggled => {
                 self.cut_armed = !self.cut_armed;
-                self.cut_from = None;
                 self.status = if self.cut_armed {
                     "cut armed: drag a line across the model, the left of the arrow goes"
                         .to_string()
@@ -2769,8 +2759,21 @@ mod tests {
     #[test]
     fn undo_with_an_empty_history_does_not_mark_it_unsaved() {
         let mut app = app();
+        assert!(!app.history.can_undo(), "the fixture already had something to undo");
         app.undo();
         assert!(!app.unsaved, "an undo that did nothing armed the unsaved marker");
+
+        // The control. Without it this test asserts the default value and would
+        // pass just as happily if `undo` did nothing at all, in either case.
+        press(&mut app, centre_of_viewport());
+        release(&mut app);
+        app.unsaved = false;
+        app.undo();
+        assert!(
+            app.unsaved,
+            "an undo with something to undo failed to mark it, so the \
+                              assertion above was vacuous"
+        );
     }
 
     /// `resample` returns early when the size is already in use. The marker sits
@@ -2855,6 +2858,8 @@ mod tests {
     #[test]
     fn a_clean_document_is_not_prompted_at_all() {
         let mut app = app();
+        assert!(!app.unsaved, "the fixture starts dirty, so this proves nothing");
+
         update(&mut app, Message::NewSculpt);
         assert!(app.confirm.is_none(), "a clean document was prompted");
 
@@ -2863,6 +2868,17 @@ mod tests {
 
         update(&mut app, Message::OpenRequested);
         assert!(app.confirm.is_none(), "a clean document was prompted on open");
+
+        // The control: the same three actions DO prompt once there is something
+        // to lose. Without it every assertion above is satisfied by the default.
+        for action in [Message::NewSculpt, Message::CloseRequested(iced::window::Id::unique())] {
+            let mut dirty = app_with_unsaved_work();
+            update(&mut dirty, action);
+            assert!(
+                dirty.confirm.is_some(),
+                "the gate never fires, so the checks above are vacuous"
+            );
+        }
     }
 
     /// The prompt draws over the viewport but the shader widget still sees
