@@ -30,6 +30,9 @@
 //! ridge into a crease, and move reads from behind along the drag, which pulls
 //! the patch after the pointer.
 //!
+//! Move is the odd one out in a second way: it is the only brush whose unit of
+//! work is a whole gesture rather than a stamp. See [`MoveStroke`].
+//!
 //! Draw and pinch were both first written the obvious way, as a value the
 //! brush adds or amplifies, and both had to be rewritten. Anything that
 //! multiplies a displacement by the local gradient, or that amplifies the
@@ -58,7 +61,7 @@
 //! field stays well formed. A renormalisation pass belongs with the GPU
 //! rewrite, not here.
 
-use glam::Vec3;
+use glam::{IVec3, Vec3};
 
 use crate::brick::{INSIDE, OUTSIDE};
 use crate::pattern::{Pattern, Prepared};
@@ -94,6 +97,29 @@ const STAMP_FRACTION_OF_RADIUS: f32 = 0.25;
 ///
 /// Kept under one voxel so the warped read stays inside the snapshot's padding.
 const PINCH_PULL_VOXELS: f32 = 0.85;
+
+/// Fraction of the fold threshold a whole Move gesture is allowed to use.
+///
+/// A domain warp folds the field back through itself once the displacement
+/// changes faster than the distance it is spread over, which happens at
+/// `radius / falloff.max_slope()` exactly. Backing off to three quarters of
+/// that keeps the warp comfortably invertible for every falloff curve, and
+/// buys a property the reads depend on: the source of every voxel a Move
+/// touches stays inside the brush's own box, so the box that is read and the
+/// box that is written are the same one. See [`MoveStroke`].
+const MOVE_DRAG_MARGIN: f32 = 0.75;
+
+/// How far the drag has to change before a Move gesture redoes its warp, in
+/// voxels.
+///
+/// The warp is recomputed from the locked field every pointer event, so an
+/// event that has not moved the pointer by a visible amount would repeat a
+/// whole pass over the brush box for an identical result. Below a quarter of a
+/// voxel the answer is the same to within the interpolation, so it is skipped.
+///
+/// This is also what makes dragging on past the cap free: once the
+/// displacement has clamped, further motion the same way leaves it unchanged.
+const MOVE_SETTLE_VOXELS: f32 = 0.25;
 
 /// Rotate a surface normal by a lean, giving the direction a tilted stylus is
 /// pushing in.
@@ -202,6 +228,23 @@ impl FalloffCurve {
     pub const ALL: [FalloffCurve; 4] =
         [FalloffCurve::Smooth, FalloffCurve::Linear, FalloffCurve::Sharp, FalloffCurve::Wide];
 
+    /// Steepest the weight ever changes, per unit of normalised distance.
+    ///
+    /// Read off the derivative of each curve rather than measured: smoothstep
+    /// peaks at three halves in the middle, a line is 1 the whole way, and both
+    /// cubics reach 3 at the end where they are steepest.
+    ///
+    /// Only [`MoveStroke`] needs it, and it needs it because a displacement
+    /// spread over a falloff steeper than this folds the field through itself.
+    #[inline]
+    pub fn max_slope(self) -> f32 {
+        match self {
+            FalloffCurve::Smooth => 1.5,
+            FalloffCurve::Linear => 1.0,
+            FalloffCurve::Sharp | FalloffCurve::Wide => 3.0,
+        }
+    }
+
     pub fn label(self) -> &'static str {
         match self {
             FalloffCurve::Smooth => "Smooth",
@@ -241,20 +284,19 @@ pub enum BrushKind {
     /// along the direction of travel, so whatever was under the cursor arrives
     /// where the cursor now is, tapering to nothing at the rim.
     ///
-    /// Reach comes from stamping repeatedly as the pointer moves, not from one
-    /// large warp. A stamp may not displace the field further than
-    /// [`MAX_STAMP_VOXELS`], so a 20 mm drag at a quarter millimetre voxel is
-    /// 80 voxels of travel assembled from stamps of at most one voxel each.
+    /// Unlike every other brush, one Move is a whole gesture rather than a
+    /// stamp. It locks the field at the moment the button goes down and warps
+    /// that locked copy by the TOTAL drag on every pointer event, which is what
+    /// Nomad and ZBrush do with a locked vertex selection. See [`MoveStroke`]
+    /// for why, and for what that costs.
     ///
-    /// It is not elastic, and nothing in the interface should suggest it is.
-    /// Nomad locks a vertex selection at the start of a stroke, so dragging out
-    /// and back returns the form exactly. An incremental warp cannot do that:
-    /// each stamp resamples what the last one left, so out and back gives a
-    /// slightly diffused, slightly volume-lost version of what you started
-    /// with. That is the price of having no vertices to lock. The escape hatch
-    /// is undo, and it is a good one -- a whole gesture is one history entry,
-    /// so the way back is a single keystroke rather than a careful reverse
-    /// drag.
+    /// Dragging out and back therefore returns the form, near enough exactly:
+    /// the second half of the gesture is not undoing the first, it is warping
+    /// the same locked field by a drag that has shrunk back to nothing.
+    ///
+    /// How far one gesture can carry the surface is bounded -- see
+    /// [`Brush::max_drag`]. Past that the surface stops following rather than
+    /// tearing, and the way to move something further is a second gesture.
     ///
     /// It drags along the surface rather than through it, because the pointer
     /// direction comes from where the cursor meets the model. Pulling a form
@@ -371,6 +413,33 @@ impl Symmetry {
         self.with_axis(axis, !self.axis(axis))
     }
 
+    /// Write the componentwise sign of every mirrored twin into `out`,
+    /// returning how many there are. Never includes the identity.
+    ///
+    /// A mirror is a reflection, so it acts on a position, a normal and a
+    /// direction of travel alike: multiply by this and every one of them comes
+    /// out on the other side pointing the right way.
+    pub(crate) fn flips(self, out: &mut [Vec3; Self::MAX_MIRRORS]) -> usize {
+        let mut count = 0;
+        // Each combination is a bit per axis; 0 is the original, which is the
+        // caller's to apply and not a twin.
+        for combination in 1..=Self::MAX_MIRRORS {
+            let flips = |index: usize| combination & (1 << index) != 0;
+            if (0..3).any(|index| flips(index) && !self.enabled[index]) {
+                continue;
+            }
+            let mut sign = Vec3::ONE;
+            for index in 0..3 {
+                if flips(index) {
+                    sign[index] = -1.0;
+                }
+            }
+            out[count] = sign;
+            count += 1;
+        }
+        count
+    }
+
     /// Write every mirrored twin of a stamp into `out`, returning how many
     /// there are. Never includes the stamp itself.
     ///
@@ -383,25 +452,17 @@ impl Symmetry {
     /// suppressing the twin near the plane would put a visible step in the
     /// stroke strength exactly where the user is trying to work.
     pub fn mirrors(self, stamp: &Stamp, out: &mut [Stamp; Self::MAX_MIRRORS]) -> usize {
-        let mut count = 0;
-        // Each combination is a bit per axis; 0 is the original, which is the
-        // caller's to apply and not a twin.
-        for combination in 1..=Self::MAX_MIRRORS {
-            let flips = |index: usize| combination & (1 << index) != 0;
-            if (0..3).any(|index| flips(index) && !self.enabled[index]) {
-                continue;
-            }
-            let mut mirrored = *stamp;
-            for index in 0..3 {
-                if flips(index) {
-                    // Reflecting across the plane negates that one component
-                    // of the position and of the surface normal.
-                    mirrored.centre[index] = -mirrored.centre[index];
-                    mirrored.normal[index] = -mirrored.normal[index];
-                }
-            }
-            out[count] = mirrored;
-            count += 1;
+        let mut signs = [Vec3::ONE; Self::MAX_MIRRORS];
+        let count = self.flips(&mut signs);
+        for (twin, sign) in out.iter_mut().zip(&signs[..count]) {
+            *twin = *stamp;
+            // Reflecting across a plane negates that component of the position,
+            // of the surface normal, and of the direction the stroke is
+            // travelling -- a twin that kept the original tangent would comb
+            // its pattern, and drag its material, the wrong way round.
+            twin.centre *= *sign;
+            twin.normal *= *sign;
+            twin.tangent *= *sign;
         }
         count
     }
@@ -435,6 +496,11 @@ pub struct Stamp {
     /// "not known": the patterns cope by picking any direction across the
     /// surface, and move declines to do anything at all, because a stroke that
     /// has not travelled has not dragged anything.
+    ///
+    /// Its LENGTH matters to move and to nothing else. The patterns normalise
+    /// it, so a unit vector is the right thing to pass for them; move reads it
+    /// as the whole drag, because [`Brush::apply`] with
+    /// [`BrushKind::Move`] is one entire gesture rather than one stamp of one.
     pub tangent: Vec3,
     pub direction: BrushDirection,
 }
@@ -451,6 +517,9 @@ impl Stamp {
 
     /// Set the stroke's direction of travel, which is what combs a hair
     /// pattern along the drag and what the move brush drags along.
+    ///
+    /// Move reads the whole vector, not just its direction. See
+    /// [`Stamp::tangent`].
     pub fn with_tangent(mut self, tangent: Vec3) -> Self {
         self.tangent = tangent;
         self
@@ -473,6 +542,10 @@ enum Skipping {
 #[derive(Debug, Default)]
 pub struct BrushScratch {
     region: FieldRegion,
+    /// Move's locked field, for the one shot [`Brush::apply`] path. The
+    /// interactive path keeps its own [`MoveStroke`] alive across the whole
+    /// gesture instead, which is the entire point of the brush.
+    locked: MoveStroke,
 }
 
 impl BrushScratch {
@@ -517,30 +590,32 @@ impl Brush {
     /// smaller than a voxel, or a slow drag would stamp the same voxels over
     /// and over for no visible gain.
     ///
-    /// # Move is weak here, and finer spacing is NOT the fix
-    ///
-    /// Move as written accumulates a warp of at most [`MAX_STAMP_VOXELS`] per
-    /// stamp while the brush passes over. The brush centre also advances by one
-    /// spacing per stamp, so only material at the very centre, at full falloff
-    /// weight, can keep pace with the pointer; everything else lags and slides
-    /// out from under the brush. That is a property of the incremental
-    /// formulation, not of how often it is sampled.
-    ///
-    /// Measured, in case anyone is tempted: a full viewport drag shifts the
-    /// surface **0.02 mm at the default 3 mm radius and 0.15 strength** on a
-    /// 60 mm model, which is why it was reported as doing nothing. Dropping
-    /// Move to voxel spacing raises that to 1.5 mm at a 10-20 mm radius but
-    /// costs **6.3 ms at radius 10 and 26.6 ms at radius 20** against a 4 ms
-    /// budget, and at the DEFAULT radius it changes the reach by nothing at
-    /// all. A twentieth of the radius was tried as a compromise and gives
-    /// 0.12 mm for 4.6 ms. Neither is a fix.
-    ///
-    /// The real fix is a different algorithm: lock the affected region at
-    /// stroke start and displace it by the TOTAL drag each time, the way Nomad
-    /// does, rather than integrating small warps. That also makes a drag out
-    /// and back return the form, which this cannot.
+    /// Move does not use this: a gesture is one locked warp recomputed per
+    /// pointer event, not a trail of stamps. See [`MoveStroke`].
     pub fn spacing(&self, voxel_size: f32) -> f32 {
         (self.radius * 0.25).max(voxel_size)
+    }
+
+    /// Furthest one Move gesture may carry the surface, in world units.
+    ///
+    /// The displacement is the drag times a falloff, so it changes by up to
+    /// `drag * falloff.max_slope() / radius` per unit of distance across the
+    /// brush. Once that reaches 1 the warp stops being invertible and the field
+    /// folds back through itself, which is a crease that no amount of narrow
+    /// band clamping catches. [`MOVE_DRAG_MARGIN`] backs off from that
+    /// threshold, giving half the radius for the default smooth falloff, three
+    /// quarters for the linear one and a quarter for the two steep cubics.
+    ///
+    /// It is not much of a restriction in practice, because this formulation
+    /// saturates near there anyway: the source of a voxel is `p - drag * w(p)`,
+    /// and solving for where material actually lands shows it stops advancing
+    /// somewhere around two thirds of the radius however far the pointer goes.
+    /// Past the cap the surface simply stops following, which is a shape the
+    /// user can see and work with. It does not tear, and it does not smear a
+    /// rim value across the brush, because the cap is exactly what keeps every
+    /// read inside the locked box.
+    pub fn max_drag(&self) -> f32 {
+        self.radius * MOVE_DRAG_MARGIN / self.falloff.max_slope()
     }
 
     /// Apply one stamp, plus its mirrors when symmetry is on.
@@ -551,6 +626,15 @@ impl Brush {
         symmetry: Symmetry,
         scratch: &mut BrushScratch,
     ) {
+        // Move mirrors itself, rather than being applied once per twin. Two
+        // twins whose boxes overlap near a mirror plane each warp from their
+        // own locked copy, so applying them in turn would have the second
+        // rewrite the first's work with the field as it stood before it.
+        if self.kind == BrushKind::Move {
+            self.drag_once(volume, stamp, symmetry, scratch);
+            return;
+        }
+
         self.apply(volume, stamp, scratch);
         if symmetry.is_off() {
             return;
@@ -560,6 +644,28 @@ impl Brush {
         for twin in &twins[..count] {
             self.apply(volume, twin, scratch);
         }
+    }
+
+    /// One whole Move gesture in a single call, dragging by `stamp.tangent`.
+    ///
+    /// The interactive path does not come through here -- it holds a
+    /// [`MoveStroke`] open for the length of the gesture, which is what makes
+    /// dragging out and back return the form. This is that same warp with the
+    /// field locked and released around one pointer event, which is what a
+    /// caller holding a `Brush` and a `Stamp` can express.
+    fn drag_once(
+        &self,
+        volume: &mut Volume,
+        stamp: &Stamp,
+        symmetry: Symmetry,
+        scratch: &mut BrushScratch,
+    ) {
+        if stamp.tangent == Vec3::ZERO {
+            return;
+        }
+        scratch.locked.begin(volume, self, stamp.centre, symmetry);
+        scratch.locked.drag_to(volume, stamp.centre + stamp.tangent, stamp.pressure);
+        scratch.locked.end();
     }
 
     /// How far past its own radius one stamp reads the field, in world units.
@@ -578,13 +684,21 @@ impl Brush {
     /// that breaks the first time one of them moves. This one costs at most a
     /// voxel of extra snapshot and cannot break that way.
     ///
+    /// Move is absent because it never reaches this code: [`MoveStroke`] works
+    /// out its own boxes, and the cap on its drag is what lets the box it reads
+    /// and the box it writes be the same one.
+    ///
     /// The value brushes read only the voxel they write, or its immediate
     /// neighbours, which the snapshot's padding already covers.
     fn read_reach(&self, voxel_size: f32, gain: f32, displacement: f32) -> f32 {
         let voxels = match self.kind {
-            BrushKind::Draw | BrushKind::Move => gain * displacement,
+            BrushKind::Draw => gain * displacement,
             BrushKind::Pinch => gain * PINCH_PULL_VOXELS,
-            BrushKind::Clay | BrushKind::Smooth | BrushKind::Inflate | BrushKind::Flatten => 0.0,
+            BrushKind::Move
+            | BrushKind::Clay
+            | BrushKind::Smooth
+            | BrushKind::Inflate
+            | BrushKind::Flatten => 0.0,
         };
         voxels * voxel_size
     }
@@ -669,11 +783,12 @@ impl Brush {
             return;
         }
 
-        // Move is steered by the drag rather than by the surface, so a stroke
-        // that has not travelled yet has nothing to tell it. Answered once per
-        // stamp rather than per voxel, and before any of the work below.
-        let drag = stamp.tangent.normalize_or_zero();
-        if self.kind == BrushKind::Move && drag == Vec3::ZERO {
+        // Move is a gesture rather than a stamp, and is steered by the drag
+        // rather than by the surface, so a stroke that has not travelled yet
+        // has nothing to tell it. Answered once per stamp rather than per
+        // voxel, and before any of the work below.
+        if self.kind == BrushKind::Move {
+            self.drag_once(volume, stamp, Symmetry::OFF, scratch);
             return;
         }
 
@@ -835,16 +950,9 @@ impl Brush {
                 }
 
                 BrushKind::Move => {
-                    // Read from behind along the drag, so the material that was
-                    // there arrives here: the falloff region is carried along
-                    // with the pointer and the surface shears smoothly back to
-                    // where it was at the rim.
-                    //
-                    // Draw's shift is along the surface normal and this one is
-                    // along the pointer's travel, which is the whole difference
-                    // between pushing clay outward and dragging it sideways.
-                    let shift = drag * (weight * displacement * voxel_size);
-                    region.sample((position - shift) / voxel_size)
+                    // Unreachable: `apply` sends Move to `drag_once` before any
+                    // of this, because a gesture is not a stamp.
+                    value
                 }
 
                 BrushKind::Clay => {
@@ -861,6 +969,264 @@ impl Brush {
             }
         });
     }
+}
+
+/// One locked copy of the field: the gesture itself, or one of its mirrors.
+///
+/// The box is fixed at the moment the gesture starts and never moves, which is
+/// what makes every pointer event write over exactly the voxels the last one
+/// wrote and leave no residue behind.
+#[derive(Debug, Clone, Copy, Default)]
+struct MoveAnchor {
+    /// Where the gesture was locked, in world space.
+    origin: Vec3,
+    /// Componentwise sign this anchor's mirror applies to the drag. All ones
+    /// for the gesture itself.
+    flip: Vec3,
+    /// Inclusive voxel box that gets written, which is the brush's own reach.
+    lo: IVec3,
+    hi: IVec3,
+}
+
+/// A Move gesture, holding the field as it stood when the button went down.
+///
+/// # Why the field is locked rather than warped a little at a time
+///
+/// The obvious formulation resamples the field a little further along on every
+/// stamp. It does not work, and the failure is not a tuning problem: a stamp
+/// that displaces the field further than about a voxel saturates the narrow
+/// band, so each stamp's warp is tiny, while the brush centre advances a whole
+/// spacing per stamp. Only material dead centre at full falloff weight keeps
+/// pace with the pointer and everything else slides out from under the brush.
+/// Measured, before this replaced it: a full viewport drag moved the surface
+/// **0.02 mm** at the default 3 mm radius. Finer spacing was tried and does not
+/// fix it -- it buys a millimetre at large radii for six times the cost, and
+/// nothing at all at the default radius.
+///
+/// So the field is copied once, at the start, and every pointer event warps
+/// that same copy by the TOTAL drag from where the gesture began. Nothing
+/// accumulates, so nothing has to be small. That is what Nomad and ZBrush do
+/// with a locked vertex selection, and it buys the same two properties:
+///
+/// - **Out and back returns the form.** The way back is not undoing the way
+///   out; it is the same warp with a drag that has shrunk to nothing.
+/// - **The surface follows the pointer**, at the full drag rather than a
+///   fiftieth of it.
+///
+/// One pointer event is cheaper than it was: the old version took a snapshot
+/// and ran a pass over the brush box for each of the N stamps it interpolated,
+/// and this runs one pass over one box and takes no snapshot at all after the
+/// first. Measured through the application, the worst event of a radius 20 mm
+/// drag went from 20 ms to 14 ms, and the default radius from 0.6 ms to 0.5 ms.
+///
+/// A whole drag costs MORE, and it is worth being straight about why: the old
+/// version only did anything once the pointer had travelled a full stamp
+/// spacing, which at that radius is 5 mm, so it sat out most events. This
+/// re-warps whenever the pointer has moved a quarter of a voxel. Per millimetre
+/// of surface actually moved it is still the cheaper of the two, by a third.
+/// What is left is the cost of one pass over the brush box, which at 20 mm and
+/// a quarter millimetre voxel is four million voxels and belongs to
+/// [`Volume::edit_voxels`], not here.
+///
+/// # The warp, and why the read box is the write box
+///
+/// A voxel at `p` reads from `p - drag * falloff(|p - origin| / radius)`. That
+/// is the standard approximation to the inverse of a falloff warp, which has no
+/// closed form; it is stable, and it is a domain warp rather than a value edit,
+/// so it cannot invent detail that was not already in the field.
+///
+/// Because the drag is capped at [`Brush::max_drag`], the distance from the
+/// origin to a read, `u * radius + drag * w(u)`, rises monotonically in `u` and
+/// so peaks at the rim, where the falloff is zero and it is exactly the radius.
+/// Every read therefore lands inside the box that is written, and the one voxel
+/// of padding [`Volume::snapshot`] adds covers the interpolation. That matters
+/// more than it sounds: [`FieldRegion::get`] clamps a read outside its box to
+/// the edge rather than panicking, so getting this wrong would smear the rim
+/// value across the brush while every value stayed legally inside the narrow
+/// band and every test still passed.
+///
+/// # Symmetry
+///
+/// Each mirror is an anchor of its own with its own locked copy, and every
+/// anchor contributes its own displacement to every voxel, summed. Applying
+/// the twins one after another instead would have each rewrite the last one's
+/// work from the field as it stood before it, wherever two boxes overlap near
+/// a mirror plane. The sum is clamped to the same cap, which is what keeps the
+/// bound above true when a voxel is inside two brushes at once -- and the
+/// copies are only grown to cover that when two anchors are close enough for
+/// it to arise, so symmetry used away from a mirror plane costs nothing extra.
+#[derive(Debug, Default)]
+pub struct MoveStroke {
+    /// Empty when no gesture is in progress. `fields` is kept allocated across
+    /// gestures and is only ever read at indices below this length.
+    anchors: Vec<MoveAnchor>,
+    fields: Vec<FieldRegion>,
+    /// Locked with the anchors, so dragging the radius slider mid-gesture
+    /// cannot invalidate the boxes that were snapshotted for it.
+    brush: Brush,
+    max_drag: f32,
+    /// The displacement already standing in the volume, so an event that has
+    /// not moved the pointer is free.
+    applied: Vec3,
+}
+
+impl MoveStroke {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// True while a gesture is locked and being dragged.
+    #[inline]
+    pub fn is_active(&self) -> bool {
+        !self.anchors.is_empty()
+    }
+
+    /// Lock the field around `at`, plus one copy per mirror.
+    ///
+    /// Reuses whatever storage the last gesture left behind. The snapshots are
+    /// the whole cost of a Move gesture that is not a pointer event, and they
+    /// are taken exactly once.
+    pub fn begin(&mut self, volume: &Volume, brush: &Brush, at: Vec3, symmetry: Symmetry) {
+        self.anchors.clear();
+        self.applied = Vec3::ZERO;
+        self.brush = *brush;
+        self.max_drag = brush.max_drag();
+        if brush.radius <= 0.0 || brush.strength <= 0.0 {
+            return;
+        }
+
+        let mut signs = [Vec3::ONE; Symmetry::MAX_MIRRORS];
+        let mirrors = if symmetry.is_off() { 0 } else { symmetry.flips(&mut signs) };
+
+        for flip in std::iter::once(Vec3::ONE).chain(signs[..mirrors].iter().copied()) {
+            let origin = at * flip;
+            let (lo, hi) = volume.voxel_bounds(
+                origin - Vec3::splat(brush.radius),
+                origin + Vec3::splat(brush.radius),
+            );
+            self.anchors.push(MoveAnchor { origin, flip, lo, hi });
+        }
+
+        // A voxel can only be inside two brushes at once if two anchors are
+        // within a diameter of each other, which happens when the gesture is
+        // working near a mirror plane. Only then is a voxel's displacement a
+        // sum rather than a single term, and only then does the argument that
+        // every read lands inside the brush's own box stop covering it -- so
+        // only then does the copy have to grow by the cap. Symmetry used away
+        // from the plane, which is most of the time, costs nothing extra.
+        let diameter = brush.radius * 2.0;
+        let crowded = self.anchors.iter().enumerate().any(|(index, one)| {
+            self.anchors[index + 1..]
+                .iter()
+                .any(|other| one.origin.distance(other.origin) < diameter)
+        });
+        let read = Vec3::splat(brush.radius + if crowded { self.max_drag } else { 0.0 });
+
+        for (index, anchor) in self.anchors.iter().enumerate() {
+            if self.fields.len() <= index {
+                self.fields.push(FieldRegion::new());
+            }
+            let (read_lo, read_hi) =
+                volume.voxel_bounds(anchor.origin - read, anchor.origin + read);
+            volume.snapshot(read_lo, read_hi, &mut self.fields[index]);
+        }
+    }
+
+    /// Warp the locked field so the material under the origin follows the
+    /// pointer to `to`.
+    ///
+    /// One pass over each anchor's box, however far the gesture has travelled
+    /// and however many events it has taken to get there. Nothing accumulates:
+    /// this writes the same answer whether it is the first event of the gesture
+    /// or the thousandth.
+    pub fn drag_to(&mut self, volume: &mut Volume, to: Vec3, pressure: f32) {
+        let Some(anchor) = self.anchors.first() else {
+            return;
+        };
+        let gain = (self.brush.strength * pressure).max(0.0);
+        let drag = ((to - anchor.origin) * gain).clamp_length_max(self.max_drag);
+        if !drag.is_finite() {
+            return;
+        }
+
+        let voxel_size = volume.voxel_size();
+        if drag.distance(self.applied) < voxel_size * MOVE_SETTLE_VOXELS {
+            return;
+        }
+        self.applied = drag;
+
+        let inverse_radius = 1.0 / self.brush.radius;
+        let falloff = self.brush.falloff;
+        let cap = self.max_drag;
+        let anchors = self.anchors.as_slice();
+
+        for (anchor, field) in anchors.iter().zip(&self.fields) {
+            volume.edit_voxels(anchor.lo, anchor.hi, |_, position, value| {
+                let Some(displacement) =
+                    move_displacement(anchors, drag, position, inverse_radius, falloff, cap)
+                else {
+                    // Outside every falloff, so no drag this gesture could have
+                    // would move it and it still holds its locked value.
+                    // Resampling would be eight reads and seven interpolations
+                    // to arrive back at itself, over the near half of the box
+                    // that a ball does not fill.
+                    //
+                    // The test is the falloff and NOT the displacement: a
+                    // displacement of zero is what a drag that has come back to
+                    // where it started produces, and those voxels are exactly
+                    // the ones that have to be written to put the form back.
+                    return value;
+                };
+                // Inside, this reads from behind along the drag, which is also
+                // what puts the field back where a previous, longer drag had
+                // moved it from: nothing here accumulates.
+                field.sample((position - displacement) / voxel_size)
+            });
+        }
+    }
+
+    /// Release the lock, keeping the buffers for the next gesture.
+    pub fn end(&mut self) {
+        self.anchors.clear();
+        self.applied = Vec3::ZERO;
+    }
+}
+
+/// How far the field under `position` is displaced, summed over every mirror,
+/// or `None` when the position is outside every falloff and so is not this
+/// gesture's to write at all.
+///
+/// The distinction matters: a voxel inside the falloff with the drag back at
+/// zero has a displacement of zero too, and it is precisely those that have to
+/// be rewritten from the locked copy to put the form back.
+#[inline]
+fn move_displacement(
+    anchors: &[MoveAnchor],
+    drag: Vec3,
+    position: Vec3,
+    inverse_radius: f32,
+    falloff: FalloffCurve,
+    cap: f32,
+) -> Option<Vec3> {
+    // The overwhelmingly common case, and the one the bound on the read box was
+    // proved for. Kept separate so symmetry costs nothing when it is off.
+    if let [only] = anchors {
+        let weight = falloff.weight(position.distance(only.origin) * inverse_radius);
+        return (weight > 0.0).then(|| drag * weight);
+    }
+
+    let mut total = Vec3::ZERO;
+    let mut reached = false;
+    for anchor in anchors {
+        let weight = falloff.weight(position.distance(anchor.origin) * inverse_radius);
+        if weight > 0.0 {
+            total += drag * anchor.flip * weight;
+            reached = true;
+        }
+    }
+    // Continuous, so two overlapping brushes crease rather than tear, and it is
+    // what keeps the summed reach inside the copies that were taken for it.
+    reached.then(|| total.clamp_length_max(cap))
 }
 
 #[cfg(test)]
@@ -1851,40 +2217,18 @@ mod move_tests {
         volume
     }
 
-    fn drag(volume: &mut Volume, brush: &Brush, at: Vec3, along: Vec3, stamps: usize) {
-        let mut scratch = BrushScratch::new();
-        for _ in 0..stamps {
-            let normal = volume.gradient_world(at);
-            brush.apply(
-                volume,
-                &Stamp::new(at, normal, BrushDirection::Add).with_tangent(along),
-                &mut scratch,
-            );
-        }
-    }
-
-    /// A gesture: the stamp centre travels along with the drag, which is what
-    /// the application does and what makes a round trip a round trip. Stamping
-    /// repeatedly at one point drags the material out from under the brush and
-    /// then works on whatever is left there instead.
+    /// One gesture: press at `at`, then drag through each waypoint in turn.
     ///
-    /// Kept on the sphere rather than on a straight line, so the centre stays
-    /// on the surface the way a raycast from the pointer would put it.
-    fn sweep(volume: &mut Volume, brush: &Brush, from: f32, to: f32, stamps: usize) -> f32 {
-        let mut scratch = BrushScratch::new();
-        let step = (to - from) / stamps as f32;
-        let along = Vec3::Y * step.signum();
-        for index in 1..=stamps {
-            let y = from + step * index as f32;
-            let at = Vec3::new(24.0, y, 0.0).normalize() * 24.0;
-            let normal = volume.gradient_world(at);
-            brush.apply(
-                volume,
-                &Stamp::new(at, normal, BrushDirection::Add).with_tangent(along),
-                &mut scratch,
-            );
+    /// This is what the application does. Every event re-warps the copy locked
+    /// by the press, so the waypoints in between change what the user sees
+    /// while the drag is happening and leave no trace in where it ends up.
+    fn gesture(volume: &mut Volume, brush: &Brush, at: Vec3, through: &[Vec3]) {
+        let mut stroke = MoveStroke::new();
+        stroke.begin(volume, brush, at, Symmetry::OFF);
+        for point in through {
+            stroke.drag_to(volume, *point, 1.0);
         }
-        to
+        stroke.end();
     }
 
     #[test]
@@ -1894,7 +2238,8 @@ mod move_tests {
         let before = bump_centre(&volume);
 
         let brush = Brush { kind: BrushKind::Move, radius: 9.0, strength: 0.8, ..Brush::default() };
-        drag(&mut volume, &brush, Vec3::new(24.0, 0.0, 0.0), Vec3::Y, 16);
+        let at = Vec3::new(24.0, 0.0, 0.0);
+        gesture(&mut volume, &brush, at, &[at + Vec3::Y * 4.0]);
 
         let after = bump_centre(&volume);
         assert!(
@@ -1905,7 +2250,7 @@ mod move_tests {
         // And the other way puts it back on the other side of where it began,
         // which rules out a drift that happens to point at plus Y.
         let mut volume = sphere_with_a_bump();
-        drag(&mut volume, &brush, Vec3::new(24.0, 0.0, 0.0), -Vec3::Y, 16);
+        gesture(&mut volume, &brush, at, &[at - Vec3::Y * 4.0]);
         assert!(
             bump_centre(&volume) < before - 0.5,
             "the drag ignored its own direction: {before} then {}",
@@ -1914,22 +2259,32 @@ mod move_tests {
     }
 
     #[test]
-    fn a_drag_out_and_back_does_not_restore_the_field_exactly() {
-        // Pinned as intended rather than left to be found later and filed as a
-        // bug. Nomad locks a vertex selection at the start of a stroke, so out
-        // and back is exact there. There are no vertices here to lock: each
-        // stamp resamples what the last one left, and a resample of a resample
-        // has lost a little every time. What comes back is the same form,
-        // slightly diffused. Undo is the exact way back, and a whole gesture is
-        // one entry.
+    fn a_drag_out_and_back_returns_the_form() {
+        // The property locking the field at the start of a gesture exists for,
+        // and the one the old incremental version could not have: the way back
+        // is not undoing the way out, it is the same warp of the same locked
+        // copy by a drag that has shrunk to nothing. Nothing accumulates, so
+        // nothing is lost on the way.
+        //
+        // Not bit exact, and it cannot be -- every event resamples the locked
+        // field with trilinear interpolation, and the final one resamples it at
+        // a coordinate that is a float division away from the voxel it started
+        // on. A thousandth of a voxel is the size of that, and it is three
+        // orders of magnitude below what the old version left behind.
         let original = sphere_with_a_bump();
         let mut volume = sphere_with_a_bump();
         let started_at = bump_centre(&original);
+        let (_, started_with) = bump(&original);
 
         let brush = Brush { kind: BrushKind::Move, radius: 9.0, strength: 0.8, ..Brush::default() };
-        sweep(&mut volume, &brush, 0.0, 6.0, 12);
-        let out_at = bump_centre(&volume);
-        sweep(&mut volume, &brush, 6.0, 0.0, 12);
+        let at = Vec3::new(24.0, 0.0, 0.0);
+
+        // Out in several events, so this is a gesture and not a single warp,
+        // then all the way back to where the button went down.
+        let mut waypoints: Vec<Vec3> =
+            (1..=8).map(|step| at + Vec3::Y * step as f32 * 0.5).collect();
+        waypoints.extend((0..=8).rev().map(|step| at + Vec3::Y * step as f32 * 0.5));
+        gesture(&mut volume, &brush, at, &waypoints);
 
         let mut worst = 0.0_f32;
         for step in -10..=10 {
@@ -1939,112 +2294,232 @@ mod move_tests {
                     worst.max((volume.sample_world(probe) - original.sample_world(probe)).abs());
             }
         }
-
         assert!(
-            worst > 1.0e-3,
-            "the drag came back bit exact, so something is quietly elastic and the doc comment \
-             is now wrong: worst difference {worst}"
+            worst < 1.0e-3,
+            "a drag out and back did not return the form: worst difference {worst}"
         );
 
-        // Diffused, not destroyed. The form does come back most of the way,
-        // which is what makes the brush usable at all, and the shortfall and
-        // the lost material are the documented price of having no vertices to
-        // lock. Both halves are asserted, because a version that recovered
-        // nothing and a version that recovered everything would each mean the
-        // doc comment on BrushKind::Move is wrong.
         let (ended_at, ended_with) = bump(&volume);
-        let (_, started_with) = bump(&original);
         assert!(
-            (ended_at - started_at).abs() < (out_at - started_at).abs() * 0.5,
-            "the drag back recovered almost nothing: out to {out_at}, back to {ended_at}"
+            (ended_at - started_at).abs() < 0.05,
+            "the bump did not come back to where it started: {started_at} then {ended_at}"
         );
         assert!(
-            ended_with < started_with,
-            "a round trip that loses no material is elastic after all: {started_with} then \
-             {ended_with}"
-        );
-        assert!(
-            ended_with > started_with * 0.5,
-            "the round trip ate the bump rather than diffusing it: {started_with} then \
-             {ended_with}"
+            (ended_with - started_with).abs() < started_with * 0.01,
+            "the round trip lost material: {started_with} then {ended_with}"
         );
     }
 
     #[test]
-    fn one_stamp_never_displaces_the_field_further_than_the_cap() {
-        // Measured rather than trusted. On a ramp of known slope a domain warp
-        // is exactly a subtraction, so the change in value at a voxel, divided
-        // by the slope, is the distance the field moved under it, in voxels.
-        // That has to stay inside MAX_STAMP_VOXELS or the next stamp has no
-        // usable field left to read.
+    fn the_surface_follows_the_pointer_by_the_whole_drag() {
+        // Not "something changed" -- how far. On a ramp of known slope a domain
+        // warp is exactly a subtraction, so the change in value at a voxel,
+        // divided by the slope, is how far the field moved under it.
         //
-        // At full strength, which is the most the gain can mean: strength is a
-        // multiplier like it is for every other brush, so a caller setting it
-        // above 1 scales this the same way it scales draw. The application
-        // clamps it to 0.8.
+        // At the brush centre the falloff is 1, so the answer is the whole
+        // drag. Anything less and the surface is lagging behind the pointer,
+        // which is exactly what the incremental version did.
         let slope = 0.05;
-
-        for radius in [1.0_f32, 2.5, 6.0, 15.0] {
+        for radius in [3.0_f32, 8.0, 20.0] {
             let brush = Brush { kind: BrushKind::Move, radius, strength: 1.0, ..Brush::default() };
+            // Comfortably inside the cap, so this is measuring the follow and
+            // not the clamp.
+            let drag = brush.max_drag() * 0.5;
+
             let before = ramp_along_x(slope);
             let mut volume = ramp_along_x(slope);
-            drag(&mut volume, &brush, Vec3::ZERO, Vec3::X, 1);
+            gesture(&mut volume, &brush, Vec3::ZERO, &[Vec3::X * drag]);
 
-            let mut furthest = 0.0_f32;
-            for z in -8..=8 {
-                for y in -8..=8 {
-                    for x in -18..=18 {
-                        let probe = Vec3::new(x as f32, y as f32, z as f32);
-                        let moved =
-                            (before.sample_world(probe) - volume.sample_world(probe)).abs() / slope;
-                        furthest = furthest.max(moved);
-                    }
-                }
-            }
-
+            let moved = (before.sample_world(Vec3::ZERO) - volume.sample_world(Vec3::ZERO)) / slope;
             assert!(
-                furthest <= MAX_STAMP_VOXELS + 1.0e-3,
-                "a radius {radius} stamp moved the field {furthest} voxels, past the \
-                 {MAX_STAMP_VOXELS} voxel cap"
+                (moved - drag).abs() < 0.05,
+                "a radius {radius} brush dragged {drag} moved the field {moved}"
             );
         }
     }
 
     #[test]
-    fn a_warp_that_reaches_outside_the_brush_reads_the_field_and_not_the_rim() {
-        // The silent failure the read box exists to prevent. FieldRegion::get
+    fn strength_scales_how_much_of_the_drag_the_surface_follows() {
+        let slope = 0.05;
+        let follow = |strength: f32| {
+            let brush = Brush { kind: BrushKind::Move, radius: 12.0, strength, ..Brush::default() };
+            let before = ramp_along_x(slope);
+            let mut volume = ramp_along_x(slope);
+            gesture(&mut volume, &brush, Vec3::ZERO, &[Vec3::X * 4.0]);
+            (before.sample_world(Vec3::ZERO) - volume.sample_world(Vec3::ZERO)) / slope
+        };
+
+        // Both are under the 6 mm cap a radius 12 smooth brush has, so this is
+        // strength doing the scaling rather than the clamp.
+        assert!((follow(1.0) - 4.0).abs() < 0.05, "full strength did not follow: {}", follow(1.0));
+        assert!((follow(0.5) - 2.0).abs() < 0.05, "half strength did not halve: {}", follow(0.5));
+    }
+
+    #[test]
+    fn dragging_past_the_cap_stops_the_surface_rather_than_tearing_it() {
+        // What the user sees when they ask for more than one gesture can give.
+        // It has to stop, and it has to stop in a shape that is still a shape:
+        // the failure to design against is a rim value smeared across the
+        // brush, which stays legally inside the narrow band and looks like
+        // geometry.
+        let slope = 0.05;
+        let brush = Brush { kind: BrushKind::Move, radius: 8.0, strength: 1.0, ..Brush::default() };
+        let cap = brush.max_drag();
+
+        let before = ramp_along_x(slope);
+        let at_the_cap = {
+            let mut volume = ramp_along_x(slope);
+            gesture(&mut volume, &brush, Vec3::ZERO, &[Vec3::X * cap]);
+            volume
+        };
+        let far_past_it = {
+            let mut volume = ramp_along_x(slope);
+            gesture(&mut volume, &brush, Vec3::ZERO, &[Vec3::X * cap * 20.0]);
+            volume
+        };
+
+        for z in -4..=4 {
+            for y in -10..=10 {
+                for x in -14..=14 {
+                    let probe = Vec3::new(x as f32, y as f32, z as f32);
+                    let stopped = at_the_cap.sample_world(probe);
+                    let dragged = far_past_it.sample_world(probe);
+                    assert!(
+                        (stopped - dragged).abs() < 1.0e-4,
+                        "dragging twenty times past the cap kept moving at {probe:?}: \
+                         {stopped} against {dragged}"
+                    );
+                }
+            }
+        }
+
+        // And what it stopped at is the cap, reached from the field rather than
+        // from the rim: a clamped read would give the value at the edge of the
+        // box, which for a radius 8 brush is about -0.45.
+        let moved =
+            (before.sample_world(Vec3::ZERO) - far_past_it.sample_world(Vec3::ZERO)) / slope;
+        assert!(
+            (moved - cap).abs() < 0.05,
+            "the field stopped {moved} from where it started rather than at the {cap} cap"
+        );
+    }
+
+    #[test]
+    fn a_warp_never_reads_outside_the_copy_it_locked() {
+        // The silent failure the cap is what protects against. FieldRegion::get
         // clamps a read outside the snapshot to its edge instead of panicking,
-        // so a read box that is too small does not crash and does not produce
+        // so a read that overshoots does not crash and does not produce
         // garbage: it smears the rim value across the brush, and every value it
         // writes is still legally inside the narrow band.
         //
-        // Reaching past the radius takes a gain above one, which the
-        // application clamps to 0.8 but the library does not: `strength` is a
-        // public field on a public struct. That is the case this pins, because
-        // it is the only one where a read box equal to the write box gives a
-        // different answer from a correct one.
+        // The cap is set so that `u * radius + drag * w(u)` rises with `u` and
+        // therefore peaks at the rim, where the falloff is zero and it is
+        // exactly the radius. This measures that: on a ramp the value at a
+        // voxel says precisely where its source was, and a clamped read would
+        // report the rim instead.
         let slope = 0.1;
-        let radius = 4.0;
-        let gain = 8.0;
-        let brush = Brush { kind: BrushKind::Move, radius, strength: gain, ..Brush::default() };
+        for falloff in FalloffCurve::ALL {
+            let radius = 6.0;
+            let brush =
+                Brush { kind: BrushKind::Move, radius, strength: 1.0, falloff, ..Brush::default() };
+            let drag = brush.max_drag();
 
-        let mut volume = ramp_along_x(slope);
-        drag(&mut volume, &brush, Vec3::ZERO, Vec3::X, 1);
+            let mut volume = ramp_along_x(slope);
+            gesture(&mut volume, &brush, Vec3::ZERO, &[Vec3::X * drag]);
 
-        // At the centre the falloff is 1, so the field is read from a full
-        // `gain * displacement` voxels back along the drag. The displacement is
-        // at its cap here, the brush being 4 voxels across.
-        let displacement = MAX_STAMP_VOXELS;
-        let expected = -gain * displacement * slope;
-        let measured = volume.sample_world(Vec3::ZERO);
-        assert!(
-            (measured - expected).abs() < 0.05,
-            "the drag read from the wrong place: {measured} against the {expected} a read from \
-             {} voxels back gives. A read box equal to the write box would clamp at the rim and \
-             give about {}.",
-            gain * displacement,
-            -(radius + 1.0) * slope
-        );
+            for step in -6..=6 {
+                let probe = Vec3::new(step as f32, 0.0, 0.0);
+                let weight = falloff.weight(probe.length() / radius);
+                let expected = (probe.x - drag * weight) * slope;
+                let measured = volume.sample_world(probe);
+                assert!(
+                    (measured - expected).abs() < 0.02,
+                    "{falloff} read from the wrong place at {probe:?}: {measured} against \
+                     the {expected} a read from {} back gives",
+                    drag * weight
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn one_gesture_never_moves_the_field_further_than_the_cap() {
+        // Measured rather than trusted, across every falloff curve, because the
+        // cap is per curve: the two cubics are three times as steep as a line
+        // and fold three times as easily.
+        let slope = 0.05;
+
+        for falloff in FalloffCurve::ALL {
+            for radius in [2.5_f32, 6.0, 15.0] {
+                let brush = Brush {
+                    kind: BrushKind::Move,
+                    radius,
+                    strength: 1.0,
+                    falloff,
+                    ..Brush::default()
+                };
+                let cap = brush.max_drag();
+                let before = ramp_along_x(slope);
+                let mut volume = ramp_along_x(slope);
+                // Asking for far more than the cap allows, which is the case
+                // that has to be bounded.
+                gesture(&mut volume, &brush, Vec3::ZERO, &[Vec3::X * radius * 10.0]);
+
+                let mut furthest = 0.0_f32;
+                for z in -8..=8 {
+                    for y in -8..=8 {
+                        for x in -20..=20 {
+                            let probe = Vec3::new(x as f32, y as f32, z as f32);
+                            let moved = (before.sample_world(probe) - volume.sample_world(probe))
+                                .abs()
+                                / slope;
+                            furthest = furthest.max(moved);
+                        }
+                    }
+                }
+
+                assert!(
+                    furthest <= cap + 0.05,
+                    "a radius {radius} {falloff} gesture moved the field {furthest}, past its \
+                     {cap} cap"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_cap_keeps_every_falloff_curve_short_of_folding() {
+        // The arithmetic the cap is derived from, pinned so a new curve cannot
+        // be added with a slope that quietly lets its warp fold.
+        for falloff in FalloffCurve::ALL {
+            let brush = Brush { kind: BrushKind::Move, radius: 10.0, falloff, ..Brush::default() };
+            let steepness = brush.max_drag() * falloff.max_slope() / brush.radius;
+            assert!(
+                steepness < 1.0,
+                "{falloff} allows a warp {steepness} times as steep as the distance it is spread \
+                 over, which folds the field through itself"
+            );
+            assert!(
+                (steepness - MOVE_DRAG_MARGIN).abs() < 1.0e-5,
+                "{falloff} is not using the margin the constant says it does: {steepness}"
+            );
+        }
+
+        // And the slopes themselves are the derivatives they claim to be.
+        for falloff in FalloffCurve::ALL {
+            let mut worst = 0.0_f32;
+            for step in 0..=1000 {
+                let u = step as f32 / 1000.0;
+                let h = 1.0e-3;
+                let slope = (falloff.weight(u + h) - falloff.weight(u - h)).abs() / (2.0 * h);
+                worst = worst.max(slope);
+            }
+            assert!(
+                worst <= falloff.max_slope() + 0.02,
+                "{falloff} really reaches a slope of {worst}, past the {} it declares",
+                falloff.max_slope()
+            );
+        }
     }
 
     #[test]
@@ -2059,6 +2534,8 @@ mod move_tests {
         let at = Vec3::new(24.0, 0.0, 0.0);
         let mut scratch = BrushScratch::new();
         brush.apply(&mut volume, &Stamp::new(at, Vec3::X, BrushDirection::Add), &mut scratch);
+        // And a locked gesture that has not been dragged anywhere either.
+        gesture(&mut volume, &brush, at, &[at]);
 
         for (step, was) in (-8..=8).zip(before) {
             let now = volume.sample_world(Vec3::new(24.0, step as f32, 0.0));
@@ -2071,14 +2548,14 @@ mod move_tests {
         let mut volume = sphere_with_a_bump();
         let brush = Brush { kind: BrushKind::Move, radius: 9.0, strength: 0.8, ..Brush::default() };
 
-        // A gesture that turns a corner, so the drag direction changes under
-        // the same material rather than only ever pushing one way.
-        for (along, at) in [
-            (Vec3::Y, Vec3::new(24.0, 0.0, 0.0)),
-            (Vec3::Z, Vec3::new(24.0, 4.0, 0.0)),
-            (-Vec3::Y, Vec3::new(23.0, 4.0, 4.0)),
+        // Several gestures that turn a corner, so the drag direction changes
+        // under the same material rather than only ever pushing one way.
+        for (at, to) in [
+            (Vec3::new(24.0, 0.0, 0.0), Vec3::new(24.0, 4.0, 0.0)),
+            (Vec3::new(24.0, 4.0, 0.0), Vec3::new(24.0, 4.0, 4.0)),
+            (Vec3::new(23.0, 4.0, 4.0), Vec3::new(23.0, 0.0, 4.0)),
         ] {
-            drag(&mut volume, &brush, at, along, 10);
+            gesture(&mut volume, &brush, at, &[to]);
         }
 
         for step in -12..=12 {
@@ -2088,6 +2565,181 @@ mod move_tests {
 
         let (_, report) = volume.export_mesh();
         assert!(report.is_printable(), "a dragged model must still print: {}", report.summary());
+    }
+
+    #[test]
+    fn a_mirrored_gesture_drags_the_twin_the_other_way() {
+        // The mirror reflects the drag as well as the position. A twin that
+        // kept the original drag would pull both halves the same way, which is
+        // not symmetry.
+        let mut volume = Volume::new(1.0);
+        volume.seed_sphere(Vec3::ZERO, 24.0);
+        let mut scratch = BrushScratch::new();
+        let poke = Brush {
+            kind: BrushKind::Draw,
+            radius: 5.0,
+            strength: 0.9,
+            falloff: FalloffCurve::Sharp,
+            ..Brush::default()
+        };
+        // A bump on each side, so there is something on the mirrored half for
+        // the twin to carry.
+        for at in [Vec3::new(24.0, 0.0, 0.0), Vec3::new(-24.0, 0.0, 0.0)] {
+            let normal = at.normalize();
+            for _ in 0..6 {
+                poke.apply(&mut volume, &Stamp::new(at, normal, BrushDirection::Add), &mut scratch);
+            }
+        }
+
+        let brush = Brush { kind: BrushKind::Move, radius: 9.0, strength: 1.0, ..Brush::default() };
+        let at = Vec3::new(24.0, 0.0, 0.0);
+        let mut stroke = MoveStroke::new();
+        stroke.begin(&volume, &brush, at, Symmetry::X);
+        stroke.drag_to(&mut volume, at + Vec3::Y * 3.0, 1.0);
+        stroke.end();
+
+        // Both bumps rose along plus Y, because the mirror is across x and Y is
+        // untouched by it.
+        let rise = |x: f32| {
+            let mut weighted = 0.0;
+            let mut total = 0.0;
+            for step in -12..=12 {
+                let y = step as f32;
+                let direction = Vec3::new(x, y, 0.0).normalize();
+                let mut last = 0.0;
+                for walk in 0..400 {
+                    let t = 20.0 + walk as f32 * 0.05;
+                    if volume.sample_world(direction * t) >= 0.0 {
+                        break;
+                    }
+                    last = t;
+                }
+                let raised = (last - 24.0).max(0.0);
+                weighted += y * raised;
+                total += raised;
+            }
+            assert!(total > 0.0, "there is no bump at x {x} to measure");
+            weighted / total
+        };
+
+        assert!(rise(24.0) > 0.5, "the gesture itself did not carry its bump: {}", rise(24.0));
+        assert!(rise(-24.0) > 0.5, "the mirrored twin never landed: {}", rise(-24.0));
+        assert!(
+            (rise(24.0) - rise(-24.0)).abs() < 0.3,
+            "the twin drifted a different distance from the original: {} against {}",
+            rise(24.0),
+            rise(-24.0)
+        );
+    }
+
+    #[test]
+    fn a_gesture_straddling_a_mirror_plane_still_reads_the_field() {
+        // Two anchors close enough to overlap is the one case where a voxel's
+        // displacement is a sum rather than a single term, and where the
+        // argument that keeps every read inside the brush's own box no longer
+        // covers it -- so the copies are grown by the cap for exactly this.
+        //
+        // Getting it wrong would not crash. FieldRegion::get clamps a read
+        // outside its box to the edge, so an overshoot smears the rim value and
+        // every value it writes is still legally inside the narrow band.
+        //
+        // The geometry is picked so the overshoot actually happens, which most
+        // arrangements do not produce. The brush centre sits half a radius from
+        // the plane, which puts it exactly on the FACE of its own twin's box;
+        // the twin is applied last, so the twin's copy is what has to reach a
+        // full cap beyond that face. On a ramp the right answer is arithmetic.
+        let slope = 0.1;
+        let radius = 6.0;
+        let brush = Brush { kind: BrushKind::Move, radius, strength: 1.0, ..Brush::default() };
+        let cap = brush.max_drag();
+        let at = Vec3::new(radius * 0.5, 0.0, 0.0);
+
+        let mut volume = ramp_along_x(slope);
+        let mut stroke = MoveStroke::new();
+        stroke.begin(&volume, &brush, at, Symmetry::X);
+        // Away from the plane, so the read at `at` goes further from the twin
+        // rather than back toward it.
+        stroke.drag_to(&mut volume, at - Vec3::X * cap, 1.0);
+        stroke.end();
+
+        // At the brush centre the falloff is 1 and the twin's is 0, so the
+        // field is read from a whole cap along plus X.
+        let expected = (at.x + cap) * slope;
+        let measured = volume.sample_world(at);
+        assert!(
+            (measured - expected).abs() < 0.02,
+            "the twin's copy did not reach the field it had to read: {measured} against the \
+             {expected} a read from {} gives. A copy grown only to the brush box would clamp at \
+             the TWIN's rim and give about {}.",
+            at.x + cap,
+            (-at.x + radius + 1.0) * slope
+        );
+    }
+
+    #[test]
+    fn a_whole_gesture_is_one_undo_entry_however_many_events_it_takes() {
+        // Re-warping the locked copy on every event writes over the same bricks
+        // again and again. That is only safe because `record_for_undo` captures
+        // a brick on FIRST touch, so what history holds is the field as it
+        // stood before the gesture, not as the previous event left it.
+        let original = sphere_with_a_bump();
+        let mut volume = sphere_with_a_bump();
+        let brush = Brush { kind: BrushKind::Move, radius: 9.0, strength: 1.0, ..Brush::default() };
+        let at = Vec3::new(24.0, 0.0, 0.0);
+
+        volume.begin_stroke();
+        let mut stroke = MoveStroke::new();
+        stroke.begin(&volume, &brush, at, Symmetry::OFF);
+        for step in 1..=10 {
+            stroke.drag_to(&mut volume, at + Vec3::Y * step as f32 * 0.4, 1.0);
+        }
+        stroke.end();
+        let edit = volume.end_stroke().expect("a gesture that moved the surface recorded nothing");
+
+        assert!(bump_centre(&volume) > bump_centre(&original) + 0.5, "the gesture did nothing");
+
+        volume.apply_edit(edit);
+        for step in -10..=10 {
+            for out in -3..=3 {
+                let probe = Vec3::new(24.0 + out as f32, step as f32, 0.0);
+                assert_eq!(
+                    volume.sample_world(probe),
+                    original.sample_world(probe),
+                    "undoing the gesture did not restore {probe:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn an_event_that_has_not_moved_the_pointer_costs_nothing() {
+        // The warp is recomputed from scratch every event, so repeating one has
+        // to be recognised rather than redone. Observed through the dirty set,
+        // which is what a redundant pass would refill.
+        let mut volume = sphere_with_a_bump();
+        let brush = Brush { kind: BrushKind::Move, radius: 9.0, strength: 1.0, ..Brush::default() };
+        let at = Vec3::new(24.0, 0.0, 0.0);
+        let mut dirty = Vec::new();
+
+        let mut stroke = MoveStroke::new();
+        stroke.begin(&volume, &brush, at, Symmetry::OFF);
+        stroke.drag_to(&mut volume, at + Vec3::Y * 3.0, 1.0);
+        volume.take_dirty(&mut dirty);
+        assert!(!dirty.is_empty(), "the first event of a gesture must do the work");
+
+        stroke.drag_to(&mut volume, at + Vec3::Y * 3.0, 1.0);
+        volume.take_dirty(&mut dirty);
+        assert!(dirty.is_empty(), "the same drag was applied twice");
+
+        // And so does dragging on past the cap, because the displacement has
+        // already clamped and is no longer changing.
+        stroke.drag_to(&mut volume, at + Vec3::Y * 500.0, 1.0);
+        volume.take_dirty(&mut dirty);
+        assert!(!dirty.is_empty(), "reaching the cap is still a change");
+        stroke.drag_to(&mut volume, at + Vec3::Y * 900.0, 1.0);
+        volume.take_dirty(&mut dirty);
+        assert!(dirty.is_empty(), "dragging further past the cap redid the warp for nothing");
+        stroke.end();
     }
 }
 
