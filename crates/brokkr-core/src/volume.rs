@@ -634,7 +634,7 @@ impl Volume {
 
     /// Capture a brick's prior contents if a stroke is being recorded and this
     /// is the first time it has been touched. Returns whether it recorded.
-    fn record_for_undo(&mut self, coord: BrickCoord) -> bool {
+    pub(crate) fn record_for_undo(&mut self, coord: BrickCoord) -> bool {
         let Some(recorder) = self.recorder.as_ref() else {
             return false;
         };
@@ -792,6 +792,15 @@ impl Volume {
     /// Put a brick in directly. Used when building a volume from another one.
     pub(crate) fn insert_brick(&mut self, coord: BrickCoord, brick: Brick) {
         self.bricks.insert(coord, brick);
+    }
+
+    /// Drop a brick entirely, so it reads as empty space again.
+    ///
+    /// Used by the plane cut: a brick wholly past the cut is `OUTSIDE`
+    /// everywhere, and an absent brick already reads that way, so removing it
+    /// is both the correct answer and the free one.
+    pub(crate) fn remove_brick(&mut self, coord: BrickCoord) {
+        self.bricks.remove(&coord);
     }
 
     /// World space bounds of every stored brick, or `None` when empty.

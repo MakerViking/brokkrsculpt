@@ -23,6 +23,7 @@
 pub mod apron;
 pub mod brick;
 pub mod brush;
+pub mod clip;
 pub mod export;
 pub mod import;
 pub mod mesh;
@@ -46,6 +47,7 @@ pub use brush::{
     Brush, BrushDirection, BrushKind, BrushScratch, FalloffCurve, MirrorAxis, Stamp, Symmetry,
     lean_normal,
 };
+pub use clip::ClipPlane;
 pub use export::{ExportMesh, MeshReport};
 pub use import::{ImportError, MESH_EXTENSIONS};
 pub use mesh::{BrickMesh, MeshScratch, Vertex};

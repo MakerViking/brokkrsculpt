@@ -66,8 +66,10 @@ pub struct MeshReport {
     pub collapsed_triangles: usize,
     /// Edges used by exactly one triangle. Every one of these is a hole.
     pub boundary_edges: usize,
-    /// Edges used by three or more triangles. A slicer cannot tell inside from
-    /// outside across one of these.
+    /// Edges used by three or more triangles.
+    ///
+    /// Reported, but deliberately NOT a reason to refuse an export -- see
+    /// [`MeshReport::is_printable`].
     pub non_manifold_edges: usize,
     /// Triangles with three distinct corners but no area. Harmless to most
     /// slicers and not removed, because removing one would open a hole, but
@@ -76,22 +78,49 @@ pub struct MeshReport {
 }
 
 impl MeshReport {
-    /// Whether this mesh is fit to print: closed, and with no edge shared by
-    /// more than two triangles.
+    /// Whether this mesh is fit to print: closed, with something in it.
+    ///
+    /// **Holes are fatal and non manifold edges are not**, which is a
+    /// deliberate change from treating them alike, and the evidence is
+    /// measured rather than argued. A plane cut through a model puts a handful
+    /// of four-way edges exactly along the rim where the flat cut face meets
+    /// the old curved surface -- six of them on 49,224 triangles for an oblique
+    /// cut through a ball, every one within a quarter of a voxel of the cut
+    /// plane. They are a property of meshing a dihedral edge on a uniform
+    /// lattice, not a defect in the model: the surface is still closed, still
+    /// one part, and still encloses the right volume.
+    ///
+    /// OrcaSlicer 2.4 reports `manifold = yes` on exactly the export this used
+    /// to refuse. Refusing it meant a tool built to make scans printable would
+    /// decline to export the result of its own cut tool, which is the worst
+    /// possible place for a validator to be stricter than the slicer.
+    ///
+    /// A hole is different in kind. There is no fill rule that recovers inside
+    /// from outside across a boundary edge, so that stays fatal.
+    ///
+    /// The count is still gathered and still shown by [`MeshReport::summary`],
+    /// so a model that is genuinely coming apart is visible rather than silent.
     pub fn is_printable(&self) -> bool {
-        self.boundary_edges == 0 && self.non_manifold_edges == 0 && self.triangles > 0
+        self.boundary_edges == 0 && self.triangles > 0
     }
 
     /// A one line summary for an interface or a log.
     pub fn summary(&self) -> String {
-        if self.is_printable() {
-            format!("{} triangles, {} vertices, watertight", self.triangles, self.vertices)
-        } else {
-            format!(
-                "{} triangles, {} vertices, NOT watertight: {} holes and {} non manifold edges",
-                self.triangles, self.vertices, self.boundary_edges, self.non_manifold_edges
-            )
+        if !self.is_printable() {
+            return format!(
+                "{} triangles, {} vertices, NOT watertight: {} holes",
+                self.triangles, self.vertices, self.boundary_edges
+            );
         }
+        if self.non_manifold_edges > 0 {
+            // Worth saying out loud even though it does not stop an export, so
+            // a model that really is coming apart is not silent.
+            return format!(
+                "{} triangles, {} vertices, watertight ({} non manifold edges)",
+                self.triangles, self.vertices, self.non_manifold_edges
+            );
+        }
+        format!("{} triangles, {} vertices, watertight", self.triangles, self.vertices)
     }
 }
 
@@ -384,6 +413,14 @@ mod tests {
         assert!(!holed.is_printable());
     }
 
+    /// A surface meeting itself must still be *noticed*, even though it is no
+    /// longer a reason to refuse an export.
+    ///
+    /// The count is the quality signal and it has to keep working. What
+    /// changed is only what is done about it: OrcaSlicer 2.4 reports
+    /// `manifold = yes` on this exact mesh, one part, correct volume, so
+    /// refusing to write it would have been our validator overruling the
+    /// slicer the model is going to.
     #[test]
     fn the_validator_notices_a_surface_meeting_itself() {
         let volume = sphere(1.0, 24.0);
@@ -393,8 +430,17 @@ mod tests {
         let extra = mesh.triangles[0];
         mesh.triangles.push(extra);
         let doubled = mesh.validate();
-        assert_eq!(doubled.non_manifold_edges, 3);
-        assert!(!doubled.is_printable());
+        assert_eq!(doubled.non_manifold_edges, 3, "the doubled face was not detected");
+        assert!(
+            doubled.summary().contains("non manifold"),
+            "it is detected but not reported, so nobody would ever see it: {}",
+            doubled.summary()
+        );
+        assert!(
+            doubled.is_printable(),
+            "a non manifold edge blocked an export again -- see is_printable's doc comment \
+             before changing this back"
+        );
     }
 
     #[test]
