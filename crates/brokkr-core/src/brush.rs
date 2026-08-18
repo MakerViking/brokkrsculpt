@@ -505,6 +505,29 @@ impl Brush {
     /// a fast drag leaves a continuous cut instead of a dotted trail. Never
     /// smaller than a voxel, or a slow drag would stamp the same voxels over
     /// and over for no visible gain.
+    ///
+    /// # Move is weak here, and finer spacing is NOT the fix
+    ///
+    /// Move as written accumulates a warp of at most [`MAX_STAMP_VOXELS`] per
+    /// stamp while the brush passes over. The brush centre also advances by one
+    /// spacing per stamp, so only material at the very centre, at full falloff
+    /// weight, can keep pace with the pointer; everything else lags and slides
+    /// out from under the brush. That is a property of the incremental
+    /// formulation, not of how often it is sampled.
+    ///
+    /// Measured, in case anyone is tempted: a full viewport drag shifts the
+    /// surface **0.02 mm at the default 3 mm radius and 0.15 strength** on a
+    /// 60 mm model, which is why it was reported as doing nothing. Dropping
+    /// Move to voxel spacing raises that to 1.5 mm at a 10-20 mm radius but
+    /// costs **6.3 ms at radius 10 and 26.6 ms at radius 20** against a 4 ms
+    /// budget, and at the DEFAULT radius it changes the reach by nothing at
+    /// all. A twentieth of the radius was tried as a compromise and gives
+    /// 0.12 mm for 4.6 ms. Neither is a fix.
+    ///
+    /// The real fix is a different algorithm: lock the affected region at
+    /// stroke start and displace it by the TOTAL drag each time, the way Nomad
+    /// does, rather than integrating small warps. That also makes a drag out
+    /// and back return the form, which this cannot.
     pub fn spacing(&self, voxel_size: f32) -> f32 {
         (self.radius * 0.25).max(voxel_size)
     }

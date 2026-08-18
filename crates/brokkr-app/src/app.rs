@@ -2942,6 +2942,98 @@ mod tests {
         std::fs::remove_dir_all(&directory).ok();
     }
 
+    /// Move through the APPLICATION, not through `Brush::apply`.
+    ///
+    /// Every existing Move test builds a `Brush` and a `Stamp` by hand, which
+    /// tests the arithmetic and says nothing about whether a drag in the
+    /// viewport ever reaches it.
+    #[test]
+    fn dragging_with_move_selected_actually_changes_the_model() {
+        let mut app = app();
+        update(&mut app, Message::BrushKindChanged(BrushKind::Move));
+        update(&mut app, Message::BrushStrengthChanged(1.0));
+        update(&mut app, Message::BrushRadiusChanged(10.0));
+
+        app.on_pointer(PointerEvent::Moved { position: centre_of_viewport(), size: SIZE });
+        let probe = app
+            .surface_under(Vec2::new(SIZE.x / 2.0, SIZE.y / 2.0))
+            .expect("the centre hits the ball");
+        let before = app.volume.sample_world(probe);
+
+        press(&mut app, centre_of_viewport());
+        for step in 1..=12 {
+            app.on_pointer(PointerEvent::Moved {
+                position: centre_of_viewport() + Vector::new(step as f32 * 4.0, 0.0),
+                size: SIZE,
+            });
+        }
+        release(&mut app);
+
+        assert!(
+            app.history_stats.undo_entries > 0,
+            "a Move drag recorded no undo entry, so it did nothing at all"
+        );
+        assert_ne!(
+            app.volume.sample_world(probe),
+            before,
+            "a Move drag across the model left the field untouched"
+        );
+    }
+
+    /// Reach and cost together, since Move trades one against the other.
+    ///
+    /// Printed rather than asserted: these are the numbers the spacing rule was
+    /// chosen from, and the point is that a future change can re-run them.
+    #[test]
+    fn measure_move_reach_and_cost() {
+        fn near_surface(app: &Brokkr, x: f32) -> Option<f32> {
+            let mut z = 40.0f32;
+            while z > -40.0 {
+                if app.volume.sample_world(Vec3::new(x, 0.0, z)) < 0.0 {
+                    return Some(z);
+                }
+                z -= 0.02;
+            }
+            None
+        }
+
+        for (radius, strength) in [(3.0f32, 0.15f32), (3.0, 1.0), (10.0, 1.0), (20.0, 1.0)] {
+            let mut app = app();
+            app.camera.yaw = 0.0;
+            app.camera.pitch = 0.0;
+            app.publish_camera();
+            update(&mut app, Message::BrushKindChanged(BrushKind::Move));
+            update(&mut app, Message::BrushRadiusChanged(radius));
+            update(&mut app, Message::BrushStrengthChanged(strength));
+
+            let probe_x = radius * 0.5;
+            let before = near_surface(&app, probe_x);
+
+            app.on_pointer(PointerEvent::Moved { position: centre_of_viewport(), size: SIZE });
+            press(&mut app, centre_of_viewport());
+            let mut worst = 0.0f32;
+            let mut stamps = 0usize;
+            for step in 1..=30 {
+                app.on_pointer(PointerEvent::Moved {
+                    position: centre_of_viewport() + Vector::new(step as f32 * 5.0, 0.0),
+                    size: SIZE,
+                });
+                worst = worst.max(app.perf.edit_ms);
+                stamps += app.perf.stamps;
+            }
+            release(&mut app);
+
+            let shift = match (before, near_surface(&app, probe_x)) {
+                (Some(b), Some(a)) => format!("{:+.2} mm", a - b),
+                _ => "n/a".to_string(),
+            };
+            eprintln!(
+                "radius {radius:>5.1} strength {strength:>4.2}: surface {shift:>9} at x={probe_x:.1}, \
+                 worst event {worst:>6.2} ms, {stamps} stamps"
+            );
+        }
+    }
+
     // --- the plane cut -------------------------------------------------------
 
     /// Which side of the dragged line is removed, pinned by observation rather
