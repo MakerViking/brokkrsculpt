@@ -10,7 +10,7 @@ use std::time::Instant;
 
 use brokkr_core::{
     BrickCoord, BrickMesh, Brush, BrushDirection, BrushKind, BrushScratch, History, HistoryStats,
-    MirrorAxis, Stamp, Stroke, Symmetry, Volume, VolumeStats, lean_normal, raycast,
+    MirrorAxis, MoveStroke, Stamp, Stroke, Symmetry, Volume, VolumeStats, lean_normal, raycast,
 };
 use glam::{Vec2, Vec3};
 use iced::{Subscription, Task};
@@ -188,6 +188,10 @@ pub struct Brokkr {
     /// recycled ones so a stroke never allocates.
     mesh_buffers: Vec<BrickMesh>,
     brush_scratch: BrushScratch,
+    /// The field Move locked when the current gesture began, if the current
+    /// gesture is a Move. Kept here rather than rebuilt per event, because
+    /// holding it across the whole gesture is the entire point of the brush.
+    move_stroke: MoveStroke,
     /// Stamp centres produced by the current pointer event. Reused so a stroke
     /// does not allocate.
     stamp_centres: Vec<Vec3>,
@@ -495,6 +499,7 @@ impl Brokkr {
             shared,
             mesh_buffers: Vec::new(),
             brush_scratch: BrushScratch::new(),
+            move_stroke: MoveStroke::new(),
             stamp_centres: Vec::new(),
             dirty: Vec::new(),
             drag: None,
@@ -798,6 +803,11 @@ impl Brokkr {
     /// spacing, so a fast drag lays a continuous cut instead of a dotted trail.
     /// The stamps are applied one after another rather than batched, because
     /// each one has to see the field the previous one left behind.
+    ///
+    /// Move is the exception, and takes none of that path. It locked the field
+    /// when the button went down and re-warps that same copy by the whole drag
+    /// so far, so it wants the raw pointer position and one pass, not a trail
+    /// of stamps that each build on the last. See `MoveStroke`.
     fn sculpt_to(&mut self, pixel: Vec2, direction: BrushDirection, start: bool) {
         let Some(point) = self.surface_under(pixel) else {
             // The cursor ran off the model. The stroke stays live so coming
@@ -819,26 +829,51 @@ impl Brokkr {
         // not moved between the stamps that one pointer event interpolates, so
         // re-reading it would only add jitter.
         let pressure = self.tablet.stamp_pressure(self.pressure_enabled, self.pressure_curve);
-        let lean = self.pen_lean();
         let brush = self.effective_brush();
-        // Which way the drag is going, for the patterns that comb. Zero until
-        // the stroke has moved far enough to have a direction, which the
-        // pattern copes with by picking any direction across the surface.
-        let tangent = self.stroke.direction().unwrap_or(Vec3::ZERO);
 
-        for index in 0..self.stamp_centres.len() {
-            let centre = self.stamp_centres[index];
-            // Take the normal from the field at each stamp rather than reusing
-            // the one from the raycast, so a stroke curving around a form stays
-            // oriented to the surface it is actually on.
-            // Leaning the pen rotates the direction the brush pushes in, which
-            // steers every brush at once because they all read this normal.
-            let normal = lean_normal(self.volume.gradient_world(centre), lean);
-            let stamp =
-                Stamp::new(centre, normal, direction).with_pressure(pressure).with_tangent(tangent);
-            brush.apply_symmetric(&mut self.volume, &stamp, self.symmetry, &mut self.brush_scratch);
+        if brush.kind == BrushKind::Move {
+            // Lock on the first event of the gesture, and also if the gesture
+            // began somewhere this one did not: a press off the model never got
+            // to lock, and holding shift smooths instead, which ends the lock
+            // because it writes into the region the lock was taken over.
+            if start || !self.move_stroke.is_active() {
+                self.move_stroke.begin(&self.volume, &brush, point, self.symmetry);
+            }
+            self.move_stroke.drag_to(&mut self.volume, point, pressure);
+            self.perf.stamps = 1;
+        } else {
+            // A locked copy of the field is only good while nothing else writes
+            // over it, and this is about to.
+            self.move_stroke.end();
+
+            let lean = self.pen_lean();
+            // Which way the drag is going, for the patterns that comb. Zero
+            // until the stroke has moved far enough to have a direction, which
+            // the pattern copes with by picking any direction across the
+            // surface.
+            let tangent = self.stroke.direction().unwrap_or(Vec3::ZERO);
+
+            for index in 0..self.stamp_centres.len() {
+                let centre = self.stamp_centres[index];
+                // Take the normal from the field at each stamp rather than
+                // reusing the one from the raycast, so a stroke curving around
+                // a form stays oriented to the surface it is actually on.
+                // Leaning the pen rotates the direction the brush pushes in,
+                // which steers every brush at once because they all read this
+                // normal.
+                let normal = lean_normal(self.volume.gradient_world(centre), lean);
+                let stamp = Stamp::new(centre, normal, direction)
+                    .with_pressure(pressure)
+                    .with_tangent(tangent);
+                brush.apply_symmetric(
+                    &mut self.volume,
+                    &stamp,
+                    self.symmetry,
+                    &mut self.brush_scratch,
+                );
+            }
+            self.perf.stamps = self.stamp_centres.len();
         }
-        self.perf.stamps = self.stamp_centres.len();
         self.perf.pressure = pressure;
         self.perf.edit_ms = started.elapsed().as_secs_f32() * 1000.0;
 
@@ -982,6 +1017,10 @@ impl Brokkr {
 
     fn finish_stroke(&mut self) {
         self.stroke.end();
+        // Releases the locked field. One gesture is one lock, so a new drag
+        // starts from the surface as it now stands rather than re-warping the
+        // last one's copy.
+        self.move_stroke.end();
         if let Some(edit) = self.volume.end_stroke() {
             self.history.push(edit);
             self.history_stats = self.history.stats();
@@ -2982,56 +3021,192 @@ mod tests {
 
     /// Reach and cost together, since Move trades one against the other.
     ///
-    /// Printed rather than asserted: these are the numbers the spacing rule was
-    /// chosen from, and the point is that a future change can re-run them.
+    /// Printed rather than asserted: these are the numbers the reach cap was
+    /// chosen against, and the point is that a future change can re-run them.
+    /// `the_surface_follows_the_pointer_through_the_application` is the one
+    /// that fails if the reach collapses again.
     #[test]
     fn measure_move_reach_and_cost() {
-        fn near_surface(app: &Brokkr, x: f32) -> Option<f32> {
-            let mut z = 40.0f32;
-            while z > -40.0 {
-                if app.volume.sample_world(Vec3::new(x, 0.0, z)) < 0.0 {
-                    return Some(z);
-                }
-                z -= 0.02;
-            }
-            None
-        }
-
-        for (radius, strength) in [(3.0f32, 0.15f32), (3.0, 1.0), (10.0, 1.0), (20.0, 1.0)] {
+        for (radius, strength) in
+            [(3.0f32, 0.15f32), (3.0, 1.0), (10.0, 0.15), (10.0, 1.0), (20.0, 0.15), (20.0, 1.0)]
+        {
             let mut app = app();
-            app.camera.yaw = 0.0;
-            app.camera.pitch = 0.0;
-            app.publish_camera();
+            aim_at_the_front(&mut app);
+            update(&mut app, Message::BrushKindChanged(BrushKind::Draw));
+            update(&mut app, Message::BrushRadiusChanged(radius.min(6.0)));
+            update(&mut app, Message::BrushStrengthChanged(0.8));
+            for _ in 0..6 {
+                press(&mut app, centre_of_viewport());
+                release(&mut app);
+            }
+
             update(&mut app, Message::BrushKindChanged(BrushKind::Move));
             update(&mut app, Message::BrushRadiusChanged(radius));
             update(&mut app, Message::BrushStrengthChanged(strength));
 
-            let probe_x = radius * 0.5;
-            let before = near_surface(&app, probe_x);
-
+            let before = bump_x(&app);
             app.on_pointer(PointerEvent::Moved { position: centre_of_viewport(), size: SIZE });
+            let from = app.surface_under(pixel(centre_of_viewport())).expect("the centre hits");
+
             press(&mut app, centre_of_viewport());
             let mut worst = 0.0f32;
-            let mut stamps = 0usize;
+            let mut total_ms = 0.0f32;
+            let mut to = from;
             for step in 1..=30 {
-                app.on_pointer(PointerEvent::Moved {
-                    position: centre_of_viewport() + Vector::new(step as f32 * 5.0, 0.0),
-                    size: SIZE,
-                });
+                let at = centre_of_viewport() + Vector::new(step as f32 * 5.0, 0.0);
+                app.on_pointer(PointerEvent::Moved { position: at, size: SIZE });
                 worst = worst.max(app.perf.edit_ms);
-                stamps += app.perf.stamps;
+                total_ms += app.perf.edit_ms;
+                if let Some(point) = app.surface_under(pixel(at)) {
+                    to = point;
+                }
             }
             release(&mut app);
 
-            let shift = match (before, near_surface(&app, probe_x)) {
-                (Some(b), Some(a)) => format!("{:+.2} mm", a - b),
-                _ => "n/a".to_string(),
-            };
+            let moved = bump_x(&app) - before;
             eprintln!(
-                "radius {radius:>5.1} strength {strength:>4.2}: surface {shift:>9} at x={probe_x:.1}, \
-                 worst event {worst:>6.2} ms, {stamps} stamps"
+                "radius {radius:>5.1} strength {strength:>4.2}: pointer travelled \
+                 {:>5.1} mm, surface followed {moved:>+6.2} mm (cap {:>5.2} mm), \
+                 worst event {worst:>6.2} ms, whole drag {total_ms:>7.2} ms",
+                from.distance(to),
+                Brush { kind: BrushKind::Move, radius, ..app.brush }.max_drag(),
             );
         }
+    }
+
+    /// Where the bump raised at the front of the ball sits along X, weighted by
+    /// how much material is standing proud of the sphere at each slice.
+    ///
+    /// A drag has to carry this along with it, and it is measured rather than
+    /// assumed to have stayed put -- which is the whole difference between
+    /// "something changed" and "the surface followed the pointer".
+    fn bump_x(app: &Brokkr) -> f32 {
+        let mut weighted = 0.0;
+        let mut total = 0.0;
+        for step in -120..=120 {
+            let x = step as f32 * 0.25;
+            // Where the surface crosses along +Z at this slice.
+            let mut z = 60.0f32;
+            while z > 0.0 {
+                if app.volume.sample_world(Vec3::new(x, 0.0, z)) < 0.0 {
+                    break;
+                }
+                z -= 0.05;
+            }
+            let raised = (z - (MODEL_RADIUS_MM * MODEL_RADIUS_MM - x * x).max(0.0).sqrt()).max(0.0);
+            weighted += x * raised;
+            total += raised;
+        }
+        assert!(total > 0.0, "there is no bump to measure");
+        weighted / total
+    }
+
+    fn pixel(at: Vector) -> Vec2 {
+        Vec2::new(at.x, at.y)
+    }
+
+    /// Look straight down -Z, so a horizontal drag on screen is a drag along
+    /// world X and the measurements above are in a frame anyone can check.
+    fn aim_at_the_front(app: &mut Brokkr) {
+        app.camera.yaw = 0.0;
+        app.camera.pitch = 0.0;
+        app.publish_camera();
+    }
+
+    /// The reach the old incremental Move could not deliver.
+    ///
+    /// It moved the surface **0.02 mm** for a full viewport drag at the default
+    /// radius, which is why it was reported as doing nothing at all. This
+    /// asserts a real magnitude rather than "something changed", because
+    /// "something changed" is exactly what the broken version also did.
+    #[test]
+    fn the_surface_follows_the_pointer_through_the_application() {
+        let mut app = app();
+        aim_at_the_front(&mut app);
+        update(&mut app, Message::BrushKindChanged(BrushKind::Draw));
+        update(&mut app, Message::BrushRadiusChanged(6.0));
+        update(&mut app, Message::BrushStrengthChanged(0.8));
+        for _ in 0..6 {
+            press(&mut app, centre_of_viewport());
+            release(&mut app);
+        }
+
+        update(&mut app, Message::BrushKindChanged(BrushKind::Move));
+        update(&mut app, Message::BrushRadiusChanged(10.0));
+        update(&mut app, Message::BrushStrengthChanged(1.0));
+
+        let before = bump_x(&app);
+        app.on_pointer(PointerEvent::Moved { position: centre_of_viewport(), size: SIZE });
+        let from = app.surface_under(pixel(centre_of_viewport())).expect("the centre hits");
+
+        press(&mut app, centre_of_viewport());
+        let mut to = from;
+        for step in 1..=10 {
+            let at = centre_of_viewport() + Vector::new(step as f32 * 5.0, 0.0);
+            app.on_pointer(PointerEvent::Moved { position: at, size: SIZE });
+            if let Some(point) = app.surface_under(pixel(at)) {
+                to = point;
+            }
+        }
+        release(&mut app);
+
+        let pointer = from.distance(to);
+        let moved = bump_x(&app) - before;
+        assert!(pointer > 3.0, "the test did not drag far enough to mean anything: {pointer} mm");
+        assert!(
+            moved > pointer * 0.4,
+            "a {pointer:.1} mm drag moved the surface {moved:.2} mm, which is the order of \
+             magnitude the incremental version failed at"
+        );
+    }
+
+    /// The property locking the field buys, seen from the application.
+    #[test]
+    fn a_drag_out_and_back_through_the_application_returns_the_form() {
+        let mut app = app();
+        aim_at_the_front(&mut app);
+        update(&mut app, Message::BrushKindChanged(BrushKind::Draw));
+        update(&mut app, Message::BrushRadiusChanged(6.0));
+        update(&mut app, Message::BrushStrengthChanged(0.8));
+        for _ in 0..6 {
+            press(&mut app, centre_of_viewport());
+            release(&mut app);
+        }
+
+        let probes: Vec<Vec3> = (-40..=40)
+            .map(|step| Vec3::new(step as f32 * 0.5, 0.0, MODEL_RADIUS_MM - 2.0))
+            .collect();
+        let before: Vec<f32> = probes.iter().map(|p| app.volume.sample_world(*p)).collect();
+
+        update(&mut app, Message::BrushKindChanged(BrushKind::Move));
+        update(&mut app, Message::BrushRadiusChanged(10.0));
+        update(&mut app, Message::BrushStrengthChanged(1.0));
+
+        press(&mut app, centre_of_viewport());
+        let mut path: Vec<f32> = (1..=8).map(|step| step as f32 * 4.0).collect();
+        path.extend((0..=8).rev().map(|step| step as f32 * 4.0));
+        for offset in path {
+            app.on_pointer(PointerEvent::Moved {
+                position: centre_of_viewport() + Vector::new(offset, 0.0),
+                size: SIZE,
+            });
+        }
+        release(&mut app);
+
+        let worst = probes
+            .iter()
+            .zip(&before)
+            .map(|(probe, was)| (app.volume.sample_world(*probe) - was).abs())
+            .fold(0.0f32, f32::max);
+        // Looser than the core test's thousandth, and for two reasons that are
+        // the application's rather than the algorithm's. The world point comes
+        // from a raycast against the surface as it currently stands, so coming
+        // back to the same pixel is not quite coming back to the same point;
+        // and a drag that has shrunk to within a quarter voxel of where it
+        // already was is skipped rather than redone. Both are bounded by a
+        // fraction of a voxel, which is what this asserts -- the values are in
+        // voxels, so a twentieth here is a hundredth of a voxel.
+        assert!(worst < 0.05, "a drag out and back left the surface {worst} different");
     }
 
     // --- the plane cut -------------------------------------------------------

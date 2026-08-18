@@ -44,8 +44,8 @@ pub use brick::{
     OUTSIDE,
 };
 pub use brush::{
-    Brush, BrushDirection, BrushKind, BrushScratch, FalloffCurve, MirrorAxis, Stamp, Symmetry,
-    lean_normal,
+    Brush, BrushDirection, BrushKind, BrushScratch, FalloffCurve, MirrorAxis, MoveStroke, Stamp,
+    Symmetry, lean_normal,
 };
 pub use clip::ClipPlane;
 pub use export::{ExportMesh, MeshReport};
