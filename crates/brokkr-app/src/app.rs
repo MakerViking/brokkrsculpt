@@ -98,6 +98,9 @@ enum DragKind {
     Sculpt(BrushDirection),
     /// The pointer is resizing the brush, not using it.
     Sizing,
+    /// The pointer is dragging the line of a plane cut. Nothing happens to the
+    /// model until the button comes back up, so the line can be adjusted.
+    Cutting,
 }
 
 /// A drag in progress, tagged with the button that started it so that
@@ -256,6 +259,14 @@ pub struct Brokkr {
     /// `Message::MenuClosed` -- must NOT close this. A prompt that a stray click
     /// dismisses is worse than no prompt: the user learns to ignore it.
     confirm: Option<PendingAction>,
+    /// Whether the next left drag cuts the model instead of sculpting it.
+    ///
+    /// A mode rather than a modifier because a cut is destructive and
+    /// irreversible-looking: arming it deliberately is worth one click, and the
+    /// tool strip shows the armed state so it can never be a surprise.
+    cut_armed: bool,
+    /// Where a cut line started, while it is being dragged.
+    cut_from: Option<Vec2>,
     /// Sculpts opened or saved recently, for the File menu.
     recent: crate::recent::Recent,
     /// Where the crash net is written.
@@ -509,6 +520,8 @@ impl Brokkr {
             project_path: None,
             unsaved: false,
             confirm: None,
+            cut_armed: false,
+            cut_from: None,
             recent: crate::recent::Recent::load(),
             autosave_file: Self::default_autosave_path(),
             last_autosave: Instant::now(),
@@ -897,6 +910,71 @@ impl Brokkr {
         let direction =
             (self.camera.right() * pen.tilt.x - self.camera.up() * pen.tilt.y).normalize_or_zero();
         direction * (magnitude * MAX_TILT)
+    }
+
+    /// Turn the dragged line into a plane and cut with it.
+    ///
+    /// The plane is the one containing the eye and both ends of the line, so it
+    /// is exactly the surface the line sweeps out going away from the viewer --
+    /// which is what makes a screen-space drag mean something in three
+    /// dimensions, and why the cut passes through the whole model rather than
+    /// stopping at the first surface.
+    ///
+    /// **Which side goes is set by the drag direction**: the material to the
+    /// LEFT of the arrow, as drawn on screen, is removed -- so a left to right
+    /// drag takes the top half. Drag the other way to keep the other half.
+    ///
+    /// That sentence is copied from what
+    /// `a_left_to_right_drag_removes_a_consistent_side` actually observes, not
+    /// from reasoning about the cross product. The sign depends on the ray
+    /// order, the handedness of the camera basis and whether the pixel-to-NDC
+    /// step flips Y, and getting it backwards means the tool removes the half
+    /// the user meant to keep.
+    fn finish_cut(&mut self) {
+        let Some(from) = self.cut_from.take() else {
+            return;
+        };
+        let Some(to) = self.cursor else {
+            return;
+        };
+        // A click is not a cut. Without this, arming the tool and clicking once
+        // would take an arbitrary half of the model away.
+        if from.distance(to) < CLICK_SLOP_PX {
+            self.status = "cut cancelled: drag a line across the model".to_string();
+            return;
+        }
+
+        let (eye, first) = self.ray_through(from);
+        let (_, second) = self.ray_through(to);
+        // Both rays leave the same eye, so their cross product is normal to the
+        // plane through the two of them. The order is what decides the sign,
+        // and therefore which side is cut.
+        let Some(plane) = brokkr_core::ClipPlane::new(eye, second.cross(first)) else {
+            self.status = "cut cancelled: that line has no direction".to_string();
+            return;
+        };
+
+        self.volume.begin_stroke();
+        let changed = self.volume.clip(plane);
+        match self.volume.end_stroke() {
+            Some(edit) if changed > 0 => {
+                self.history.push(edit);
+                self.history_stats = self.history.stats();
+                self.unsaved = true;
+                self.status = format!("cut {changed} bricks");
+                self.remesh_dirty();
+                self.refresh_overlay();
+            }
+            _ => {
+                // The plane missed the model. Nothing changed, so nothing is
+                // recorded -- an undo entry for a no-op would be worse than
+                // none.
+                self.status = "the cut missed the model".to_string();
+            }
+        }
+        // One cut per arming. A destructive tool that stays live is how a
+        // stray click removes half the model.
+        self.cut_armed = false;
     }
 
     fn finish_stroke(&mut self) {
@@ -1595,6 +1673,12 @@ impl Brokkr {
                 }
 
                 let kind = match button {
+                    // A cut outranks sculpting: the mode was armed deliberately
+                    // and the next left drag is the line, not a stroke.
+                    PointerButton::Left if self.cut_armed => {
+                        self.cut_from = Some(position);
+                        DragKind::Cutting
+                    }
                     // Left sculpts -- unless a hold-and-drag resize is in
                     // progress, in which case the pointer belongs to that
                     // gesture and a press must not lay down a stroke.
@@ -1629,6 +1713,9 @@ impl Brokkr {
             }
             PointerEvent::Released { button } => {
                 if let Some(drag) = self.drag.filter(|drag| drag.button == button) {
+                    if matches!(drag.kind, DragKind::Cutting) {
+                        self.finish_cut();
+                    }
                     if matches!(drag.kind, DragKind::Sculpt(_)) {
                         self.finish_stroke();
                     }
@@ -1678,7 +1765,10 @@ impl Brokkr {
                         self.camera.pan(delta, self.viewport_size.y);
                         self.publish_camera();
                     }
-                    Some(DragKind::Sizing) | None => {}
+                    // The cut line is only drawn while it is being dragged;
+                    // the model is not touched until the button comes up, so
+                    // the line can be adjusted freely.
+                    Some(DragKind::Cutting) | Some(DragKind::Sizing) | None => {}
                 }
 
                 // Over the cube: light the part under the pointer, and draw no
@@ -1773,12 +1863,26 @@ impl Brokkr {
                 if self.confirm.is_some() {
                     return self.answer_confirm(ConfirmChoice::Cancel);
                 }
+                // Escape is also the way out of an armed cut, which is the only
+                // mode in the application that changes what a click does.
+                self.cut_armed = false;
+                self.cut_from = None;
                 self.menu = None;
                 self.menu_edit = None;
                 self.top_menu = None;
             }
             Message::MenuFieldEdited(which, text) => self.edit_menu_field(which, text),
             Message::MenuFieldSubmitted => self.menu_edit = None,
+            Message::CutToggled => {
+                self.cut_armed = !self.cut_armed;
+                self.cut_from = None;
+                self.status = if self.cut_armed {
+                    "cut armed: drag a line across the model, the left of the arrow goes"
+                        .to_string()
+                } else {
+                    String::new()
+                };
+            }
             Message::DynamicRadiusToggled(on) => self.dynamic_radius = on,
             Message::BrushRadiusScaled(factor) => {
                 self.brush.radius =
@@ -2805,6 +2909,102 @@ mod tests {
         );
 
         std::fs::remove_dir_all(&directory).ok();
+    }
+
+    // --- the plane cut -------------------------------------------------------
+
+    /// Which side of the dragged line is removed, pinned by observation rather
+    /// than by reasoning about cross products on paper.
+    ///
+    /// This is the one thing about the cut that cannot be got right by thinking
+    /// about it: the sign depends on the ray order, the handedness of the
+    /// camera basis, and whether the pixel-to-NDC step flips Y. Get it backwards
+    /// and the tool takes the half the user meant to keep -- which is
+    /// destructive, and only obvious after the fact.
+    #[test]
+    fn a_left_to_right_drag_removes_a_consistent_side() {
+        let mut app = app();
+        // A known camera: looking straight down -Z at the origin.
+        app.camera.yaw = 0.0;
+        app.camera.pitch = 0.0;
+        app.publish_camera();
+
+        let middle_y = SIZE.y / 2.0;
+        update(&mut app, Message::CutToggled);
+        assert!(app.cut_armed, "the cut did not arm");
+
+        // Drag left to right across the middle of the viewport.
+        press(&mut app, Vector::new(SIZE.x * 0.1, middle_y));
+        app.on_pointer(PointerEvent::Moved {
+            position: Vector::new(SIZE.x * 0.9, middle_y),
+            size: SIZE,
+        });
+        release(&mut app);
+
+        assert!(!app.cut_armed, "the cut stayed armed after being used");
+        assert!(app.unsaved, "a cut did not mark the document unsaved");
+
+        let above = app.volume.sample_world(Vec3::new(0.0, 12.0, 0.0));
+        let below = app.volume.sample_world(Vec3::new(0.0, -12.0, 0.0));
+        assert_ne!(
+            above < 0.0,
+            below < 0.0,
+            "the cut removed both halves or neither: above {above}, below {below}"
+        );
+        // Record which one it actually is, so a change of sign fails here
+        // rather than in someone's sculpt. If this assertion is what fails
+        // after a camera change, check the ray order in `finish_cut` before
+        // editing the expectation.
+        assert!(
+            below < 0.0 && above > 0.0,
+            "a left to right drag should keep the LOWER half on screen: \
+             above {above}, below {below}"
+        );
+    }
+
+    /// A cut is destructive, so a click must never be one.
+    #[test]
+    fn a_click_with_the_cut_armed_does_nothing() {
+        let mut app = app();
+        update(&mut app, Message::CutToggled);
+        let before = app.volume.brick_coords().count();
+
+        press(&mut app, centre_of_viewport());
+        release(&mut app);
+
+        assert_eq!(app.volume.brick_coords().count(), before, "a click cut the model");
+        assert!(!app.unsaved, "a click that cut nothing marked the document unsaved");
+        assert!(app.status.contains("cancelled"), "reported: {}", app.status);
+    }
+
+    #[test]
+    fn a_cut_is_undoable_through_the_application() {
+        let mut app = app();
+        let probe = Vec3::new(0.0, 12.0, 0.0);
+        let before = app.volume.sample_world(probe);
+
+        update(&mut app, Message::CutToggled);
+        press(&mut app, Vector::new(SIZE.x * 0.1, SIZE.y / 2.0));
+        app.on_pointer(PointerEvent::Moved {
+            position: Vector::new(SIZE.x * 0.9, SIZE.y / 2.0),
+            size: SIZE,
+        });
+        release(&mut app);
+        assert_ne!(app.volume.sample_world(probe), before, "the cut did nothing to undo");
+
+        app.undo();
+        assert_eq!(app.volume.sample_world(probe), before, "undo did not restore the cut");
+    }
+
+    /// Escape is the way out of every other mode, and a destructive one must
+    /// not be the exception.
+    #[test]
+    fn escape_disarms_the_cut() {
+        let mut app = app();
+        update(&mut app, Message::CutToggled);
+        assert!(app.cut_armed);
+        update(&mut app, Message::MenuClosed);
+        assert!(!app.cut_armed, "escape left a destructive mode armed");
     }
 
     // --- importing a mesh ----------------------------------------------------

@@ -309,4 +309,6 @@ pub enum Message {
     SpaceMouse(SpaceMouseSetting),
     /// Open or close one block of the properties panel.
     SectionToggled(PanelSection),
+    /// Arm or disarm the plane cut. The next left drag becomes the cut line.
+    CutToggled,
 }

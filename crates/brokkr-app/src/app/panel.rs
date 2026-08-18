@@ -574,6 +574,17 @@ impl Brokkr {
                     .color(if smoothing { theme::ACCENT } else { theme::TEXT_MUTE }),
                 text("MIRROR").size(theme::CAPTION_SIZE).color(theme::TEXT_MUTE),
                 mirrors,
+                text("CUT").size(theme::CAPTION_SIZE).color(theme::TEXT_MUTE),
+                // Armed state is shown in the strip, not just in the status
+                // line, because this is the one mode that changes what a left
+                // drag does and a cut is not something to discover by accident.
+                button(
+                    text(if self.cut_armed { "armed" } else { "plane" })
+                        .size(theme::TEXT_SIZE_SMALL)
+                )
+                .width(Length::Fill)
+                .style(if self.cut_armed { theme::tool_button_active } else { theme::tool_button })
+                .on_press(Message::CutToggled),
             ]
             .spacing(theme::S3)
             .align_x(Alignment::Center),
