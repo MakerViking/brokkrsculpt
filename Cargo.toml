@@ -29,7 +29,16 @@ evdev = "0.13"
 rfd = "0.17"
 pollster = "0.4"
 rayon = "1"
+# XML and raw DEFLATE, both needed to read a 3MF and both already compiled for
+# this workspace before they were named here: roxmltree arrives through
+# fontconfig-parser -> fontdb -> cosmic-text, and yazi through swash ->
+# cosmic-text, so making them direct dependencies of brokkr-core costs zero new
+# crates. Each has no dependencies of its own, so the worst case if Iced ever
+# changes its text stack is that we compile two small leaf crates ourselves.
+# Pinned to 0.20 rather than 0.21 because 0.21 is both a new compile and yanked.
+roxmltree = "0.20"
 rustc-hash = "2"
+yazi = "0.2.1"
 # Pinned to 27 because iced_wgpu 0.14 depends on wgpu ^27. The shader widget
 # hands us a real wgpu::Device and RenderPass, so a different major version
 # here would be a different, incompatible type. Bump both together or not at

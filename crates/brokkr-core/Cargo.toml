@@ -17,7 +17,9 @@ bytemuck.workspace = true
 fast-surface-nets.workspace = true
 glam.workspace = true
 rayon.workspace = true
+roxmltree.workspace = true
 rustc-hash.workspace = true
+yazi.workspace = true
 
 [dev-dependencies]
 glam.workspace = true

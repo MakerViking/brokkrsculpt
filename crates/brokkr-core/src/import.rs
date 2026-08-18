@@ -21,6 +21,7 @@
 
 pub mod obj;
 pub mod stl;
+pub mod threemf;
 
 use std::path::Path;
 
@@ -76,14 +77,14 @@ impl From<std::io::Error> for ImportError {
 }
 
 /// Every extension the open dialog should offer.
-pub const MESH_EXTENSIONS: [&str; 2] = ["stl", "obj"];
+pub const MESH_EXTENSIONS: [&str; 3] = ["stl", "obj", "3mf"];
 
 /// Read a mesh, choosing the parser by extension.
 ///
-/// Extension rather than content sniffing, because the two formats we read have
-/// no reliable magic between them -- an ASCII STL and an OBJ are both plain
-/// text -- and because a user who renamed a file is better served by a clear
-/// "that is not an STL" than by a parser guessing.
+/// Extension rather than content sniffing, because two of the three formats we
+/// read have no reliable magic between them -- an ASCII STL and an OBJ are both
+/// plain text -- and because a user who renamed a file is better served by a
+/// clear "that is not an STL" than by a parser guessing.
 pub fn read_path(path: &Path) -> Result<ExportMesh, ImportError> {
     let extension =
         path.extension().map(|raw| raw.to_string_lossy().to_ascii_lowercase()).unwrap_or_default();
@@ -93,11 +94,6 @@ pub fn read_path(path: &Path) -> Result<ExportMesh, ImportError> {
             "a .sindri file holds a CAD feature tree, not a mesh -- export STL from SindriCAD \
              and import that"
                 .to_string(),
-        ));
-    }
-    if extension == "3mf" {
-        return Err(ImportError::Unsupported(
-            "3MF import is not built yet -- export STL or OBJ instead".to_string(),
         ));
     }
 
@@ -110,6 +106,7 @@ pub fn read_path(path: &Path) -> Result<ExportMesh, ImportError> {
     match extension.as_str() {
         "stl" => stl::read(&bytes),
         "obj" => obj::read(&bytes),
+        "3mf" => threemf::read(&bytes),
         other => Err(ImportError::Unsupported(format!("there is no reader for a .{other} file"))),
     }
 }

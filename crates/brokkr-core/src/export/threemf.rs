@@ -14,8 +14,12 @@
 //! crate and a compression crate, and the format is fixed forever, so there is
 //! nothing here to keep up with.
 //!
-//! The output is checked by reading it back with a real ZIP implementation in
-//! the tests, not by trusting this code.
+//! What this writer produces is a deliberately degenerate subset of the format:
+//! stored entries only, one namespace, always millimetres, one object and no
+//! transforms. [`crate::import::threemf`] reads it back in the tests, which is
+//! what stops this module being checked only against its own assumptions -- but
+//! that reader is not tested against this writer alone, precisely because
+//! agreeing with it would prove nothing about a real file.
 //!
 //! Coordinates are rotated to Z-up on the way out. See [`crate::orientation`].
 //! 3MF carries no vertex normals, so positions are all there is to rotate.
@@ -176,7 +180,11 @@ impl ZipWriter {
 
 /// CRC32 as ZIP uses it: the reflected IEEE polynomial, computed a byte at a
 /// time. Small enough that a lookup table would be the only reason to do more.
-fn crc32(data: &[u8]) -> u32 {
+///
+/// Shared with [`crate::import::threemf`], which needs the same check value to
+/// verify an entry it has just unpacked. Note that `yazi` ships an Adler-32,
+/// which is what zlib wraps a stream in and is *not* what a ZIP entry stores.
+pub(crate) fn crc32(data: &[u8]) -> u32 {
     let mut crc = 0xffff_ffffu32;
     for byte in data {
         crc ^= u32::from(*byte);
