@@ -1438,3 +1438,55 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod preflight_calibration {
+    use super::*;
+    use crate::volume::Volume;
+
+    /// The preflight refuses an import by estimating its cost from surface
+    /// area, and both factors started as guesses. A guess that is too low
+    /// accepts an import that then exhausts memory; too high refuses one that
+    /// would have fitted. This measures them against reality on a shape whose
+    /// area is known analytically, and requires the estimate to be on the
+    /// conservative side without being absurd.
+    #[test]
+    fn the_preflight_estimate_brackets_what_actually_gets_built() {
+        for (radius, voxel) in [(20.0f32, 0.5f32), (40.0, 0.5), (20.0, 0.25)] {
+            let mut seeded = Volume::new(voxel);
+            seeded.seed_sphere(Vec3::ZERO, radius);
+            seeded.mark_everything_dirty();
+            let (mesh, _) = seeded.export_mesh();
+
+            let (built, report) = voxelise(
+                &mesh,
+                &VoxeliseOptions { voxel_size: voxel, centre: false, refit_if_implausible: false },
+            )
+            .expect("the fixture should voxelise");
+
+            let area = 4.0 * std::f64::consts::PI * (radius as f64).powi(2);
+            let brick_mm = BRICK_DIM as f64 * voxel as f64;
+            let estimated = area / (brick_mm * brick_mm) * SHELL_FACTOR;
+            let actual = report.dense_bricks as f64;
+            let ratio = estimated / actual.max(1.0);
+
+            assert!(
+                (0.8..=6.0).contains(&ratio),
+                "at radius {radius} and voxel {voxel} the preflight estimates {estimated:.0} \
+                 dense bricks against {actual:.0} actually built ({ratio:.2}x). Below 1 it \
+                 would accept an import that does not fit; far above it refuses ones that do."
+            );
+
+            let (exported, _) = built.export_mesh();
+            let estimated_vertices = area / (voxel as f64 * voxel as f64) * VERTEX_FACTOR;
+            let vertex_ratio = estimated_vertices / exported.positions.len().max(1) as f64;
+            assert!(
+                (0.8..=6.0).contains(&vertex_ratio),
+                "at radius {radius} and voxel {voxel} the preflight estimates \
+                 {estimated_vertices:.0} vertices against {} actually produced \
+                 ({vertex_ratio:.2}x)",
+                exported.positions.len()
+            );
+        }
+    }
+}
