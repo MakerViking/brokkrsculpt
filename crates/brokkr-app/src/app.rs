@@ -188,6 +188,19 @@ pub struct Brokkr {
     /// recycled ones so a stroke never allocates.
     mesh_buffers: Vec<BrickMesh>,
     brush_scratch: BrushScratch,
+    /// Strength per brush, so switching tools restores what that tool was last
+    /// set to rather than carrying a number that means something different.
+    ///
+    /// Strength is not the same quantity for every brush -- for Move it is the
+    /// fraction of the drag the surface follows -- so one shared slider value
+    /// made Move look broken at Draw's default. Indexed by `BrushKind::ALL`.
+    strengths: [f32; BrushKind::ALL.len()],
+    /// Where a Move gesture grabbed the surface, fixed for the whole drag.
+    ///
+    /// The drag target is the pointer projected into the view plane through
+    /// this point, so the surface follows the cursor across the screen rather
+    /// than crawling around the form. See `view_plane_point`.
+    move_grab: Option<Vec3>,
     /// The field Move locked when the current gesture began, if the current
     /// gesture is a Move. Kept here rather than rebuilt per event, because
     /// holding it across the whole gesture is the entire point of the brush.
@@ -499,6 +512,8 @@ impl Brokkr {
             shared,
             mesh_buffers: Vec::new(),
             brush_scratch: BrushScratch::new(),
+            strengths: BrushKind::ALL.map(BrushKind::default_strength),
+            move_grab: None,
             move_stroke: MoveStroke::new(),
             stamp_centres: Vec::new(),
             dirty: Vec::new(),
@@ -808,7 +823,105 @@ impl Brokkr {
     /// when the button went down and re-warps that same copy by the whole drag
     /// so far, so it wants the raw pointer position and one pass, not a trail
     /// of stamps that each build on the last. See `MoveStroke`.
+    /// Index of a brush in the per-kind strength table.
+    fn strength_slot(kind: BrushKind) -> usize {
+        BrushKind::ALL.iter().position(|candidate| *candidate == kind).unwrap_or(0)
+    }
+
+    /// Where the pointer is, in the plane through `through` that faces the
+    /// camera.
+    ///
+    /// This is what makes a grab feel like a grab. Raycasting the pointer onto
+    /// the surface instead gives a target that crawls ALONG the form: drag
+    /// sideways across a ball and the hit point slides around its curve, so the
+    /// vector from the grab point stays short and keeps turning, and the result
+    /// is a smear rather than a pull. It is also a feedback loop, because the
+    /// surface being raycast is the one currently being deformed.
+    ///
+    /// Projecting into the view plane instead means the surface follows the
+    /// cursor the way the hand expects, in the plane of the screen, and it
+    /// keeps working when the cursor is dragged off the model entirely -- which
+    /// is exactly when a grab is most useful.
+    fn view_plane_point(&self, pixel: Vec2, through: Vec3) -> Vec3 {
+        let (origin, ray) = self.ray_through(pixel);
+        let Some(facing) = (self.camera.target - self.camera.eye()).try_normalize() else {
+            return through;
+        };
+        let denominator = ray.dot(facing);
+        // The ray is parallel to the plane, which cannot happen for a pointer
+        // inside the viewport but is cheap to refuse.
+        if denominator.abs() < 1.0e-6 {
+            return through;
+        }
+        origin + ray * ((through - origin).dot(facing) / denominator)
+    }
+
+    /// One event of a Move gesture.
+    ///
+    /// Kept apart from `sculpt_to` because Move shares almost none of it: no
+    /// stroke interpolation, no per-stamp normals, no trail of stamps building
+    /// on each other. It locks the field once and re-warps that copy by the
+    /// whole drag so far.
+    fn move_to(&mut self, pixel: Vec2, start: bool) {
+        let brush = self.effective_brush();
+        let pressure = self.tablet.stamp_pressure(self.pressure_enabled, self.pressure_curve);
+        let started = Instant::now();
+
+        // The anchor is the one thing that needs the surface, and it is taken
+        // once. After that the gesture is about the pointer.
+        if start || !self.move_stroke.is_active() {
+            let Some(point) = self.surface_under(pixel) else {
+                return;
+            };
+            self.move_stroke.begin(&self.volume, &brush, point, self.symmetry);
+            self.move_grab = Some(point);
+        }
+        let Some(grab) = self.move_grab else {
+            return;
+        };
+
+        let target = self.view_plane_point(pixel, grab);
+        self.move_stroke.drag_to(&mut self.volume, target, pressure);
+
+        // Re-anchor once this lock has warped as far as it safely can, and let
+        // the drag carry on from where the material now is.
+        //
+        // Without this a gesture stops dead at `Brush::max_drag`, which is a
+        // quarter of the fold threshold and only a millimetre and a half for
+        // the default 3 mm brush -- the surface simply refuses to follow the
+        // cursor any further, which is exactly the "it does something, but not
+        // what I expected" complaint. The cap itself cannot just be raised: past
+        // the fold threshold a domain warp turns the field back through itself.
+        // Chaining fold-safe warps gives unlimited reach without ever crossing
+        // it. ZBrush can drag as far as it likes because it moves mesh vertices,
+        // which stretch; a field has to be re-locked instead.
+        //
+        // Safe inside one stroke because `record_for_undo` captures a brick the
+        // first time it is touched and not again, so a chain of locks is still
+        // one undo entry.
+        if self.move_stroke.is_at_the_limit() {
+            let carried = grab + self.move_stroke.applied();
+            self.move_stroke.begin(&self.volume, &brush, carried, self.symmetry);
+            self.move_grab = Some(carried);
+        }
+
+        self.perf.stamps = 1;
+        self.perf.pressure = pressure;
+        self.perf.edit_ms = started.elapsed().as_secs_f32() * 1000.0;
+        self.remesh_dirty();
+        self.hover = Some(grab);
+        self.refresh_overlay();
+    }
+
     fn sculpt_to(&mut self, pixel: Vec2, direction: BrushDirection, start: bool) {
+        // Move is handled before anything else, because it wants the pointer
+        // rather than the surface under the pointer, and it must keep working
+        // once the cursor has been dragged off the model.
+        if self.effective_brush().kind == BrushKind::Move {
+            self.move_to(pixel, start);
+            return;
+        }
+
         let Some(point) = self.surface_under(pixel) else {
             // The cursor ran off the model. The stroke stays live so coming
             // back onto it continues rather than restarting, but nothing is
@@ -831,20 +944,11 @@ impl Brokkr {
         let pressure = self.tablet.stamp_pressure(self.pressure_enabled, self.pressure_curve);
         let brush = self.effective_brush();
 
-        if brush.kind == BrushKind::Move {
-            // Lock on the first event of the gesture, and also if the gesture
-            // began somewhere this one did not: a press off the model never got
-            // to lock, and holding shift smooths instead, which ends the lock
-            // because it writes into the region the lock was taken over.
-            if start || !self.move_stroke.is_active() {
-                self.move_stroke.begin(&self.volume, &brush, point, self.symmetry);
-            }
-            self.move_stroke.drag_to(&mut self.volume, point, pressure);
-            self.perf.stamps = 1;
-        } else {
+        {
             // A locked copy of the field is only good while nothing else writes
             // over it, and this is about to.
             self.move_stroke.end();
+            self.move_grab = None;
 
             let lean = self.pen_lean();
             // Which way the drag is going, for the patterns that comb. Zero
@@ -1021,6 +1125,7 @@ impl Brokkr {
         // starts from the surface as it now stands rather than re-warping the
         // last one's copy.
         self.move_stroke.end();
+        self.move_grab = None;
         if let Some(edit) = self.volume.end_stroke() {
             self.history.push(edit);
             self.history_stats = self.history.stats();
@@ -1883,10 +1988,19 @@ impl Brokkr {
                 self.drive_from_spacemouse(elapsed_ms);
                 self.maybe_autosave();
             }
-            Message::BrushKindChanged(kind) => self.brush.kind = kind,
+            Message::BrushKindChanged(kind) => {
+                // Remember what the outgoing brush was set to, and restore what
+                // this one was last on.
+                self.strengths[Self::strength_slot(self.brush.kind)] = self.brush.strength;
+                self.brush.kind = kind;
+                self.brush.strength = self.strengths[Self::strength_slot(kind)];
+            }
             Message::FalloffChanged(curve) => self.brush.falloff = curve,
             Message::BrushRadiusChanged(radius) => self.brush.radius = radius,
-            Message::BrushStrengthChanged(strength) => self.brush.strength = strength,
+            Message::BrushStrengthChanged(strength) => {
+                self.brush.strength = strength;
+                self.strengths[Self::strength_slot(self.brush.kind)] = strength;
+            }
             Message::SymmetryAxisToggled(axis) => self.symmetry = self.symmetry.toggled(axis),
             Message::PatternChanged(kind) => self.brush.pattern.kind = kind,
             Message::PatternScaleChanged(scale) => self.brush.pattern.scale_mm = scale,
@@ -2979,6 +3093,71 @@ mod tests {
         );
 
         std::fs::remove_dir_all(&directory).ok();
+    }
+
+    /// Selecting a brush restores the strength that brush was last on.
+    ///
+    /// One shared number made Move look broken: for Move, strength is the
+    /// fraction of the drag the surface follows, so Draw's 0.15 meant the form
+    /// crawled at a seventh of the pointer.
+    #[test]
+    fn each_brush_remembers_its_own_strength() {
+        let mut app = app();
+        update(&mut app, Message::BrushKindChanged(BrushKind::Draw));
+        assert!((app.brush.strength - 0.15).abs() < 1.0e-6, "draw: {}", app.brush.strength);
+
+        update(&mut app, Message::BrushKindChanged(BrushKind::Move));
+        assert!(
+            app.brush.strength > 0.9,
+            "a grab tool at {} would follow a seventh of the drag",
+            app.brush.strength
+        );
+
+        // A deliberate change sticks, and survives a round trip through another
+        // brush.
+        update(&mut app, Message::BrushStrengthChanged(0.5));
+        update(&mut app, Message::BrushKindChanged(BrushKind::Draw));
+        assert!((app.brush.strength - 0.15).abs() < 1.0e-6, "draw was overwritten");
+        update(&mut app, Message::BrushKindChanged(BrushKind::Move));
+        assert!((app.brush.strength - 0.5).abs() < 1.0e-6, "move forgot its setting");
+    }
+
+    /// A Move drag must follow the pointer across the SCREEN, not crawl around
+    /// the form.
+    ///
+    /// Raycasting the pointer onto the surface gives a target that slides along
+    /// the curve, so the vector from the grab point stays short and keeps
+    /// turning. Dragging past the silhouette is the case that separates the two:
+    /// there is no surface under the cursor at all there, and a raycast version
+    /// simply stops.
+    #[test]
+    fn a_move_drag_keeps_working_past_the_edge_of_the_model() {
+        let mut app = app();
+        app.camera.yaw = 0.0;
+        app.camera.pitch = 0.0;
+        app.publish_camera();
+        update(&mut app, Message::BrushKindChanged(BrushKind::Move));
+        update(&mut app, Message::BrushRadiusChanged(10.0));
+
+        let probe = Vec3::new(0.0, 0.0, 30.0);
+        let before = app.volume.sample_world(probe);
+
+        press(&mut app, centre_of_viewport());
+        // Well past the silhouette of the ball.
+        for step in 1..=40 {
+            app.on_pointer(PointerEvent::Moved {
+                position: centre_of_viewport() + Vector::new(step as f32 * 12.0, 0.0),
+                size: SIZE,
+            });
+        }
+        release(&mut app);
+
+        assert_ne!(
+            app.volume.sample_world(probe),
+            before,
+            "the drag stopped at the silhouette, so it is still raycasting the surface"
+        );
+        assert!(app.history_stats.undo_entries > 0, "a long drag recorded no undo entry");
     }
 
     /// Move through the APPLICATION, not through `Brush::apply`.

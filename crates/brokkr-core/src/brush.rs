@@ -327,6 +327,22 @@ impl BrushKind {
         }
     }
 
+    /// What strength this brush wants when it is first selected.
+    ///
+    /// One number for every brush was wrong in one specific way: for Move,
+    /// strength is the FRACTION of the drag the surface follows, so the 0.15
+    /// that suits Draw means the form crawls at a seventh of the pointer and
+    /// reads as the tool barely working. A grab should follow the hand.
+    pub fn default_strength(self) -> f32 {
+        match self {
+            // Follows the cursor essentially one to one.
+            BrushKind::Move => 1.0,
+            // Smoothing at full strength erases detail in one pass.
+            BrushKind::Smooth => 0.4,
+            _ => 0.15,
+        }
+    }
+
     /// Whether inverting the stroke means anything for this brush.
     ///
     /// Smooth and flatten are their own opposite: there is no such thing as
@@ -1189,6 +1205,22 @@ impl MoveStroke {
     pub fn end(&mut self) {
         self.anchors.clear();
         self.applied = Vec3::ZERO;
+    }
+
+    /// How far the surface has actually been carried so far, after the gain
+    /// and the fold-safe clamp.
+    ///
+    /// The caller needs this to know when a gesture has used up its allowance
+    /// and should re-anchor. It is not the same as the distance the pointer has
+    /// travelled -- strength scales it down and [`Brush::max_drag`] caps it.
+    pub fn applied(&self) -> Vec3 {
+        self.applied
+    }
+
+    /// Whether the gesture has reached the furthest it can safely warp in one
+    /// lock, so the caller should snapshot again and carry on from there.
+    pub fn is_at_the_limit(&self) -> bool {
+        self.max_drag > 0.0 && self.applied.length() >= self.max_drag * 0.98
     }
 }
 
