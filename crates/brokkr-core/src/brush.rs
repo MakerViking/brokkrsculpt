@@ -21,13 +21,14 @@
 //! - Clay blends toward a plane held slightly outside the surface, kept to the
 //!   direction that adds material, which is how clay is actually built up.
 //!
-//! Three of them move material, and those have to be handled with more care.
+//! Four of them move material, and those have to be handled with more care.
 //! Inflate offsets the whole level set, which moves every point of the surface
 //! along its own normal, and is the natural operation on a distance field.
-//! Draw and pinch instead resample the field from a shifted position: draw
-//! reads from behind along the stroke normal, which slides the patch outward,
-//! and pinch reads from slightly nearer the brush axis, which squeezes a ridge
-//! into a crease.
+//! Draw, pinch and move instead resample the field from a shifted position:
+//! draw reads from behind along the stroke normal, which slides the patch
+//! outward, pinch reads from slightly nearer the brush axis, which squeezes a
+//! ridge into a crease, and move reads from behind along the drag, which pulls
+//! the patch after the pointer.
 //!
 //! Draw and pinch were both first written the obvious way, as a value the
 //! brush adds or amplifies, and both had to be rewritten. Anything that
@@ -35,6 +36,20 @@
 //! difference from a local average, has gain above one somewhere and turns its
 //! own rounding error into visible crust over the course of a stroke. Warping
 //! where the field is read from cannot introduce detail that was not there.
+//! Move was written that way from the start for the same reason.
+//!
+//! # Reading outside the box being written
+//!
+//! The brushes that warp the domain read the field from somewhere other than
+//! the voxel they are writing, so the box that is snapshotted is not the box
+//! that is edited. [`Brush::read_reach`] is how far past the radius the reads
+//! can go, and it is what separates the two boxes.
+//!
+//! Getting that wrong fails silently. [`FieldRegion::get`] clamps a read
+//! outside the stored box to its edge rather than panicking, so a read that
+//! overshoots smears the rim value across the brush instead of crashing, and
+//! every value it produces is still legally inside the narrow band. Nothing
+//! but looking at the model catches it.
 //!
 //! None of these preserve the eikonal property: after many overlapping stamps
 //! the gradient magnitude drifts from 1 and the surface moves slightly less per
@@ -219,16 +234,42 @@ pub enum BrushKind {
     Pinch,
     /// Blend toward the tangent plane under the cursor.
     Flatten,
+    /// Drag the surface along with the pointer.
+    ///
+    /// The falloff region follows the drag: the field is resampled from behind
+    /// along the direction of travel, so whatever was under the cursor arrives
+    /// where the cursor now is, tapering to nothing at the rim.
+    ///
+    /// Reach comes from stamping repeatedly as the pointer moves, not from one
+    /// large warp. A stamp may not displace the field further than
+    /// [`MAX_STAMP_VOXELS`], so a 20 mm drag at a quarter millimetre voxel is
+    /// 80 voxels of travel assembled from stamps of at most one voxel each.
+    ///
+    /// It is not elastic, and nothing in the interface should suggest it is.
+    /// Nomad locks a vertex selection at the start of a stroke, so dragging out
+    /// and back returns the form exactly. An incremental warp cannot do that:
+    /// each stamp resamples what the last one left, so out and back gives a
+    /// slightly diffused, slightly volume-lost version of what you started
+    /// with. That is the price of having no vertices to lock. The escape hatch
+    /// is undo, and it is a good one -- a whole gesture is one history entry,
+    /// so the way back is a single keystroke rather than a careful reverse
+    /// drag.
+    ///
+    /// It drags along the surface rather than through it, because the pointer
+    /// direction comes from where the cursor meets the model. Pulling a form
+    /// out toward the camera is draw's job, not this one's.
+    Move,
 }
 
 impl BrushKind {
-    pub const ALL: [BrushKind; 6] = [
+    pub const ALL: [BrushKind; 7] = [
         BrushKind::Draw,
         BrushKind::Clay,
         BrushKind::Smooth,
         BrushKind::Inflate,
         BrushKind::Pinch,
         BrushKind::Flatten,
+        BrushKind::Move,
     ];
 
     pub fn label(self) -> &'static str {
@@ -239,17 +280,21 @@ impl BrushKind {
             BrushKind::Inflate => "Inflate",
             BrushKind::Pinch => "Pinch",
             BrushKind::Flatten => "Flatten",
+            BrushKind::Move => "Move",
         }
     }
 
     /// Whether inverting the stroke means anything for this brush.
     ///
     /// Smooth and flatten are their own opposite: there is no such thing as
-    /// unsmoothing toward a plane. Holding the invert key with them selected
-    /// does nothing, which is worth saying in the interface rather than leaving
-    /// the user to wonder.
+    /// unsmoothing toward a plane. Move already takes its direction from the
+    /// pointer, so inverting it would drag the surface the opposite way from
+    /// the hand doing the dragging, which is not an operation anybody wants.
+    /// Holding the invert key with any of the three selected does nothing,
+    /// which is worth saying in the interface rather than leaving the user to
+    /// wonder.
     pub fn is_directional(self) -> bool {
-        !matches!(self, BrushKind::Smooth | BrushKind::Flatten)
+        !matches!(self, BrushKind::Smooth | BrushKind::Flatten | BrushKind::Move)
     }
 }
 
@@ -384,9 +429,11 @@ pub struct Stamp {
     /// Stylus pressure from 0 to 1, scaling strength. Defaults to 1, which is
     /// what a mouse always reports.
     pub pressure: f32,
-    /// Which way the stroke is travelling, in world space. Only the patterns
-    /// that comb read it, and a zero vector means "not known", which they cope
-    /// with by picking any direction across the surface.
+    /// Which way the stroke is travelling, in world space. The patterns that
+    /// comb read it, and move is steered entirely by it. A zero vector means
+    /// "not known": the patterns cope by picking any direction across the
+    /// surface, and move declines to do anything at all, because a stroke that
+    /// has not travelled has not dragged anything.
     pub tangent: Vec3,
     pub direction: BrushDirection,
 }
@@ -402,7 +449,7 @@ impl Stamp {
     }
 
     /// Set the stroke's direction of travel, which is what combs a hair
-    /// pattern along the drag.
+    /// pattern along the drag and what the move brush drags along.
     pub fn with_tangent(mut self, tangent: Vec3) -> Self {
         self.tangent = tangent;
         self
@@ -481,6 +528,33 @@ impl Brush {
         }
     }
 
+    /// How far past its own radius one stamp reads the field, in world units.
+    ///
+    /// The brushes that warp the domain resample from `position - shift`
+    /// rather than reading the voxel they are writing, and nothing about the
+    /// radius covers that shift. This is the bound on it: the shift is the
+    /// per-stamp displacement scaled by a weight that never exceeds `gain`, so
+    /// `gain * displacement` bounds it whatever the falloff curve does in
+    /// between.
+    ///
+    /// Deliberately a crude bound rather than a tight one. The tight bound
+    /// depends on the maximum slope of the falloff curve, on
+    /// [`STAMP_FRACTION_OF_RADIUS`] and on the snapshot's padding all at once,
+    /// and a bound that three unrelated constants have to agree on is a bound
+    /// that breaks the first time one of them moves. This one costs at most a
+    /// voxel of extra snapshot and cannot break that way.
+    ///
+    /// The value brushes read only the voxel they write, or its immediate
+    /// neighbours, which the snapshot's padding already covers.
+    fn read_reach(&self, voxel_size: f32, gain: f32, displacement: f32) -> f32 {
+        let voxels = match self.kind {
+            BrushKind::Draw | BrushKind::Move => gain * displacement,
+            BrushKind::Pinch => gain * PINCH_PULL_VOXELS,
+            BrushKind::Clay | BrushKind::Smooth | BrushKind::Inflate | BrushKind::Flatten => 0.0,
+        };
+        voxels * voxel_size
+    }
+
     /// Apply one stamp.
     ///
     /// Work is proportional to the brush volume, never to the size of the
@@ -490,13 +564,15 @@ impl Brush {
             return;
         }
 
+        // Move is steered by the drag rather than by the surface, so a stroke
+        // that has not travelled yet has nothing to tell it. Answered once per
+        // stamp rather than per voxel, and before any of the work below.
+        let drag = stamp.tangent.normalize_or_zero();
+        if self.kind == BrushKind::Move && drag == Vec3::ZERO {
+            return;
+        }
+
         let voxel_size = volume.voxel_size();
-        let extent = Vec3::splat(self.radius);
-        let (lo, hi) = volume.voxel_bounds(stamp.centre - extent, stamp.centre + extent);
-
-        volume.snapshot(lo, hi, &mut scratch.region);
-        let region = &scratch.region;
-
         let inverse_radius = 1.0 / self.radius;
         let gain = self.strength * stamp.pressure;
         // Displacement at full weight, in voxels, capped so one stamp can never
@@ -504,6 +580,20 @@ impl Brush {
         let displacement =
             (self.radius / voxel_size * STAMP_FRACTION_OF_RADIUS).min(MAX_STAMP_VOXELS);
         let field_sign = stamp.direction.field_sign();
+
+        // Two boxes, not one. The box being written is the brush's own reach.
+        // The box being read is that grown by however far the warp resamples
+        // from, which for the brushes that only read the voxel they write is
+        // not at all. Reading and writing the same box is correct for those and
+        // silently wrong for the rest -- see the module docs.
+        let extent = Vec3::splat(self.radius);
+        let (lo, hi) = volume.voxel_bounds(stamp.centre - extent, stamp.centre + extent);
+        let read_extent = extent + Vec3::splat(self.read_reach(voxel_size, gain, displacement));
+        let (read_lo, read_hi) =
+            volume.voxel_bounds(stamp.centre - read_extent, stamp.centre + read_extent);
+
+        volume.snapshot(read_lo, read_hi, &mut scratch.region);
+        let region = &scratch.region;
 
         // Reference plane for clay and flatten, in world space. Clay holds it
         // just outside the surface so material builds up to it.
@@ -598,6 +688,19 @@ impl Brush {
                 BrushKind::Flatten => {
                     let plane = (position - plane_point).dot(stroke_normal) / voxel_size;
                     value + (plane - value) * weight
+                }
+
+                BrushKind::Move => {
+                    // Read from behind along the drag, so the material that was
+                    // there arrives here: the falloff region is carried along
+                    // with the pointer and the surface shears smoothly back to
+                    // where it was at the rim.
+                    //
+                    // Draw's shift is along the surface normal and this one is
+                    // along the pointer's travel, which is the whole difference
+                    // between pushing clay outward and dragging it sideways.
+                    let shift = drag * (weight * displacement * voxel_size);
+                    region.sample((position - shift) / voxel_size)
                 }
 
                 BrushKind::Clay => {
@@ -700,7 +803,9 @@ mod tests {
             for _ in 0..40 {
                 brush.apply(
                     &mut volume,
-                    &Stamp::new(point, normal, BrushDirection::Add),
+                    // Across the surface, so move has a drag to follow rather
+                    // than declining to do anything and passing for free.
+                    &Stamp::new(point, normal, BrushDirection::Add).with_tangent(Vec3::Y),
                     &mut scratch,
                 );
             }
@@ -942,7 +1047,13 @@ mod tests {
         //
         // A stroke of overlapping stamps must leave a surface that is still
         // smooth, measured here as the height varying gently across the bump.
-        for kind in [BrushKind::Draw, BrushKind::Inflate, BrushKind::Clay, BrushKind::Pinch] {
+        for kind in [
+            BrushKind::Draw,
+            BrushKind::Inflate,
+            BrushKind::Clay,
+            BrushKind::Pinch,
+            BrushKind::Move,
+        ] {
             let mut volume = sphere();
             let mut scratch = BrushScratch::new();
             let (point, normal) = surface(&volume);
@@ -953,7 +1064,7 @@ mod tests {
                 for _ in 0..4 {
                     brush.apply(
                         &mut volume,
-                        &Stamp::new(at, normal, BrushDirection::Add),
+                        &Stamp::new(at, normal, BrushDirection::Add).with_tangent(Vec3::Y),
                         &mut scratch,
                     );
                 }
@@ -1171,6 +1282,326 @@ mod tests {
         assert_eq!(tiny.spacing(0.25), 0.25);
         let large = Brush { radius: 8.0, ..Brush::default() };
         assert_eq!(large.spacing(0.25), 2.0);
+    }
+}
+
+#[cfg(test)]
+mod move_tests {
+    use glam::IVec3;
+
+    use super::*;
+    use crate::brick::{INSIDE, OUTSIDE};
+
+    /// Where the sphere's surface is along a ray from the origin through
+    /// `(24, y, 0)`, which is how a bump is measured without assuming it has
+    /// stayed put.
+    fn surface_radius(volume: &Volume, y: f32) -> f32 {
+        let direction = Vec3::new(24.0, y, 0.0).normalize();
+        let mut last = 0.0;
+        for step in 0..400 {
+            let t = 20.0 + step as f32 * 0.05;
+            if volume.sample_world(direction * t) >= 0.0 {
+                return last;
+            }
+            last = t;
+        }
+        last
+    }
+
+    /// Where along Y the raised material sits, weighted by how much of it there
+    /// is. A drag should carry this along with it.
+    fn bump_centre(volume: &Volume) -> f32 {
+        bump(volume).0
+    }
+
+    /// Where the raised material sits along Y, and how much of it there is.
+    fn bump(volume: &Volume) -> (f32, f32) {
+        let mut weighted = 0.0;
+        let mut total = 0.0;
+        for step in -12..=12 {
+            let y = step as f32;
+            let raised = (surface_radius(volume, y) - 24.0).max(0.0);
+            weighted += y * raised;
+            total += raised;
+        }
+        assert!(total > 0.0, "there is no bump to measure");
+        (weighted / total, total)
+    }
+
+    /// A sphere with a lump on it at `(24, 0, 0)`, which is something a drag
+    /// can visibly carry. Dragging an unblemished sphere is a no op by
+    /// definition, because a sphere slid sideways is the same sphere.
+    fn sphere_with_a_bump() -> Volume {
+        let mut volume = Volume::new(1.0);
+        volume.seed_sphere(Vec3::ZERO, 24.0);
+        let mut scratch = BrushScratch::new();
+        let poke = Brush {
+            kind: BrushKind::Draw,
+            radius: 5.0,
+            strength: 0.9,
+            falloff: FalloffCurve::Sharp,
+            ..Brush::default()
+        };
+        let at = Vec3::new(24.0, 0.0, 0.0);
+        for _ in 0..6 {
+            poke.apply(&mut volume, &Stamp::new(at, Vec3::X, BrushDirection::Add), &mut scratch);
+        }
+        volume
+    }
+
+    /// A field rising steadily along X at `slope` per voxel, over a box wide
+    /// enough to hold a stamp and everything it can read.
+    ///
+    /// Not a distance field, deliberately. A warp of a linear field is exactly
+    /// a subtraction, so the answer a resample should give is known in closed
+    /// form and any deviation is the resample reading the wrong place. The
+    /// slope is kept small enough that nothing clips against the narrow band.
+    fn ramp_along_x(slope: f32) -> Volume {
+        let mut volume = Volume::new(1.0);
+        let half = 24;
+        volume.edit_voxels(IVec3::splat(-half), IVec3::splat(half), |_, position, _| {
+            position.x * slope
+        });
+        volume
+    }
+
+    fn drag(volume: &mut Volume, brush: &Brush, at: Vec3, along: Vec3, stamps: usize) {
+        let mut scratch = BrushScratch::new();
+        for _ in 0..stamps {
+            let normal = volume.gradient_world(at);
+            brush.apply(
+                volume,
+                &Stamp::new(at, normal, BrushDirection::Add).with_tangent(along),
+                &mut scratch,
+            );
+        }
+    }
+
+    /// A gesture: the stamp centre travels along with the drag, which is what
+    /// the application does and what makes a round trip a round trip. Stamping
+    /// repeatedly at one point drags the material out from under the brush and
+    /// then works on whatever is left there instead.
+    ///
+    /// Kept on the sphere rather than on a straight line, so the centre stays
+    /// on the surface the way a raycast from the pointer would put it.
+    fn sweep(volume: &mut Volume, brush: &Brush, from: f32, to: f32, stamps: usize) -> f32 {
+        let mut scratch = BrushScratch::new();
+        let step = (to - from) / stamps as f32;
+        let along = Vec3::Y * step.signum();
+        for index in 1..=stamps {
+            let y = from + step * index as f32;
+            let at = Vec3::new(24.0, y, 0.0).normalize() * 24.0;
+            let normal = volume.gradient_world(at);
+            brush.apply(
+                volume,
+                &Stamp::new(at, normal, BrushDirection::Add).with_tangent(along),
+                &mut scratch,
+            );
+        }
+        to
+    }
+
+    #[test]
+    fn dragging_carries_the_material_along_the_drag() {
+        // The whole point of the brush.
+        let mut volume = sphere_with_a_bump();
+        let before = bump_centre(&volume);
+
+        let brush = Brush { kind: BrushKind::Move, radius: 9.0, strength: 0.8, ..Brush::default() };
+        drag(&mut volume, &brush, Vec3::new(24.0, 0.0, 0.0), Vec3::Y, 16);
+
+        let after = bump_centre(&volume);
+        assert!(
+            after > before + 0.5,
+            "the bump did not travel with the drag: {before} then {after}"
+        );
+
+        // And the other way puts it back on the other side of where it began,
+        // which rules out a drift that happens to point at plus Y.
+        let mut volume = sphere_with_a_bump();
+        drag(&mut volume, &brush, Vec3::new(24.0, 0.0, 0.0), -Vec3::Y, 16);
+        assert!(
+            bump_centre(&volume) < before - 0.5,
+            "the drag ignored its own direction: {before} then {}",
+            bump_centre(&volume)
+        );
+    }
+
+    #[test]
+    fn a_drag_out_and_back_does_not_restore_the_field_exactly() {
+        // Pinned as intended rather than left to be found later and filed as a
+        // bug. Nomad locks a vertex selection at the start of a stroke, so out
+        // and back is exact there. There are no vertices here to lock: each
+        // stamp resamples what the last one left, and a resample of a resample
+        // has lost a little every time. What comes back is the same form,
+        // slightly diffused. Undo is the exact way back, and a whole gesture is
+        // one entry.
+        let original = sphere_with_a_bump();
+        let mut volume = sphere_with_a_bump();
+        let started_at = bump_centre(&original);
+
+        let brush = Brush { kind: BrushKind::Move, radius: 9.0, strength: 0.8, ..Brush::default() };
+        sweep(&mut volume, &brush, 0.0, 6.0, 12);
+        let out_at = bump_centre(&volume);
+        sweep(&mut volume, &brush, 6.0, 0.0, 12);
+
+        let mut worst = 0.0_f32;
+        for step in -10..=10 {
+            for out in -3..=3 {
+                let probe = Vec3::new(24.0 + out as f32, step as f32, 0.0);
+                worst =
+                    worst.max((volume.sample_world(probe) - original.sample_world(probe)).abs());
+            }
+        }
+
+        assert!(
+            worst > 1.0e-3,
+            "the drag came back bit exact, so something is quietly elastic and the doc comment \
+             is now wrong: worst difference {worst}"
+        );
+
+        // Diffused, not destroyed. The form does come back most of the way,
+        // which is what makes the brush usable at all, and the shortfall and
+        // the lost material are the documented price of having no vertices to
+        // lock. Both halves are asserted, because a version that recovered
+        // nothing and a version that recovered everything would each mean the
+        // doc comment on BrushKind::Move is wrong.
+        let (ended_at, ended_with) = bump(&volume);
+        let (_, started_with) = bump(&original);
+        assert!(
+            (ended_at - started_at).abs() < (out_at - started_at).abs() * 0.5,
+            "the drag back recovered almost nothing: out to {out_at}, back to {ended_at}"
+        );
+        assert!(
+            ended_with < started_with,
+            "a round trip that loses no material is elastic after all: {started_with} then \
+             {ended_with}"
+        );
+        assert!(
+            ended_with > started_with * 0.5,
+            "the round trip ate the bump rather than diffusing it: {started_with} then \
+             {ended_with}"
+        );
+    }
+
+    #[test]
+    fn one_stamp_never_displaces_the_field_further_than_the_cap() {
+        // Measured rather than trusted. On a ramp of known slope a domain warp
+        // is exactly a subtraction, so the change in value at a voxel, divided
+        // by the slope, is the distance the field moved under it, in voxels.
+        // That has to stay inside MAX_STAMP_VOXELS or the next stamp has no
+        // usable field left to read.
+        //
+        // At full strength, which is the most the gain can mean: strength is a
+        // multiplier like it is for every other brush, so a caller setting it
+        // above 1 scales this the same way it scales draw. The application
+        // clamps it to 0.8.
+        let slope = 0.05;
+
+        for radius in [1.0_f32, 2.5, 6.0, 15.0] {
+            let brush = Brush { kind: BrushKind::Move, radius, strength: 1.0, ..Brush::default() };
+            let before = ramp_along_x(slope);
+            let mut volume = ramp_along_x(slope);
+            drag(&mut volume, &brush, Vec3::ZERO, Vec3::X, 1);
+
+            let mut furthest = 0.0_f32;
+            for z in -8..=8 {
+                for y in -8..=8 {
+                    for x in -18..=18 {
+                        let probe = Vec3::new(x as f32, y as f32, z as f32);
+                        let moved =
+                            (before.sample_world(probe) - volume.sample_world(probe)).abs() / slope;
+                        furthest = furthest.max(moved);
+                    }
+                }
+            }
+
+            assert!(
+                furthest <= MAX_STAMP_VOXELS + 1.0e-3,
+                "a radius {radius} stamp moved the field {furthest} voxels, past the \
+                 {MAX_STAMP_VOXELS} voxel cap"
+            );
+        }
+    }
+
+    #[test]
+    fn a_warp_that_reaches_outside_the_brush_reads_the_field_and_not_the_rim() {
+        // The silent failure the read box exists to prevent. FieldRegion::get
+        // clamps a read outside the snapshot to its edge instead of panicking,
+        // so a read box that is too small does not crash and does not produce
+        // garbage: it smears the rim value across the brush, and every value it
+        // writes is still legally inside the narrow band.
+        //
+        // Reaching past the radius takes a gain above one, which the
+        // application clamps to 0.8 but the library does not: `strength` is a
+        // public field on a public struct. That is the case this pins, because
+        // it is the only one where a read box equal to the write box gives a
+        // different answer from a correct one.
+        let slope = 0.1;
+        let radius = 4.0;
+        let gain = 8.0;
+        let brush = Brush { kind: BrushKind::Move, radius, strength: gain, ..Brush::default() };
+
+        let mut volume = ramp_along_x(slope);
+        drag(&mut volume, &brush, Vec3::ZERO, Vec3::X, 1);
+
+        // At the centre the falloff is 1, so the field is read from a full
+        // `gain * displacement` voxels back along the drag. The displacement is
+        // at its cap here, the brush being 4 voxels across.
+        let displacement = MAX_STAMP_VOXELS;
+        let expected = -gain * displacement * slope;
+        let measured = volume.sample_world(Vec3::ZERO);
+        assert!(
+            (measured - expected).abs() < 0.05,
+            "the drag read from the wrong place: {measured} against the {expected} a read from \
+             {} voxels back gives. A read box equal to the write box would clamp at the rim and \
+             give about {}.",
+            gain * displacement,
+            -(radius + 1.0) * slope
+        );
+    }
+
+    #[test]
+    fn a_stroke_that_has_not_travelled_yet_drags_nothing() {
+        // The first stamp of every stroke arrives with no direction of travel.
+        // Picking one would drag the surface somewhere the user never pointed.
+        let mut volume = sphere_with_a_bump();
+        let before: Vec<f32> =
+            (-8..=8).map(|step| volume.sample_world(Vec3::new(24.0, step as f32, 0.0))).collect();
+
+        let brush = Brush { kind: BrushKind::Move, radius: 9.0, strength: 0.8, ..Brush::default() };
+        let at = Vec3::new(24.0, 0.0, 0.0);
+        let mut scratch = BrushScratch::new();
+        brush.apply(&mut volume, &Stamp::new(at, Vec3::X, BrushDirection::Add), &mut scratch);
+
+        for (step, was) in (-8..=8).zip(before) {
+            let now = volume.sample_world(Vec3::new(24.0, step as f32, 0.0));
+            assert_eq!(now, was, "a directionless stamp moved the field at y {step}");
+        }
+    }
+
+    #[test]
+    fn a_dragged_model_still_exports_watertight() {
+        let mut volume = sphere_with_a_bump();
+        let brush = Brush { kind: BrushKind::Move, radius: 9.0, strength: 0.8, ..Brush::default() };
+
+        // A gesture that turns a corner, so the drag direction changes under
+        // the same material rather than only ever pushing one way.
+        for (along, at) in [
+            (Vec3::Y, Vec3::new(24.0, 0.0, 0.0)),
+            (Vec3::Z, Vec3::new(24.0, 4.0, 0.0)),
+            (-Vec3::Y, Vec3::new(23.0, 4.0, 4.0)),
+        ] {
+            drag(&mut volume, &brush, at, along, 10);
+        }
+
+        for step in -12..=12 {
+            let value = volume.sample_world(Vec3::new(24.0, step as f32, 0.0));
+            assert!((INSIDE..=OUTSIDE).contains(&value), "the drag left the band: {value}");
+        }
+
+        let (_, report) = volume.export_mesh();
+        assert!(report.is_printable(), "a dragged model must still print: {}", report.summary());
     }
 }
 

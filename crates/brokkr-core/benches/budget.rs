@@ -291,7 +291,14 @@ fn main() {
             let started = Instant::now();
             each.apply(
                 &mut volume,
-                &Stamp::new(at, normal, BrushDirection::Add),
+                // The way round the circle the stamps walk, which is the drag
+                // move needs before it will do any work. Costs the others
+                // nothing.
+                &Stamp::new(at, normal, BrushDirection::Add).with_tangent(Vec3::new(
+                    -angle.sin(),
+                    0.0,
+                    angle.cos(),
+                )),
                 &mut brush_scratch,
             );
             samples.0.push(started.elapsed());

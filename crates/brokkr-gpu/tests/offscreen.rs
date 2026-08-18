@@ -378,7 +378,7 @@ fn every_brush_leaves_a_visible_mark() {
     // a plausible amount. A brush that dirties bricks but produces geometry
     // identical to what was there would pass every unit test in the engine.
     //
-    // Run with BROKKR_DUMP_FRAMES set to look at the six results.
+    // Run with BROKKR_DUMP_FRAMES set to look at the results.
     let Some(harness) = Harness::new() else {
         eprintln!("no usable wgpu adapter, skipping the offscreen render test");
         return;
@@ -419,7 +419,9 @@ fn every_brush_leaves_a_visible_mark() {
             for _ in 0..4 {
                 brush.apply(
                     &mut volume,
-                    &Stamp::new(at, normal, BrushDirection::Add),
+                    // The drag that move follows. Every other brush ignores it
+                    // unless it is running a comb pattern, and none is here.
+                    &Stamp::new(at, normal, BrushDirection::Add).with_tangent(Vec3::Y),
                     &mut brush_scratch,
                 );
             }

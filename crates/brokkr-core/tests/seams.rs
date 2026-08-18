@@ -153,7 +153,13 @@ fn sculpting_keeps_the_surface_closed() {
             (Vec3::new(48.0, 8.0, 48.0 + index as f32), BrushDirection::Add),
         ] {
             let normal = volume.gradient_world(centre);
-            brush.apply(&mut volume, &Stamp::new(centre, normal, direction), &mut scratch);
+            brush.apply(
+                &mut volume,
+                // Move is steered by the drag rather than the surface, and
+                // without one it would sit this test out entirely.
+                &Stamp::new(centre, normal, direction).with_tangent(Vec3::Y),
+                &mut scratch,
+            );
         }
     }
 
