@@ -1843,9 +1843,13 @@ impl Brokkr {
                 };
                 self.status = format!("importing {}…", path.display());
                 let voxel_size = self.voxel_size;
-                // Off the update loop, unlike open and save. Those are
-                // milliseconds; voxelising a large mesh is seconds, and the
-                // update loop is the thread that draws.
+                // Off the update loop, unlike open and save. Measured by
+                // `cargo bench -p brokkr-core --bench import`: a 542k triangle
+                // sphere reads in 62 ms and voxelises in 148 to 210 ms
+                // depending on voxel size -- so not the seconds this was first
+                // written for, but still twelve dropped frames if it ran on the
+                // thread that draws, and a scan or a fine voxel size scales it
+                // straight past that.
                 return Task::perform(
                     async move {
                         let started = Instant::now();

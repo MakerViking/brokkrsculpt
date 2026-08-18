@@ -31,3 +31,7 @@ harness = false
 [[bench]]
 name = "scale"
 harness = false
+
+[[bench]]
+name = "import"
+harness = false
