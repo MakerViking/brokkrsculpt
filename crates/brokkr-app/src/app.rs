@@ -277,6 +277,8 @@ pub struct Brokkr {
     autosave_file: Option<std::path::PathBuf>,
     /// When the crash net was last written. See [`Brokkr::maybe_autosave`].
     last_autosave: Instant,
+    /// When the pointer last did anything, so the autosave can wait for a pause.
+    last_activity: Instant,
     /// A numeric field in the menu being typed into.
     ///
     /// Held as text rather than parsed on every keystroke, because a half typed
@@ -525,6 +527,7 @@ impl Brokkr {
             recent: crate::recent::Recent::load(),
             autosave_file: Self::default_autosave_path(),
             last_autosave: Instant::now(),
+            last_activity: Instant::now(),
             menu_edit: None,
         };
         app.remesh_dirty();
@@ -1081,6 +1084,24 @@ impl Brokkr {
     /// something you sculpt against.
     const AUTOSAVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(120);
 
+    /// How long the pointer must have been still before the crash net is
+    /// written.
+    ///
+    /// The write happens on the thread that draws, and it is not small:
+    /// measured at **1.55 GB/s**, so a 159 MB model takes 100 ms and the 671 MB
+    /// autosave seen from a real scan session would take about 430 ms -- some
+    /// twenty six dropped frames, every two minutes, in the middle of
+    /// sculpting. That is exactly the kind of thing that gets reported as "it
+    /// stutters sometimes" and is miserable to track down.
+    ///
+    /// Waiting for a pause is the cheap fix, and it works because sculpting is
+    /// full of pauses: the hitch lands while the user is looking at the model
+    /// rather than dragging across it, where it is invisible. It does not make
+    /// the write faster, and if that ever matters the next step is encoding to
+    /// a buffer on this thread and doing the file write from a `Task`, the way
+    /// import already does.
+    const AUTOSAVE_IDLE_GAP: std::time::Duration = std::time::Duration::from_secs(3);
+
     /// Where the crash net lives.
     ///
     /// `$XDG_STATE_HOME`, not the config directory: this is recoverable state
@@ -1116,10 +1137,19 @@ impl Brokkr {
             || self.stroke.is_active()
             || self.drag.is_some()
             || self.last_autosave.elapsed() < Self::AUTOSAVE_INTERVAL
+            // And not while the pointer is still moving. See the constant.
+            || self.last_activity.elapsed() < Self::AUTOSAVE_IDLE_GAP
         {
             return;
         }
+        let started = Instant::now();
         self.write_autosave();
+        let taken = started.elapsed().as_secs_f64() * 1000.0;
+        if taken > 50.0 {
+            // Visible in the log rather than silent, so the next person to
+            // wonder where a hitch came from has the number in front of them.
+            log::warn!("the autosave took {taken:.0} ms on the draw thread");
+        }
         self.last_autosave = Instant::now();
     }
 
@@ -1642,6 +1672,7 @@ impl Brokkr {
         if self.confirm.is_some() {
             return;
         }
+        self.last_activity = Instant::now();
         match event {
             PointerEvent::Modifiers { shift, control, alt } => {
                 self.shift = shift;
@@ -3128,10 +3159,20 @@ mod tests {
         app.maybe_autosave();
         assert!(!app.has_autosave(), "it autosaved in the middle of a stroke");
 
-        // Released, dirty and overdue.
+        // Released, dirty and overdue -- but the pointer only just stopped, so
+        // the write still waits for the pause.
         release(&mut app);
         app.maybe_autosave();
-        assert!(app.has_autosave(), "an overdue autosave never happened");
+        assert!(
+            !app.has_autosave(),
+            "it autosaved the instant the pointer stopped, which is where a 400 ms write \
+             lands as a visible hitch"
+        );
+
+        // Once the pointer has been still long enough, it writes.
+        app.last_activity = Instant::now() - Duration::from_secs(60);
+        app.maybe_autosave();
+        assert!(app.has_autosave(), "an overdue autosave never happened after a pause");
 
         std::fs::remove_dir_all(&directory).ok();
     }
