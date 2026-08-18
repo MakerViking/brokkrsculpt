@@ -517,7 +517,7 @@ impl Brokkr {
     ///
     /// A strip rather than the dropdown this replaced: choosing a brush was two
     /// clicks and a read, for something that should be one glance and one key.
-    /// The numbers match the 1..6 shortcuts, so the key and the button are
+    /// The numbers match the 1..7 shortcuts, so the key and the button are
     /// visibly the same thing.
     ///
     /// Down the left rather than along the top, which is what SindriCAD's

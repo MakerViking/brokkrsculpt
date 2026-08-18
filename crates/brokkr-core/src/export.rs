@@ -327,7 +327,9 @@ mod tests {
                 let normal = volume.gradient_world(at);
                 brush.apply(
                     &mut volume,
-                    &Stamp::new(at, normal, BrushDirection::Add),
+                    // Move needs a drag to follow, and a tangent is harmless to
+                    // every other brush that is not running a comb pattern.
+                    &Stamp::new(at, normal, BrushDirection::Add).with_tangent(Vec3::Y),
                     &mut scratch,
                 );
             }
