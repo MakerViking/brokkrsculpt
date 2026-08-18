@@ -26,6 +26,59 @@ pub struct VolumeStats {
     pub resident_bytes: usize,
 }
 
+/// What is known about one brick before an edit decides whether to touch it.
+///
+/// The useful part is [`BrickPreview::uniform`]. Most of a large brush's box is
+/// deep interior or far exterior, saturated at a single value across whole
+/// bricks, and a brush that resamples or averages cannot change a region that
+/// already reads as one value everywhere. Answering that before the brick is
+/// made dense is what keeps a 20 mm brush from allocating and rewriting thirty
+/// megabytes it will not change.
+#[derive(Debug, Clone, Copy)]
+pub struct BrickPreview {
+    pub coord: BrickCoord,
+    /// Inclusive world voxel range of this brick that the edit's box covers.
+    pub lo: IVec3,
+    pub hi: IVec3,
+    /// `Some(v)` when every voxel of this brick holds `v`, which covers both a
+    /// uniform tile and an absent brick -- absent reads as [`OUTSIDE`]. `None`
+    /// when the brick carries detail.
+    ///
+    /// This says nothing about its neighbours. A brush that answers
+    /// [`BrickVerdict::OnlyNearDifferentNeighbours`] is telling the volume it
+    /// leaves `v` alone, and the volume works out how much of the brick is far
+    /// enough from anything else for that to hold.
+    pub uniform: Option<f32>,
+}
+
+/// What an edit wants done with one brick.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BrickVerdict {
+    /// Nothing in it can change, so do not read it, make it dense, record it
+    /// for undo or write it.
+    Skip,
+    /// Resolve every voxel of it that the edit's box covers.
+    Whole,
+    /// It holds one value that this edit leaves alone, so only the part of it
+    /// within reach of a neighbour holding something different can change.
+    ///
+    /// Only legal when [`BrickPreview::uniform`] is `Some`. This is where the
+    /// bulk of a large brush's saving comes from, and it is much stronger than
+    /// asking for the whole neighbourhood to be uniform: a brick is 32 voxels
+    /// across and a stamp reads two, so a tile sitting against the surface
+    /// still has 96 percent of itself out of reach.
+    OnlyNearDifferentNeighbours,
+}
+
+/// One brick an edit has decided to visit, and where inside it.
+#[derive(Debug, Clone, Copy)]
+struct Visit {
+    coord: BrickCoord,
+    /// Inclusive voxel range of this brick that the edit's box covers.
+    lo: IVec3,
+    hi: IVec3,
+}
+
 /// One brick lifted out of the map for the duration of an edit.
 ///
 /// Taking bricks out is what lets the writing phase hold several mutable bricks
@@ -40,6 +93,22 @@ struct Taken {
     was_uniform: bool,
     recorded_now: bool,
     changed: bool,
+}
+
+/// Working space for [`Volume::edit_voxels_where`], kept between calls.
+///
+/// A stroke lays down thousands of stamps and the budget forbids allocating in
+/// that path, so all three buffers live on the volume and are reused.
+#[derive(Default)]
+struct EditScratch {
+    /// One entry per brick of the edit's box plus a ring around it: `Some(v)`
+    /// when every voxel of that brick holds `v`. Laid out with X fastest, from
+    /// the grown box's minimum brick.
+    fills: Vec<Option<f32>>,
+    /// Bricks the classifier kept.
+    visits: Vec<Visit>,
+    /// Bricks lifted out of the map by the parallel path.
+    taken: Vec<Taken>,
 }
 
 /// Apply an edit to one brick's voxels, returning whether anything changed.
@@ -82,6 +151,68 @@ where
     changed
 }
 
+/// The part of a uniform brick that an edit could still change, given that the
+/// brick holds `value` everywhere and can read `reach` voxels past its own
+/// faces.
+///
+/// Returns the inclusive voxel range within `reach` of a neighbouring brick
+/// that holds something other than `value`, or `None` when all 26 of them hold
+/// `value` too and the brick is therefore untouchable.
+///
+/// A bounding box of the union rather than the union itself, which is exact
+/// whenever the differing neighbours are all on one side -- the usual case,
+/// because what makes a neighbour differ is the surface passing through it.
+fn reachable_from_elsewhere<F>(
+    brick: IVec3,
+    value: f32,
+    reach: i32,
+    at: &F,
+    fills: &[Option<f32>],
+) -> Option<(IVec3, IVec3)>
+where
+    F: Fn(IVec3) -> usize,
+{
+    let dim = BRICK_DIM as i32;
+    let origin = brick * dim;
+    let last = origin + IVec3::splat(dim - 1);
+
+    let mut lo = IVec3::splat(i32::MAX);
+    let mut hi = IVec3::splat(i32::MIN);
+
+    for dz in -1..=1 {
+        for dy in -1..=1 {
+            for dx in -1..=1 {
+                let offset = IVec3::new(dx, dy, dz);
+                if offset == IVec3::ZERO {
+                    continue;
+                }
+                if fills[at(brick + offset)] == Some(value) {
+                    continue;
+                }
+                // The slab of this brick lying within `reach` of that
+                // neighbour, per axis: the near face, the far face, or all of
+                // it when the neighbour is not offset along that axis at all.
+                let mut near_lo = origin;
+                let mut near_hi = last;
+                for axis in 0..3 {
+                    match offset[axis] {
+                        -1 => near_hi[axis] = origin[axis] + reach - 1,
+                        1 => near_lo[axis] = last[axis] - reach + 1,
+                        _ => {}
+                    }
+                }
+                if near_lo.cmpgt(near_hi).any() {
+                    continue;
+                }
+                lo = lo.min(near_lo);
+                hi = hi.max(near_hi);
+            }
+        }
+    }
+
+    (lo.cmple(hi).all()).then_some((lo, hi))
+}
+
 /// A sparse grid of bricks at a fixed world space voxel size.
 ///
 /// Only bricks that carry detail are stored. Absent bricks read as [`OUTSIDE`],
@@ -95,10 +226,7 @@ pub struct Volume {
     /// when no stroke is in progress. The inner `None` means the brick did not
     /// exist, which undo has to restore just as faithfully as any content.
     recorder: Option<FxHashMap<BrickCoord, Option<Brick>>>,
-    /// Working space for [`Volume::edit_voxels`], kept between calls. A stroke
-    /// lays down thousands of stamps, and the budget forbids allocating in that
-    /// path.
-    edit_scratch: Vec<Taken>,
+    scratch: EditScratch,
 }
 
 impl Volume {
@@ -114,7 +242,7 @@ impl Volume {
             bricks: FxHashMap::default(),
             dirty: FxHashSet::default(),
             recorder: None,
-            edit_scratch: Vec::new(),
+            scratch: EditScratch::default(),
         }
     }
 
@@ -361,7 +489,21 @@ impl Volume {
     /// each voxel. A stamp of radius 12 voxels covers about 20 000 samples, and
     /// looking every one of them up through the brick map put the fast drag
     /// case within one percent of the edit budget on its own.
+    ///
+    /// A plane of the box at a time, across every core once there is enough of
+    /// it to be worth the hand off. The planes are disjoint and the volume is
+    /// only read, so there is nothing to synchronise. It is worth doing: a
+    /// 20 mm brush at a quarter millimetre voxel copies sixteen megabytes, and
+    /// one core moves that at about the speed one core can write memory, which
+    /// was a third of the whole stamp.
+    ///
+    /// Every element of the box is written exactly once -- the bricks tile it
+    /// -- which is what lets [`FieldRegion::resize`] hand back a dirty buffer
+    /// rather than zeroing it first.
     pub fn snapshot(&self, lo: IVec3, hi: IVec3, region: &mut FieldRegion) {
+        /// Samples in the box below which the copy stays on one core.
+        const PARALLEL_SNAPSHOT_THRESHOLD: usize = 8 * BRICK_VOXELS;
+
         let lo = lo - IVec3::ONE;
         let hi = hi + IVec3::ONE;
         let size = hi - lo + IVec3::ONE;
@@ -369,45 +511,56 @@ impl Volume {
 
         let b_min = BrickCoord::containing(lo).0;
         let b_max = BrickCoord::containing(hi).0;
+        let plane = (size.x * size.y) as usize;
 
-        for bz in b_min.z..=b_max.z {
+        let fill_plane = |wz: i32, slab: &mut [f32]| {
+            let bz = BrickCoord::containing(IVec3::new(lo.x, lo.y, wz)).0.z;
             for by in b_min.y..=b_max.y {
                 for bx in b_min.x..=b_max.x {
                     let coord = BrickCoord::new(bx, by, bz);
                     let brick_lo = coord.origin();
+                    let brick_hi = coord.max_voxel();
 
-                    // The part of this brick that falls inside the box.
-                    let clip_lo = lo.max(brick_lo);
-                    let clip_hi = hi.min(coord.max_voxel());
-                    if clip_lo.cmpgt(clip_hi).any() {
+                    // The part of this brick's column that falls inside the box.
+                    let from_x = lo.x.max(brick_lo.x);
+                    let to_x = hi.x.min(brick_hi.x);
+                    let from_y = lo.y.max(brick_lo.y);
+                    let to_y = hi.y.min(brick_hi.y);
+                    if from_x > to_x || from_y > to_y {
                         continue;
                     }
 
-                    let run = (clip_hi.x - clip_lo.x + 1) as usize;
+                    let run = (to_x - from_x + 1) as usize;
                     let brick = self.bricks.get(&coord);
 
-                    for wz in clip_lo.z..=clip_hi.z {
-                        for wy in clip_lo.y..=clip_hi.y {
-                            let local = IVec3::new(clip_lo.x, wy, wz) - lo;
-                            let start =
-                                (local.x + local.y * size.x + local.z * size.x * size.y) as usize;
-                            let destination = &mut values[start..start + run];
+                    for wy in from_y..=to_y {
+                        let start = ((from_x - lo.x) + (wy - lo.y) * size.x) as usize;
+                        let destination = &mut slab[start..start + run];
 
-                            match brick {
-                                None => destination.fill(OUTSIDE),
-                                Some(Brick::Uniform(value)) => destination.fill(*value),
-                                Some(Brick::Dense(data)) => {
-                                    let source = brick_index(
-                                        (clip_lo.x - brick_lo.x) as usize,
-                                        (wy - brick_lo.y) as usize,
-                                        (wz - brick_lo.z) as usize,
-                                    );
-                                    destination.copy_from_slice(&data[source..source + run]);
-                                }
+                        match brick {
+                            None => destination.fill(OUTSIDE),
+                            Some(Brick::Uniform(value)) => destination.fill(*value),
+                            Some(Brick::Dense(data)) => {
+                                let source = brick_index(
+                                    (from_x - brick_lo.x) as usize,
+                                    (wy - brick_lo.y) as usize,
+                                    (wz - brick_lo.z) as usize,
+                                );
+                                destination.copy_from_slice(&data[source..source + run]);
                             }
                         }
                     }
                 }
+            }
+        };
+
+        if values.len() >= PARALLEL_SNAPSHOT_THRESHOLD {
+            values.par_chunks_mut(plane).enumerate().for_each(|(index, slab)| {
+                fill_plane(lo.z + index as i32, slab);
+            });
+        } else {
+            for (index, slab) in values.chunks_mut(plane).enumerate() {
+                fill_plane(lo.z + index as i32, slab);
             }
         }
     }
@@ -420,19 +573,45 @@ impl Volume {
     ///
     /// Cost is proportional to the box, never to the size of the model. That
     /// property is the whole point of the brick grid and must not regress.
-    ///
-    /// There are two implementations because a brush covers a fixed world radius
-    /// and so touches cubically more voxels as the voxel size shrinks. A default
-    /// brush at a quarter millimetre voxel is a few thousand voxels and belongs
-    /// on one core. The same brush at the sizes M2 targets is over a million and
-    /// takes six times less wall clock across cores.
     pub fn edit_voxels(
         &mut self,
         v_min: IVec3,
         v_max: IVec3,
         edit: impl Fn(IVec3, Vec3, f32) -> f32 + Sync,
     ) {
-        /// Voxels in the box below which the edit stays on one core.
+        self.edit_voxels_where(v_min, v_max, 0, |_| BrickVerdict::Whole, edit);
+    }
+
+    /// Apply `edit` to an inclusive voxel box, leaving out whatever `decide`
+    /// says cannot change.
+    ///
+    /// A skipped brick is not read, not made dense, not recorded for undo and
+    /// not written. That is what makes it worth having: a brush box grows with
+    /// the cube of the radius, but the part of it near the surface does not,
+    /// and everything else is deep interior or far exterior that the edit
+    /// cannot change. Promoting those to dense costs 128 KB and a memset each
+    /// before the edit discovers it had nothing to do.
+    ///
+    /// `reach` is how many voxels past the one it is writing the edit can read,
+    /// and it is what [`BrickVerdict::OnlyNearDifferentNeighbours`] is resolved
+    /// against. Declaring too little is a silently wrong result, so an edit
+    /// that starts resampling from further away has to widen this at the same
+    /// time. Zero means it reads only the voxel it writes.
+    ///
+    /// `decide` is called once per brick of the box, in an unspecified order,
+    /// and must be a pure function of the preview: it decides whether work
+    /// happens, so an answer that varies for the same brick makes the result
+    /// depend on iteration order.
+    pub fn edit_voxels_where(
+        &mut self,
+        v_min: IVec3,
+        v_max: IVec3,
+        reach: i32,
+        decide: impl Fn(&BrickPreview) -> BrickVerdict,
+        edit: impl Fn(IVec3, Vec3, f32) -> f32 + Sync,
+    ) {
+        /// Voxels actually being written below which the edit stays on one
+        /// core.
         ///
         /// Measured, and it matters in both directions. Sending a small stamp to
         /// a thread pool cost more than it saved and put the fast drag case over
@@ -440,16 +619,128 @@ impl Volume {
         /// two regimes.
         const PARALLEL_VOXEL_THRESHOLD: i64 = 2 * BRICK_VOXELS as i64;
 
-        let voxels_in_box =
-            (v_max - v_min + IVec3::ONE).max(IVec3::ZERO).as_i64vec3().element_product();
+        // Lifted off the volume for the duration so the planning phase can hold
+        // it while borrowing the brick map, and put back at the end so the next
+        // stamp reuses the same allocations.
+        let mut scratch = std::mem::take(&mut self.scratch);
+        self.plan_visits(v_min, v_max, reach, &decide, &mut scratch);
 
-        if voxels_in_box >= PARALLEL_VOXEL_THRESHOLD {
-            self.edit_voxels_across_cores(v_min, v_max, &edit);
+        let voxels: i64 = scratch
+            .visits
+            .iter()
+            .map(|visit| (visit.hi - visit.lo + IVec3::ONE).as_i64vec3().element_product())
+            .sum();
+
+        if voxels >= PARALLEL_VOXEL_THRESHOLD {
+            self.edit_planned_across_cores(&scratch.visits, &mut scratch.taken, &edit);
         } else {
-            self.edit_voxels_on_one_core(v_min, v_max, &edit);
+            self.edit_planned_on_one_core(&scratch.visits, &edit);
         }
 
+        self.scratch = scratch;
         self.mark_dirty_voxel_range(v_min, v_max);
+    }
+
+    /// Work out which bricks of a box the edit will visit, and how much of
+    /// each.
+    ///
+    /// Two passes. The first records, for every brick of the box and the ring
+    /// of bricks around it, whether it holds a single value everywhere -- one
+    /// map lookup each, and an absent brick counts as [`OUTSIDE`]. The second
+    /// offers each brick of the box to `decide`, and for the ones it answers
+    /// [`BrickVerdict::OnlyNearDifferentNeighbours`] about, narrows the range
+    /// to whatever sits within `reach` voxels of a neighbour that holds
+    /// something else.
+    fn plan_visits<D>(
+        &self,
+        v_min: IVec3,
+        v_max: IVec3,
+        reach: i32,
+        decide: &D,
+        scratch: &mut EditScratch,
+    ) where
+        D: Fn(&BrickPreview) -> BrickVerdict,
+    {
+        let dim = BRICK_DIM as i32;
+        let b_min = BrickCoord::containing(v_min).0;
+        let b_max = BrickCoord::containing(v_max).0;
+        // One brick of margin, because a voxel at a brick's face reads into the
+        // brick next door. `reach` never exceeds a brick, which is checked
+        // below rather than assumed.
+        let grid_min = b_min - IVec3::ONE;
+        let grid_size = b_max - b_min + IVec3::splat(3);
+
+        scratch.fills.clear();
+        scratch.fills.reserve(grid_size.as_i64vec3().element_product().max(0) as usize);
+        for z in 0..grid_size.z {
+            for y in 0..grid_size.y {
+                for x in 0..grid_size.x {
+                    let coord = BrickCoord(grid_min + IVec3::new(x, y, z));
+                    scratch.fills.push(match self.bricks.get(&coord) {
+                        None => Some(OUTSIDE),
+                        Some(Brick::Uniform(value)) => Some(*value),
+                        Some(Brick::Dense(_)) => None,
+                    });
+                }
+            }
+        }
+
+        let at = |brick: IVec3| {
+            let local = brick - grid_min;
+            (local.x + local.y * grid_size.x + local.z * grid_size.x * grid_size.y) as usize
+        };
+
+        scratch.visits.clear();
+        for bz in b_min.z..=b_max.z {
+            for by in b_min.y..=b_max.y {
+                for bx in b_min.x..=b_max.x {
+                    let brick = IVec3::new(bx, by, bz);
+                    let coord = BrickCoord(brick);
+                    let origin = coord.origin();
+                    let mut lo = v_min.max(origin);
+                    let mut hi = v_max.min(coord.max_voxel());
+                    if lo.cmpgt(hi).any() {
+                        continue;
+                    }
+
+                    let uniform = scratch.fills[at(brick)];
+                    match decide(&BrickPreview { coord, lo, hi, uniform }) {
+                        BrickVerdict::Skip => continue,
+                        BrickVerdict::Whole => {}
+                        BrickVerdict::OnlyNearDifferentNeighbours => {
+                            let Some(value) = uniform else {
+                                debug_assert!(
+                                    false,
+                                    "a brick with detail in it has no constant to leave alone"
+                                );
+                                scratch.visits.push(Visit { coord, lo, hi });
+                                continue;
+                            };
+                            // Reach is clamped to a brick so that only the 26
+                            // immediate neighbours can be within it. A brush
+                            // that reads further than that would have to look
+                            // at more of them, and clamping keeps the answer
+                            // conservative rather than wrong.
+                            let reach = reach.clamp(0, dim);
+                            let Some((near_lo, near_hi)) =
+                                reachable_from_elsewhere(brick, value, reach, &at, &scratch.fills)
+                            else {
+                                // Nothing else is close enough to reach in, so
+                                // the whole brick stays the value it is.
+                                continue;
+                            };
+                            lo = lo.max(near_lo);
+                            hi = hi.min(near_hi);
+                            if lo.cmpgt(hi).any() {
+                                continue;
+                            }
+                        }
+                    }
+
+                    scratch.visits.push(Visit { coord, lo, hi });
+                }
+            }
+        }
     }
 
     /// One brick at a time, resolving and writing each before moving on.
@@ -459,96 +750,74 @@ impl Volume {
     /// put it back, and doing that thousands of times a stroke leaves enough
     /// deletion markers in the table to cost 20 percent. This path only ever
     /// looks a brick up.
-    fn edit_voxels_on_one_core<F>(&mut self, v_min: IVec3, v_max: IVec3, edit: &F)
+    fn edit_planned_on_one_core<F>(&mut self, visits: &[Visit], edit: &F)
     where
         F: Fn(IVec3, Vec3, f32) -> f32 + Sync,
     {
         let voxel_size = self.voxel_size;
-        let b_min = BrickCoord::containing(v_min).0;
-        let b_max = BrickCoord::containing(v_max).0;
+        for visit in visits {
+            let coord = visit.coord;
+            let origin = coord.origin();
 
-        for bz in b_min.z..=b_max.z {
-            for by in b_min.y..=b_max.y {
-                for bx in b_min.x..=b_max.x {
-                    let coord = BrickCoord::new(bx, by, bz);
-                    let origin = coord.origin();
-                    let lo = v_min.max(origin);
-                    let hi = v_max.min(coord.max_voxel());
-                    if lo.cmpgt(hi).any() {
-                        continue;
-                    }
+            // The prior contents have to be captured before the brick is
+            // promoted to dense, because that is what destroys them.
+            let recorded_now = self.record_for_undo(coord);
+            let existed = self.bricks.contains_key(&coord);
+            let brick = self.bricks.entry(coord).or_insert(Brick::Uniform(OUTSIDE));
+            let was_uniform = matches!(brick, Brick::Uniform(_));
+            let data = brick.make_dense();
 
-                    // The prior contents have to be captured before the brick is
-                    // promoted to dense, because that is what destroys them.
-                    let recorded_now = self.record_for_undo(coord);
-                    let existed = self.bricks.contains_key(&coord);
-                    let brick = self.bricks.entry(coord).or_insert(Brick::Uniform(OUTSIDE));
-                    let was_uniform = matches!(brick, Brick::Uniform(_));
-                    let data = brick.make_dense();
-
-                    let changed = write_voxels(data, origin, lo, hi, voxel_size, edit);
-                    if !changed {
-                        self.undo_promotion(coord, existed, was_uniform, recorded_now);
-                    }
-                }
+            let changed = write_voxels(data, origin, visit.lo, visit.hi, voxel_size, edit);
+            if !changed {
+                self.undo_promotion(coord, existed, was_uniform, recorded_now);
             }
         }
     }
 
-    /// Lift the affected bricks out of the map, write them across every core,
+    /// Lift the planned bricks out of the map, write them across every core,
     /// then put them back.
     ///
     /// Removing them is what allows several to be held mutably at once, and it
     /// costs a pointer move each rather than a scan of the whole volume.
-    fn edit_voxels_across_cores<F>(&mut self, v_min: IVec3, v_max: IVec3, edit: &F)
+    ///
+    /// The promotion to dense happens inside the parallel phase rather than
+    /// while the bricks are being lifted out. It is a 128 KB allocation and
+    /// memset per brick, and a large brush plans enough of them that doing it
+    /// on one thread was a third of the cost of the whole edit.
+    fn edit_planned_across_cores<F>(&mut self, visits: &[Visit], taken: &mut Vec<Taken>, edit: &F)
     where
         F: Fn(IVec3, Vec3, f32) -> f32 + Sync,
     {
         let voxel_size = self.voxel_size;
-        let b_min = BrickCoord::containing(v_min).0;
-        let b_max = BrickCoord::containing(v_max).0;
 
-        let mut taken = std::mem::take(&mut self.edit_scratch);
         taken.clear();
-        for bz in b_min.z..=b_max.z {
-            for by in b_min.y..=b_max.y {
-                for bx in b_min.x..=b_max.x {
-                    let coord = BrickCoord::new(bx, by, bz);
-                    let lo = v_min.max(coord.origin());
-                    let hi = v_max.min(coord.max_voxel());
-                    if lo.cmpgt(hi).any() {
-                        continue;
-                    }
+        taken.reserve(visits.len());
+        for visit in visits {
+            let coord = visit.coord;
+            let recorded_now = self.record_for_undo(coord);
+            let removed = self.bricks.remove(&coord);
+            let existed = removed.is_some();
+            let brick = removed.unwrap_or(Brick::Uniform(OUTSIDE));
+            let was_uniform = matches!(brick, Brick::Uniform(_));
 
-                    let recorded_now = self.record_for_undo(coord);
-                    let existed = self.bricks.contains_key(&coord);
-                    let mut brick = self.bricks.remove(&coord).unwrap_or(Brick::Uniform(OUTSIDE));
-                    let was_uniform = matches!(brick, Brick::Uniform(_));
-                    brick.make_dense();
-
-                    taken.push(Taken {
-                        coord,
-                        brick,
-                        lo,
-                        hi,
-                        existed,
-                        was_uniform,
-                        recorded_now,
-                        changed: false,
-                    });
-                }
-            }
+            taken.push(Taken {
+                coord,
+                brick,
+                lo: visit.lo,
+                hi: visit.hi,
+                existed,
+                was_uniform,
+                recorded_now,
+                changed: false,
+            });
         }
 
         // Every brick is now a disjoint piece of memory that this thread owns,
         // and `edit` only reads, so there is nothing to synchronise.
         taken.par_iter_mut().for_each(|entry| {
-            let data = match &mut entry.brick {
-                Brick::Dense(data) => data,
-                Brick::Uniform(_) => unreachable!("made dense above"),
-            };
-            entry.changed =
-                write_voxels(data, entry.coord.origin(), entry.lo, entry.hi, voxel_size, edit);
+            let origin = entry.coord.origin();
+            let data = entry.brick.make_dense();
+            entry.changed = write_voxels(data, origin, entry.lo, entry.hi, voxel_size, edit);
         });
 
         for entry in taken.drain(..) {
@@ -562,8 +831,16 @@ impl Volume {
                 );
             }
         }
+    }
 
-        self.edit_scratch = taken;
+    /// How many bricks the last edit decided to visit.
+    ///
+    /// For tests that need to see the skipping actually happening rather than
+    /// just agreeing with the unskipped path, which it would also do if it
+    /// skipped nothing.
+    #[cfg(test)]
+    pub(crate) fn last_visited_bricks(&self) -> usize {
+        self.scratch.visits.len()
     }
 
     /// Roll back a brick that an edit's box clipped but never actually reached.
@@ -891,10 +1168,35 @@ mod tests {
         assert_eq!(apron.coord(), Some(coord));
     }
 
+    /// Run one edit down the serial path and the same edit down the parallel
+    /// one, with no bricks skipped, and hand back both volumes.
+    fn both_paths(
+        build: impl Fn() -> Volume,
+        lo: IVec3,
+        hi: IVec3,
+        edit: impl Fn(IVec3, Vec3, f32) -> f32 + Sync,
+    ) -> (Volume, Volume) {
+        let mut one_core = build();
+        let mut scratch = EditScratch::default();
+        one_core.plan_visits(lo, hi, 0, &|_: &BrickPreview| BrickVerdict::Whole, &mut scratch);
+        let visits = std::mem::take(&mut scratch.visits);
+        one_core.edit_planned_on_one_core(&visits, &edit);
+        one_core.mark_dirty_voxel_range(lo, hi);
+
+        let mut many_cores = build();
+        many_cores.plan_visits(lo, hi, 0, &|_: &BrickPreview| BrickVerdict::Whole, &mut scratch);
+        let visits = std::mem::take(&mut scratch.visits);
+        let mut taken = Vec::new();
+        many_cores.edit_planned_across_cores(&visits, &mut taken, &edit);
+        many_cores.mark_dirty_voxel_range(lo, hi);
+
+        (one_core, many_cores)
+    }
+
     #[test]
     fn the_two_edit_paths_agree_exactly() {
         // There are two implementations of the same edit, chosen by how much
-        // work the box holds, because the one that parallelises has to lift
+        // work the plan holds, because the one that parallelises has to lift
         // bricks out of the map and doing that for small stamps costs more than
         // it saves. Two implementations of one thing need pinning together.
         let build = || {
@@ -912,10 +1214,7 @@ mod tests {
             if voxel.x > 10 { value } else { value - 0.25 }
         };
 
-        let mut one_core = build();
-        one_core.edit_voxels_on_one_core(lo, hi, &edit);
-        let mut many_cores = build();
-        many_cores.edit_voxels_across_cores(lo, hi, &edit);
+        let (one_core, many_cores) = both_paths(build, lo, hi, edit);
 
         assert_eq!(
             one_core.stats(),
@@ -951,15 +1250,180 @@ mod tests {
             if voxel.x > 10 { value } else { value - 0.25 }
         };
 
-        let mut one_core = build();
-        one_core.edit_voxels_on_one_core(lo, hi, &edit);
-        let mut many_cores = build();
-        many_cores.edit_voxels_across_cores(lo, hi, &edit);
+        let (mut one_core, mut many_cores) = both_paths(build, lo, hi, edit);
 
         let from_one = one_core.end_stroke().expect("the edit changed something");
         let from_many = many_cores.end_stroke().expect("the edit changed something");
         assert_eq!(from_one.len(), from_many.len(), "different numbers of bricks snapshotted");
         assert_eq!(from_one.bytes(), from_many.bytes());
+    }
+
+    #[test]
+    fn a_narrowed_brick_covers_exactly_what_the_neighbour_that_differs_can_reach() {
+        // One differing neighbour at a time, all 26 of them. The realistic
+        // case below cannot pin this down: around a real surface several
+        // neighbours differ at once, and the bounding box of their slabs hides
+        // a slab that is a voxel short on one face, or a corner neighbour that
+        // never gets looked at.
+        for dz in -1..=1 {
+            for dy in -1..=1 {
+                for dx in -1..=1 {
+                    let offset = IVec3::new(dx, dy, dz);
+                    if offset == IVec3::ZERO {
+                        continue;
+                    }
+                    for reach in [1, 2, 7] {
+                        let middle = BrickCoord::new(1, 1, 1);
+                        let mut volume = Volume::new(1.0);
+                        // The brick and all 26 around it hold one value, so the
+                        // only thing that can reach into it is the one made
+                        // dense below.
+                        for z in 0..3 {
+                            for y in 0..3 {
+                                for x in 0..3 {
+                                    volume.insert_brick(
+                                        BrickCoord::new(x, y, z),
+                                        Brick::Uniform(INSIDE),
+                                    );
+                                }
+                            }
+                        }
+                        volume.insert_brick(
+                            BrickCoord(middle.0 + offset),
+                            Brick::dense_filled(OUTSIDE),
+                        );
+
+                        let mut scratch = EditScratch::default();
+                        volume.plan_visits(
+                            middle.origin(),
+                            middle.max_voxel(),
+                            reach,
+                            &|preview: &BrickPreview| {
+                                assert_eq!(preview.uniform, Some(INSIDE), "wrong brick offered");
+                                BrickVerdict::OnlyNearDifferentNeighbours
+                            },
+                            &mut scratch,
+                        );
+
+                        // Per axis: the near face, the far face, or all of it
+                        // where the neighbour is not offset along that axis.
+                        let mut want_lo = middle.origin();
+                        let mut want_hi = middle.max_voxel();
+                        for axis in 0..3 {
+                            match offset[axis] {
+                                -1 => want_hi[axis] = middle.origin()[axis] + reach - 1,
+                                1 => want_lo[axis] = middle.max_voxel()[axis] - reach + 1,
+                                _ => {}
+                            }
+                        }
+
+                        assert_eq!(scratch.visits.len(), 1, "offset {offset:?} reach {reach}");
+                        let visit = scratch.visits[0];
+                        assert_eq!(
+                            (visit.lo, visit.hi),
+                            (want_lo, want_hi),
+                            "a neighbour at {offset:?} reaching {reach} voxels should narrow the \
+                             brick to {want_lo:?}..{want_hi:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn narrowing_a_uniform_brick_leaves_out_only_what_nothing_can_reach() {
+        // The invariant the whole optimisation rests on. When a brush says it
+        // leaves a constant alone, the planner narrows the brick to whatever
+        // sits within `reach` of a neighbour holding something else -- and
+        // everything it leaves out has to be genuinely unreachable, or a stamp
+        // quietly stops working part way into a brick.
+        //
+        // Checked against the field itself rather than against the planner's
+        // own reasoning: find where the brick's neighbourhood stops holding the
+        // value, grow that by the reach, and the visit has to cover it.
+        let mut volume = Volume::new(1.0);
+        volume.seed_sphere(Vec3::splat(64.0), 46.0);
+
+        for reach in [1, 2, 5] {
+            let mut scratch = EditScratch::default();
+            let lo = IVec3::splat(-8);
+            let hi = IVec3::splat(136);
+            let uniforms = std::cell::RefCell::new(Vec::new());
+            volume.plan_visits(
+                lo,
+                hi,
+                reach,
+                &|preview: &BrickPreview| match preview.uniform {
+                    Some(value) => {
+                        uniforms.borrow_mut().push((preview.coord, value));
+                        BrickVerdict::OnlyNearDifferentNeighbours
+                    }
+                    None => BrickVerdict::Skip,
+                },
+                &mut scratch,
+            );
+
+            let uniforms = uniforms.into_inner();
+            assert!(!uniforms.is_empty(), "the test needs uniform bricks to be worth running");
+            let mut narrowed = 0;
+            let mut dropped = 0;
+
+            for (coord, value) in uniforms {
+                let visit =
+                    scratch.visits.iter().find(|visit| visit.coord == coord).map(|v| (v.lo, v.hi));
+
+                // Where the neighbourhood stops holding `value`, as a box.
+                let from = coord.origin() - IVec3::splat(reach);
+                let to = coord.max_voxel() + IVec3::splat(reach);
+                let mut different_lo = IVec3::splat(i32::MAX);
+                let mut different_hi = IVec3::splat(i32::MIN);
+                for z in from.z..=to.z {
+                    for y in from.y..=to.y {
+                        for x in from.x..=to.x {
+                            let voxel = IVec3::new(x, y, z);
+                            if volume.sample_voxel(voxel) != value {
+                                different_lo = different_lo.min(voxel);
+                                different_hi = different_hi.max(voxel);
+                            }
+                        }
+                    }
+                }
+
+                // Anything within `reach` of a differing voxel could change, so
+                // the visit has to cover all of it. Covering more than that is
+                // allowed and does happen: the planner asks whether a whole
+                // neighbouring brick differs, not whether the voxels close
+                // enough to matter do, so it can keep a slab that nothing
+                // actually reaches into.
+                let must_lo = (different_lo - IVec3::splat(reach)).max(coord.origin());
+                let must_hi = (different_hi + IVec3::splat(reach)).min(coord.max_voxel());
+                let must_change = must_lo.cmple(must_hi).all();
+
+                let Some((visit_lo, visit_hi)) = visit else {
+                    assert!(
+                        !must_change,
+                        "brick {coord:?} was dropped whole at reach {reach}, but \
+                         {must_lo:?}..{must_hi:?} of it is within reach of something else"
+                    );
+                    dropped += 1;
+                    continue;
+                };
+                if must_change {
+                    assert!(
+                        visit_lo.cmple(must_lo).all() && visit_hi.cmpge(must_hi).all(),
+                        "brick {coord:?} at reach {reach} was narrowed to \
+                         {visit_lo:?}..{visit_hi:?}, which leaves out {must_lo:?}..{must_hi:?}"
+                    );
+                }
+                if (visit_lo, visit_hi) != (coord.origin(), coord.max_voxel()) {
+                    narrowed += 1;
+                }
+            }
+
+            assert!(dropped > 0, "no uniform brick was dropped whole at reach {reach}");
+            assert!(narrowed > 0, "no uniform brick was narrowed to a slab at reach {reach}");
+        }
     }
 
     #[test]
@@ -1018,6 +1482,11 @@ mod tests {
         volume.seed_sphere(Vec3::new(20.0, -12.0, 33.0), 26.0);
 
         let mut region = FieldRegion::new();
+        // Reused, and `FieldRegion::resize` deliberately does not clear: a
+        // snapshot claims to write every element of the box, and the way that
+        // claim breaks is a stale value left over from the last stamp. So take
+        // one snapshot elsewhere first, and let this one land on top of it.
+        volume.snapshot(IVec3::splat(-200), IVec3::splat(-140), &mut region);
         // Deliberately straddling several bricks, including negative ones.
         let lo = IVec3::new(-40, -20, 25);
         let hi = IVec3::new(6, 14, 70);

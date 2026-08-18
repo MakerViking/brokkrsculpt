@@ -60,9 +60,10 @@
 
 use glam::Vec3;
 
+use crate::brick::{INSIDE, OUTSIDE};
 use crate::pattern::{Pattern, Prepared};
 use crate::region::FieldRegion;
-use crate::volume::Volume;
+use crate::volume::{BrickPreview, BrickVerdict, Volume};
 
 /// How far outside the surface the clay plane sits, as a fraction of radius.
 ///
@@ -456,6 +457,16 @@ impl Stamp {
     }
 }
 
+/// Whether a stamp may leave out the bricks it can prove it would not change.
+///
+/// Two spellings of one operation, which is the shape that goes quietly wrong,
+/// so they are pinned against each other by a test rather than trusted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Skipping {
+    On,
+    Off,
+}
+
 /// Reusable working memory for stamping.
 ///
 /// Holding one across a stroke is what keeps sculpting out of the allocator.
@@ -578,11 +589,82 @@ impl Brush {
         voxels * voxel_size
     }
 
+    /// Whether one stamp provably leaves a region alone, given that the region
+    /// and everything the stamp can read around it already hold the single
+    /// value `value` at every voxel.
+    ///
+    /// This is what lets a large brush ignore the deep interior and the far
+    /// exterior, which between them are most of its box: a 20 mm brush at a
+    /// quarter millimetre voxel spans four million voxels and only a shell a
+    /// few voxels thick around the surface carries anything it can act on.
+    ///
+    /// It is a claim about the arithmetic in [`Brush::apply`] and it has to
+    /// stay true of it. `every_brush_skips_only_what_it_would_not_have_changed`
+    /// runs every brush both ways and compares the field bit for bit, so a
+    /// wrong answer here fails a test rather than showing up as a quiet dent in
+    /// somebody's model.
+    fn leaves_constant_alone(&self, value: f32, direction: BrushDirection) -> bool {
+        // A floor rather than a necessity. Every brush below that answers yes
+        // would in fact leave any constant alone, saturated or not, and a
+        // uniform brick part way through the band can exist -- a tile that an
+        // edit clipped but never reached is put back exactly as it was. But a
+        // constant mid band value means a flat patch of real surface, which is
+        // where a brush is supposed to be doing something, and a claim that
+        // holds only for the two ends of the band is a much easier one for the
+        // next brush to keep. Removing this line does not break anything
+        // today; keeping it means it cannot.
+        if value != INSIDE && value != OUTSIDE {
+            return false;
+        }
+        match self.kind {
+            // Resampling a constant field gives the constant back, whatever the
+            // weight and wherever it reads from, provided everything it can
+            // read is covered by the halo -- which is what `apply` declares.
+            BrushKind::Draw | BrushKind::Pinch | BrushKind::Move => true,
+            // The mean of six equal values is that value, so the blend has
+            // nothing to blend toward.
+            BrushKind::Smooth => true,
+            // Adding a constant offset lands back on the clamp it started at,
+            // but only in the direction the clamp is already holding: inflating
+            // outward cannot make solid interior any more solid, and carving
+            // cannot make empty space any emptier.
+            BrushKind::Inflate => match direction {
+                BrushDirection::Add => value == INSIDE,
+                BrushDirection::Subtract => value == OUTSIDE,
+            },
+            // Both blend toward a plane, and the plane's own value varies
+            // across the region. Far enough behind it the blend does clamp
+            // straight back, but proving that needs the region's box and the
+            // plane together, and neither of them is the expensive case: these
+            // two are the cheapest brushes there are. They get the radius
+            // culling and nothing more.
+            BrushKind::Clay | BrushKind::Flatten => false,
+        }
+    }
+
     /// Apply one stamp.
     ///
     /// Work is proportional to the brush volume, never to the size of the
     /// model.
     pub fn apply(&self, volume: &mut Volume, stamp: &Stamp, scratch: &mut BrushScratch) {
+        self.stamp(volume, stamp, scratch, Skipping::On);
+    }
+
+    /// One stamp, with the option of visiting every brick of the box whether it
+    /// can change or not.
+    ///
+    /// The two are meant to produce identical fields and identical undo
+    /// entries, and `skipping_leaves_the_same_field_and_the_same_undo_entry`
+    /// is what holds them to it. Nothing outside that test asks for
+    /// [`Skipping::Off`]: it exists so the optimisation has something honest to
+    /// be compared against.
+    fn stamp(
+        &self,
+        volume: &mut Volume,
+        stamp: &Stamp,
+        scratch: &mut BrushScratch,
+        skipping: Skipping,
+    ) {
         if self.radius <= 0.0 || self.strength <= 0.0 || stamp.pressure <= 0.0 {
             return;
         }
@@ -642,7 +724,46 @@ impl Brush {
         let stroke_normal = stamp.normal;
         let direction = stamp.direction;
 
-        volume.edit_voxels(lo, hi, |voxel, position, value| {
+        // Which of that box can actually change. Without this a large brush
+        // pays for its whole bounding cube: the corners the ball never reaches,
+        // and the deep interior and far exterior that are already saturated at
+        // one value. Both are far bigger than the shell of surface the stamp is
+        // really working on.
+        //
+        // How far past the voxel it is writing the stamp reads, which is what
+        // the volume resolves the constant regions against. It comes from the
+        // same `read_reach` the snapshot is sized with, so a brush that starts
+        // resampling from further away widens both together.
+        let read_voxels = (self.read_reach(voxel_size, gain, displacement) / voxel_size).ceil()
+            as i32
+            // The trilinear tap lands one voxel past wherever the warp reads,
+            // and the value brushes that warp nothing still read their six
+            // axis neighbours.
+            + 1;
+        let radius = self.radius;
+        let decide = |preview: &BrickPreview| {
+            if skipping == Skipping::Off {
+                return BrickVerdict::Whole;
+            }
+            // A voxel further from the centre than the radius gets its own
+            // value back, so a brick the ball misses cannot change. Grown by a
+            // voxel so this is a bound on the per voxel test rather than a race
+            // with the last bit of its rounding.
+            let slack = Vec3::splat(voxel_size);
+            let box_min = preview.lo.as_vec3() * voxel_size - slack;
+            let box_max = preview.hi.as_vec3() * voxel_size + slack;
+            if centre.clamp(box_min, box_max).distance(centre) >= radius {
+                return BrickVerdict::Skip;
+            }
+            match preview.uniform {
+                Some(value) if self.leaves_constant_alone(value, direction) => {
+                    BrickVerdict::OnlyNearDifferentNeighbours
+                }
+                _ => BrickVerdict::Whole,
+            }
+        };
+
+        volume.edit_voxels_where(lo, hi, read_voxels, decide, |voxel, position, value| {
             let distance = position.distance(centre) * inverse_radius;
             if distance >= 1.0 {
                 return value;
@@ -1305,6 +1426,348 @@ mod tests {
         assert_eq!(tiny.spacing(0.25), 0.25);
         let large = Brush { radius: 8.0, ..Brush::default() };
         assert_eq!(large.spacing(0.25), 2.0);
+    }
+}
+/// The optimisation that lets a large brush cost less than its bounding box:
+/// bricks it can prove it would not change are never read, never made dense
+/// and never written.
+///
+/// Everything here is about that proof. An optimisation that changes the
+/// sculpt is a bug, and this one would fail quietly if it were wrong -- a dent
+/// that does not appear, on one brush, in one direction, only when the surface
+/// happens to sit a couple of bricks away.
+#[cfg(test)]
+mod skipping_tests {
+    use super::*;
+    use crate::brick::{BRICK_DIM, BRICK_VOXELS, Brick, BrickCoord, INSIDE, OUTSIDE, brick_index};
+
+    /// Every brush, both ways round the stroke, which is the grid the claims in
+    /// [`Brush::leaves_constant_alone`] are made over.
+    fn every_brush() -> impl Iterator<Item = (BrushKind, BrushDirection)> {
+        BrushKind::ALL.into_iter().flat_map(|kind| {
+            [BrushDirection::Add, BrushDirection::Subtract].map(move |d| (kind, d))
+        })
+    }
+
+    /// A stamp with everything the directional brushes need filled in, so no
+    /// brush passes a test by declining to do anything.
+    fn stamp_at(centre: Vec3, normal: Vec3, direction: BrushDirection) -> Stamp {
+        Stamp::new(centre, normal, direction)
+            .with_tangent(normal.cross(Vec3::Z).normalize_or(Vec3::Y))
+    }
+
+    /// Assert two volumes hold the same field, brick for brick.
+    ///
+    /// Compared through the storage rather than by sampling every voxel,
+    /// which makes it a memcmp per brick instead of a hash lookup per voxel.
+    /// The representation has to match too: a brick the unskipped path made
+    /// dense and then found it had not changed is rolled back to the tile it
+    /// was, so a difference there would mean one path is leaving 128 KB behind.
+    fn assert_same_field(a: &Volume, b: &Volume, what: &str) {
+        let mut left: Vec<BrickCoord> = a.brick_coords().collect();
+        let mut right: Vec<BrickCoord> = b.brick_coords().collect();
+        left.sort();
+        right.sort();
+        assert_eq!(left, right, "{what}: different bricks are stored");
+
+        for coord in left {
+            match (a.brick(coord), b.brick(coord)) {
+                (Some(Brick::Uniform(x)), Some(Brick::Uniform(y))) => {
+                    assert_eq!(x, y, "{what}: tile {coord:?} differs");
+                }
+                (Some(Brick::Dense(x)), Some(Brick::Dense(y))) => {
+                    assert!(x[..] == y[..], "{what}: brick {coord:?} differs");
+                }
+                (x, y) => panic!(
+                    "{what}: brick {coord:?} is stored differently: {:?} against {:?}",
+                    x.map(|brick| matches!(brick, Brick::Dense(_))),
+                    y.map(|brick| matches!(brick, Brick::Dense(_))),
+                ),
+            }
+        }
+    }
+
+    /// A solid half space, `x <= surface`, over a block of bricks wide enough
+    /// that whole bricks of interior and whole bricks of empty space both sit
+    /// two bricks clear of the one the surface passes through.
+    ///
+    /// A sphere small enough to test with quickly cannot arrange that. A brick
+    /// is 32 voxels and the halo disqualifies the brick next to the surface, so
+    /// a stamp has to reach two of them before it finds a constant it is
+    /// allowed to skip. The slab puts that within a radius the test can afford
+    /// to run, and every dense brick in it is the same brick, so building one
+    /// and cloning it costs a memcpy instead of a million evaluations.
+    fn slab(surface: f32) -> Volume {
+        let mut volume = Volume::new(1.0);
+        let span = -1..=7;
+        let mut transition: Option<Brick> = None;
+
+        for z in span.clone() {
+            for y in span.clone() {
+                for x in span.clone() {
+                    let coord = BrickCoord::new(x, y, z);
+                    let origin = coord.origin();
+                    let near = origin.x as f32 - surface;
+                    let far = (origin.x + BRICK_DIM as i32 - 1) as f32 - surface;
+                    if far <= INSIDE {
+                        volume.insert_brick(coord, Brick::Uniform(INSIDE));
+                    } else if near >= OUTSIDE {
+                        // Left absent, which already reads as OUTSIDE.
+                    } else {
+                        let brick = transition.get_or_insert_with(|| {
+                            let mut data = vec![0.0_f32; BRICK_VOXELS];
+                            for vz in 0..BRICK_DIM {
+                                for vy in 0..BRICK_DIM {
+                                    for vx in 0..BRICK_DIM {
+                                        data[brick_index(vx, vy, vz)] =
+                                            ((origin.x + vx as i32) as f32 - surface)
+                                                .clamp(INSIDE, OUTSIDE);
+                                    }
+                                }
+                            }
+                            let data: Box<[f32; BRICK_VOXELS]> =
+                                data.into_boxed_slice().try_into().expect("one brick of values");
+                            Brick::Dense(data)
+                        });
+                        volume.insert_brick(coord, brick.clone());
+                    }
+                }
+            }
+        }
+        volume.take_dirty(&mut Vec::new());
+        volume
+    }
+
+    /// Where the surface sits in [`slab`], and the three places a stamp is put
+    /// against it: on the surface, two bricks into the solid, and two bricks
+    /// out into the empty side.
+    const SURFACE: f32 = 3.0 * BRICK_DIM as f32;
+    const STAND_OFF: f32 = 44.0;
+
+    /// How many bricks one stamp visits, with and without the skipping.
+    fn visits(brush: Brush, at: Vec3, direction: BrushDirection) -> (usize, usize) {
+        let mut with = slab(SURFACE);
+        brush.stamp(
+            &mut with,
+            &stamp_at(at, Vec3::X, direction),
+            &mut BrushScratch::new(),
+            Skipping::On,
+        );
+        let mut without = slab(SURFACE);
+        brush.stamp(
+            &mut without,
+            &stamp_at(at, Vec3::X, direction),
+            &mut BrushScratch::new(),
+            Skipping::Off,
+        );
+        (with.last_visited_bricks(), without.last_visited_bricks())
+    }
+
+    #[test]
+    fn a_saturated_field_is_left_alone_by_every_brush_that_says_so() {
+        // The claim under test, stated the other way round: wherever
+        // `leaves_constant_alone` answers yes, running the stamp anyway must
+        // change nothing at all. Checked with the skipping switched OFF, so it
+        // is the brush arithmetic being measured and not the shortcut agreeing
+        // with itself.
+        let centre = Vec3::splat(BRICK_DIM as f32 * 2.5);
+        let mut ever_changed = false;
+
+        for value in [INSIDE, OUTSIDE] {
+            for (kind, direction) in every_brush() {
+                // A block of bricks all holding one value. OUTSIDE is what an
+                // absent brick already reads as, so leaving them out is the
+                // same field and covers the absent case as well.
+                let build = || {
+                    let mut volume = Volume::new(1.0);
+                    if value != OUTSIDE {
+                        for z in 0..5 {
+                            for y in 0..5 {
+                                for x in 0..5 {
+                                    volume.insert_brick(
+                                        BrickCoord::new(x, y, z),
+                                        Brick::Uniform(value),
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    volume
+                };
+
+                let mut volume = build();
+                let brush = Brush { kind, radius: 12.0, strength: 0.9, ..Brush::default() };
+                brush.stamp(
+                    &mut volume,
+                    &stamp_at(centre, Vec3::X, direction),
+                    &mut BrushScratch::new(),
+                    Skipping::Off,
+                );
+
+                let untouched = build();
+                let claim = brush.leaves_constant_alone(value, direction);
+                if claim {
+                    assert_same_field(
+                        &volume,
+                        &untouched,
+                        &format!("{kind} {direction:?} claims it leaves a field of {value} alone"),
+                    );
+                } else {
+                    ever_changed |= volume.brick_count() != untouched.brick_count();
+                }
+            }
+        }
+
+        assert!(
+            ever_changed,
+            "no brush changed a saturated field at all, so this test cannot tell a mistake \
+             from a pass"
+        );
+    }
+
+    #[test]
+    fn skipping_leaves_the_same_field_and_the_same_undo_entry() {
+        // Bit for bit, every brush, both directions.
+        //
+        // Two stamps against the slab. The first sits on the surface, where the
+        // ball reaches two bricks into the solid and the deep ones are a
+        // constant the resampling brushes can skip. The second stands off in
+        // the empty side, where the far ones are a constant of the other sign.
+        // Between them every branch of `leaves_constant_alone` is reached with
+        // a real stamp behind it.
+        let stamps = [
+            Vec3::new(SURFACE, 100.0, 100.0),
+            Vec3::new(SURFACE - STAND_OFF, 100.0, 100.0),
+            Vec3::new(SURFACE + STAND_OFF, 100.0, 100.0),
+        ];
+
+        for (kind, direction) in every_brush() {
+            let brush = Brush { kind, radius: 48.0, strength: 0.5, ..Brush::default() };
+
+            let run = |skipping| {
+                let mut volume = slab(SURFACE);
+                volume.begin_stroke();
+                let mut scratch = BrushScratch::new();
+                let mut visited = 0;
+                for at in stamps {
+                    brush.stamp(
+                        &mut volume,
+                        &stamp_at(at, Vec3::X, direction),
+                        &mut scratch,
+                        skipping,
+                    );
+                    visited += volume.last_visited_bricks();
+                }
+                (volume, visited)
+            };
+
+            let (mut skipped, visited_when_skipping) = run(Skipping::On);
+            let (mut whole, visited_when_not) = run(Skipping::Off);
+
+            assert!(
+                visited_when_skipping < visited_when_not,
+                "{kind} {direction:?} skipped nothing: {visited_when_skipping} bricks either way"
+            );
+            assert_same_field(&skipped, &whole, &format!("{kind} {direction:?}"));
+
+            match (skipped.end_stroke(), whole.end_stroke()) {
+                (Some(a), Some(b)) => {
+                    assert_eq!(a.len(), b.len(), "{kind} {direction:?} recorded a different undo");
+                    assert_eq!(a.bytes(), b.bytes(), "{kind} {direction:?} undo entry differs");
+                }
+                (None, None) => {}
+                (a, b) => panic!(
+                    "{kind} {direction:?} recorded an undo entry one way and not the other: \
+                     {} against {}",
+                    a.is_some(),
+                    b.is_some()
+                ),
+            }
+        }
+    }
+
+    #[test]
+    fn a_stroke_of_overlapping_stamps_survives_the_skipping() {
+        // The single stamp cases above cannot catch a brick that is safely
+        // skipped once and then has to be picked up again when a later stamp
+        // moves the surface into it. Cheap enough at a small radius to run as
+        // a real stroke.
+        for (kind, direction) in every_brush() {
+            let brush = Brush { kind, radius: 9.0, strength: 0.8, ..Brush::default() };
+            let run = |skipping| {
+                let mut volume = Volume::new(1.0);
+                volume.seed_sphere(Vec3::splat(48.0), 30.0);
+                volume.take_dirty(&mut Vec::new());
+                volume.begin_stroke();
+                let mut scratch = BrushScratch::new();
+                for step in 0..24 {
+                    let angle = step as f32 / 24.0 * std::f32::consts::TAU;
+                    let at = Vec3::splat(48.0) + Vec3::new(angle.cos(), angle.sin(), 0.35) * 30.0;
+                    let normal = volume.gradient_world(at);
+                    brush.stamp(
+                        &mut volume,
+                        &stamp_at(at, normal, direction),
+                        &mut scratch,
+                        skipping,
+                    );
+                }
+                volume
+            };
+
+            let mut skipped = run(Skipping::On);
+            let mut whole = run(Skipping::Off);
+            assert_same_field(&skipped, &whole, &format!("{kind} {direction:?} over a stroke"));
+            assert_eq!(
+                skipped.end_stroke().map(|edit| (edit.len(), edit.bytes())),
+                whole.end_stroke().map(|edit| (edit.len(), edit.bytes())),
+                "{kind} {direction:?} recorded a different undo entry over a stroke"
+            );
+        }
+    }
+
+    #[test]
+    fn the_constant_skip_reaches_past_what_a_radius_cull_alone_would() {
+        // Two things at once. That the constant skip is doing anything at all
+        // -- flatten never uses it, so it is the control, and a brush that
+        // does use it has to visit strictly fewer bricks at the same radius in
+        // the same place. And that inflate's answer really does turn on the
+        // direction: it can leave solid interior alone only while it is adding
+        // and empty space alone only while it is carving, and getting that
+        // backwards would erode a model from the inside where nobody looks.
+        let brush = |kind| Brush { kind, radius: 48.0, strength: 0.5, ..Brush::default() };
+        let deep = Vec3::new(SURFACE - STAND_OFF, 100.0, 100.0);
+        let clear = Vec3::new(SURFACE + STAND_OFF, 100.0, 100.0);
+
+        for (where_, at, saturating) in [
+            ("into the solid", deep, BrushDirection::Add),
+            ("out in the open", clear, BrushDirection::Subtract),
+        ] {
+            // Flatten never uses the constant test, so what it visits is what
+            // the radius cull alone leaves behind.
+            let (control, whole) = visits(brush(BrushKind::Flatten), at, saturating);
+            assert!(control < whole, "the radius cull did nothing, so there is no control here");
+
+            for kind in [BrushKind::Draw, BrushKind::Smooth, BrushKind::Pinch, BrushKind::Move] {
+                let (skipped, _) = visits(brush(kind), at, saturating);
+                assert!(
+                    skipped < control,
+                    "{kind} {where_}: skipped {skipped} of {control}, so the constant test \
+                     bought nothing over the radius cull"
+                );
+            }
+
+            let (with_grain, _) = visits(brush(BrushKind::Inflate), at, saturating);
+            let (against, _) = visits(brush(BrushKind::Inflate), at, saturating.inverted());
+            assert!(
+                with_grain < control,
+                "inflate {where_} should leave a constant it can only push against the clamp alone"
+            );
+            assert_eq!(
+                against, control,
+                "inflate {where_} the other way round moves the value off the clamp, so it \
+                 cannot skip anything the radius does not already cull"
+            );
+        }
     }
 }
 

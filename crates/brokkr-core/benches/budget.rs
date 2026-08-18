@@ -40,6 +40,34 @@ const EDIT_BUDGET: Duration = Duration::from_micros(4_000);
 /// version, which was not enough on its own. The remaining lever, if this ever
 /// needs one, is evaluating the pattern per brick row rather than per voxel.
 const PATTERN_EDIT_BUDGET: Duration = Duration::from_micros(6_000);
+/// Edit budget at the largest radius on the tool strip.
+///
+/// The 4 ms edit budget is not met at a 20 mm radius and, on this
+/// architecture, will not be. It is worth being plain about why rather than
+/// quietly widening the number.
+///
+/// A brush covers a fixed world radius, so its box grows with the cube of it: a
+/// 20 mm brush at the 0.25 mm voxel the application ships is four million
+/// voxels against fifteen thousand for the 3 mm default. Most of that box can
+/// be skipped -- the corners the ball never reaches, and the deep interior and
+/// far exterior already saturated at one value -- and after that skipping a
+/// single stamp costs about 3.5 ms. What remains is a shell of real surface a
+/// couple of million voxels across, each of which a resampling brush reads
+/// eight neighbours for. That is honest work, and the way to make it cheaper is
+/// the GPU path, not another arrangement of this loop.
+///
+/// So this is derived from the frame rather than invented. The 4 ms figure was
+/// only ever a sub-allocation of the 16 ms frame, sized to leave 8 ms for the
+/// remesh. At this radius the remesh measures 3.2 ms median and 4.4 ms worst
+/// against that 8, so the frame has slack the edit can borrow. Half the frame
+/// for the edit plus the remesh's measured cost still closes it with several
+/// milliseconds to spare, which is what "edit plus remesh" against
+/// [`FRAME_BUDGET`] gates and is the number a user actually feels.
+///
+/// It is deliberately looser than the single stamp rows need, so it will not
+/// catch a small regression in them. The medians printed above are what to
+/// watch for that; this is here to catch something going badly wrong.
+const LARGE_BRUSH_EDIT_BUDGET: Duration = Duration::from_micros(8_000);
 /// Remeshing whatever the edit dirtied.
 const REMESH_BUDGET: Duration = Duration::from_micros(8_000);
 
@@ -47,6 +75,30 @@ const REMESH_BUDGET: Duration = Duration::from_micros(8_000);
 const EFFECTIVE_RESOLUTION: f32 = 256.0;
 /// Stroke steps to time.
 const STEPS: usize = 240;
+
+/// Brush radii to sweep, in voxels.
+///
+/// The application ships a 0.25 mm voxel and a radius slider a user drags from
+/// a few millimetres to a couple of centimetres, so these are the 3 mm, 10 mm
+/// and 20 mm settings from the tool strip. Everything in this harness is scaled
+/// in voxels, so the numbers transfer directly.
+///
+/// The largest of the three is the case this file did not cover for a long
+/// time, and it was three times over budget when it was finally measured. A
+/// gate that only ever exercises the default radius is not a gate.
+const RADII: [f32; 3] = [12.0, 40.0, 80.0];
+
+/// The budget a radius is held to: [`LARGE_BRUSH_EDIT_BUDGET`] for the widest
+/// setting on the tool strip and [`EDIT_BUDGET`] for the rest.
+fn edit_budget_at(radius: f32) -> Duration {
+    if radius >= RADII[RADII.len() - 1] { LARGE_BRUSH_EDIT_BUDGET } else { EDIT_BUDGET }
+}
+
+/// Stamps to time in the per radius sweep.
+///
+/// Fewer than the stroke cases because each row seeds its own volume and the
+/// largest radius is expensive; still enough for a median and a worst case.
+const SWEEP_STAMPS: usize = 32;
 
 struct Samples(Vec<Duration>);
 
@@ -339,6 +391,118 @@ fn main() {
         passed &= report(&format!("  {kind}"), &mut samples, EDIT_BUDGET);
     }
     println!();
+
+    // How the cost of one stamp grows with the radius.
+    //
+    // A brush covers a fixed world radius, so doubling it is eight times the
+    // voxels, and the largest setting on the tool strip is the one that decides
+    // whether sculpting stays fluid. Each row seeds its own sphere so the rows
+    // are comparable with each other and stable across runs: a stamp is much
+    // cheaper on a field the previous row has already flattened.
+    println!("  cost of one stamp by brush and radius, on a fresh sphere per row:");
+    for brush_radius in RADII {
+        for kind in BrushKind::ALL {
+            let each = Brush { kind, radius: brush_radius, ..brush };
+            let mut fresh = Volume::new(voxel_size);
+            fresh.seed_sphere(centre, radius);
+            fresh.take_dirty(&mut dirty);
+
+            let mut samples = Samples::new();
+            for step in 0..SWEEP_STAMPS {
+                let angle = step as f32 / SWEEP_STAMPS as f32 * std::f32::consts::TAU;
+                let at = centre + Vec3::new(angle.cos(), 0.0, angle.sin()) * radius;
+                let normal = fresh.gradient_world(at);
+                let started = Instant::now();
+                each.apply(
+                    &mut fresh,
+                    &Stamp::new(at, normal, BrushDirection::Add).with_tangent(Vec3::new(
+                        -angle.sin(),
+                        0.0,
+                        angle.cos(),
+                    )),
+                    &mut brush_scratch,
+                );
+                samples.0.push(started.elapsed());
+                fresh.take_dirty(&mut dirty);
+            }
+            let label = format!("  {kind} r{}", brush_radius as u32);
+            passed &= report(&label, &mut samples, edit_budget_at(brush_radius));
+        }
+        println!();
+    }
+
+    // The same large brush through the whole stroke machinery, which is what a
+    // pointer event actually costs: interpolated stamps, mirrored twins and the
+    // undo recorder, not one stamp in isolation.
+    {
+        let wide = Brush { radius: RADII[RADII.len() - 1], ..brush };
+        let spacing = wide.spacing(voxel_size);
+        let events = STEPS / 5;
+
+        let mut fresh = Volume::new(voxel_size);
+        fresh.seed_sphere(centre, radius);
+        fresh.take_dirty(&mut dirty);
+        fresh.begin_stroke();
+
+        let mut edit_samples = Samples::new();
+        let mut remesh_samples = Samples::new();
+        let mut combined_samples = Samples::new();
+        let mut stroke = Stroke::new();
+        let mut stamp_total = 0usize;
+
+        for step in 0..events {
+            let angle = step as f32 / events as f32 * std::f32::consts::TAU;
+            let tilt = (step as f32 * 0.11).sin() * 0.8;
+            let point = centre
+                + Vec3::new(angle.cos() * tilt.cos(), tilt.sin(), angle.sin() * tilt.cos())
+                    * radius;
+
+            let edit_start = Instant::now();
+            centres.clear();
+            stroke.advance(point, spacing, &mut centres);
+            for &at in &centres {
+                let normal = fresh.gradient_world(at);
+                wide.apply_symmetric(
+                    &mut fresh,
+                    &Stamp::new(at, normal, BrushDirection::Add)
+                        .with_tangent(stroke.direction().unwrap_or(Vec3::ZERO)),
+                    Symmetry::X,
+                    &mut brush_scratch,
+                );
+            }
+            let edit_time = edit_start.elapsed();
+            stamp_total += centres.len();
+
+            fresh.take_dirty(&mut dirty);
+            let remesh_start = Instant::now();
+            while meshes.len() < dirty.len() {
+                meshes.push(BrickMesh::default());
+            }
+            fresh.mesh_bricks(&dirty, &mut meshes[..dirty.len()]);
+            let remesh_time = remesh_start.elapsed();
+
+            edit_samples.0.push(edit_time);
+            remesh_samples.0.push(remesh_time);
+            combined_samples.0.push(edit_time + remesh_time);
+        }
+
+        if let Some(edit) = fresh.end_stroke() {
+            println!(
+                "  undo entry covers {} bricks, {:.1} MB",
+                edit.len(),
+                edit.bytes() as f64 / (1024.0 * 1024.0)
+            );
+        }
+        println!(
+            "  fast drag, r{} brush: {events} pointer events, {:.1} stamps per event",
+            wide.radius as u32,
+            stamp_total as f64 / events as f64
+        );
+        passed &= report("  brush edit", &mut edit_samples, edit_budget_at(wide.radius));
+        passed &= report("  dirty remesh", &mut remesh_samples, REMESH_BUDGET);
+        passed &= report("  edit plus remesh", &mut combined_samples, FRAME_BUDGET);
+        println!();
+    }
 
     let after = volume.stats();
     println!();
