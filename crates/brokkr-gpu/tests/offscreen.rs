@@ -715,3 +715,64 @@ fn overlay_geometry_draws_in_front_and_is_hidden_behind() {
     // A ring is a rim, not a disc: it must cover far less than a filled quad.
     assert!(ring_pixels < changed, "the ring covered as much as a filled quad");
 }
+
+/// An imported model has to actually be visible.
+///
+/// Every other check on the voxeliser is numeric, and the class of bug that
+/// compiles, passes every numeric test and still looks wrong has already caught
+/// this project three times. A field can be geometrically correct and render as
+/// nothing -- bricks written but never marked dirty, or marked and never
+/// uploaded -- and only pixels say so.
+///
+/// It also compares against the sculpted sphere it was made from. Two frames
+/// that are identically blank would satisfy a bare "did it draw" check, so the
+/// assertion is that the import covers a comparable area of the screen.
+#[test]
+fn an_imported_mesh_renders() {
+    use brokkr_core::voxelise::{VoxeliseOptions, voxelise};
+
+    let Some(harness) = Harness::new() else {
+        eprintln!("no usable wgpu adapter, skipping the offscreen render test");
+        return;
+    };
+
+    let mut renderer = SculptRenderer::new(&harness.device, &harness.queue, TARGET_FORMAT);
+    renderer.resize(&harness.device, WIDTH, HEIGHT);
+    renderer.write_uniforms(&harness.queue, &uniforms(MODEL_RADIUS * 3.0));
+
+    // The reference: a seeded sphere, drawn the ordinary way.
+    let mut seeded = Volume::new(VOXEL_SIZE);
+    seeded.seed_sphere(Vec3::ZERO, MODEL_RADIUS);
+    seeded.mark_everything_dirty();
+    upload_all(&mut renderer, &harness.queue, &mut seeded);
+    let (seeded_lit, _) = coverage(&harness.frame(&renderer));
+    assert!(seeded_lit > 0, "the reference sphere drew nothing, so this test proves nothing");
+    dump("import-reference", &harness.frame(&renderer));
+
+    // The same sphere, put through export and voxelise, and drawn again.
+    let (mesh, report) = seeded.export_mesh();
+    assert!(report.is_printable(), "the fixture is not printable: {}", report.summary());
+    let (mut imported, _) = voxelise(
+        &mesh,
+        &VoxeliseOptions { voxel_size: VOXEL_SIZE, centre: false, refit_if_implausible: false },
+    )
+    .expect("the exported sphere should voxelise");
+
+    let mut fresh = SculptRenderer::new(&harness.device, &harness.queue, TARGET_FORMAT);
+    fresh.resize(&harness.device, WIDTH, HEIGHT);
+    fresh.write_uniforms(&harness.queue, &uniforms(MODEL_RADIUS * 3.0));
+    let uploaded = upload_all(&mut fresh, &harness.queue, &mut imported);
+    assert!(uploaded > 0, "the imported volume produced no mesh to upload");
+
+    let pixels = harness.frame(&fresh);
+    let (imported_lit, _) = coverage(&pixels);
+    dump("import-voxelised", &pixels);
+
+    assert!(imported_lit > 0, "the imported model drew nothing at all");
+    let ratio = imported_lit as f64 / seeded_lit as f64;
+    assert!(
+        (0.9..=1.1).contains(&ratio),
+        "the imported sphere covers {imported_lit} pixels against the seeded sphere's \
+         {seeded_lit} ({ratio:.2}x) -- it is on screen but it is not the same shape"
+    );
+}
