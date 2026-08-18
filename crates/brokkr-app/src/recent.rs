@@ -29,17 +29,9 @@ pub struct Recent {
 }
 
 impl Recent {
-    /// Where the list lives.
-    ///
-    /// `$XDG_CONFIG_HOME` if it is set and absolute, otherwise `~/.config`, per
-    /// the base directory specification -- the same rule the puck's settings
-    /// use, so the two files sit together.
+    /// Where the list lives, beside the puck's settings.
     pub fn path() -> Option<PathBuf> {
-        let base = std::env::var_os("XDG_CONFIG_HOME")
-            .map(PathBuf::from)
-            .filter(|path| path.is_absolute())
-            .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))?;
-        Some(base.join("brokkrsculpt").join("recent"))
+        crate::paths::config_file("recent")
     }
 
     /// Read the list from the standard location. A missing or unreadable file

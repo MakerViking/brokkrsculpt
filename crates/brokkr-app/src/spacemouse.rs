@@ -655,17 +655,8 @@ pub fn report() -> String {
 
 impl Config {
     /// Where the puck's settings live.
-    ///
-    /// `$XDG_CONFIG_HOME` if set, otherwise `~/.config`, per the base directory
-    /// specification.
     pub fn path() -> Option<std::path::PathBuf> {
-        let base = std::env::var_os("XDG_CONFIG_HOME")
-            .map(std::path::PathBuf::from)
-            .filter(|path| path.is_absolute())
-            .or_else(|| {
-                std::env::var_os("HOME").map(|home| std::path::PathBuf::from(home).join(".config"))
-            })?;
-        Some(base.join("brokkrsculpt").join("spacemouse.conf"))
+        crate::paths::config_file("spacemouse.conf")
     }
 
     /// Read the settings, falling back to the defaults for anything missing or

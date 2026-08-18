@@ -1252,14 +1252,7 @@ impl Brokkr {
     /// rather than settings, and it must never sit next to the user's own
     /// files where it could be mistaken for one.
     pub(crate) fn default_autosave_path() -> Option<std::path::PathBuf> {
-        let base = std::env::var_os("XDG_STATE_HOME")
-            .map(std::path::PathBuf::from)
-            .filter(|path| path.is_absolute())
-            .or_else(|| {
-                std::env::var_os("HOME")
-                    .map(|home| std::path::PathBuf::from(home).join(".local").join("state"))
-            })?;
-        Some(base.join("brokkrsculpt").join("autosave.brokkr"))
+        crate::paths::state_file("autosave.brokkr")
     }
 
     /// Write the crash net if it is due.

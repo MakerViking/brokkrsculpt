@@ -9,6 +9,7 @@ mod cursor;
 mod input_watch;
 mod message;
 mod navcube;
+mod paths;
 mod recent;
 mod spacemouse;
 mod tablet;
