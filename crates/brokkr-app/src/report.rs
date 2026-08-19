@@ -642,4 +642,33 @@ mod wire_tests {
             send(sample_report(), "http://127.0.0.1:1").expect_err("nothing is listening there");
         assert!(why.contains("could not reach"), "unhelpful message: {why}");
     }
+
+    /// Against the real tinkeratlas.com, and it FILES A REAL REPORT, which is
+    /// why it is ignored by default.
+    ///
+    /// Run it deliberately:
+    /// `cargo test -p brokkr-app -- --ignored the_real_endpoint --nocapture`
+    ///
+    /// It is here because everything else in this file proves the bytes are
+    /// right against a socket we control, and none of it proves the server
+    /// accepts them. The two ways that can be wrong are both invisible from
+    /// this side: the endpoint could reject the `product` field, or accept it
+    /// and file the row under the wrong source.
+    #[test]
+    #[ignore = "posts a real bug report to tinkeratlas.com"]
+    fn the_real_endpoint_accepts_a_report_from_this_application() {
+        let report = Report::new(
+            "ignore me: end to end check of the BrokkrSculpt bug reporter",
+            "sent by the test suite, not by a user",
+            &["[wgpu] test harness".to_string()],
+            None,
+            concat!(env!("CARGO_PKG_VERSION"), " (test)"),
+            "test harness",
+        );
+        println!("fingerprint {}", report.fingerprint);
+        match send(report, TINKERATLAS) {
+            Ok(note) => println!("accepted: {note}"),
+            Err(why) => panic!("the real endpoint refused it: {why}"),
+        }
+    }
 }
