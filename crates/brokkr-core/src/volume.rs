@@ -847,10 +847,31 @@ impl Volume {
     /// while the bricks are being lifted out. It is a 128 KB allocation and
     /// memset per brick, and a large brush plans enough of them that doing it
     /// on one thread was a third of the cost of the whole edit.
+    ///
+    /// # What makes this safe to run across cores
+    ///
+    /// Each entry owns its brick outright for the duration, so the parallel
+    /// phase shares nothing mutable; `edit` is `Sync` and only reads, and what
+    /// the resampling brushes read is a *copy* taken before the edit rather
+    /// than the volume being written. The one precondition that is not
+    /// self-evident is that `visits` holds each brick at most once -- a repeat
+    /// would find the second `remove` empty, edit a fresh empty brick, and then
+    /// overwrite the first entry's work on the way back in, losing an edit
+    /// silently and only sometimes. `plan_visits` walks a brick range and emits
+    /// one visit per brick, so it holds; the assertion below is what keeps it
+    /// holding if that ever stops being how visits are produced.
     fn edit_planned_across_cores<F>(&mut self, visits: &[Visit], taken: &mut Vec<Taken>, edit: &F)
     where
         F: Fn(IVec3, Vec3, f32) -> f32 + Sync,
     {
+        debug_assert!(
+            visits.windows(2).all(|pair| {
+                let (a, b) = (pair[0].coord.0, pair[1].coord.0);
+                (a.z, a.y, a.x) < (b.z, b.y, b.x)
+            }),
+            "visits must be strictly ascending, and so each brick at most once"
+        );
+
         let voxel_size = self.voxel_size;
 
         taken.clear();
