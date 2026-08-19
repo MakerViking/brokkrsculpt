@@ -925,6 +925,28 @@ impl Brush {
                 Some(value) if self.leaves_constant_alone(value, direction) => {
                     BrickVerdict::OnlyNearDifferentNeighbours
                 }
+                // The two that blend toward a plane, which the claim above
+                // cannot make because the target varies across the brick.
+                // Here the brick's own box is in hand, so the target's range
+                // over it can be worked out and the claim made properly. See
+                // `blend_toward_plane_clamps_back`.
+                Some(value)
+                    if matches!(kind, BrushKind::Clay | BrushKind::Flatten)
+                        && blend_toward_plane_clamps_back(
+                            value,
+                            box_min,
+                            box_max,
+                            plane_point,
+                            stroke_normal,
+                            voxel_size,
+                        ) =>
+                {
+                    // Not `OnlyNearDifferentNeighbours`: these two read the
+                    // voxel they write and nothing else, so there is no
+                    // neighbour that could reach in, and the whole box is
+                    // provably left alone rather than all but a rim of it.
+                    BrickVerdict::Skip
+                }
                 _ => BrickVerdict::Whole,
             }
         };
@@ -1032,6 +1054,49 @@ impl Brush {
     }
 }
 
+/// Whether clay's and flatten's blend toward a plane provably clamps straight
+/// back to `value` everywhere in a world space box already holding `value`.
+///
+/// Both compute `value + (plane - value) * weight` and clamp the result to the
+/// narrow band, where `plane` is the signed distance to the reference plane in
+/// voxels and `weight` is somewhere in `0..=1`. So whenever `plane` sits at or
+/// beyond a saturated `value` on the same side, the blend can only push further
+/// out and the clamp puts it straight back. Clay's extra `min`/`max` against
+/// `value` moves it the same way or not at all, so it does not weaken this.
+///
+/// That is a claim about a whole box rather than about one value, which is why
+/// it cannot live in [`Brush::leaves_constant_alone`] alongside the others: the
+/// plane's distance varies across a brick, so the brick's extent has to be in
+/// hand. `plane` is linear in position, so its range over the box is its value
+/// at the centre give or take the box's half extent projected onto the normal
+/// -- there is no need to visit the eight corners.
+///
+/// Conservative in the only direction that matters: a box grown by slack widens
+/// that range and so makes the claim harder to satisfy, never easier.
+fn blend_toward_plane_clamps_back(
+    value: f32,
+    box_min: Vec3,
+    box_max: Vec3,
+    plane_point: Vec3,
+    plane_normal: Vec3,
+    voxel_size: f32,
+) -> bool {
+    // In voxels, because that is the unit `apply` puts the plane distance in
+    // and the unit the band's own bounds are expressed in.
+    let middle = ((box_min + box_max) * 0.5 - plane_point).dot(plane_normal) / voxel_size;
+    let spread = ((box_max - box_min) * 0.5).dot(plane_normal.abs()) / voxel_size;
+    if value == INSIDE {
+        middle + spread <= INSIDE
+    } else if value == OUTSIDE {
+        middle - spread >= OUTSIDE
+    } else {
+        // Same floor as `leaves_constant_alone`: a constant part way through
+        // the band is a flat patch of real surface, which is where these two
+        // are meant to be doing something.
+        false
+    }
+}
+
 /// One locked copy of the field: the gesture itself, or one of its mirrors.
 ///
 /// The box is fixed at the moment the gesture starts and never moves, which is
@@ -1048,11 +1113,6 @@ struct MoveAnchor {
     lo: IVec3,
     hi: IVec3,
 }
-
-pub static PROBE_CULL: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-pub static PROBE_DENSE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-pub static PROBE_SAT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-pub static PROBE_UNSAT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 /// Which bricks of one locked copy hold a single value everywhere.
 ///
@@ -1431,12 +1491,10 @@ impl MoveStroke {
                     back_max += far.max(Vec3::ZERO);
                 }
                 if !reached {
-                    PROBE_CULL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     return BrickVerdict::Skip;
                 }
 
                 let Some(value) = preview.uniform else {
-                    PROBE_DENSE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     return BrickVerdict::Whole;
                 };
                 // A voxel at `p` reads from `p - displacement`, rounded outward
@@ -1447,14 +1505,8 @@ impl MoveStroke {
                 match fills
                     .reachable_from_elsewhere(preview.lo, preview.hi, back_min, back_max, value)
                 {
-                    None => {
-                        PROBE_SAT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        BrickVerdict::Skip
-                    }
-                    Some((near_lo, near_hi)) => {
-                        PROBE_UNSAT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        BrickVerdict::OnlyWithin(near_lo, near_hi)
-                    }
+                    None => BrickVerdict::Skip,
+                    Some((near_lo, near_hi)) => BrickVerdict::OnlyWithin(near_lo, near_hi),
                 }
             };
 
@@ -2521,12 +2573,20 @@ mod skipping_tests {
     #[test]
     fn the_constant_skip_reaches_past_what_a_radius_cull_alone_would() {
         // Two things at once. That the constant skip is doing anything at all
-        // -- flatten never uses it, so it is the control, and a brush that
-        // does use it has to visit strictly fewer bricks at the same radius in
-        // the same place. And that inflate's answer really does turn on the
-        // direction: it can leave solid interior alone only while it is adding
-        // and empty space alone only while it is carving, and getting that
-        // backwards would erode a model from the inside where nobody looks.
+        // -- a brush that uses it has to visit strictly fewer bricks than one
+        // that cannot, at the same radius in the same place. And that
+        // inflate's answer really does turn on the direction: it can leave
+        // solid interior alone only while it is adding and empty space alone
+        // only while it is carving, and getting that backwards would erode a
+        // model from the inside where nobody looks.
+        //
+        // The control is inflate pushed the way it cannot skip, which is the
+        // one brush and direction left with no constant test of any kind, so
+        // what it visits is what the radius cull alone leaves behind. Flatten
+        // used to serve as that control and no longer can: it proves its own
+        // constants against the plane it blends toward. A control has to be
+        // something that provably lacks the feature, not something that
+        // happens not to have it yet.
         let brush = |kind| Brush { kind, radius: 48.0, strength: 0.5, ..Brush::default() };
         let deep = Vec3::new(SURFACE - STAND_OFF, 100.0, 100.0);
         let clear = Vec3::new(SURFACE + STAND_OFF, 100.0, 100.0);
@@ -2535,9 +2595,7 @@ mod skipping_tests {
             ("into the solid", deep, BrushDirection::Add),
             ("out in the open", clear, BrushDirection::Subtract),
         ] {
-            // Flatten never uses the constant test, so what it visits is what
-            // the radius cull alone leaves behind.
-            let (control, whole) = visits(brush(BrushKind::Flatten), at, saturating);
+            let (control, whole) = visits(brush(BrushKind::Inflate), at, saturating.inverted());
             assert!(control < whole, "the radius cull did nothing, so there is no control here");
 
             // Move is in here too. It proves its constants against the locked
@@ -2545,7 +2603,14 @@ mod skipping_tests {
             // `MoveStroke` -- but the property being asserted is the same one:
             // a brush that can leave a saturated region alone has to visit
             // strictly fewer bricks than the radius cull alone leaves behind.
-            for kind in [BrushKind::Draw, BrushKind::Smooth, BrushKind::Pinch, BrushKind::Move] {
+            for kind in [
+                BrushKind::Draw,
+                BrushKind::Smooth,
+                BrushKind::Pinch,
+                BrushKind::Move,
+                BrushKind::Clay,
+                BrushKind::Flatten,
+            ] {
                 let (skipped, _) = visits(brush(kind), at, saturating);
                 assert!(
                     skipped < control,
@@ -2555,15 +2620,10 @@ mod skipping_tests {
             }
 
             let (with_grain, _) = visits(brush(BrushKind::Inflate), at, saturating);
-            let (against, _) = visits(brush(BrushKind::Inflate), at, saturating.inverted());
             assert!(
                 with_grain < control,
-                "inflate {where_} should leave a constant it can only push against the clamp alone"
-            );
-            assert_eq!(
-                against, control,
-                "inflate {where_} the other way round moves the value off the clamp, so it \
-                 cannot skip anything the radius does not already cull"
+                "inflate {where_} should leave a constant it can only push against the clamp \
+                 alone, and visit less than the same brush pushed the other way"
             );
         }
     }

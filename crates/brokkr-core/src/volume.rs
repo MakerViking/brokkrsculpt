@@ -81,6 +81,32 @@ pub enum BrickVerdict {
     OnlyWithin(IVec3, IVec3),
 }
 
+/// What the last edit's planning phase decided, brick by brick and voxel by
+/// voxel.
+///
+/// Bricks alone cannot answer whether the skipping is working. A brick the
+/// classifier narrowed to a two voxel slab still counts as one visited brick,
+/// so a brick ratio reads a 94 percent saving as no saving at all. The voxel
+/// counts are the ones to look at; the verdict tallies say which rule earned
+/// them.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct PlanStats {
+    /// Bricks the edit's box covers, whatever was decided about them.
+    pub bricks_in_box: usize,
+    /// Bricks the edit ruled out entirely, by either verdict.
+    pub bricks_skipped: usize,
+    /// Bricks resolved over the whole of what the box covers.
+    pub bricks_whole: usize,
+    /// Bricks narrowed to the part within reach of a different neighbour,
+    /// by [`BrickVerdict::OnlyNearDifferentNeighbours`] or
+    /// [`BrickVerdict::OnlyWithin`].
+    pub bricks_narrowed: usize,
+    /// Voxels the edit's box covers.
+    pub voxels_in_box: i64,
+    /// Voxels the edit will actually visit.
+    pub voxels_visited: i64,
+}
+
 /// One brick an edit has decided to visit, and where inside it.
 #[derive(Debug, Clone, Copy)]
 struct Visit {
@@ -120,6 +146,9 @@ struct EditScratch {
     visits: Vec<Visit>,
     /// Bricks lifted out of the map by the parallel path.
     taken: Vec<Taken>,
+    /// What the last planning pass decided. Counters only, never read by the
+    /// edit itself.
+    plan: PlanStats,
 }
 
 /// Apply an edit to one brick's voxels, returning whether anything changed.
@@ -697,6 +726,7 @@ impl Volume {
         };
 
         scratch.visits.clear();
+        scratch.plan = PlanStats::default();
         for bz in b_min.z..=b_max.z {
             for by in b_min.y..=b_max.y {
                 for bx in b_min.x..=b_max.x {
@@ -708,17 +738,26 @@ impl Volume {
                     if lo.cmpgt(hi).any() {
                         continue;
                     }
+                    scratch.plan.bricks_in_box += 1;
+                    scratch.plan.voxels_in_box +=
+                        (hi - lo + IVec3::ONE).as_i64vec3().element_product();
 
                     let uniform = scratch.fills[at(brick)];
                     match decide(&BrickPreview { coord, lo, hi, uniform }) {
-                        BrickVerdict::Skip => continue,
-                        BrickVerdict::Whole => {}
+                        BrickVerdict::Skip => {
+                            scratch.plan.bricks_skipped += 1;
+                            continue;
+                        }
+                        BrickVerdict::Whole => scratch.plan.bricks_whole += 1,
                         BrickVerdict::OnlyNearDifferentNeighbours => {
                             let Some(value) = uniform else {
                                 debug_assert!(
                                     false,
                                     "a brick with detail in it has no constant to leave alone"
                                 );
+                                scratch.plan.bricks_whole += 1;
+                                scratch.plan.voxels_visited +=
+                                    (hi - lo + IVec3::ONE).as_i64vec3().element_product();
                                 scratch.visits.push(Visit { coord, lo, hi });
                                 continue;
                             };
@@ -733,13 +772,16 @@ impl Volume {
                             else {
                                 // Nothing else is close enough to reach in, so
                                 // the whole brick stays the value it is.
+                                scratch.plan.bricks_skipped += 1;
                                 continue;
                             };
                             lo = lo.max(near_lo);
                             hi = hi.min(near_hi);
                             if lo.cmpgt(hi).any() {
+                                scratch.plan.bricks_skipped += 1;
                                 continue;
                             }
+                            scratch.plan.bricks_narrowed += 1;
                         }
                         BrickVerdict::OnlyWithin(near_lo, near_hi) => {
                             debug_assert!(
@@ -749,11 +791,15 @@ impl Volume {
                             lo = lo.max(near_lo);
                             hi = hi.min(near_hi);
                             if lo.cmpgt(hi).any() {
+                                scratch.plan.bricks_skipped += 1;
                                 continue;
                             }
+                            scratch.plan.bricks_narrowed += 1;
                         }
                     }
 
+                    scratch.plan.voxels_visited +=
+                        (hi - lo + IVec3::ONE).as_i64vec3().element_product();
                     scratch.visits.push(Visit { coord, lo, hi });
                 }
             }
@@ -857,6 +903,14 @@ impl Volume {
     /// skipped nothing.
     pub fn last_visited_bricks(&self) -> usize {
         self.scratch.visits.len()
+    }
+
+    /// What the last edit's planning phase decided.
+    ///
+    /// The voxel counts are the honest measure of the skipping; see
+    /// [`PlanStats`] for why the brick counts alone mislead.
+    pub fn last_plan(&self) -> PlanStats {
+        self.scratch.plan
     }
 
     /// Roll back a brick that an edit's box clipped but never actually reached.
@@ -1465,6 +1519,49 @@ mod tests {
             assert!(dropped > 0, "no uniform brick was dropped whole at reach {reach}");
             assert!(narrowed > 0, "no uniform brick was narrowed to a slab at reach {reach}");
         }
+    }
+
+    #[test]
+    fn the_plan_counters_account_for_every_brick_of_the_box() {
+        // The counters are what the skipping is judged by, so they have to be
+        // arithmetic rather than an impression. Every brick of the box lands
+        // in exactly one of the three tallies, and the voxels actually visited
+        // are a subset of the ones the box covers.
+        //
+        // The narrowed count is the one worth pinning: a brick narrowed to a
+        // slab still counts as one visited brick, so a brick ratio reads a
+        // saving of ninety odd percent inside that brick as no saving at all.
+        // That is what sent a previous session looking in the wrong place.
+        let mut volume = Volume::new(1.0);
+        volume.seed_sphere(Vec3::splat(64.0), 46.0);
+
+        let mut scratch = EditScratch::default();
+        volume.plan_visits(
+            IVec3::splat(-8),
+            IVec3::splat(136),
+            2,
+            &|preview: &BrickPreview| match preview.uniform {
+                Some(_) => BrickVerdict::OnlyNearDifferentNeighbours,
+                None => BrickVerdict::Whole,
+            },
+            &mut scratch,
+        );
+
+        let plan = scratch.plan;
+        assert_eq!(
+            plan.bricks_skipped + plan.bricks_whole + plan.bricks_narrowed,
+            plan.bricks_in_box,
+            "the three verdicts do not add up to the box: {plan:?}"
+        );
+        assert!(plan.bricks_narrowed > 0 && plan.bricks_skipped > 0, "nothing to count: {plan:?}");
+        assert!(plan.voxels_visited < plan.voxels_in_box, "nothing was left out: {plan:?}");
+
+        let visited: i64 = scratch
+            .visits
+            .iter()
+            .map(|visit| (visit.hi - visit.lo + IVec3::ONE).as_i64vec3().element_product())
+            .sum();
+        assert_eq!(visited, plan.voxels_visited, "the voxel count disagrees with the visits");
     }
 
     #[test]

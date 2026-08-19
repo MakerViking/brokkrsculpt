@@ -58,4 +58,4 @@ pub use raycast::{Hit, raycast};
 pub use region::FieldRegion;
 pub use stroke::{MAX_STAMPS_PER_EVENT, Stroke};
 pub use undo::{DEFAULT_HISTORY_BUDGET, History, HistoryStats, StrokeEdit};
-pub use volume::{BrickPreview, BrickVerdict, Volume, VolumeStats};
+pub use volume::{BrickPreview, BrickVerdict, PlanStats, Volume, VolumeStats};
