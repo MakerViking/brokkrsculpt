@@ -1765,6 +1765,51 @@ impl Brokkr {
         }
     }
 
+    /// Export the sculpt to a staging file and open it in OrcaSlicer.
+    ///
+    /// A staging path under the state directory rather than a dialog: this is a
+    /// handoff and not a save, the file is the slicer's input rather than the
+    /// user's document, and asking where to put something they will not look
+    /// for again is a question with no useful answer.
+    ///
+    /// 3MF rather than STL, because it carries units. An STL does not, so a
+    /// slicer has to guess millimetres, and every slicer guessing right is a
+    /// convention rather than a guarantee.
+    ///
+    /// Runs on the update thread, like `export` already does. The export itself
+    /// is the slow half and it is the same work the Export buttons do.
+    fn hand_to_slicer(&mut self) {
+        let Some(slicer) = crate::slicer::find() else {
+            self.status = "could not find OrcaSlicer — install it and try again".to_string();
+            return;
+        };
+        let Some(staged) = crate::paths::state_file("handoff.3mf") else {
+            self.status = "could not work out where to put the file".to_string();
+            return;
+        };
+        if let Some(parent) = staged.parent()
+            && let Err(error) = std::fs::create_dir_all(parent)
+        {
+            self.status = format!("could not make {}: {error}", parent.display());
+            return;
+        }
+
+        self.export(ExportFormat::ThreeMf, &staged);
+        // `export` refuses a model that would not print, and says so in the
+        // status. Handing the slicer a file that was never written would
+        // replace that message with a less useful one.
+        if !staged.is_file() || self.status.contains("not exported") {
+            return;
+        }
+
+        match crate::slicer::open(&slicer, &staged) {
+            Ok(()) => {
+                self.status = format!("opened in {}", slicer.display());
+            }
+            Err(why) => self.status = format!("could not open the slicer: {why}"),
+        }
+    }
+
     /// The voxel size a request actually lands on.
     fn clamped_voxel_size(requested: f32) -> f32 {
         requested.clamp(FINEST_VOXEL_MM, COARSEST_VOXEL_MM)
@@ -2222,6 +2267,42 @@ impl Brokkr {
                 self.top_menu = None;
                 self.status = format!("report bugs at {ISSUE_URL}");
                 log::info!("{}", self.diagnostics());
+            }
+            Message::OpenInSlicer => {
+                self.top_menu = None;
+                self.hand_to_slicer();
+            }
+            Message::PrinterChecked => {
+                self.top_menu = None;
+                let Some(printer) =
+                    crate::printer::configured(crate::paths::config_file("printer").as_deref())
+                else {
+                    // Says where to write it rather than only that it is
+                    // missing: a setting with no interface needs its file named
+                    // or it may as well not exist.
+                    self.status = match crate::paths::config_file("printer") {
+                        Some(path) => format!(
+                            "no printer set — put `host = 192.168.0.46` in {}",
+                            path.display()
+                        ),
+                        None => "could not work out where the printer config lives".to_string(),
+                    };
+                    return Task::none();
+                };
+                self.status = format!("asking {}…", printer.host);
+                return Task::perform(
+                    async move {
+                        crate::printer::status(&printer.host, printer.port)
+                            .map(|status| status.summary())
+                    },
+                    Message::PrinterAnswered,
+                );
+            }
+            Message::PrinterAnswered(answer) => {
+                self.status = match answer {
+                    Ok(summary) => summary,
+                    Err(why) => format!("could not reach the printer: {why}"),
+                };
             }
             Message::BugReportOpened => {
                 self.top_menu = None;

@@ -233,6 +233,13 @@ pub enum Message {
     /// The strip was laid out this many pixels wide.
     TimelineResized(f32),
 
+    /// Export the sculpt to a staging file and open it in OrcaSlicer.
+    OpenInSlicer,
+    /// Ask the configured printer what it is doing.
+    PrinterChecked,
+    /// What it said.
+    PrinterAnswered(Result<String, String>),
+
     /// Open the bug report dialog.
     BugReportOpened,
     /// The description editor did something.

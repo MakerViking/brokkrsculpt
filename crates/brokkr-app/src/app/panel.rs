@@ -379,6 +379,10 @@ impl Brokkr {
                     .push(entry("Save As…", Message::SaveAsRequested))
                     .push(separator())
                     .push(exports)
+                    // Below the exports, because it IS an export -- of a file
+                    // the user does not have to name or find afterwards.
+                    .push(entry("Open in OrcaSlicer", Message::OpenInSlicer))
+                    .push(entry("Check the printer", Message::PrinterChecked))
             }
             // No Settings menu: the properties panel already carries every
             // setting there is, and a second surface for the same state would

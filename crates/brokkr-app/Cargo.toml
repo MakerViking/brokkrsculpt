@@ -22,6 +22,7 @@ glam.workspace = true
 iced = { workspace = true, features = ["advanced", "wgpu", "debug"] }
 log.workspace = true
 rfd.workspace = true
+serde_json = "1.0.151"
 # The bug report's one and only network call. `default-features = false` with
 # just `rustls` is what keeps this to a measured 17 compiled crates for this
 # target: no proxy support, no cookies, no charset transcoding, no gzip, and
