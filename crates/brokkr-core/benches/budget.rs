@@ -79,13 +79,22 @@ const STEPS: usize = 240;
 /// Brush radii to sweep, in voxels.
 ///
 /// The application ships a 0.25 mm voxel and a radius slider a user drags from
-/// a few millimetres to a couple of centimetres, so these are the 3 mm, 10 mm
-/// and 20 mm settings from the tool strip. Everything in this harness is scaled
-/// in voxels, so the numbers transfer directly.
+/// a quarter of a millimetre to twenty, so these are the 3 mm, 10 mm and 20 mm
+/// settings from the tool strip. Everything in this harness is scaled in
+/// voxels, so the numbers transfer directly.
 ///
-/// The largest of the three is the case this file did not cover for a long
-/// time, and it was three times over budget when it was finally measured. A
-/// gate that only ever exercises the default radius is not a gate.
+/// The largest is the top of the slider, and it has to stay that way: a gate
+/// that stops short of what the interface offers is not a gate, and a slider
+/// that goes past what the gate covers is a promise nothing checks. **Move the
+/// two together or neither.**
+///
+/// This file is what settled where that ceiling sits. Raising it to 30 mm was
+/// tried and refused outright -- draw and pinch p95 at 10.2 and 10.9 ms, edit
+/// plus remesh at 24.8 ms against the 16 ms frame. 25 mm passed every single
+/// stamp row and then failed the fast drag, which is the case that matters:
+/// 11.3 ms of edit against 8, and 15.7 ms p95 combined with a 17.8 ms worst,
+/// so a dropped frame now and again in exactly the gesture a user makes fast.
+/// 20 mm passes all of it.
 const RADII: [f32; 3] = [12.0, 40.0, 80.0];
 
 /// The budget a radius is held to: [`LARGE_BRUSH_EDIT_BUDGET`] for the widest

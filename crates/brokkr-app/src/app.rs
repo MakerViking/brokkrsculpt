@@ -36,16 +36,32 @@ use crate::viewport::SharedFrame;
 const MODEL_RADIUS_MM: f32 = 30.0;
 const VOXEL_SIZE_MM: f32 = 0.25;
 
-/// Range the voxel size may be resampled to, in millimetres.
-///
-/// The lower bound is where the mesh pool has been measured to hold the result:
-/// a 60 mm ball at 0.055 mm comes to 11.2 million triangles and 6.2 million
-/// vertices against a pool of 8 million. Going finer would overflow it and put
-/// an incomplete model on screen, so the interface will not offer it.
 /// Range the brush radius may be nudged to with the keyboard, in millimetres.
 /// The same range the slider offers, so the two cannot disagree.
+///
+/// It was 12 mm, which was too small to grab a form with Move. The new ceiling
+/// is measured rather than chosen, and `cargo bench -p brokkr-core` is what
+/// measured it: a brush covers a fixed world radius, so its cost grows with the
+/// cube of it, and what a drag has to fit inside is the 16 ms frame -- edit plus
+/// remesh, per pointer event.
+///
+/// 30 mm was tried first, on an estimate that undercounted the remesh, and the
+/// bench refused it flatly. 25 mm passed every single stamp row and then failed
+/// the **fast drag**, which is the case that decides this: fewer pointer
+/// samples means more interpolated stamps per event, and it came to 15.7 ms p95
+/// with a 17.8 ms worst against the 16 ms frame. A brush that is fluid until
+/// you hurry is not fluid.
+///
+/// So 20 mm, where all of it passes, and the bench's own sweep tops out at the
+/// same place. **Move the two together or neither** -- a slider that goes past
+/// what the gate covers is a promise nothing checks.
+///
+/// The cap is the same for every brush, deliberately. Move is among the
+/// cheapest and could afford more, but a per-brush ceiling means the radius
+/// jumps when the tool changes, and a number that moves on its own is worse
+/// than a number that is merely smaller than you wanted.
 pub(crate) const MIN_RADIUS_MM: f32 = 0.25;
-pub(crate) const MAX_RADIUS_MM: f32 = 12.0;
+pub(crate) const MAX_RADIUS_MM: f32 = 20.0;
 
 /// Range the brush strength may take, matching the slider.
 pub(crate) const MIN_STRENGTH: f32 = 0.02;
@@ -58,6 +74,12 @@ pub(crate) const MAX_STRENGTH: f32 = 0.80;
 const RADIUS_PER_PIXEL: f32 = 0.006;
 const STRENGTH_PER_PIXEL: f32 = 0.002;
 
+/// Range the voxel size may be resampled to, in millimetres.
+///
+/// The lower bound is where the mesh pool has been measured to hold the result:
+/// a 60 mm ball at 0.055 mm comes to 11.2 million triangles and 6.2 million
+/// vertices against a pool of 8 million. Going finer would overflow it and put
+/// an incomplete model on screen, so the interface will not offer it.
 const FINEST_VOXEL_MM: f32 = 0.06;
 const COARSEST_VOXEL_MM: f32 = 2.0;
 
