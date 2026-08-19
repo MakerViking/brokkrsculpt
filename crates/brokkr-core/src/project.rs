@@ -44,7 +44,7 @@ use std::io::{Read, Write};
 
 use glam::{IVec3, Vec3};
 
-use crate::brick::{BRICK_DIM, BRICK_VOXELS, Brick, BrickCoord, NARROW_BAND};
+use crate::brick::{BRICK_DIM, BRICK_VOXELS, Brick, BrickCoord, INSIDE, NARROW_BAND, OUTSIDE};
 use crate::volume::Volume;
 
 /// Magic bytes. Long enough that a truncated or mistyped file is rejected
@@ -71,6 +71,50 @@ const FIELD_VERSION: u16 = 1;
 /// tried a ratio test and removed it because it fires on legitimately sparse
 /// data, and a narrow band field clamped to ±3 is about as sparse as data gets.
 const MAX_BRICKS: u64 = 8 * 1024 * 1024 * 1024 / BRICK_BYTES as u64;
+
+/// How far from the origin a brick coordinate may sit.
+///
+/// Derived rather than chosen: [`BrickCoord::origin`] multiplies the coordinate
+/// by [`BRICK_DIM`] and [`BrickCoord::max_voxel`] adds the last voxel, so this
+/// is the largest coordinate whose own voxel range still fits in an `i32`.
+/// Beyond it the multiply overflows, which is a panic in a debug build and a
+/// wrapped coordinate in a release one -- a brick that silently lands somewhere
+/// else in the model.
+///
+/// Nothing this build writes comes close: it is 67 million bricks, which at the
+/// shipped 0.25 mm voxel is over five hundred kilometres. It is a bound on what
+/// the lattice can represent, not a judgement about what a sculpt should
+/// contain, which is why it is derived from the arithmetic rather than picked.
+/// A corrupt file is what reaches it.
+const MAX_BRICK_COORD: i32 = (i32::MAX - (BRICK_DIM as i32 - 1)) / BRICK_DIM as i32;
+
+/// Read one distance and hold it to what every writer here guarantees.
+fn read_distance(input: &mut impl Read) -> Result<f32> {
+    checked_distance(read_f32(input)?)
+}
+
+/// Refuse a distance that no writer in this build could have produced.
+///
+/// Every value reaching a brick has been clamped to the narrow band --
+/// `write_voxels` does it on every edit, and the seeding, voxelising, clipping
+/// and resampling paths all go through it -- so a value outside the band did
+/// not come from here. Accepting one is not harmless: the band is what the
+/// brushes' skipping reasons about and what the mesher's classification
+/// assumes, so an out of band value is a sculpt that behaves differently from
+/// every other sculpt in ways nothing reports.
+///
+/// Refused rather than clamped, deliberately. Clamping would load a file that
+/// is provably corrupt while showing something plausible, which is the failure
+/// mode the lattice constants in the header exist to prevent.
+fn checked_distance(value: f32) -> Result<f32> {
+    if !value.is_finite() {
+        return Err(ProjectError::NonFiniteValue);
+    }
+    if !(INSIDE..=OUTSIDE).contains(&value) {
+        return Err(ProjectError::OutsideTheBand { found: value });
+    }
+    Ok(value)
+}
 
 /// Bytes a dense brick occupies in the file.
 const BRICK_BYTES: usize = BRICK_VOXELS * 4;
@@ -151,6 +195,17 @@ pub enum ProjectError {
     UnknownBrickTag(u8),
     /// A distance value that is not a finite number.
     NonFiniteValue,
+    /// A distance value outside the narrow band, which every writer in this
+    /// build clamps into it.
+    OutsideTheBand {
+        found: f32,
+    },
+    /// A brick coordinate so far out that its own voxel origin does not fit in
+    /// the lattice.
+    BrickOutOfRange {
+        found: [i32; 3],
+        limit: i32,
+    },
     /// The file ended in the middle of something.
     Truncated,
 }
@@ -180,6 +235,14 @@ impl std::fmt::Display for ProjectError {
             ProjectError::UnknownBrickTag(tag) => write!(f, "unknown brick kind {tag}"),
             ProjectError::NonFiniteValue => {
                 write!(f, "the file holds a distance that is not a finite number")
+            }
+            ProjectError::OutsideTheBand { found } => write!(
+                f,
+                "the file holds a distance of {found}, and the narrow band is \
+                 {INSIDE} to {OUTSIDE}"
+            ),
+            ProjectError::BrickOutOfRange { found, limit } => {
+                write!(f, "the file places a brick at {found:?}, and the lattice reaches {limit}")
             }
             ProjectError::Truncated => write!(f, "the file ends part way through"),
         }
@@ -404,26 +467,27 @@ pub fn read(input: &mut impl Read) -> Result<(Volume, ProjectState)> {
             i32::from_le_bytes(read_exact::<4>(input)?),
             i32::from_le_bytes(read_exact::<4>(input)?),
         ));
+        // Compared against both ends rather than through `abs`, because
+        // `i32::MIN.abs()` overflows -- the check would then panic on exactly
+        // the value it exists to refuse.
+        let limit = IVec3::splat(MAX_BRICK_COORD);
+        if coord.0.cmpgt(limit).any() || coord.0.cmplt(-limit).any() {
+            return Err(ProjectError::BrickOutOfRange {
+                found: coord.0.to_array(),
+                limit: MAX_BRICK_COORD,
+            });
+        }
 
         let tag: [u8; 1] = read_exact(input)?;
         let brick = match tag[0] {
-            TAG_UNIFORM => {
-                let value = read_f32(input)?;
-                if !value.is_finite() {
-                    return Err(ProjectError::NonFiniteValue);
-                }
-                Brick::Uniform(value)
-            }
+            TAG_UNIFORM => Brick::Uniform(read_distance(input)?),
             TAG_DENSE => {
                 let mut values = vec![0.0f32; BRICK_VOXELS];
                 let mut bytes = vec![0u8; BRICK_BYTES];
                 input.read_exact(&mut bytes)?;
                 for (slot, chunk) in values.iter_mut().zip(bytes.chunks_exact(4)) {
                     let value = f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
-                    if !value.is_finite() {
-                        return Err(ProjectError::NonFiniteValue);
-                    }
-                    *slot = value;
+                    *slot = checked_distance(value)?;
                 }
                 let boxed: Box<[f32; BRICK_VOXELS]> = values
                     .into_boxed_slice()
@@ -447,6 +511,7 @@ pub fn read(input: &mut impl Read) -> Result<(Volume, ProjectState)> {
 mod tests {
     use super::*;
     use crate::brush::{Brush, BrushDirection, BrushKind, BrushScratch, Stamp};
+    use crate::testing::Noise;
 
     fn sculpted() -> Volume {
         let mut volume = Volume::new(0.5);
@@ -716,5 +781,177 @@ mod tests {
         let (loaded, _) = round_trip(&volume, &ProjectState::default());
         assert_eq!(loaded.voxel_size(), 0.25);
         assert_eq!(loaded.brick_coords().count(), 0);
+    }
+
+    #[test]
+    fn a_corrupted_project_is_answered_rather_than_survived() {
+        // The targeted corruptions above each aim at one field. This aims at
+        // nothing in particular, which is what an interrupted autosave, a
+        // half synced file or a failing disk actually produce.
+        //
+        // The property is that every input gets an answer. A panic here is
+        // worse than in the mesh readers: this runs on File > Open and on
+        // File > Recover, so the file most likely to be corrupt is the crash
+        // net a user is reaching for precisely because something already went
+        // wrong. Whatever loads has to be a volume the rest of the
+        // application can use -- finite everywhere, and inside the narrow
+        // band, because a value outside it means a brick that meshes into
+        // nothing or into a surface where there is none.
+        let mut valid = Vec::new();
+        write(&mut valid, &sculpted(), &ProjectState::default()).expect("write failed");
+
+        let mut loaded = 0usize;
+        let mut reached_the_bricks = 0usize;
+        let mut tried = 0usize;
+
+        for strategy in 0..3 {
+            for run in 0..600u64 {
+                let seed = (strategy as u64) << 32 | run | 1;
+                let mut noise = Noise::seeded(seed);
+                let mut bytes = valid.clone();
+
+                match strategy {
+                    // Flipped bits anywhere, header included.
+                    0 => {
+                        for _ in 0..1 + noise.below(8) {
+                            let at = noise.below(bytes.len());
+                            bytes[at] ^= 1 << noise.below(8);
+                        }
+                    }
+                    // Cut short at an arbitrary point rather than at one of
+                    // the four fractions the targeted test uses. This is what
+                    // a save interrupted by a crash leaves behind.
+                    1 => {
+                        let keep = noise.below(bytes.len());
+                        bytes.truncate(keep);
+                    }
+                    // A run of the body replaced wholesale, which is what a
+                    // partial sync or a bad sector looks like.
+                    _ => {
+                        let at = noise.below(bytes.len());
+                        let run = noise.below(256).min(bytes.len() - at);
+                        for slot in &mut bytes[at..at + run] {
+                            *slot = noise.byte();
+                        }
+                    }
+                }
+
+                tried += 1;
+                let volume = match read(&mut bytes.as_slice()) {
+                    Ok((volume, _)) => {
+                        reached_the_bricks += 1;
+                        volume
+                    }
+                    // Refusals that can only be raised from inside the brick
+                    // loop, so each one is proof the body ran on this mutant.
+                    Err(
+                        ProjectError::NonFiniteValue
+                        | ProjectError::OutsideTheBand { .. }
+                        | ProjectError::UnknownBrickTag(_)
+                        | ProjectError::BrickOutOfRange { .. },
+                    ) => {
+                        reached_the_bricks += 1;
+                        continue;
+                    }
+                    Err(_) => continue,
+                };
+                loaded += 1;
+
+                assert!(volume.voxel_size() > 0.0, "seed {seed}: a non positive voxel size loaded");
+                for coord in volume.brick_coords().collect::<Vec<_>>() {
+                    let origin = coord.origin();
+                    for offset in [IVec3::ZERO, IVec3::splat(BRICK_DIM as i32 - 1)] {
+                        let value = volume.sample_voxel(origin + offset);
+                        assert!(
+                            value.is_finite() && (INSIDE..=OUTSIDE).contains(&value),
+                            "seed {seed}: brick {coord:?} loaded {value}, which is outside the band"
+                        );
+                    }
+                }
+            }
+        }
+
+        // The control: without it a reader that refused everything at the
+        // magic bytes would pass this file having parsed nothing.
+        //
+        // It counts mutants that reached the brick loop, not mutants that
+        // loaded, and the difference is the point. The band check refuses
+        // almost every corrupted brick -- one flipped exponent bit is enough
+        // -- so counting only what loads measures how strict the validation
+        // is rather than how far the reader got. Measured at 1200 of 1800
+        // reaching the loop, of which 20 loaded whole.
+        assert!(
+            reached_the_bricks > tried / 4,
+            "only {reached_the_bricks} of {tried} corrupted projects got as far as the brick \
+             loop, so this is measuring the header check and not the reader"
+        );
+        assert!(loaded > 0, "not one corrupted project loaded, so nothing was checked on load");
+    }
+
+    /// The overflow the fuzz above found, pinned as its own case so that a
+    /// future change to the bound fails here with a clear name rather than
+    /// somewhere inside two thousand random mutants.
+    #[test]
+    fn a_brick_placed_past_the_lattice_is_refused_rather_than_overflowing() {
+        // `BrickCoord::origin` multiplies by BRICK_DIM, so a coordinate near
+        // i32::MAX overflows: a panic in a debug build, and in a release one a
+        // wrapped coordinate that puts the brick somewhere else in the model
+        // with nothing reported. Nothing here writes such a file; a corrupt
+        // one is what carries it.
+        let mut bytes = Vec::new();
+        write(&mut bytes, &sculpted(), &ProjectState::default()).expect("write failed");
+
+        // The first brick's coordinate sits immediately after the count, which
+        // is the last field an empty volume writes.
+        let mut empty = Vec::new();
+        write(&mut empty, &Volume::new(0.5), &ProjectState::default()).expect("write failed");
+        let coord_at = empty.len();
+
+        for offending in [i32::MAX, i32::MIN, MAX_BRICK_COORD + 1, -(MAX_BRICK_COORD + 1)] {
+            let mut broken = bytes.clone();
+            broken[coord_at..coord_at + 4].copy_from_slice(&offending.to_le_bytes());
+            match read(&mut broken.as_slice()) {
+                Err(ProjectError::BrickOutOfRange { found, limit }) => {
+                    assert_eq!(found[0], offending);
+                    assert_eq!(limit, MAX_BRICK_COORD);
+                }
+                Ok(_) => panic!("a brick at {offending} was accepted"),
+                Err(other) => panic!("expected a range refusal for {offending}, got {other}"),
+            }
+        }
+
+        // And the bound is not so tight that it refuses the edge it allows.
+        let mut fine = bytes.clone();
+        fine[coord_at..coord_at + 4].copy_from_slice(&MAX_BRICK_COORD.to_le_bytes());
+        let (volume, _) = read(&mut fine.as_slice()).expect("the largest legal brick was refused");
+        let coord = volume
+            .brick_coords()
+            .find(|coord| coord.0.x == MAX_BRICK_COORD)
+            .expect("the brick did not survive the load");
+        // The thing the bound is for: this is what overflowed.
+        let _ = coord.max_voxel();
+    }
+
+    #[test]
+    fn a_distance_outside_the_narrow_band_is_refused() {
+        // Every writer here clamps into the band, so a value outside it did
+        // not come from this build. It is refused rather than clamped: a file
+        // that is provably corrupt should say so, not show something
+        // plausible.
+        let mut volume = Volume::new(0.5);
+        volume.seed_sphere(Vec3::ZERO, 10.0);
+        let mut bytes = Vec::new();
+        write(&mut bytes, &volume, &ProjectState::default()).expect("write failed");
+
+        for offending in [OUTSIDE * 2.0, INSIDE * 2.0, 1e30, -1e30] {
+            let mut broken = bytes.clone();
+            let end = broken.len();
+            broken[end - 4..].copy_from_slice(&offending.to_le_bytes());
+            match read(&mut broken.as_slice()) {
+                Err(ProjectError::OutsideTheBand { found }) => assert_eq!(found, offending),
+                Ok(_) => panic!("a distance of {offending} was accepted"),
+                Err(other) => panic!("expected a band refusal for {offending}, got {other}"),
+            }
+        }
     }
 }

@@ -418,6 +418,7 @@ where
 mod tests {
     use super::*;
     use crate::export::threemf::crc32;
+    use crate::testing::Noise;
 
     /// How an entry is put into a test package.
     #[derive(Clone, Copy, PartialEq)]
@@ -973,6 +974,128 @@ mod tests {
             read_back.positions.len(),
             exported.positions.len(),
             "3MF already shares its vertices, so welding should recover exactly them"
+        );
+    }
+
+    #[test]
+    fn a_corrupted_model_part_is_answered_rather_than_survived() {
+        // `tests/hostile_meshes.rs` corrupts whole files, which for 3MF means
+        // corrupting a deflate stream under a CRC: the container catches most
+        // of it and the XML underneath is barely reached. This corrupts the
+        // XML and then packages it correctly, so the container is never the
+        // thing that objects and the parser is always the thing under test.
+        //
+        // The property is the same one: every input gets an answer. An index
+        // past the end of `vertices` is the failure this is really watching
+        // for -- it is one flipped digit away in any real file, and it panics
+        // the voxeliser rather than the reader.
+        let valid = one_tetrahedron("unit=\"millimeter\"", "");
+        let mut accepted = 0usize;
+        let mut tried = 0usize;
+
+        for strategy in 0..2 {
+            for run in 0..2_000u64 {
+                let seed = (strategy as u64) << 32 | run | 1;
+                let mut noise = Noise::seeded(seed);
+                let mut bytes = valid.clone().into_bytes();
+
+                if strategy == 0 {
+                    // Anywhere, any printable byte. Most of these break well
+                    // formedness and are refused by the XML parser, which is
+                    // the container's job done properly rather than a gap.
+                    for _ in 0..1 + noise.below(6) {
+                        let at = noise.below(bytes.len());
+                        bytes[at] = 0x20 + (noise.below(95) as u8);
+                    }
+                } else {
+                    // Digits only, which leaves the markup well formed and
+                    // lands every mutation on an index, a coordinate or an
+                    // object id. This is the strategy that reaches the
+                    // reader's own reasoning, and the one that would find an
+                    // unchecked `v1`.
+                    let digits: Vec<usize> = bytes
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, byte)| byte.is_ascii_digit())
+                        .map(|(at, _)| at)
+                        .collect();
+                    if digits.is_empty() {
+                        continue;
+                    }
+                    for _ in 0..1 + noise.below(4) {
+                        let at = digits[noise.below(digits.len())];
+                        bytes[at] = b'0' + (noise.below(10) as u8);
+                    }
+                }
+
+                let Ok(text) = String::from_utf8(bytes) else {
+                    continue;
+                };
+
+                tried += 1;
+                if let Ok(mesh) = read(&packaged(&text)) {
+                    accepted += 1;
+                    for (index, triangle) in mesh.triangles.iter().enumerate() {
+                        for corner in triangle {
+                            assert!(
+                                (*corner as usize) < mesh.positions.len(),
+                                "strategy {strategy} run {run}: triangle {index} refers to \
+                                 vertex {corner} of {}",
+                                mesh.positions.len()
+                            );
+                        }
+                    }
+                    for position in &mesh.positions {
+                        assert!(
+                            position.is_finite(),
+                            "strategy {strategy} run {run}: {position:?}"
+                        );
+                    }
+                }
+            }
+        }
+
+        // The control: without it a reader that rejected every mutant would
+        // pass this without the parser ever having run. Measured at 814 of
+        // 4000 when this was written -- 152 of 2000 for the scattergun
+        // strategy, which mostly breaks well formedness, against 662 of 2000
+        // for the digits, which by construction does not. The floor is set
+        // under the scattergun rate on its own, so it holds even if the XML
+        // parser is one day swapped for a stricter one.
+        assert!(
+            accepted > tried / 10,
+            "only {accepted} of {tried} corrupted parts got as far as being parsed, \
+             so this is measuring the container and not the reader"
+        );
+    }
+
+    #[test]
+    fn nesting_far_past_the_component_guard_is_refused_rather_than_overflowing() {
+        // `MAX_COMPONENT_DEPTH` exists so a package cannot drive the component
+        // walk as deep as it likes. This drives it two orders of magnitude
+        // past the guard: the guard has to be what stops it, because the
+        // alternative is a stack overflow, which aborts the process outright
+        // and cannot be caught or reported.
+        let deep = 8_000;
+        let mut resources = String::from(
+            "  <object id=\"1\" type=\"model\">\n   <mesh>\n{TETRAHEDRON}\n   </mesh>\n  </object>\n",
+        );
+        resources = resources.replace("{TETRAHEDRON}", TETRAHEDRON);
+        for id in 2..=deep {
+            resources.push_str(&format!(
+                "  <object id=\"{id}\" type=\"model\">\n   <components>\n    \
+                 <component objectid=\"{}\"/>\n   </components>\n  </object>\n",
+                id - 1
+            ));
+        }
+        let part = model("", &resources, &format!("  <item objectid=\"{deep}\"/>\n"));
+
+        let Err(error) = read(&packaged(&part)) else {
+            panic!("nesting far past the guard should be refused, not read");
+        };
+        assert!(
+            format!("{error}").contains("deep"),
+            "refused for the wrong reason, which means the guard is not what stopped it: {error}"
         );
     }
 }

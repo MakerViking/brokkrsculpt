@@ -34,6 +34,8 @@ pub mod raycast;
 pub mod region;
 pub mod resample;
 pub mod stroke;
+#[cfg(test)]
+mod testing;
 pub mod undo;
 pub mod volume;
 pub mod voxelise;
