@@ -217,6 +217,21 @@ pub enum SpaceMouseSetting {
 #[derive(Debug, Clone)]
 pub enum Message {
     Pointer(PointerEvent),
+    /// The pointer moved over the timeline strip, at this offset in pixels
+    /// from its left edge.
+    ///
+    /// Carried separately from `Pointer` because it is a different widget with
+    /// its own coordinate space, and because `mouse_area`'s press carries no
+    /// position at all -- this is what a press then acts on.
+    TimelineHover(f32),
+    TimelinePressed,
+    TimelineReleased,
+    TimelineLeft,
+    /// Remove the key under the pointer.
+    TimelineRemoveKey,
+    TimelinePlayToggled,
+    /// The strip was laid out this many pixels wide.
+    TimelineResized(f32),
     /// One presented frame, used to drive the frame rate readout and to keep
     /// the viewport redrawing while a stroke is in progress.
     Frame,

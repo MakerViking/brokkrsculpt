@@ -267,3 +267,38 @@ pub fn tool_strip(_theme: &iced::Theme) -> iced::widget::container::Style {
         ..Default::default()
     }
 }
+
+/// The timeline's empty track.
+///
+/// Darker than a panel so the strip reads as a groove cut into the layout
+/// rather than another surface floating on it.
+pub fn timeline_track(_theme: &iced::Theme) -> iced::widget::container::Style {
+    iced::widget::container::Style {
+        background: Some(BG_DEEP.into()),
+        border: iced::Border { radius: RADIUS_SM.into(), width: 1.0, color: LINE },
+        ..Default::default()
+    }
+}
+
+/// One stored key.
+pub fn timeline_key(_theme: &iced::Theme) -> iced::widget::container::Style {
+    iced::widget::container::Style {
+        background: Some(TEXT_DIM.into()),
+        border: iced::Border { radius: 2.0.into(), ..Default::default() },
+        ..Default::default()
+    }
+}
+
+/// A key under the pointer, or being dragged.
+pub fn timeline_key_lit(_theme: &iced::Theme) -> iced::widget::container::Style {
+    iced::widget::container::Style {
+        background: Some(ACCENT.into()),
+        border: iced::Border { radius: 2.0.into(), ..Default::default() },
+        ..Default::default()
+    }
+}
+
+/// The playhead.
+pub fn timeline_playhead(_theme: &iced::Theme) -> iced::widget::container::Style {
+    iced::widget::container::Style { background: Some(ACCENT_HOT.into()), ..Default::default() }
+}

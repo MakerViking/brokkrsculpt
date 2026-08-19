@@ -263,6 +263,9 @@ pub struct Brokkr {
     /// The model's bounding radius, refreshed on remesh. `Volume::bounding_radius`
     /// walks the brick map, so it is not something to call per frame.
     model_radius: f32,
+    /// Stored views on the strip above the viewport, and the state of
+    /// scrubbing through them.
+    timeline: crate::timeline::Timeline,
     /// The navigation cube's geometry, swapped to the renderer the same way.
     cube: brokkr_gpu::OverlayBatch,
     /// The cube part under the pointer, lit so a click's effect is visible
@@ -554,6 +557,7 @@ impl Brokkr {
             sizing: None,
             dynamic_radius: false,
             model_radius: MODEL_RADIUS_MM,
+            timeline: crate::timeline::Timeline::new(),
             cube: brokkr_gpu::OverlayBatch::default(),
             cube_hover: None,
             flight: None,
@@ -1366,7 +1370,33 @@ impl Brokkr {
     /// Shared by the explicit save and the autosave so the two cannot record
     /// different things.
     fn project_state(&self) -> brokkr_core::ProjectState {
-        brokkr_core::ProjectState {
+        brokkr_core::ProjectState { view: self.current_view(), keys: self.timeline.keys.clone() }
+    }
+
+    /// Put the camera where a view says, and nothing else.
+    ///
+    /// The counterpart to `apply_view`, and the difference between them is the
+    /// whole policy of the timeline: **going to a key restores everything it
+    /// holds, and playing through the keys moves only the camera.** A
+    /// fly-through that reached over and changed the brush, or switched a
+    /// mirror plane on halfway, would be alarming rather than useful.
+    fn fly_camera_to(&mut self, view: &brokkr_core::View) {
+        self.camera.target = view.camera_target;
+        self.camera.distance = view.camera_distance;
+        self.camera.yaw = view.camera_yaw;
+        self.camera.pitch = view.camera_pitch;
+        self.camera.roll = view.camera_roll;
+        self.publish_camera();
+        self.refresh_overlay();
+    }
+
+    /// Where the camera is and what the brush is set to, right now.
+    ///
+    /// The same function serves saving a file and storing a timeline key, which
+    /// is the point of `View` being one type: a key cannot come to restore less
+    /// than a reopen does.
+    fn current_view(&self) -> brokkr_core::View {
+        brokkr_core::View {
             camera_target: self.camera.target,
             camera_distance: self.camera.distance,
             camera_yaw: self.camera.yaw,
@@ -1376,6 +1406,30 @@ impl Brokkr {
             brush_strength: self.brush.strength,
             mirror: MirrorAxis::ALL.map(|axis| self.symmetry.axis(axis)),
         }
+    }
+
+    /// Put the camera, brush and mirror planes back the way a view records
+    /// them, clamping every number to the range the interface offers.
+    ///
+    /// Clamped rather than trusted for the same reason `open_project` clamps:
+    /// a view can come from a file, and the radius ceiling has already moved
+    /// once. A saved 12 mm brush is fine; a saved 40 mm one from some future
+    /// build must not put the slider somewhere it cannot be dragged back from.
+    fn apply_view(&mut self, view: &brokkr_core::View) {
+        self.camera = OrbitCamera {
+            target: view.camera_target,
+            distance: view.camera_distance,
+            yaw: view.camera_yaw,
+            pitch: view.camera_pitch,
+            roll: view.camera_roll,
+            ..OrbitCamera::framing(Vec3::ZERO, MODEL_RADIUS_MM)
+        };
+        self.brush.radius = view.brush_radius.clamp(MIN_RADIUS_MM, MAX_RADIUS_MM);
+        self.brush.strength = view.brush_strength.clamp(MIN_STRENGTH, MAX_STRENGTH);
+        self.symmetry = MirrorAxis::ALL
+            .into_iter()
+            .zip(view.mirror)
+            .fold(Symmetry::OFF, |set, (axis, on)| set.with_axis(axis, on));
     }
 
     /// Whether there is a crash net to offer.
@@ -1439,20 +1493,8 @@ impl Brokkr {
         }
 
         self.voxel_size = self.volume.voxel_size();
-        self.camera = OrbitCamera {
-            target: state.camera_target,
-            distance: state.camera_distance,
-            yaw: state.camera_yaw,
-            pitch: state.camera_pitch,
-            roll: state.camera_roll,
-            ..OrbitCamera::framing(Vec3::ZERO, MODEL_RADIUS_MM)
-        };
-        self.brush.radius = state.brush_radius.clamp(MIN_RADIUS_MM, MAX_RADIUS_MM);
-        self.brush.strength = state.brush_strength.clamp(MIN_STRENGTH, MAX_STRENGTH);
-        self.symmetry = MirrorAxis::ALL
-            .into_iter()
-            .zip(state.mirror)
-            .fold(Symmetry::OFF, |set, (axis, on)| set.with_axis(axis, on));
+        self.apply_view(&state.view);
+        self.timeline.adopt(state.keys);
 
         // History belongs to the model that just went away.
         self.history.clear();
@@ -1992,6 +2034,13 @@ impl Brokkr {
                 if self.advance_flight(elapsed_ms) {
                     self.publish_camera();
                 }
+                // Driven off the frame tick for the same reason the autosave
+                // is: `iced::time::every` does not exist under this feature
+                // set. It stalls on a hidden window, which for playback is
+                // exactly right -- nothing is watching it.
+                if let Some(pose) = self.timeline.advance(elapsed_ms) {
+                    self.fly_camera_to(&pose);
+                }
                 self.drive_from_spacemouse(elapsed_ms);
                 self.maybe_autosave();
             }
@@ -2073,6 +2122,59 @@ impl Brokkr {
                 };
             }
             Message::DynamicRadiusToggled(on) => self.dynamic_radius = on,
+
+            Message::TimelineResized(width) => self.timeline.resized(width),
+            Message::TimelineHover(x) => {
+                self.timeline.hover(x);
+                // A drag re-times the key it is holding, which moves it under
+                // the playhead, so the view follows the pointer.
+                if self.timeline.dragged_key().is_some() {
+                    self.unsaved = true;
+                }
+            }
+            Message::TimelinePressed => {
+                let view = self.current_view();
+                match self.timeline.press(view) {
+                    Some(crate::timeline::Pressed::WentTo(index)) => {
+                        // Everything a key holds, not only the camera: going
+                        // to a key is going back to a working setup.
+                        if let Some(key) = self.timeline.keys.get(index).copied() {
+                            self.apply_view(&key.view);
+                            self.publish_camera();
+                            self.refresh_overlay();
+                        }
+                        self.status = format!("key {} of {}", index + 1, self.timeline.keys.len());
+                    }
+                    Some(crate::timeline::Pressed::Added(index)) => {
+                        self.unsaved = true;
+                        self.status =
+                            format!("stored key {} of {}", index + 1, self.timeline.keys.len());
+                    }
+                    None => {}
+                }
+            }
+            Message::TimelineReleased => self.timeline.release(),
+            Message::TimelineLeft => self.timeline.leave(),
+            Message::TimelineRemoveKey => {
+                if self.timeline.remove_under_pointer().is_some() {
+                    self.unsaved = true;
+                    self.status = match self.timeline.keys.len() {
+                        0 => "removed the last key".to_string(),
+                        left => format!("removed a key, {left} left"),
+                    };
+                }
+            }
+            Message::TimelinePlayToggled => {
+                self.timeline.toggle_play();
+                if self.timeline.playing {
+                    // The playhead may be sitting anywhere; put the camera
+                    // where it is before the first frame advances it, or
+                    // playback starts with a jump.
+                    if let Some(pose) = self.timeline.pose_at(self.timeline.playhead) {
+                        self.fly_camera_to(&pose);
+                    }
+                }
+            }
             Message::BrushRadiusScaled(factor) => {
                 self.brush.radius =
                     (self.brush.radius * factor).clamp(MIN_RADIUS_MM, MAX_RADIUS_MM);
@@ -4360,5 +4462,264 @@ mod export_tests {
         update(&mut app, Message::Resample(same));
         assert_eq!(app.volume.brick_count(), before);
         assert!(app.status.is_empty(), "nothing happened, so nothing should be reported");
+    }
+}
+
+#[cfg(test)]
+mod timeline_tests {
+    use super::*;
+
+    /// See the note in `tests::update`.
+    fn update(app: &mut Brokkr, message: Message) {
+        drop(app.update(message));
+    }
+
+    fn app() -> Brokkr {
+        Brokkr::with_tablet(crate::tablet::Tablet::inert())
+    }
+
+    /// Put the pointer somewhere along the strip and press.
+    ///
+    /// Through the real messages rather than by calling `Timeline` directly.
+    /// The Move brush shipped twice passing tests that built the objects by
+    /// hand and never went through the routing, and both times it did nothing
+    /// in the hand -- so what is exercised here is the path a click takes.
+    fn click_at(app: &mut Brokkr, fraction: f32) {
+        let x = fraction * app.timeline.width();
+        update(app, Message::TimelineHover(x));
+        update(app, Message::TimelinePressed);
+        update(app, Message::TimelineReleased);
+    }
+
+    #[test]
+    fn clicking_empty_track_stores_the_view_that_was_showing() {
+        let mut app = app();
+        app.camera.yaw = 1.25;
+        app.camera.distance = 88.0;
+        update(&mut app, Message::BrushRadiusChanged(7.5));
+        update(&mut app, Message::SymmetryAxisToggled(MirrorAxis::Y));
+
+        click_at(&mut app, 0.4);
+
+        assert_eq!(app.timeline.keys.len(), 1, "a click on empty track stored nothing");
+        let key = app.timeline.keys[0];
+        assert!((key.at - 0.4).abs() < 0.01, "the key landed at {}", key.at);
+        assert_eq!(key.view.camera_yaw, 1.25);
+        assert_eq!(key.view.camera_distance, 88.0);
+        assert_eq!(key.view.brush_radius, 7.5, "a key has to hold the brush, not only the camera");
+        assert_eq!(key.view.mirror, [false, true, false], "the mirror planes were not stored");
+        assert!(app.unsaved, "storing a key changed the document and did not say so");
+    }
+
+    #[test]
+    fn clicking_a_key_puts_everything_it_holds_back() {
+        // The property that makes a key a stored working setup rather than a
+        // camera angle. Every field has to come back, so this moves all of
+        // them away between storing and returning.
+        let mut app = app();
+        app.camera.yaw = 0.2;
+        app.camera.distance = 40.0;
+        update(&mut app, Message::BrushRadiusChanged(3.0));
+        update(&mut app, Message::BrushStrengthChanged(0.2));
+        click_at(&mut app, 0.3);
+
+        app.camera.yaw = 2.9;
+        app.camera.distance = 150.0;
+        update(&mut app, Message::BrushRadiusChanged(9.0));
+        update(&mut app, Message::BrushStrengthChanged(0.6));
+        update(&mut app, Message::SymmetryAxisToggled(MirrorAxis::X));
+
+        click_at(&mut app, 0.3);
+
+        assert_eq!(app.timeline.keys.len(), 1, "clicking the key added a second one");
+        assert_eq!(app.camera.yaw, 0.2);
+        assert_eq!(app.camera.distance, 40.0);
+        assert_eq!(app.brush.radius, 3.0);
+        assert_eq!(app.brush.strength, 0.2);
+        assert!(!app.symmetry.axis(MirrorAxis::X), "the mirror plane was not restored");
+    }
+
+    #[test]
+    fn dragging_a_key_past_its_neighbour_keeps_hold_of_it() {
+        // The list stays sorted, so a dragged key's index moves under the
+        // drag. Losing track of it here drops the drag at exactly the moment
+        // a user is watching for it.
+        let mut app = app();
+        click_at(&mut app, 0.2);
+        click_at(&mut app, 0.5);
+        click_at(&mut app, 0.8);
+        // Distinguish them by something that travels with the key.
+        for (index, key) in app.timeline.keys.iter_mut().enumerate() {
+            key.view.camera_distance = 100.0 + index as f32;
+        }
+
+        // Pick up the leftmost and haul it past both the others.
+        let width = app.timeline.width();
+        update(&mut app, Message::TimelineHover(0.2 * width));
+        update(&mut app, Message::TimelinePressed);
+        assert_eq!(app.timeline.dragged_key(), Some(0));
+        update(&mut app, Message::TimelineHover(0.95 * width));
+        update(&mut app, Message::TimelineReleased);
+
+        let order: Vec<f32> =
+            app.timeline.keys.iter().map(|key| key.view.camera_distance).collect();
+        assert_eq!(order, vec![101.0, 102.0, 100.0], "the dragged key did not travel");
+        let at: Vec<f32> = app.timeline.keys.iter().map(|key| key.at).collect();
+        assert!(at.windows(2).all(|pair| pair[0] <= pair[1]), "the keys came out unsorted: {at:?}");
+    }
+
+    #[test]
+    fn a_right_click_removes_the_key_under_the_pointer_and_only_that_one() {
+        let mut app = app();
+        click_at(&mut app, 0.25);
+        click_at(&mut app, 0.75);
+        app.unsaved = false;
+
+        let width = app.timeline.width();
+        update(&mut app, Message::TimelineHover(0.25 * width));
+        update(&mut app, Message::TimelineRemoveKey);
+
+        assert_eq!(app.timeline.keys.len(), 1);
+        assert!((app.timeline.keys[0].at - 0.75).abs() < 0.01, "the wrong key went");
+        assert!(app.unsaved, "removing a key changed the document and did not say so");
+    }
+
+    #[test]
+    fn a_right_click_on_empty_track_removes_nothing() {
+        let mut app = app();
+        click_at(&mut app, 0.25);
+        app.unsaved = false;
+
+        let width = app.timeline.width();
+        update(&mut app, Message::TimelineHover(0.9 * width));
+        update(&mut app, Message::TimelineRemoveKey);
+
+        assert_eq!(app.timeline.keys.len(), 1, "a right click on nothing removed a key");
+        assert!(!app.unsaved, "nothing changed, so nothing should be marked unsaved");
+    }
+
+    #[test]
+    fn playing_moves_the_camera_and_leaves_the_brush_alone() {
+        // The policy the whole module is built around, and the one that would
+        // be maddening to discover by accident: a fly-through must not reach
+        // over and change the tool in the user's hand.
+        let mut app = app();
+        app.camera.yaw = 0.0;
+        update(&mut app, Message::BrushRadiusChanged(4.0));
+        click_at(&mut app, 0.0);
+
+        app.camera.yaw = 2.0;
+        update(&mut app, Message::BrushRadiusChanged(9.0));
+        update(&mut app, Message::SymmetryAxisToggled(MirrorAxis::Z));
+        click_at(&mut app, 1.0);
+
+        // Back to the start, then play.
+        click_at(&mut app, 0.0);
+        assert_eq!(app.brush.radius, 4.0, "going to a key should restore the brush");
+        update(&mut app, Message::BrushRadiusChanged(9.0));
+        update(&mut app, Message::TimelinePlayToggled);
+        assert!(app.timeline.playing);
+
+        let started_at = app.camera.yaw;
+        for _ in 0..40 {
+            update(&mut app, Message::Frame);
+        }
+        assert_ne!(app.camera.yaw, started_at, "playback did not move the camera");
+        assert_eq!(app.brush.radius, 9.0, "playback changed the brush out from under the hand");
+    }
+
+    #[test]
+    fn playback_stops_itself_at_the_last_key() {
+        let mut app = app();
+        click_at(&mut app, 0.0);
+        app.camera.yaw = 1.5;
+        click_at(&mut app, 0.5);
+        click_at(&mut app, 0.0);
+        update(&mut app, Message::TimelinePlayToggled);
+
+        // In controlled time, for the reason `finish_flight` documents:
+        // `Message::Frame` scales by the real clock and consecutive calls in a
+        // test are microseconds apart, so a run driven that way never arrives.
+        // That `Frame` drives playback at all is covered by the test above.
+        //
+        // Far more steps than the run needs, so a playhead that failed to stop
+        // would have run off the end of the strip.
+        for _ in 0..600 {
+            if let Some(pose) = app.timeline.advance(16.0) {
+                app.fly_camera_to(&pose);
+            }
+        }
+        assert!(!app.timeline.playing, "playback never stopped");
+        assert!(app.timeline.playhead <= 1.0, "the playhead ran off the strip");
+        assert!(
+            (app.timeline.playhead - 0.5).abs() < 0.01,
+            "it stopped at {} rather than at the last key",
+            app.timeline.playhead
+        );
+    }
+
+    #[test]
+    fn play_does_nothing_with_fewer_than_two_keys() {
+        // There is nothing to fly between, and a button that visibly does
+        // nothing is worse than one that is plainly unavailable.
+        let mut app = app();
+        update(&mut app, Message::TimelinePlayToggled);
+        assert!(!app.timeline.playing);
+        click_at(&mut app, 0.5);
+        update(&mut app, Message::TimelinePlayToggled);
+        assert!(!app.timeline.playing);
+    }
+
+    #[test]
+    fn keys_survive_a_save_and_a_reopen_through_the_application() {
+        // Through the application rather than the format, because the
+        // interesting failures are in the wiring: a state that is built
+        // without them, or a load that reads them and drops them on the floor.
+        let directory =
+            std::env::temp_dir().join(format!("brokkr-timeline-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("keys.brokkr");
+
+        let mut app = app();
+        app.camera.yaw = 0.4;
+        click_at(&mut app, 0.1);
+        app.camera.yaw = 2.4;
+        click_at(&mut app, 0.6);
+        app.save_project(&path);
+        assert!(app.status.starts_with("saved"), "save reported: {}", app.status);
+
+        let mut reopened = Brokkr::with_tablet(crate::tablet::Tablet::inert());
+        reopened.open_project(&path);
+        assert!(!reopened.status.contains("could not"), "open reported: {}", reopened.status);
+        assert_eq!(reopened.timeline.keys.len(), 2, "the keys did not survive the reopen");
+        assert!((reopened.timeline.keys[0].view.camera_yaw - 0.4).abs() < 1.0e-6);
+        assert!((reopened.timeline.keys[1].view.camera_yaw - 2.4).abs() < 1.0e-6);
+
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn opening_a_second_file_does_not_leave_the_first_ones_keys_behind() {
+        // `adopt` replaces rather than extends. Getting this wrong leaves keys
+        // pointing at a model that is no longer on screen, which looks like
+        // the timeline remembering something it should not.
+        let directory =
+            std::env::temp_dir().join(format!("brokkr-timeline-swap-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let with_keys = directory.join("keys.brokkr");
+        let without = directory.join("bare.brokkr");
+
+        let mut app = app();
+        click_at(&mut app, 0.3);
+        app.save_project(&with_keys);
+
+        let mut bare = Brokkr::with_tablet(crate::tablet::Tablet::inert());
+        bare.save_project(&without);
+
+        app.open_project(&without);
+        assert!(app.timeline.keys.is_empty(), "the previous model's keys are still on the strip");
+        assert!(!app.timeline.playing);
+
+        let _ = std::fs::remove_dir_all(&directory);
     }
 }

@@ -55,7 +55,7 @@ pub use import::{ImportError, MESH_EXTENSIONS};
 pub use mesh::{BrickMesh, MeshScratch, Vertex};
 pub use orientation::{from_print_space, to_print_space};
 pub use pattern::{MAX_SCALE_MM, MIN_SCALE_VOXELS, Pattern, PatternKind};
-pub use project::{ProjectError, ProjectState};
+pub use project::{Keyframe, ProjectError, ProjectState, View};
 pub use raycast::{Hit, raycast};
 pub use region::FieldRegion;
 pub use stroke::{MAX_STAMPS_PER_EVENT, Stroke};

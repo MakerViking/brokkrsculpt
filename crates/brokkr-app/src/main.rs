@@ -14,6 +14,7 @@ mod recent;
 mod spacemouse;
 mod tablet;
 mod theme;
+mod timeline;
 mod viewport;
 
 use app::Brokkr;

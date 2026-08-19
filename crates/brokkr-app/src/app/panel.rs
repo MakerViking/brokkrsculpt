@@ -14,8 +14,8 @@ use std::sync::Arc;
 
 use brokkr_core::{BrushKind, FalloffCurve, MirrorAxis, PatternKind};
 use iced::widget::{
-    button, checkbox, column, container, pick_list, row, scrollable, slider, stack, text,
-    text_input,
+    button, checkbox, column, container, mouse_area, pick_list, row, scrollable, sensor, slider,
+    space, stack, text, text_input,
 };
 use iced::{Alignment, Element, Length, Padding};
 
@@ -51,7 +51,12 @@ impl Brokkr {
             self.header(),
             row![
                 self.tool_strip(),
-                container(scene).width(Length::Fill).height(Length::Fill),
+                column![
+                    self.timeline_strip(),
+                    container(scene).width(Length::Fill).height(Length::Fill)
+                ]
+                .spacing(theme::S2)
+                .width(Length::Fill),
                 self.tools(),
             ]
             .spacing(theme::S3)
@@ -593,6 +598,95 @@ impl Brokkr {
         .width(Length::Fixed(76.0))
         .height(Length::Fill)
         .style(theme::tool_strip)
+        .into()
+    }
+
+    /// The timeline strip: stored views, a playhead, and a play button.
+    ///
+    /// Above the viewport rather than over it. ZBrush floats its timeline on
+    /// the canvas, which costs it a strip of the model; there is room here, and
+    /// a widget in the layout is a widget iced can hit-test for us rather than
+    /// one this file has to hit-test itself.
+    ///
+    /// Built from spacers rather than drawn, because `canvas` is behind a
+    /// feature this build does not enable and turning it on would pull a
+    /// tessellator in for four diamonds and a line. The strip's own pixel width
+    /// comes back through `sensor`, which is what turns a pointer offset into a
+    /// position along it.
+    fn timeline_strip(&self) -> Element<'_, Message> {
+        /// Height of the clickable strip.
+        const STRIP_H: f32 = 18.0;
+        /// Width of a key marker, and of the playhead.
+        const KEY_W: f32 = 7.0;
+        const HEAD_W: f32 = 2.0;
+
+        let width = self.timeline.width();
+        // Markers laid out as a row of spacers: each one is placed by the gap
+        // in front of it, so the gaps have to be *differences* along the
+        // strip. Running left to right and remembering where the last one
+        // ended is what keeps them from piling up at the origin.
+        let mut placed = 0.0_f32;
+        let mut markers = row![];
+        for (index, at) in self.timeline.positions() {
+            let centre = at * width;
+            let gap = (centre - KEY_W * 0.5 - placed).max(0.0);
+            let lit =
+                self.timeline.hovered == Some(index) || self.timeline.dragged_key() == Some(index);
+            markers = markers.push(space().width(Length::Fixed(gap))).push(
+                container(space())
+                    .width(Length::Fixed(KEY_W))
+                    .height(Length::Fixed(STRIP_H))
+                    .style(if lit { theme::timeline_key_lit } else { theme::timeline_key }),
+            );
+            placed += gap + KEY_W;
+        }
+
+        let head_x = (self.timeline.playhead * width - HEAD_W * 0.5).max(0.0);
+        let playhead = row![
+            space().width(Length::Fixed(head_x)),
+            container(space())
+                .width(Length::Fixed(HEAD_W))
+                .height(Length::Fixed(STRIP_H))
+                .style(theme::timeline_playhead),
+        ];
+
+        let track = container(space())
+            .width(Length::Fill)
+            .height(Length::Fixed(STRIP_H))
+            .style(theme::timeline_track);
+
+        let strip = mouse_area(stack![track, markers, playhead])
+            .on_move(|point| Message::TimelineHover(point.x))
+            .on_press(Message::TimelinePressed)
+            .on_release(Message::TimelineReleased)
+            // A drag that leaves the strip has to let go of its key, because
+            // `on_release` only fires while the pointer is still over it.
+            .on_exit(Message::TimelineLeft)
+            .on_right_press(Message::TimelineRemoveKey);
+
+        let play = button(
+            text(if self.timeline.playing { "\u{25a0}" } else { "\u{25b6}" })
+                .size(theme::CAPTION_SIZE),
+        )
+        .padding(Padding { top: 1.0, right: 6.0, bottom: 1.0, left: 6.0 })
+        .style(if self.timeline.playing { theme::tool_button_active } else { theme::tool_button })
+        .on_press_maybe((self.timeline.keys.len() >= 2).then_some(Message::TimelinePlayToggled));
+
+        let hint = match self.timeline.keys.len() {
+            0 => "click to store a view".to_string(),
+            1 => "1 key — drag to re-time, right click to remove".to_string(),
+            many => format!("{many} keys — drag to re-time, right click to remove"),
+        };
+
+        row![
+            play,
+            sensor(strip)
+                .on_show(|size| Message::TimelineResized(size.width))
+                .on_resize(|size| Message::TimelineResized(size.width)),
+            text(hint).size(theme::CAPTION_SIZE).color(theme::TEXT_MUTE),
+        ]
+        .spacing(theme::S2)
+        .align_y(Alignment::Center)
         .into()
     }
 

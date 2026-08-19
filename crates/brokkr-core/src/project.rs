@@ -52,7 +52,23 @@ use crate::volume::Volume;
 const MAGIC: &[u8; 8] = b"BROKKR\x00\x01";
 
 /// Version of the file's *layout*: the header fields and the order of sections.
-const CONTAINER_VERSION: u16 = 1;
+///
+/// 2 added the timeline key trailer after the brick stream. Bumping it did not
+/// have to orphan every file already written, and did not: see
+/// [`OLDEST_CONTAINER_VERSION`].
+const CONTAINER_VERSION: u16 = 2;
+
+/// The oldest layout this build still reads.
+///
+/// Version 1 is version 2 without the key trailer, so reading one is a matter
+/// of not looking for the trailer -- there is no conversion and no second code
+/// path through the geometry. This exists because the alternative was refusing
+/// every `.brokkr` file in existence to add a feature none of them use, which
+/// is not a trade a save format gets to make. **Only add a version here when
+/// the old layout is genuinely still readable**; the point of refusing an
+/// unknown one is that a plausible-looking sculpt made of misread numbers is
+/// worse than an error.
+const OLDEST_CONTAINER_VERSION: u16 = 1;
 
 /// Version of how a brick's field values are *encoded*. Kept separate from the
 /// container version, because the two change for different reasons — a new
@@ -87,6 +103,14 @@ const MAX_BRICKS: u64 = 8 * 1024 * 1024 * 1024 / BRICK_BYTES as u64;
 /// contain, which is why it is derived from the arithmetic rather than picked.
 /// A corrupt file is what reaches it.
 const MAX_BRICK_COORD: i32 = (i32::MAX - (BRICK_DIM as i32 - 1)) / BRICK_DIM as i32;
+
+/// Most timeline keys a file may carry.
+///
+/// A ceiling rather than a limit anyone should meet: the strip is a few hundred
+/// pixels wide, so a thousand keys is already more than one per pixel. It is
+/// here for the same reason [`MAX_BRICKS`] is -- a count read out of a file
+/// decides an allocation, and a corrupt one should not decide a large one.
+const MAX_KEYS: u32 = 1024;
 
 /// Read one distance and hold it to what every writer here guarantees.
 fn read_distance(input: &mut impl Read) -> Result<f32> {
@@ -124,15 +148,17 @@ const TAG_UNIFORM: u8 = 0;
 /// Tag for a brick stored as a full array.
 const TAG_DENSE: u8 = 1;
 
-/// Everything about a session that is worth reopening into, beyond the field
-/// itself.
+/// Where the camera was and what the brush was set to.
 ///
-/// Deliberately small. These are conveniences — where the camera was, what the
-/// brush was set to — and a file whose header is readable but whose settings are
-/// nonsense should still load its geometry, so every one of these is clamped on
-/// read rather than trusted.
+/// Deliberately small. These are conveniences, and a file whose header is
+/// readable but whose settings are nonsense should still load its geometry, so
+/// every one of these is clamped on read rather than trusted.
+///
+/// Its own type because two things restore it: reopening a file, and jumping to
+/// a timeline key. Keeping them one type is what stops a key from quietly
+/// restoring less than a reopen does when a field is added here.
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub struct ProjectState {
+pub struct View {
     pub camera_target: Vec3,
     pub camera_distance: f32,
     pub camera_yaw: f32,
@@ -144,7 +170,7 @@ pub struct ProjectState {
     pub mirror: [bool; 3],
 }
 
-impl Default for ProjectState {
+impl Default for View {
     fn default() -> Self {
         Self {
             camera_target: Vec3::ZERO,
@@ -157,6 +183,33 @@ impl Default for ProjectState {
             mirror: [false; 3],
         }
     }
+}
+
+/// One stored view on the timeline.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Keyframe {
+    /// Where along the strip it sits, from 0 at the left to 1 at the right.
+    ///
+    /// A position rather than a duration, because the strip is a fixed length
+    /// a user drags keys around on. What that length means in seconds is the
+    /// application's business, not the file's.
+    pub at: f32,
+    pub view: View,
+}
+
+/// Everything about a session that is worth reopening into, beyond the field
+/// itself.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ProjectState {
+    /// Where things were when the file was saved.
+    pub view: View,
+    /// Timeline keys, in ascending `at` order.
+    ///
+    /// Held sorted rather than sorted on use, because everything that reads
+    /// them wants neighbours -- the pair a playhead sits between, the key
+    /// nearest a click -- and a list that is sorted only sometimes makes every
+    /// one of those a bug waiting for the one caller that forgot.
+    pub keys: Vec<Keyframe>,
 }
 
 /// Why a `.brokkr` file could not be read.
@@ -206,6 +259,11 @@ pub enum ProjectError {
         found: [i32; 3],
         limit: i32,
     },
+    /// More timeline keys than [`MAX_KEYS`].
+    TooManyKeys {
+        keys: u32,
+        limit: u32,
+    },
     /// The file ended in the middle of something.
     Truncated,
 }
@@ -233,6 +291,9 @@ impl std::fmt::Display for ProjectError {
                 write!(f, "the file claims {bricks} bricks, and the limit is {limit}")
             }
             ProjectError::UnknownBrickTag(tag) => write!(f, "unknown brick kind {tag}"),
+            ProjectError::TooManyKeys { keys, limit } => {
+                write!(f, "the file claims {keys} timeline keys, and the limit is {limit}")
+            }
             ProjectError::NonFiniteValue => {
                 write!(f, "the file holds a distance that is not a finite number")
             }
@@ -318,6 +379,60 @@ fn read_vec3(input: &mut impl Read) -> Result<Vec3> {
     Ok(Vec3::new(read_f32(input)?, read_f32(input)?, read_f32(input)?))
 }
 
+/// Write the camera and brush settings.
+///
+/// One function for both the session's own view and every timeline key, so the
+/// two can never store different things. Adding a field here adds it to both.
+fn write_view(out: &mut impl Write, view: &View) -> Result<()> {
+    write_vec3(out, view.camera_target)?;
+    write_f32(out, view.camera_distance)?;
+    write_f32(out, view.camera_yaw)?;
+    write_f32(out, view.camera_pitch)?;
+    write_f32(out, view.camera_roll)?;
+    write_f32(out, view.brush_radius)?;
+    write_f32(out, view.brush_strength)?;
+    out.write_all(&[u8::from(view.mirror[0]), u8::from(view.mirror[1]), u8::from(view.mirror[2])])?;
+    Ok(())
+}
+
+/// Read the camera and brush settings, repaired rather than refused.
+///
+/// The field itself gets no such latitude -- see `checked_distance` -- but
+/// these are conveniences. A file whose geometry is intact and whose camera is
+/// a NaN should open, show the sculpt, and put the camera somewhere sensible;
+/// refusing it would lose the model to protect a number nobody would miss.
+fn read_view(input: &mut impl Read) -> Result<View> {
+    let mut view = View {
+        camera_target: read_vec3(input)?,
+        camera_distance: read_f32(input)?,
+        camera_yaw: read_f32(input)?,
+        camera_pitch: read_f32(input)?,
+        camera_roll: read_f32(input)?,
+        brush_radius: read_f32(input)?,
+        brush_strength: read_f32(input)?,
+        mirror: [false; 3],
+    };
+    let mirror: [u8; 3] = read_exact(input)?;
+    view.mirror = [mirror[0] != 0, mirror[1] != 0, mirror[2] != 0];
+
+    if !view.camera_target.is_finite() {
+        view.camera_target = Vec3::ZERO;
+    }
+    for value in [
+        &mut view.camera_distance,
+        &mut view.camera_yaw,
+        &mut view.camera_pitch,
+        &mut view.camera_roll,
+        &mut view.brush_radius,
+        &mut view.brush_strength,
+    ] {
+        if !value.is_finite() {
+            *value = 0.0;
+        }
+    }
+    Ok(view)
+}
+
 /// Write a sculpt.
 ///
 /// Bricks go out in a deterministic order, so saving the same volume twice
@@ -335,18 +450,7 @@ pub fn write(out: &mut impl Write, volume: &Volume, state: &ProjectState) -> Res
 
     write_f32(out, volume.voxel_size())?;
 
-    write_vec3(out, state.camera_target)?;
-    write_f32(out, state.camera_distance)?;
-    write_f32(out, state.camera_yaw)?;
-    write_f32(out, state.camera_pitch)?;
-    write_f32(out, state.camera_roll)?;
-    write_f32(out, state.brush_radius)?;
-    write_f32(out, state.brush_strength)?;
-    out.write_all(&[
-        u8::from(state.mirror[0]),
-        u8::from(state.mirror[1]),
-        u8::from(state.mirror[2]),
-    ])?;
+    write_view(out, &state.view)?;
 
     let mut coords: Vec<BrickCoord> = volume.brick_coords().collect();
     coords.sort_unstable();
@@ -376,6 +480,16 @@ pub fn write(out: &mut impl Write, volume: &Volume, state: &ProjectState) -> Res
         }
     }
 
+    // The key trailer, after the bricks rather than in the header. A version 1
+    // file is exactly this file without it, which is what lets one still be
+    // read: the brick count says where the geometry ends, and there is simply
+    // nothing after it.
+    write_u32(out, state.keys.len() as u32)?;
+    for key in &state.keys {
+        write_f32(out, key.at)?;
+        write_view(out, &key.view)?;
+    }
+
     out.flush()?;
     Ok(())
 }
@@ -388,7 +502,7 @@ pub fn read(input: &mut impl Read) -> Result<(Volume, ProjectState)> {
     }
 
     let container = read_u16(input)?;
-    if container != CONTAINER_VERSION {
+    if !(OLDEST_CONTAINER_VERSION..=CONTAINER_VERSION).contains(&container) {
         return Err(ProjectError::ContainerVersion {
             found: container,
             supported: CONTAINER_VERSION,
@@ -423,37 +537,7 @@ pub fn read(input: &mut impl Read) -> Result<(Volume, ProjectState)> {
         return Err(ProjectError::NonFiniteValue);
     }
 
-    let mut state = ProjectState {
-        camera_target: read_vec3(input)?,
-        camera_distance: read_f32(input)?,
-        camera_yaw: read_f32(input)?,
-        camera_pitch: read_f32(input)?,
-        camera_roll: read_f32(input)?,
-        brush_radius: read_f32(input)?,
-        brush_strength: read_f32(input)?,
-        mirror: [false; 3],
-    };
-    let mirror: [u8; 3] = read_exact(input)?;
-    state.mirror = [mirror[0] != 0, mirror[1] != 0, mirror[2] != 0];
-
-    // Settings are conveniences, so a file with nonsense in them still loads its
-    // geometry rather than refusing outright. The field itself gets no such
-    // latitude, below.
-    if !state.camera_target.is_finite() {
-        state.camera_target = Vec3::ZERO;
-    }
-    for value in [
-        &mut state.camera_distance,
-        &mut state.camera_yaw,
-        &mut state.camera_pitch,
-        &mut state.camera_roll,
-        &mut state.brush_radius,
-        &mut state.brush_strength,
-    ] {
-        if !value.is_finite() {
-            *value = 0.0;
-        }
-    }
+    let mut state = ProjectState { view: read_view(input)?, keys: Vec::new() };
 
     let count = read_u64(input)?;
     if count > MAX_BRICKS {
@@ -500,6 +584,27 @@ pub fn read(input: &mut impl Read) -> Result<(Volume, ProjectState)> {
         volume.insert_brick(coord, brick);
     }
 
+    // The key trailer, which only version 2 and later carry. A version 1 file
+    // ends with its last brick, and reading one is a matter of not looking.
+    if container >= 2 {
+        let count = read_u32(input)?;
+        if count > MAX_KEYS {
+            return Err(ProjectError::TooManyKeys { keys: count, limit: MAX_KEYS });
+        }
+        state.keys.reserve(count as usize);
+        for _ in 0..count {
+            let at = read_f32(input)?;
+            // Repaired rather than refused, like the view itself: a key at a
+            // nonsense position is a key in the wrong place, not a reason to
+            // lose the sculpt it was saved beside.
+            let at = if at.is_finite() { at.clamp(0.0, 1.0) } else { 0.0 };
+            state.keys.push(Keyframe { at, view: read_view(input)? });
+        }
+        // Sorted on the way in, because everything downstream asks for
+        // neighbours and a file is free to have been written by anything.
+        state.keys.sort_by(|a, b| a.at.partial_cmp(&b.at).expect("clamped, so no NaN"));
+    }
+
     // Nothing has been meshed yet, and the renderer holds whatever the previous
     // model left. Marking everything dirty is what makes the load visible.
     volume.mark_everything_dirty();
@@ -524,6 +629,28 @@ mod tests {
             brush.apply(&mut volume, &Stamp::new(at, normal, BrushDirection::Add), &mut scratch);
         }
         volume
+    }
+
+    /// Bytes the key trailer occupies when there are no keys: just its count.
+    ///
+    /// Several tests below reach for the *last brick value*, which used to mean
+    /// the last four bytes of the file. Since version 2 the file ends with the
+    /// key trailer instead, so they have to step back over it. Named rather
+    /// than written as a bare 4, because when the trailer grows every one of
+    /// them has to move with it.
+    const EMPTY_TRAILER_BYTES: usize = 4;
+
+    /// Where the final brick's last distance value starts.
+    fn last_distance_at(bytes: &[u8]) -> usize {
+        bytes.len() - EMPTY_TRAILER_BYTES - 4
+    }
+
+    /// Where the first brick's coordinate starts, found by measuring the
+    /// header with an empty volume rather than by counting field widths.
+    fn first_brick_at() -> usize {
+        let mut empty = Vec::new();
+        write(&mut empty, &Volume::new(0.5), &ProjectState::default()).expect("write failed");
+        empty.len() - EMPTY_TRAILER_BYTES
     }
 
     fn round_trip(volume: &Volume, state: &ProjectState) -> (Volume, ProjectState) {
@@ -577,14 +704,17 @@ mod tests {
     #[test]
     fn the_session_settings_come_back_too() {
         let state = ProjectState {
-            camera_target: Vec3::new(1.0, -2.0, 3.5),
-            camera_distance: 42.0,
-            camera_yaw: 0.75,
-            camera_pitch: -0.25,
-            camera_roll: 0.1,
-            brush_radius: 4.25,
-            brush_strength: 0.33,
-            mirror: [true, false, true],
+            view: View {
+                camera_target: Vec3::new(1.0, -2.0, 3.5),
+                camera_distance: 42.0,
+                camera_yaw: 0.75,
+                camera_pitch: -0.25,
+                camera_roll: 0.1,
+                brush_radius: 4.25,
+                brush_strength: 0.33,
+                mirror: [true, false, true],
+            },
+            keys: Vec::new(),
         };
         let (_, loaded) = round_trip(&sculpted(), &state);
         assert_eq!(loaded, state);
@@ -685,11 +815,7 @@ mod tests {
         let mut bytes = Vec::new();
         write(&mut bytes, &sculpted(), &ProjectState::default()).unwrap();
 
-        // The count sits after the fixed size header; find it by writing an
-        // empty volume and measuring.
-        let mut empty = Vec::new();
-        write(&mut empty, &Volume::new(0.5), &ProjectState::default()).unwrap();
-        let count_at = empty.len() - 8;
+        let count_at = first_brick_at() - 8;
 
         let mut absurd = bytes.clone();
         absurd[count_at..count_at + 8].copy_from_slice(&u64::MAX.to_le_bytes());
@@ -710,9 +836,10 @@ mod tests {
         let mut bytes = Vec::new();
         write(&mut bytes, &volume, &ProjectState::default()).unwrap();
 
-        // Poison the last four bytes, which are inside the final brick.
-        let end = bytes.len();
-        bytes[end - 4..].copy_from_slice(&f32::NAN.to_le_bytes());
+        // Poison the final brick's last value, which sits just before the
+        // key trailer rather than at the end of the file.
+        let at = last_distance_at(&bytes);
+        bytes[at..at + 4].copy_from_slice(&f32::NAN.to_le_bytes());
         assert!(matches!(read(&mut bytes.as_slice()), Err(ProjectError::NonFiniteValue)));
     }
 
@@ -723,10 +850,8 @@ mod tests {
         volume.seed_sphere(Vec3::ZERO, 10.0);
         write(&mut bytes, &volume, &ProjectState::default()).unwrap();
 
-        let mut empty = Vec::new();
-        write(&mut empty, &Volume::new(0.5), &ProjectState::default()).unwrap();
         // First brick's tag: past the header, past the count, past the coord.
-        let tag_at = empty.len() + 12;
+        let tag_at = first_brick_at() + 12;
         bytes[tag_at] = 99;
         assert!(matches!(read(&mut bytes.as_slice()), Err(ProjectError::UnknownBrickTag(99))));
     }
@@ -901,11 +1026,7 @@ mod tests {
         let mut bytes = Vec::new();
         write(&mut bytes, &sculpted(), &ProjectState::default()).expect("write failed");
 
-        // The first brick's coordinate sits immediately after the count, which
-        // is the last field an empty volume writes.
-        let mut empty = Vec::new();
-        write(&mut empty, &Volume::new(0.5), &ProjectState::default()).expect("write failed");
-        let coord_at = empty.len();
+        let coord_at = first_brick_at();
 
         for offending in [i32::MAX, i32::MIN, MAX_BRICK_COORD + 1, -(MAX_BRICK_COORD + 1)] {
             let mut broken = bytes.clone();
@@ -945,13 +1066,166 @@ mod tests {
 
         for offending in [OUTSIDE * 2.0, INSIDE * 2.0, 1e30, -1e30] {
             let mut broken = bytes.clone();
-            let end = broken.len();
-            broken[end - 4..].copy_from_slice(&offending.to_le_bytes());
+            let at = last_distance_at(&broken);
+            broken[at..at + 4].copy_from_slice(&offending.to_le_bytes());
             match read(&mut broken.as_slice()) {
                 Err(ProjectError::OutsideTheBand { found }) => assert_eq!(found, offending),
                 Ok(_) => panic!("a distance of {offending} was accepted"),
                 Err(other) => panic!("expected a band refusal for {offending}, got {other}"),
             }
         }
+    }
+
+    fn a_key(at: f32, distance: f32) -> Keyframe {
+        Keyframe {
+            at,
+            view: View {
+                camera_distance: distance,
+                camera_yaw: at * 2.0,
+                mirror: [at > 0.5, false, true],
+                ..View::default()
+            },
+        }
+    }
+
+    #[test]
+    fn timeline_keys_survive_a_round_trip_in_order() {
+        let state = ProjectState {
+            view: View { camera_distance: 77.0, ..View::default() },
+            keys: vec![a_key(0.0, 10.0), a_key(0.25, 20.0), a_key(0.9, 30.0)],
+        };
+        let (_, loaded) = round_trip(&sculpted(), &state);
+        assert_eq!(loaded, state, "the keys did not come back as they went in");
+    }
+
+    #[test]
+    fn keys_written_out_of_order_come_back_sorted() {
+        // The file is a stream of bytes and anything may have written it, so
+        // the invariant `ProjectState::keys` documents -- ascending `at` -- has
+        // to be established on read rather than assumed of the writer.
+        let state = ProjectState {
+            view: View::default(),
+            keys: vec![a_key(0.8, 1.0), a_key(0.1, 2.0), a_key(0.5, 3.0)],
+        };
+        let (_, loaded) = round_trip(&sculpted(), &state);
+        let order: Vec<f32> = loaded.keys.iter().map(|key| key.at).collect();
+        assert_eq!(order, vec![0.1, 0.5, 0.8]);
+        // And each key kept its own view rather than merely its position.
+        assert_eq!(loaded.keys[0].view.camera_distance, 2.0);
+        assert_eq!(loaded.keys[2].view.camera_distance, 1.0);
+    }
+
+    /// The one that matters most about the version bump: every `.brokkr` file
+    /// already written is a version 1 file, and there were real ones on disk
+    /// when the timeline was added.
+    ///
+    /// A version 1 file is a version 2 file without the key trailer, so one is
+    /// built here by writing a version 2 file and taking the trailer back off.
+    /// That is exactly what the old writer produced, byte for byte, which is
+    /// what makes this a test of compatibility rather than of a fixture.
+    #[test]
+    fn a_file_from_before_the_timeline_still_opens() {
+        let volume = sculpted();
+        let state = ProjectState {
+            view: View { camera_distance: 55.0, brush_radius: 7.0, ..View::default() },
+            keys: Vec::new(),
+        };
+        let mut bytes = Vec::new();
+        write(&mut bytes, &volume, &state).expect("write failed");
+
+        // Back to version 1: stamp the old number in, and drop the trailer.
+        bytes[8..10].copy_from_slice(&1u16.to_le_bytes());
+        bytes.truncate(bytes.len() - EMPTY_TRAILER_BYTES);
+
+        let (loaded, loaded_state) =
+            read(&mut bytes.as_slice()).expect("a version 1 file was refused");
+        assert_eq!(loaded_state.view, state.view, "the old file's settings came back wrong");
+        assert!(loaded_state.keys.is_empty(), "a file with no trailer gained keys");
+        assert_eq!(
+            loaded.brick_coords().count(),
+            volume.brick_coords().count(),
+            "the geometry did not survive"
+        );
+    }
+
+    #[test]
+    fn a_layout_newer_than_this_build_is_still_refused() {
+        // Widening the accepted range must not have widened it upward. A file
+        // from a future build may put anything after the header, and reading
+        // it as though it were this one is the plausible-looking-sculpt failure
+        // the version numbers exist to prevent.
+        let mut bytes = Vec::new();
+        write(&mut bytes, &sculpted(), &ProjectState::default()).expect("write failed");
+        bytes[8..10].copy_from_slice(&(CONTAINER_VERSION + 1).to_le_bytes());
+        match read(&mut bytes.as_slice()) {
+            Err(ProjectError::ContainerVersion { found, supported }) => {
+                assert_eq!(found, CONTAINER_VERSION + 1);
+                assert_eq!(supported, CONTAINER_VERSION);
+            }
+            Ok(_) => panic!("a newer layout was accepted"),
+            Err(other) => panic!("expected a version refusal, got {other}"),
+        }
+        // And so is one older than anything that ever existed.
+        bytes[8..10].copy_from_slice(&0u16.to_le_bytes());
+        assert!(matches!(
+            read(&mut bytes.as_slice()),
+            Err(ProjectError::ContainerVersion { found: 0, .. })
+        ));
+    }
+
+    #[test]
+    fn an_absurd_key_count_is_refused_before_anything_is_read() {
+        let mut bytes = Vec::new();
+        write(&mut bytes, &sculpted(), &ProjectState::default()).expect("write failed");
+        let at = bytes.len() - EMPTY_TRAILER_BYTES;
+        bytes[at..].copy_from_slice(&u32::MAX.to_le_bytes());
+        match read(&mut bytes.as_slice()) {
+            Err(ProjectError::TooManyKeys { keys, limit }) => {
+                assert_eq!(keys, u32::MAX);
+                assert_eq!(limit, MAX_KEYS);
+            }
+            Ok(_) => panic!("a count of four billion keys was accepted"),
+            Err(other) => panic!("expected a key count refusal, got {other}"),
+        }
+    }
+
+    #[test]
+    fn a_key_at_a_nonsense_position_is_repaired_rather_than_refused() {
+        // Keys are conveniences like the camera is. A key in the wrong place
+        // is not a reason to lose the sculpt saved beside it -- but it does
+        // have to land somewhere on the strip, or it is a key nothing can
+        // reach.
+        for offending in [f32::NAN, f32::INFINITY, -5.0, 900.0] {
+            let state = ProjectState {
+                view: View::default(),
+                keys: vec![Keyframe { at: offending, view: View::default() }],
+            };
+            let (_, loaded) = round_trip(&sculpted(), &state);
+            let at = loaded.keys[0].at;
+            assert!(
+                (0.0..=1.0).contains(&at),
+                "a key written at {offending} came back at {at}, which is off the strip"
+            );
+        }
+    }
+
+    #[test]
+    fn a_key_with_a_nonsense_view_is_repaired_the_way_the_session_view_is() {
+        // The repair lives in `read_view`, which both go through, so this is
+        // really asserting that they still do.
+        let state = ProjectState {
+            view: View::default(),
+            keys: vec![Keyframe {
+                at: 0.5,
+                view: View {
+                    camera_target: Vec3::splat(f32::NAN),
+                    camera_distance: f32::INFINITY,
+                    ..View::default()
+                },
+            }],
+        };
+        let (_, loaded) = round_trip(&sculpted(), &state);
+        assert!(loaded.keys[0].view.camera_target.is_finite());
+        assert!(loaded.keys[0].view.camera_distance.is_finite());
     }
 }
