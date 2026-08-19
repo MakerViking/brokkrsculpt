@@ -15,7 +15,7 @@ use std::sync::Arc;
 use brokkr_core::{BrushKind, FalloffCurve, MirrorAxis, PatternKind};
 use iced::widget::{
     button, checkbox, column, container, mouse_area, pick_list, row, scrollable, sensor, slider,
-    space, stack, text, text_input,
+    space, stack, text, text_editor, text_input,
 };
 use iced::{Alignment, Element, Length, Padding};
 
@@ -68,6 +68,13 @@ impl Brokkr {
         // menu drawn over it would be reachable while the prompt is not.
         if let Some(pending) = &self.confirm {
             return stack![body, self.confirm_card(pending)].into();
+        }
+
+        // Same reasoning, one rank down: the bug report is modal too, and it
+        // yields to the unsaved prompt because losing work outranks filing a
+        // report about it.
+        if let Some(draft) = &self.bug_report {
+            return stack![body, self.bug_report_card(draft)].into();
         }
 
         match self.top_menu {
@@ -190,6 +197,100 @@ impl Brokkr {
             .into()
     }
 
+    /// The bug report dialog.
+    ///
+    /// It shows the payload rather than describing it. `diagnostics` was
+    /// written on the principle that "the user can read exactly what they are
+    /// sending before they send it", and uploading it would have quietly ended
+    /// that -- so the whole body is on screen, scrollable, assembled by the
+    /// same function that sends it. A summary of what is attached is a summary
+    /// that goes out of date; this cannot.
+    fn bug_report_card<'a>(&'a self, draft: &'a super::BugReport) -> Element<'a, Message> {
+        let payload = self.assemble_report();
+        let ready = payload.is_some() && !draft.sending;
+
+        let preview: Element<'_, Message> = match &payload {
+            Some(report) => scrollable(
+                text(report.to_json())
+                    .size(theme::CAPTION_SIZE)
+                    .font(theme::MONO)
+                    .color(theme::TEXT_MUTE),
+            )
+            .height(Length::Fixed(150.0))
+            .into(),
+            None => text("describe the problem and the exact payload appears here")
+                .size(theme::CAPTION_SIZE)
+                .color(theme::TEXT_MUTE)
+                .into(),
+        };
+
+        type ButtonStyle = fn(&iced::Theme, button::Status) -> button::Style;
+        let action = |label: &'static str, message: Option<Message>, style: ButtonStyle| {
+            button(text(label).size(theme::TEXT_SIZE))
+                .padding(Padding {
+                    top: theme::S2,
+                    bottom: theme::S2,
+                    left: theme::S5,
+                    right: theme::S5,
+                })
+                .style(style)
+                .on_press_maybe(message)
+        };
+
+        let card = container(
+            column![
+                text("Report a bug").size(theme::TEXT_SIZE).color(theme::TEXT),
+                text("What happened? The first line becomes the title.")
+                    .size(theme::TEXT_SIZE_SMALL)
+                    .color(theme::TEXT_DIM),
+                text_editor(&draft.description)
+                    .height(Length::Fixed(110.0))
+                    .on_action(Message::BugReportEdited),
+                checkbox(draft.with_detail)
+                    .label("attach the diagnostics and what this session did")
+                    .on_toggle(Message::BugReportDetailToggled)
+                    .text_size(theme::CAPTION_SIZE),
+                text("Sent anonymously to tinkeratlas.com. Home directories are removed.")
+                    .size(theme::CAPTION_SIZE)
+                    .color(theme::TEXT_MUTE),
+                preview,
+                row![
+                    action(
+                        if draft.sending { "Sending…" } else { "Send" },
+                        ready.then_some(Message::BugReportSubmitted),
+                        // Styled by whether it will actually do something. A
+                        // button that looks pressable and is not is a worse
+                        // failure than one that looks unavailable, because the
+                        // user concludes the application ignored them.
+                        if ready { theme::tool_button_active } else { theme::tool_button },
+                    ),
+                    // Always available, and not only as a fallback. A user
+                    // without a network, or who would rather read it into an
+                    // issue themselves, gets the same bytes.
+                    action(
+                        "Copy",
+                        payload.is_some().then_some(Message::BugReportCopied),
+                        theme::tool_button,
+                    ),
+                    action("Cancel", Some(Message::BugReportDismissed), theme::tool_button),
+                ]
+                .spacing(theme::S3),
+            ]
+            .spacing(theme::S3)
+            .width(Length::Fixed(520.0)),
+        )
+        .padding(theme::S5)
+        .style(theme::menu_card);
+
+        container(card)
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .align_x(Alignment::Center)
+            .align_y(Alignment::Center)
+            .style(theme::scrim)
+            .into()
+    }
+
     /// The panel that drops from an open top bar menu.
     ///
     /// Positioned with the same padding trick the right click menu uses, since
@@ -292,7 +393,8 @@ impl Brokkr {
                 text("AGPL-3.0-or-later").size(theme::CAPTION_SIZE).color(theme::TEXT_MUTE),
                 separator(),
                 entry("Copy diagnostics", Message::DiagnosticsCopied),
-                entry("Report a bug…", Message::IssueOpened),
+                entry("Report a bug…", Message::BugReportOpened),
+                entry("Open the issue tracker", Message::IssueOpened),
             ]
             .spacing(theme::S1),
         };

@@ -266,6 +266,24 @@ pub struct Brokkr {
     /// Stored views on the strip above the viewport, and the state of
     /// scrubbing through them.
     timeline: crate::timeline::Timeline,
+    /// What this session has done, for a bug report.
+    breadcrumbs: crate::breadcrumbs::Breadcrumbs,
+    /// The status line as it was when it was last recorded as a breadcrumb.
+    ///
+    /// The trail is taken by watching `status` change rather than by calling
+    /// `crumb` at each of the two dozen places that set it. A trail that
+    /// depends on remembering to add a line is a trail that goes quietly
+    /// incomplete, and the failure is invisible until the one report that
+    /// needed it.
+    crumbed_status: String,
+    /// The bug report dialog, open or not.
+    bug_report: Option<BugReport>,
+    /// Whether the once-per-session facts have been recorded yet.
+    ///
+    /// Not done in the constructor: the renderer has not looked at the adapter
+    /// by then, and the devices are still being scanned. The first frame is the
+    /// earliest point at which there is anything true to say.
+    facts_recorded: bool,
     /// The navigation cube's geometry, swapped to the renderer the same way.
     cube: brokkr_gpu::OverlayBatch,
     /// The cube part under the pointer, lit so a click's effect is visible
@@ -341,6 +359,35 @@ struct Flight {
 
 /// How long a click on the navigation cube takes to arrive.
 const FLIGHT_MS: f32 = 260.0;
+
+/// The bug report dialog while it is open.
+///
+/// Held on the application rather than passed around because the description
+/// editor owns its own cursor and selection state, which has to outlive a
+/// redraw.
+pub(crate) struct BugReport {
+    description: iced::widget::text_editor::Content,
+    /// Whether to attach the diagnostics and the session trail.
+    ///
+    /// On by default, and the reason the dialog shows the whole payload: a
+    /// report without them is rarely answerable, and a user who can read
+    /// exactly what is attached can decide for themselves rather than being
+    /// asked to trust a sentence about it.
+    with_detail: bool,
+    /// True while the request is in flight, so the button cannot be pressed
+    /// twice and file two rows for one bug.
+    sending: bool,
+}
+
+impl BugReport {
+    fn new() -> Self {
+        Self {
+            description: iced::widget::text_editor::Content::new(),
+            with_detail: true,
+            sending: false,
+        }
+    }
+}
 
 /// Something the user asked for that would discard unsaved work, held until
 /// they say what to do about it.
@@ -558,6 +605,10 @@ impl Brokkr {
             dynamic_radius: false,
             model_radius: MODEL_RADIUS_MM,
             timeline: crate::timeline::Timeline::new(),
+            breadcrumbs: crate::breadcrumbs::Breadcrumbs::new(),
+            crumbed_status: String::new(),
+            bug_report: None,
+            facts_recorded: false,
             cube: brokkr_gpu::OverlayBatch::default(),
             cube_hover: None,
             flight: None,
@@ -1172,6 +1223,71 @@ impl Brokkr {
     /// bad report: running on XWayland puts the window outside the X screen's
     /// bounds and the compositor stops requesting frames, which reads as a 1 fps
     /// bug and is not one.
+    /// Note the status line in the trail if it has changed since last frame.
+    ///
+    /// Watching one string beat a `set_status` helper through two dozen call
+    /// sites: this cannot be forgotten by the next person to add one, and the
+    /// per-frame cost is a string comparison that allocates only when something
+    /// actually happened.
+    ///
+    /// The consequence to know about is that a status set and replaced within
+    /// a single frame is not recorded. Nothing here does that -- a status is
+    /// something a user reads -- and the alternative was a trail with holes in
+    /// it nobody would notice.
+    fn record_status_change(&mut self) {
+        if self.status == self.crumbed_status {
+            return;
+        }
+        self.crumbed_status.clone_from(&self.status);
+        self.breadcrumbs.crumb(&self.status);
+    }
+
+    /// Record the things that are true of this session rather than the things
+    /// that happened in it.
+    ///
+    /// Called once the renderer and the input devices have been looked at, so
+    /// there is something to say. These are what make a report from a machine
+    /// nobody here owns answerable: which graphics stack, which session type,
+    /// whether the devices the application steers with were found at all.
+    fn record_session_facts(&mut self) {
+        self.breadcrumbs.sticky_fact(&format!("[wgpu] {}", self.shared.adapter_summary()));
+        self.breadcrumbs.sticky_fact(&format!(
+            "[session] {} on {}",
+            std::env::var("XDG_SESSION_TYPE").unwrap_or_else(|_| "unknown".into()),
+            std::env::var("XDG_CURRENT_DESKTOP").unwrap_or_else(|_| "unknown".into()),
+        ));
+        self.breadcrumbs.sticky_fact(&format!("[tablet] {}", self.tablet.diagnosis().explain()));
+        self.breadcrumbs
+            .sticky_fact(&format!("[spacemouse] {}", self.spacemouse.diagnosis().explain()));
+    }
+
+    /// Build the report the dialog would send, or `None` when there is nothing
+    /// to send.
+    ///
+    /// One function for the preview, the clipboard and the upload, so what is
+    /// shown is what is sent. A description of the payload that is assembled
+    /// separately from the payload is a description that goes stale.
+    pub(crate) fn assemble_report(&self) -> Option<crate::report::Report> {
+        let draft = self.bug_report.as_ref()?;
+        let description = draft.description.text();
+        if description.trim().is_empty() {
+            return None;
+        }
+        let (diagnostics, trail) = if draft.with_detail {
+            (self.diagnostics(), self.breadcrumbs.all())
+        } else {
+            (String::new(), Vec::new())
+        };
+        Some(crate::report::Report::new(
+            &description,
+            &diagnostics,
+            &trail,
+            None,
+            &format!("{} ({})", env!("CARGO_PKG_VERSION"), build_commit()),
+            &self.shared.adapter_summary(),
+        ))
+    }
+
     pub(crate) fn diagnostics(&self) -> String {
         use std::fmt::Write;
         let mut out = String::new();
@@ -1208,6 +1324,13 @@ impl Brokkr {
         let _ = writeln!(out, "spacemouse: {}", self.spacemouse.diagnosis().explain());
         if !self.status.is_empty() {
             let _ = writeln!(out, "last message: {}", self.status);
+        }
+        let trail = self.breadcrumbs.all();
+        if !trail.is_empty() {
+            let _ = writeln!(out, "\ntrail:");
+            for crumb in crate::report::trim_breadcrumbs(&trail) {
+                let _ = writeln!(out, "  {crumb}");
+            }
         }
         out
     }
@@ -2031,6 +2154,11 @@ impl Brokkr {
             Message::Pointer(event) => self.on_pointer(event),
             Message::Frame => {
                 let elapsed_ms = self.perf.record_frame();
+                if !self.facts_recorded {
+                    self.facts_recorded = true;
+                    self.record_session_facts();
+                }
+                self.record_status_change();
                 if self.advance_flight(elapsed_ms) {
                     self.publish_camera();
                 }
@@ -2094,6 +2222,54 @@ impl Brokkr {
                 self.top_menu = None;
                 self.status = format!("report bugs at {ISSUE_URL}");
                 log::info!("{}", self.diagnostics());
+            }
+            Message::BugReportOpened => {
+                self.top_menu = None;
+                self.bug_report = Some(BugReport::new());
+            }
+            Message::BugReportEdited(action) => {
+                if let Some(draft) = &mut self.bug_report {
+                    draft.description.perform(action);
+                }
+            }
+            Message::BugReportDetailToggled(on) => {
+                if let Some(draft) = &mut self.bug_report {
+                    draft.with_detail = on;
+                }
+            }
+            Message::BugReportDismissed => self.bug_report = None,
+            Message::BugReportCopied => {
+                let Some(report) = self.assemble_report() else {
+                    self.status =
+                        "could not build the report: describe the problem first".to_string();
+                    return Task::none();
+                };
+                self.status = "report copied — paste it into an issue".to_string();
+                return iced::clipboard::write(report.to_json());
+            }
+            Message::BugReportSubmitted => {
+                let Some(report) = self.assemble_report() else {
+                    self.status = "could not send: describe the problem first".to_string();
+                    return Task::none();
+                };
+                if let Some(draft) = &mut self.bug_report {
+                    draft.sending = true;
+                }
+                self.status = "sending the report…".to_string();
+                return Task::perform(
+                    async move { crate::report::send(report, crate::report::TINKERATLAS) },
+                    Message::BugReportFinished,
+                );
+            }
+            Message::BugReportFinished(outcome) => {
+                self.bug_report = None;
+                self.status = match outcome {
+                    Ok(note) => note,
+                    // The substring "could not" is what colours the status line
+                    // as an error -- see `panel.rs`. A failure worded without it
+                    // renders in muted grey as though it had worked.
+                    Err(why) => format!("could not send the report: {why}"),
+                };
             }
             Message::MenuClosed => {
                 // Escape is the only sender. Against an open prompt it means

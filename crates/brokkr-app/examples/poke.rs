@@ -21,6 +21,7 @@
 //! cargo run --release -p brokkr-app --example poke -- rightclick 964 1000
 //! cargo run --release -p brokkr-app --example poke -- drag 964 1000 1200 1000
 //! cargo run --release -p brokkr-app --example poke -- rdrag 900 1300 1100 1300
+//! cargo run --release -p brokkr-app --example poke -- type 964 1000 "it went black"
 //! ```
 //!
 //! A drag is emitted as a run of small steps rather than one jump, because
@@ -51,15 +52,22 @@ const DESKTOP_H: i32 = 1824;
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    let mut to_text: Option<String> = None;
     let (action, x, y, to) = match args.as_slice() {
         [action, x, y] => (action, number(x), number(y), None),
+        // `type` takes text where a drag takes a destination.
+        [action, x, y, text] if action == "type" => {
+            to_text = Some(text.clone());
+            (action, number(x), number(y), None)
+        }
         [action, x, y, to_x, to_y] => {
             (action, number(x), number(y), Some((number(to_x), number(to_y))))
         }
         _ => {
             eprintln!(
                 "usage: poke <move|click|rightclick|press|release> <x> <y>\n       \
-                 poke <drag|rdrag> <x> <y> <to x> <to y>"
+                 poke <drag|rdrag> <x> <y> <to x> <to y>\n       \
+                 poke type <x> <y> <text>"
             );
             std::process::exit(2);
         }
@@ -91,6 +99,27 @@ fn main() {
         }
         "press" => button(&mut device, KeyCode::BTN_LEFT, true),
         "release" => button(&mut device, KeyCode::BTN_LEFT, false),
+        "type" => {
+            let text = to_text.as_deref().unwrap_or_default();
+            for character in text.chars() {
+                let Some((code, shifted)) = key_for(character) else {
+                    eprintln!("poke: no key for {character:?}, skipping");
+                    continue;
+                };
+                if shifted {
+                    button(&mut device, KeyCode::KEY_LEFTSHIFT, true);
+                }
+                button(&mut device, code, true);
+                button(&mut device, code, false);
+                if shifted {
+                    button(&mut device, KeyCode::KEY_LEFTSHIFT, false);
+                }
+                // Slower than a real typist. A key press and release in the
+                // same millisecond is within one frame, and a widget that
+                // samples on redraw can miss it.
+                sleep(Duration::from_millis(12));
+            }
+        }
         "drag" | "rdrag" => {
             let (to_x, to_y) = to.expect("a drag needs a destination");
             let held = if action == "rdrag" { KeyCode::BTN_RIGHT } else { KeyCode::BTN_LEFT };
@@ -125,6 +154,69 @@ fn main() {
     println!("poked {action} at {x},{y}");
 }
 
+/// The keys `type` can send: character, key code, and whether shift is held.
+///
+/// Deliberately a table rather than a computed mapping. A keyboard layout is
+/// not a function of the character -- this assumes the compositor is on a US
+/// layout, which is what this machine runs, and a wrong assumption shows up as
+/// the wrong letter rather than as an error.
+const TYPEABLE: &[(char, KeyCode, bool)] = &[
+    ('a', KeyCode::KEY_A, false),
+    ('b', KeyCode::KEY_B, false),
+    ('c', KeyCode::KEY_C, false),
+    ('d', KeyCode::KEY_D, false),
+    ('e', KeyCode::KEY_E, false),
+    ('f', KeyCode::KEY_F, false),
+    ('g', KeyCode::KEY_G, false),
+    ('h', KeyCode::KEY_H, false),
+    ('i', KeyCode::KEY_I, false),
+    ('j', KeyCode::KEY_J, false),
+    ('k', KeyCode::KEY_K, false),
+    ('l', KeyCode::KEY_L, false),
+    ('m', KeyCode::KEY_M, false),
+    ('n', KeyCode::KEY_N, false),
+    ('o', KeyCode::KEY_O, false),
+    ('p', KeyCode::KEY_P, false),
+    ('q', KeyCode::KEY_Q, false),
+    ('r', KeyCode::KEY_R, false),
+    ('s', KeyCode::KEY_S, false),
+    ('t', KeyCode::KEY_T, false),
+    ('u', KeyCode::KEY_U, false),
+    ('v', KeyCode::KEY_V, false),
+    ('w', KeyCode::KEY_W, false),
+    ('x', KeyCode::KEY_X, false),
+    ('y', KeyCode::KEY_Y, false),
+    ('z', KeyCode::KEY_Z, false),
+    ('0', KeyCode::KEY_0, false),
+    ('1', KeyCode::KEY_1, false),
+    ('2', KeyCode::KEY_2, false),
+    ('3', KeyCode::KEY_3, false),
+    ('4', KeyCode::KEY_4, false),
+    ('5', KeyCode::KEY_5, false),
+    ('6', KeyCode::KEY_6, false),
+    ('7', KeyCode::KEY_7, false),
+    ('8', KeyCode::KEY_8, false),
+    ('9', KeyCode::KEY_9, false),
+    (' ', KeyCode::KEY_SPACE, false),
+    ('.', KeyCode::KEY_DOT, false),
+    (',', KeyCode::KEY_COMMA, false),
+    ('-', KeyCode::KEY_MINUS, false),
+    ('/', KeyCode::KEY_SLASH, false),
+    ('\n', KeyCode::KEY_ENTER, false),
+    ('?', KeyCode::KEY_SLASH, true),
+    ('!', KeyCode::KEY_1, true),
+    (':', KeyCode::KEY_SEMICOLON, true),
+    (';', KeyCode::KEY_SEMICOLON, false),
+];
+
+fn key_for(character: char) -> Option<(KeyCode, bool)> {
+    let lower = character.to_ascii_lowercase();
+    TYPEABLE
+        .iter()
+        .find(|(c, _, _)| *c == lower)
+        .map(|(_, code, shifted)| (*code, *shifted || character.is_ascii_uppercase()))
+}
+
 fn number(raw: &str) -> i32 {
     raw.parse().unwrap_or_else(|_| panic!("{raw} is not a number"))
 }
@@ -135,6 +227,13 @@ fn build() -> Option<VirtualDevice> {
     // an absolute pointer rather than as a tablet or a touchscreen.
     keys.insert(KeyCode::BTN_LEFT);
     keys.insert(KeyCode::BTN_RIGHT);
+    // Every key `type` can emit, declared up front: a uinput device's
+    // capabilities are fixed when it is created, and a key that was not
+    // declared is silently dropped rather than refused.
+    for key in TYPEABLE.iter().map(|(_, code, _)| *code) {
+        keys.insert(key);
+    }
+    keys.insert(KeyCode::KEY_LEFTSHIFT);
 
     let axis = |code, maximum| UinputAbsSetup::new(code, AbsInfo::new(0, 0, maximum, 0, 0, 0));
 

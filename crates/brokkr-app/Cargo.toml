@@ -22,6 +22,20 @@ glam.workspace = true
 iced = { workspace = true, features = ["advanced", "wgpu", "debug"] }
 log.workspace = true
 rfd.workspace = true
+# The bug report's one and only network call. `default-features = false` with
+# just `rustls` is what keeps this to a measured 17 compiled crates for this
+# target: no proxy support, no cookies, no charset transcoding, no gzip, and
+# rustls with its bundled webpki-roots rather than a platform verifier, so
+# there is no system OpenSSL to link and the trust store is reproducible.
+#
+# The `~3.3` bound is a COOLDOWN, not a compatibility limit. Cargo has no
+# release-age gate the way npm and bun do here, so publish dates are checked by
+# hand -- and 3.4.0 was ten days old when this went in, against the 216 days
+# rfd had. It costs one crate to stay on 3.3 (ureq-proto 3.3 pulls base64 0.22
+# alongside the 0.23 already in the graph); an extra leaf crate is a cheaper
+# risk than a fortnight-old release of the code that terminates our TLS.
+# Lift the bound to "3" once 3.4.x has aged.
+ureq = { version = "~3.3", default-features = false, features = ["rustls"] }
 wgpu.workspace = true
 
 # Stylus pressure is read straight from the kernel's evdev interface. That sits

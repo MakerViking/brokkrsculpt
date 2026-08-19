@@ -3,6 +3,7 @@
 //! BrokkrSculpt: a voxel and SDF based 3D sculpting application.
 
 mod app;
+mod breadcrumbs;
 mod camera;
 mod cursor;
 #[cfg(target_os = "linux")]
@@ -11,6 +12,7 @@ mod message;
 mod navcube;
 mod paths;
 mod recent;
+mod report;
 mod spacemouse;
 mod tablet;
 mod theme;

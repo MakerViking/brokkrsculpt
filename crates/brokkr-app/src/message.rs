@@ -232,6 +232,20 @@ pub enum Message {
     TimelinePlayToggled,
     /// The strip was laid out this many pixels wide.
     TimelineResized(f32),
+
+    /// Open the bug report dialog.
+    BugReportOpened,
+    /// The description editor did something.
+    BugReportEdited(iced::widget::text_editor::Action),
+    /// Include the session trail and diagnostics, or do not.
+    BugReportDetailToggled(bool),
+    /// Send it to TinkerAtlas.
+    BugReportSubmitted,
+    /// The send finished, with what to show for it.
+    BugReportFinished(Result<String, String>),
+    /// Put the exact payload on the clipboard instead of sending it.
+    BugReportCopied,
+    BugReportDismissed,
     /// One presented frame, used to drive the frame rate readout and to keep
     /// the viewport redrawing while a stroke is in progress.
     Frame,
