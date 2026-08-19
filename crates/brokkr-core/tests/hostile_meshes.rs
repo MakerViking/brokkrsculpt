@@ -22,7 +22,8 @@
 
 use brokkr_core::export::ExportMesh;
 use brokkr_core::import::{obj, stl, threemf};
-use glam::Vec3;
+use brokkr_core::voxelise::{VoxeliseOptions, voxelise};
+use glam::{IVec3, Vec3};
 
 /// Mutants generated per seed file per strategy.
 ///
@@ -134,11 +135,55 @@ fn feed(read: Reader, bytes: &[u8], what: &str) -> bool {
     match read(bytes) {
         Ok(mesh) => {
             check(&mesh, what);
+            voxelise_it(&mesh, what);
             true
         }
         Err(_) => false,
     }
 }
+
+/// The rest of the import, which is where a mesh that merely *parsed* has to
+/// survive being turned into a field.
+///
+/// Reading is only half the path a hostile file travels: `File > Import mesh`
+/// reads and then voxelises, on the same task, and a panic in the second half
+/// loses the sculpt exactly as surely as one in the first. The reader's own
+/// checks do not cover what the voxeliser cares about -- a coordinate of 1e20
+/// is perfectly finite, and a sliver at that distance has an area the
+/// preflight is happy with while sitting where the voxel lattice cannot
+/// address it.
+fn voxelise_it(mesh: &ExportMesh, what: &str) {
+    // Coarse deliberately: the point is to reach the grid arithmetic, not to
+    // spend the test budget building fields.
+    let options = VoxeliseOptions::at(1.0);
+    let Ok((volume, report)) = voxelise(mesh, &options) else {
+        return;
+    };
+    for coord in volume.brick_coords() {
+        // What the lattice has to be able to say about any brick it stores.
+        // This is the arithmetic that overflowed in `project::read`.
+        let origin = coord.origin();
+        assert!(
+            origin.max(coord.max_voxel()).cmplt(IVec3::splat(i32::MAX)).all(),
+            "{what}: a brick landed at {coord:?}, whose own voxels do not fit the lattice"
+        );
+    }
+    assert!(
+        report.longest_mm.is_finite() && report.longest_mm < RESCALED_CEILING_MM,
+        "{what}: it built a model {} mm across",
+        report.longest_mm
+    );
+}
+
+/// A ceiling on what this file will accept as a built model, in millimetres.
+///
+/// Not the engine's own `IMPLAUSIBLY_LARGE_MM`, which is 500 and is where
+/// `refit_if_implausible` starts rescaling. This is deliberately looser: the
+/// property being pinned is that an implausible model comes back *rescaled to
+/// something the lattice can hold*, not that it lands on any particular size,
+/// and pinning the engine's exact threshold from out here would break this
+/// file every time that number is retuned.
+const RESCALED_CEILING_MM: f32 = 10_000.0;
 
 #[test]
 fn a_corrupted_file_is_answered_rather_than_survived() {
@@ -254,5 +299,71 @@ fn the_degenerate_inputs_every_parser_trips_over() {
         feed(stl::read, bytes, &format!("stl: {what}"));
         feed(obj::read, bytes, &format!("obj: {what}"));
         feed(threemf::read, bytes, &format!("3mf: {what}"));
+    }
+}
+
+#[test]
+fn a_mesh_the_lattice_cannot_hold_is_refused_rather_than_built() {
+    // The cases the reader has no opinion about, because every coordinate in
+    // them is a perfectly good finite number. It is the *voxeliser* that has
+    // to object, and what it objects with is the preflight -- which bounds an
+    // import by its surface AREA. A sliver is the case that tests whether area
+    // is enough on its own: it is tiny, so the preflight is happy, and it sits
+    // where the voxel lattice cannot address it.
+    let far = 1.0e20_f32;
+    let cases: Vec<(&str, ExportMesh)> = vec![
+        (
+            "a sliver a hundred quintillion millimetres out",
+            ExportMesh {
+                positions: vec![
+                    Vec3::new(far, 0.0, 0.0),
+                    Vec3::new(far + 1.0, 0.0, 0.0),
+                    Vec3::new(far, 1.0, 0.0),
+                    Vec3::new(far, 0.0, 1.0),
+                ],
+                normals: Vec::new(),
+                triangles: vec![[0, 2, 1], [0, 1, 3], [0, 3, 2], [1, 2, 3]],
+            },
+        ),
+        (
+            "a tetrahedron spanning the float range",
+            ExportMesh {
+                positions: vec![
+                    Vec3::new(-far, -far, -far),
+                    Vec3::new(far, -far, -far),
+                    Vec3::new(-far, far, -far),
+                    Vec3::new(-far, -far, far),
+                ],
+                normals: Vec::new(),
+                triangles: vec![[0, 2, 1], [0, 1, 3], [0, 3, 2], [1, 2, 3]],
+            },
+        ),
+        (
+            "every triangle degenerate",
+            ExportMesh {
+                positions: vec![Vec3::ZERO, Vec3::ZERO, Vec3::ZERO],
+                normals: Vec::new(),
+                triangles: vec![[0, 1, 2], [0, 1, 2]],
+            },
+        ),
+        (
+            "one triangle, no volume",
+            ExportMesh {
+                positions: vec![Vec3::ZERO, Vec3::X * 10.0, Vec3::Y * 10.0],
+                normals: Vec::new(),
+                triangles: vec![[0, 1, 2]],
+            },
+        ),
+    ];
+
+    for (what, mesh) in &cases {
+        // An answer either way. What must not happen is a panic, an overflowed
+        // lattice coordinate, or an allocation the machine cannot serve.
+        //
+        // The spanning tetrahedron is the one that gets *built*: it is
+        // implausibly large rather than impossible, so `refit_if_implausible`
+        // rescales it to something the lattice can hold and reports the factor.
+        // The other three are refused, each for a reason of its own.
+        voxelise_it(mesh, what);
     }
 }
