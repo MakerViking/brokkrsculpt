@@ -717,12 +717,12 @@ impl Brokkr {
                         self.brush.pattern.scale_mm.clamp(floor, brokkr_core::MAX_SCALE_MM),
                         Message::PatternScaleChanged
                     )
-                    .step(0.05),
+                    .step(0.05_f32),
                     text(format!("Depth  {:.2}", self.brush.pattern.depth))
                         .size(theme::CAPTION_SIZE)
                         .color(theme::TEXT_DIM),
                     slider(0.0..=1.0, self.brush.pattern.depth, Message::PatternDepthChanged)
-                        .step(0.02),
+                        .step(0.02_f32),
                 ]
                 .spacing(theme::S1),
             );
@@ -929,7 +929,7 @@ impl Brokkr {
                 self.brush.radius,
                 Message::BrushRadiusChanged
             )
-            .step(0.05),
+            .step(0.05_f32),
             checkbox(self.dynamic_radius)
                 .label("scale with model")
                 .on_toggle(Message::DynamicRadiusToggled)
@@ -949,7 +949,7 @@ impl Brokkr {
                 self.brush.strength,
                 Message::BrushStrengthChanged
             )
-            .step(0.01),
+            .step(0.01_f32),
         ]
         .spacing(theme::S2);
 
@@ -1129,7 +1129,7 @@ impl Brokkr {
                         .size(theme::CAPTION_SIZE)
                         .color(theme::TEXT_DIM),
                     slider(0.1..=5.0, multiple, move |m| Message::SpaceMouse(make(m * default)))
-                        .step(0.05)
+                        .step(0.05_f32)
                         .on_release(Message::SpaceMouse(SpaceMouseSetting::Save)),
                 ]
                 .spacing(theme::S1)
@@ -1177,7 +1177,7 @@ impl Brokkr {
                 slider(0.0..=120.0, config.deadzone, |value| Message::SpaceMouse(
                     SpaceMouseSetting::Deadzone(value)
                 ))
-                .step(1.0)
+                .step(1.0_f32)
                 .on_release(Message::SpaceMouse(SpaceMouseSetting::Save)),
             ]
             .spacing(theme::S1),
@@ -1271,11 +1271,11 @@ impl Brokkr {
                     ),
                     Message::PatternScaleChanged
                 )
-                .step(0.05),
+                .step(0.05_f32),
                 text(format!("Depth  {:.2}", pattern.depth))
                     .size(theme::CAPTION_SIZE)
                     .color(theme::TEXT_DIM),
-                slider(0.0..=1.0, pattern.depth, Message::PatternDepthChanged).step(0.02),
+                slider(0.0..=1.0, pattern.depth, Message::PatternDepthChanged).step(0.02_f32),
                 text(if pattern.kind.follows_the_stroke() {
                     "combs along the drag"
                 } else {
@@ -1410,7 +1410,7 @@ impl Brokkr {
             text(format!("Curve  {:.2}", self.pressure_curve))
                 .size(theme::TEXT_SIZE_SMALL)
                 .color(theme::TEXT_DIM),
-            slider(0.30..=3.00, self.pressure_curve, Message::PressureCurveChanged).step(0.05),
+            slider(0.30..=3.00, self.pressure_curve, Message::PressureCurveChanged).step(0.05_f32),
             checkbox(self.tilt_enabled)
                 .label("Tilt steers stroke")
                 .on_toggle(Message::TiltToggled)
