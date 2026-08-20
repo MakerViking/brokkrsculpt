@@ -143,6 +143,12 @@ pub struct Imported {
     pub report: brokkr_core::voxelise::VoxeliseReport,
     pub source: std::path::PathBuf,
     pub elapsed_ms: f64,
+    /// Which way the mesh's own up pointed, if it could be guessed, already
+    /// expressed in sculpt space. See [`brokkr_core::resting_up`].
+    ///
+    /// Carried from the import task because it has to be measured on the mesh,
+    /// and by the time the volume exists the mesh is gone.
+    pub resting_up: Option<brokkr_core::Facing>,
 }
 
 /// A collapsible block of the properties panel.
@@ -284,6 +290,12 @@ pub enum Message {
     DynamicRadiusToggled(bool),
     /// Close the right-click menu.
     MenuClosed,
+    /// Turn the model so the face the cube menu was opened on becomes this
+    /// direction.
+    OrientFace(brokkr_core::Facing),
+    /// Answer the "this looks like it came in lying down" prompt. `false`
+    /// leaves the model exactly as imported.
+    OrientPromptAnswered(bool),
     /// Open a top bar menu, or close it if it is the one already open.
     TopMenuToggled(TopMenu),
     /// Put the diagnostics on the clipboard, for pasting into a bug report.

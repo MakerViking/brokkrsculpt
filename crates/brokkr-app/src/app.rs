@@ -293,6 +293,15 @@ pub struct Brokkr {
     flight: Option<Flight>,
     /// Where the right-click menu is open, in widget pixels.
     menu: Option<Vec2>,
+    /// The navigation cube's own menu: where it is drawn and the face it acts
+    /// on. See [`CubeMenu`].
+    pub(crate) cube_menu: Option<CubeMenu>,
+    /// An imported model whose own up is not up, and which way it points.
+    ///
+    /// Offered rather than applied: nothing in a mesh file states which axis is
+    /// up, so this is a guess, and a guess that silently turned the model would
+    /// be worse than one the user waves away. `None` once answered either way.
+    pub(crate) orient_prompt: Option<brokkr_core::Facing>,
     /// Which top bar menu is open, if any.
     pub(crate) top_menu: Option<TopMenu>,
     /// The file this sculpt was opened from or last saved to. `None` until it
@@ -359,6 +368,20 @@ struct Flight {
 
 /// How long a click on the navigation cube takes to arrive.
 const FLIGHT_MS: f32 = 260.0;
+
+/// The navigation cube's right-click menu while it is open.
+///
+/// Fusion's ViewCube, and the answer to "down isn't down": a left click on the
+/// cube moves the camera, a right click asks what that face of the *model*
+/// should become. The two need different state because the second one has to
+/// remember which face was picked until the answer arrives.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct CubeMenu {
+    /// Where to draw it, in widget pixels.
+    pub(crate) at: Vec2,
+    /// The face the menu was opened on, which is the one that will be moved.
+    pub(crate) facing: brokkr_core::Facing,
+}
 
 /// The bug report dialog while it is open.
 ///
@@ -613,6 +636,8 @@ impl Brokkr {
             cube_hover: None,
             flight: None,
             menu: None,
+            cube_menu: None,
+            orient_prompt: None,
             top_menu: None,
             project_path: None,
             unsaved: false,
@@ -1678,6 +1703,15 @@ impl Brokkr {
             imported.elapsed_ms,
         );
         log::info!("{}", self.status);
+        // Nothing in an STL, OBJ or 3MF says which axis is up, and the two
+        // conventions in the world disagree -- so a mesh that arrived lying
+        // down is a normal outcome rather than a corrupt file. Ask; do not
+        // turn it silently, because the guess can be wrong and a model turned
+        // without being asked about is one the user cannot account for.
+        //
+        // Filtered against `Up`, so the common case of a print-ready file that
+        // was already standing raises nothing.
+        self.orient_prompt = imported.resting_up.filter(|up| *up != brokkr_core::Facing::Up);
         self.publish_camera();
         self.remesh_dirty();
         self.refresh_overlay();
@@ -1846,6 +1880,45 @@ impl Brokkr {
             "resampled to {voxel_size:.3} mm, {} dense bricks, {:.0} MB, {:.0} ms",
             self.volume_stats.dense_bricks,
             self.volume_stats.resident_bytes as f64 / (1024.0 * 1024.0),
+            started.elapsed().as_secs_f64() * 1000.0
+        );
+        log::info!("{}", self.status);
+    }
+
+    /// Turn the whole model, so that a face the user picked becomes the
+    /// direction they asked for.
+    ///
+    /// Exact, unlike [`Brokkr::resample`]: a quarter turn maps voxels onto
+    /// voxels, so nothing is resampled and turning back returns the same bits.
+    /// That is also why there is no undo entry -- see below.
+    fn orient(&mut self, rotation: brokkr_core::AxisRotation) {
+        if rotation.is_identity() {
+            return;
+        }
+
+        let started = Instant::now();
+        let mut turned = self.volume.rotated(rotation);
+        // The old bricks have to be cleared out of the renderer's pool. After a
+        // turn their coordinates hold something else, or nothing at all, and a
+        // brick nobody marks is one the pool keeps drawing -- the previous pose
+        // would stay on screen underneath the new one.
+        for coord in self.volume.brick_coords() {
+            turned.mark_dirty(coord);
+        }
+
+        self.volume = turned;
+        self.unsaved = true;
+        // Every entry names a brick of a volume that no longer exists, exactly
+        // as after a resample. Snapshotting the whole field instead would
+        // exceed the history budget on any real model, and it is not needed:
+        // turning back is the undo, and it is exact.
+        self.history.clear();
+        self.history_stats = self.history.stats();
+        self.remesh_dirty();
+        self.refresh_overlay();
+
+        self.status = format!(
+            "turned the model, {:.0} ms -- turn it back the same way to undo",
             started.elapsed().as_secs_f64() * 1000.0
         );
         log::info!("{}", self.status);
@@ -2027,12 +2100,13 @@ impl Brokkr {
     }
 
     fn on_pointer(&mut self, event: PointerEvent) {
-        // While the unsaved-work prompt is up, the pointer belongs to it. The
-        // capture layer in `view` already swallows presses, but the viewport is
-        // a shader widget that sees events wherever the cursor is, so this is
-        // the guarantee rather than the belt: without it a press behind the
-        // card would sculpt into a document the user is about to discard.
-        if self.confirm.is_some() {
+        // While a modal prompt is up, the pointer belongs to it. The capture
+        // layer in `view` already swallows presses, but the viewport is a
+        // shader widget that sees events wherever the cursor is, so this is the
+        // guarantee rather than the belt: without it a press behind the card
+        // would sculpt into a document the user is about to discard, or into a
+        // model they are about to turn.
+        if self.confirm.is_some() || self.orient_prompt.is_some() {
             return;
         }
         self.last_activity = Instant::now();
@@ -2052,17 +2126,37 @@ impl Brokkr {
 
                 // An open menu swallows the next press: closing it is what the
                 // click was for, and sculpting as well would be a surprise.
-                if self.menu.take().is_some() || self.top_menu.take().is_some() {
+                if self.menu.take().is_some()
+                    || self.top_menu.take().is_some()
+                    || self.cube_menu.take().is_some()
+                {
                     return;
                 }
 
                 // A press on the navigation cube belongs to the cube. Checked
                 // before anything else, or clicking it would also carve a divot
                 // out of the model behind it.
-                if button == PointerButton::Left
-                    && let Some(part) = navcube::pick(&self.camera, self.viewport_size, position)
-                {
-                    self.fly_to(part);
+                //
+                // Both buttons are taken, not just the left one. A right press
+                // that fell through would start an orbit and then, on release,
+                // open the brush menu on top of the cube -- and the cube's own
+                // menu is what a right click there is for.
+                if let Some(part) = navcube::pick(&self.camera, self.viewport_size, position) {
+                    match button {
+                        PointerButton::Left => self.fly_to(part),
+                        PointerButton::Right => {
+                            // Faces only. An edge or a corner points along no
+                            // axis, and a quarter turn is the only kind of
+                            // re-orientation offered, so there is nothing the
+                            // menu could truthfully offer for one.
+                            if part.extremes == 1
+                                && let Some(facing) = brokkr_core::Facing::nearest(part.direction)
+                            {
+                                self.cube_menu = Some(CubeMenu { at: position, facing });
+                            }
+                        }
+                        PointerButton::Middle => {}
+                    }
                     return;
                 }
 
@@ -2366,9 +2460,31 @@ impl Brokkr {
                 self.menu = None;
                 self.menu_edit = None;
                 self.top_menu = None;
+                self.cube_menu = None;
+                // Unlike `confirm` above, this one IS cleared: declining to
+                // turn the model is the safe answer and leaves it exactly as
+                // imported, where declining to answer "you have unsaved work"
+                // loses the work.
+                self.orient_prompt = None;
             }
             Message::MenuFieldEdited(which, text) => self.edit_menu_field(which, text),
             Message::MenuFieldSubmitted => self.menu_edit = None,
+            Message::OrientFace(to) => {
+                // Taken rather than read: the menu asked its question and has
+                // been answered, and leaving it open over a model that just
+                // moved would invite a second turn from a face that is no
+                // longer there.
+                if let Some(menu) = self.cube_menu.take() {
+                    self.orient(brokkr_core::AxisRotation::taking(menu.facing, to));
+                }
+            }
+            Message::OrientPromptAnswered(accept) => {
+                if let Some(up) = self.orient_prompt.take()
+                    && accept
+                {
+                    self.orient(brokkr_core::AxisRotation::taking(up, brokkr_core::Facing::Up));
+                }
+            }
             Message::CutToggled => {
                 self.cut_armed = !self.cut_armed;
                 self.status = if self.cut_armed {
@@ -2506,6 +2622,11 @@ impl Brokkr {
                     async move {
                         let started = Instant::now();
                         let outcome = brokkr_core::import::read_path(&path).and_then(|mesh| {
+                            // Measured on the mesh, because by the time there
+                            // is a volume the mesh is gone and its bounding box
+                            // has been centred on the origin -- which destroys
+                            // the one tell there is.
+                            let resting_up = brokkr_core::resting_up(&mesh.positions);
                             let options = brokkr_core::voxelise::VoxeliseOptions::at(voxel_size);
                             brokkr_core::voxelise::voxelise(&mesh, &options).map(
                                 |(volume, report)| crate::message::Imported {
@@ -2513,6 +2634,7 @@ impl Brokkr {
                                     report,
                                     source: path.clone(),
                                     elapsed_ms: started.elapsed().as_secs_f64() * 1000.0,
+                                    resting_up,
                                 },
                             )
                         });
@@ -3910,6 +4032,7 @@ mod tests {
             report: voxel_report,
             source: path.clone(),
             elapsed_ms: 0.0,
+            resting_up: brokkr_core::resting_up(&imported.positions),
         });
 
         assert!(
@@ -4530,6 +4653,254 @@ mod tests {
             release(&mut app);
             assert_eq!(app.history_stats.undo_entries, 1, "{kind} recorded no undo entry");
         }
+    }
+
+    // --- re-orienting the model ------------------------------------------
+
+    /// The middle of the navigation cube, which always picks a face rather than
+    /// an edge or a corner.
+    fn cube_centre() -> Vector {
+        let (origin, size) = crate::navcube::corner_rect(Vec2::new(SIZE.x, SIZE.y));
+        let middle = origin + size * 0.5;
+        Vector::new(middle.x, middle.y)
+    }
+
+    /// A model with material in one identifiable place, so a turn is visible.
+    ///
+    /// The seeded sphere is centred and symmetric, so every rotation leaves it
+    /// looking exactly the same -- a test built on it would pass whether or not
+    /// anything turned.
+    fn lopsided(app: &mut Brokkr) {
+        let mut volume = brokkr_core::Volume::new(app.voxel_size);
+        volume.seed_sphere(Vec3::new(0.0, 30.0, 0.0), 8.0);
+        volume.mark_everything_dirty();
+        app.volume = volume;
+        app.remesh_dirty();
+    }
+
+    /// The collision this feature had to resolve. A right press on the cube
+    /// used to fall through to an orbit and then, on release, open the BRUSH
+    /// menu on top of the cube -- so the one gesture that should have asked
+    /// about orientation asked about brush radius instead.
+    #[test]
+    fn a_right_click_on_the_cube_opens_the_cubes_menu_and_not_the_brushs() {
+        let mut app = app();
+        right_press(&mut app, cube_centre());
+        right_release(&mut app);
+
+        assert!(app.cube_menu.is_some(), "the cube's own menu did not open");
+        assert!(app.menu.is_none(), "the brush menu opened on top of the cube");
+        assert!(app.drag.is_none(), "the press started an orbit");
+        assert!(app.flight.is_none(), "a right click flew the camera as though it were a left one");
+    }
+
+    #[test]
+    fn a_left_click_on_the_cube_still_flies_the_camera() {
+        // The half of the cube's behaviour that already existed, pinned
+        // alongside the new half so a change to the routing cannot take it out
+        // silently.
+        let mut app = app();
+        press(&mut app, cube_centre());
+        release(&mut app);
+
+        assert!(app.flight.is_some(), "the left click stopped moving the camera");
+        assert!(app.cube_menu.is_none(), "a left click opened the orientation menu");
+    }
+
+    #[test]
+    fn the_next_press_closes_the_cube_menu_without_sculpting() {
+        let mut app = app();
+        let probe = app.camera.eye().normalize() * MODEL_RADIUS_MM;
+        right_press(&mut app, cube_centre());
+        right_release(&mut app);
+        assert!(app.cube_menu.is_some());
+
+        let before = app.volume.sample_world(probe);
+        press(&mut app, centre_of_viewport());
+        release(&mut app);
+
+        assert!(app.cube_menu.is_none(), "the menu stayed open");
+        assert_eq!(app.volume.sample_world(probe), before, "dismissing the menu also sculpted");
+    }
+
+    #[test]
+    fn escape_closes_the_cube_menu() {
+        let mut app = app();
+        right_press(&mut app, cube_centre());
+        right_release(&mut app);
+        update(&mut app, Message::MenuClosed);
+        assert!(app.cube_menu.is_none());
+    }
+
+    #[test]
+    fn choosing_a_direction_turns_the_model_and_leaves_the_camera_alone() {
+        let mut app = app();
+        lopsided(&mut app);
+        let (yaw, pitch, roll) = (app.camera.yaw, app.camera.pitch, app.camera.roll);
+        let above = Vec3::new(0.0, 30.0, 0.0);
+        let in_front = Vec3::new(0.0, 0.0, 30.0);
+        assert!(app.volume.sample_world(above) < 0.0, "the fixture is wrong");
+
+        app.cube_menu =
+            Some(CubeMenu { at: Vec2::new(700.0, 20.0), facing: brokkr_core::Facing::Up });
+        update(&mut app, Message::OrientFace(brokkr_core::Facing::Front));
+
+        // The model moved...
+        assert!(
+            app.volume.sample_world(in_front) < 0.0,
+            "the material did not arrive in front of the origin"
+        );
+        assert!(app.volume.sample_world(above) >= 0.0, "the material is still above the origin");
+        // ...and the camera did not. This is the whole difference between
+        // turning the model and re-aiming the view, and it is what makes an
+        // export land upright.
+        assert_eq!((app.camera.yaw, app.camera.pitch, app.camera.roll), (yaw, pitch, roll));
+
+        assert!(app.cube_menu.is_none(), "the menu stayed open over a model that had moved");
+        assert!(app.unsaved, "a turned model is unsaved work");
+        assert!(!app.history.can_undo(), "history outlived the volume it named bricks of");
+        assert!(app.perf.dirty_bricks > 0, "nothing was remeshed, so the turn is invisible");
+    }
+
+    #[test]
+    fn turning_a_face_onto_itself_changes_nothing() {
+        // The menu greys this one out, but the message is public and the guard
+        // is in `orient`, not in the widget.
+        let mut app = app();
+        lopsided(&mut app);
+        app.unsaved = false;
+        let above = Vec3::new(0.0, 30.0, 0.0);
+        let before = app.volume.sample_world(above);
+
+        app.cube_menu = Some(CubeMenu { at: Vec2::ZERO, facing: brokkr_core::Facing::Up });
+        update(&mut app, Message::OrientFace(brokkr_core::Facing::Up));
+
+        assert_eq!(app.volume.sample_world(above), before);
+        assert!(!app.unsaved, "a turn that did nothing still marked the document dirty");
+    }
+
+    #[test]
+    fn turning_back_returns_the_model() {
+        // The recovery path, and the reason there is no undo entry: a quarter
+        // turn is exact, so the other way round is a real undo rather than an
+        // approximation of one.
+        let mut app = app();
+        lopsided(&mut app);
+        let above = Vec3::new(0.0, 30.0, 0.0);
+        let before = app.volume.sample_world(above);
+
+        app.cube_menu = Some(CubeMenu { at: Vec2::ZERO, facing: brokkr_core::Facing::Up });
+        update(&mut app, Message::OrientFace(brokkr_core::Facing::Front));
+        app.cube_menu = Some(CubeMenu { at: Vec2::ZERO, facing: brokkr_core::Facing::Front });
+        update(&mut app, Message::OrientFace(brokkr_core::Facing::Up));
+
+        assert_eq!(app.volume.sample_world(above), before, "turning back did not return the model");
+    }
+
+    /// Build what a finished import delivers, with a chosen guess about which
+    /// way the mesh's own up pointed.
+    fn imported_with(resting_up: Option<brokkr_core::Facing>) -> crate::message::Imported {
+        let mut volume = brokkr_core::Volume::new(0.5);
+        volume.seed_sphere(Vec3::new(0.0, 20.0, 0.0), 6.0);
+        volume.mark_everything_dirty();
+        crate::message::Imported {
+            volume,
+            report: brokkr_core::voxelise::VoxeliseReport::default(),
+            source: std::path::PathBuf::from("nightwing.obj"),
+            elapsed_ms: 0.0,
+            resting_up,
+        }
+    }
+
+    #[test]
+    fn an_import_that_came_in_lying_down_raises_the_prompt() {
+        let mut app = app();
+        app.adopt_import(imported_with(Some(brokkr_core::Facing::Back)));
+        assert_eq!(
+            app.orient_prompt,
+            Some(brokkr_core::Facing::Back),
+            "the model is on its back and nothing offered to stand it up"
+        );
+    }
+
+    #[test]
+    fn an_import_that_is_already_upright_is_not_asked_about() {
+        // The case that decides whether this feature is usable or a nuisance:
+        // an STL exported for a slicer sits on the bed and arrives standing, so
+        // the guess resolves to `Up` and must raise nothing at all. Getting
+        // this wrong would put a dialog in front of nearly every print file.
+        let mut app = app();
+        app.adopt_import(imported_with(Some(brokkr_core::Facing::Up)));
+        assert!(app.orient_prompt.is_none(), "an upright model was asked about");
+    }
+
+    #[test]
+    fn an_import_with_no_tell_is_not_guessed_at() {
+        let mut app = app();
+        app.adopt_import(imported_with(None));
+        assert!(app.orient_prompt.is_none());
+    }
+
+    #[test]
+    fn accepting_the_prompt_stands_the_model_up() {
+        let mut app = app();
+        app.adopt_import(imported_with(Some(brokkr_core::Facing::Back)));
+        // The fixture's material is above the origin; a model whose own up
+        // points backwards has to be turned for that to mean anything, so
+        // check where it lands rather than that it merely moved.
+        let turned =
+            brokkr_core::AxisRotation::taking(brokkr_core::Facing::Back, brokkr_core::Facing::Up)
+                .apply(Vec3::new(0.0, 20.0, 0.0));
+
+        update(&mut app, Message::OrientPromptAnswered(true));
+
+        assert!(app.orient_prompt.is_none(), "the prompt stayed up after being answered");
+        assert!(app.volume.sample_world(turned) < 0.0, "the model did not turn the way promised");
+    }
+
+    #[test]
+    fn declining_the_prompt_leaves_the_model_exactly_as_imported() {
+        let mut app = app();
+        app.adopt_import(imported_with(Some(brokkr_core::Facing::Back)));
+        let above = Vec3::new(0.0, 20.0, 0.0);
+        let before = app.volume.sample_world(above);
+
+        update(&mut app, Message::OrientPromptAnswered(false));
+
+        assert!(app.orient_prompt.is_none());
+        assert_eq!(app.volume.sample_world(above), before, "declining still turned the model");
+    }
+
+    #[test]
+    fn a_press_behind_the_orientation_prompt_does_not_sculpt() {
+        // iced 0.14's `stack!` layers do not block what is underneath them, so
+        // the scrim is the widget that swallows presses and this early return
+        // is the guarantee behind it. Without both, a click behind the card
+        // carves the model the user is being asked about.
+        let mut app = app();
+        app.adopt_import(imported_with(Some(brokkr_core::Facing::Back)));
+        assert!(app.orient_prompt.is_some());
+
+        let probe = app.camera.eye().normalize() * MODEL_RADIUS_MM;
+        let before = app.volume.sample_world(probe);
+        press(&mut app, centre_of_viewport());
+        release(&mut app);
+
+        assert_eq!(app.volume.sample_world(probe), before, "a press reached the model behind it");
+        assert!(app.drag.is_none());
+    }
+
+    #[test]
+    fn escape_declines_the_orientation_prompt() {
+        let mut app = app();
+        app.adopt_import(imported_with(Some(brokkr_core::Facing::Back)));
+        let above = Vec3::new(0.0, 20.0, 0.0);
+        let before = app.volume.sample_world(above);
+
+        update(&mut app, Message::MenuClosed);
+
+        assert!(app.orient_prompt.is_none(), "escape did not dismiss it");
+        assert_eq!(app.volume.sample_world(above), before, "escape turned the model");
     }
 }
 

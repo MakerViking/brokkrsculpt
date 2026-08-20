@@ -33,6 +33,7 @@ pub mod project;
 pub mod raycast;
 pub mod region;
 pub mod resample;
+pub mod rotate;
 pub mod stroke;
 #[cfg(test)]
 mod testing;
@@ -53,7 +54,7 @@ pub use clip::ClipPlane;
 pub use export::{ExportMesh, MeshReport};
 pub use import::{ImportError, MESH_EXTENSIONS};
 pub use mesh::{BrickMesh, MeshScratch, Vertex};
-pub use orientation::{from_print_space, to_print_space};
+pub use orientation::{AxisRotation, Facing, from_print_space, resting_up, to_print_space};
 pub use pattern::{MAX_SCALE_MM, MIN_SCALE_VOXELS, Pattern, PatternKind};
 pub use project::{Keyframe, ProjectError, ProjectState, View};
 pub use raycast::{Hit, raycast};

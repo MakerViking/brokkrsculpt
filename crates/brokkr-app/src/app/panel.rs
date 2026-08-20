@@ -42,9 +42,13 @@ impl Brokkr {
             .height(Length::Fill)
             .style(theme::viewport_well);
 
-        let scene = match self.menu {
-            Some(at) => stack![well, self.overlay(), self.tool_menu(at)],
-            None => stack![well, self.overlay()],
+        let scene = match (self.menu, self.cube_menu) {
+            // Mutually exclusive by construction -- opening either swallows the
+            // press that would have opened the other -- but ordered anyway
+            // rather than left to whichever `stack!` happened to draw last.
+            (Some(at), _) => stack![well, self.overlay(), self.tool_menu(at)],
+            (None, Some(cube)) => stack![well, self.overlay(), self.cube_menu_card(cube)],
+            (None, None) => stack![well, self.overlay()],
         };
 
         let body = column![
@@ -75,6 +79,13 @@ impl Brokkr {
         // report about it.
         if let Some(draft) = &self.bug_report {
             return stack![body, self.bug_report_card(draft)].into();
+        }
+
+        // And one rank below that. It only ever appears just after an import,
+        // when neither of the two above can be up, but the ordering is stated
+        // rather than assumed.
+        if let Some(up) = self.orient_prompt {
+            return stack![body, self.orient_prompt_card(up)].into();
         }
 
         match self.top_menu {
@@ -487,6 +498,112 @@ impl Brokkr {
 
         container(container(readout).padding(theme::S3).style(theme::overlay_card))
             .padding(theme::S4)
+            .into()
+    }
+
+    /// What a face of the navigation cube should become, at the cursor.
+    ///
+    /// Fusion's ViewCube right-click menu. The difference worth stating is that
+    /// this turns the MODEL, not the camera: a mesh that arrived lying down
+    /// would still export lying down if all this did was re-aim the view, and
+    /// landing upright on the plate is the whole reason it exists.
+    fn cube_menu_card(&self, menu: super::CubeMenu) -> Element<'_, Message> {
+        const WIDTH: f32 = 190.0;
+        // Roughly how tall it comes out; only used to keep it on screen.
+        const HEIGHT: f32 = 250.0;
+
+        let choices = brokkr_core::Facing::ALL.into_iter().fold(
+            column![].spacing(theme::S1),
+            |assembled, facing| {
+                let current = facing == menu.facing;
+                assembled.push(
+                    button(text(crate::navcube::facing_label(facing)).size(theme::CAPTION_SIZE))
+                        .width(Length::Fill)
+                        .style(if current { theme::tool_button_active } else { theme::tool_button })
+                        // The face is already there, so there is nothing to do
+                        // and a button that says so beats one that no-ops.
+                        .on_press_maybe((!current).then_some(Message::OrientFace(facing))),
+                )
+            },
+        );
+
+        let body = column![
+            text(format!("{} FACE", crate::navcube::facing_label(menu.facing).to_uppercase()))
+                .size(theme::CAPTION_SIZE)
+                .color(theme::TEXT_MUTE),
+            text("move it to").size(theme::CAPTION_SIZE).color(theme::TEXT_DIM),
+            choices,
+            text("exact, and reversible by turning back")
+                .size(theme::CAPTION_SIZE)
+                .color(theme::TEXT_DIM),
+        ]
+        .spacing(theme::S3);
+
+        // Kept on screen. The cube lives in the top right corner, so this one
+        // opens against the right edge every time and would always hang off.
+        let left = menu.at.x.min((self.viewport_size.x - WIDTH).max(0.0)).max(0.0);
+        let top = menu.at.y.min((self.viewport_size.y - HEIGHT).max(0.0)).max(0.0);
+
+        container(
+            container(body).padding(theme::S4).width(Length::Fixed(WIDTH)).style(theme::menu_card),
+        )
+        .padding(Padding { left, top, ..Padding::ZERO })
+        .into()
+    }
+
+    /// Offer to stand an imported model up.
+    ///
+    /// Modal, and on the same scrim as the unsaved-work prompt, for the reason
+    /// documented there: a bare `stack!` layer in iced 0.14 lets clicks through
+    /// to the sliders underneath.
+    fn orient_prompt_card(&self, up: brokkr_core::Facing) -> Element<'_, Message> {
+        type ButtonStyle = fn(&iced::Theme, button::Status) -> button::Style;
+        let answer = |label: &'static str, accept: bool, style: ButtonStyle| {
+            button(text(label).size(theme::TEXT_SIZE))
+                .padding(Padding {
+                    top: theme::S2,
+                    bottom: theme::S2,
+                    left: theme::S5,
+                    right: theme::S5,
+                })
+                .style(style)
+                .on_press(Message::OrientPromptAnswered(accept))
+        };
+
+        let card = container(
+            column![
+                text("This model came in lying down").size(theme::TEXT_SIZE).color(theme::TEXT),
+                // Says what was observed, not just what it concluded. The
+                // reader can then judge the guess instead of trusting it.
+                text(format!(
+                    "It stands on a flat base, and that base is now facing {}. \
+                     Mesh files do not state which axis is up, and the model and \
+                     printing worlds disagree, so this is a guess.",
+                    crate::navcube::facing_label(up).to_lowercase()
+                ))
+                .size(theme::CAPTION_SIZE)
+                .color(theme::TEXT_MUTE),
+                text("Turning it is exact -- nothing is resampled -- and you can turn it back from the cube at any time.")
+                    .size(theme::CAPTION_SIZE)
+                    .color(theme::TEXT_DIM),
+                row![
+                    answer("Stand it up", true, theme::tool_button_active),
+                    answer("Leave it", false, theme::tool_button),
+                ]
+                .spacing(theme::S3),
+            ]
+            .spacing(theme::S4),
+        )
+        .padding(theme::S5)
+        .width(Length::Fixed(420.0))
+        .style(theme::menu_card);
+
+        container(card)
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .align_x(Alignment::Center)
+            .align_y(Alignment::Center)
+            .style(theme::scrim)
             .into()
     }
 

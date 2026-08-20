@@ -64,7 +64,25 @@ const IMPLAUSIBLY_SMALL_MM: f32 = 0.5;
 /// ...and above which the same is assumed at the other end.
 const IMPLAUSIBLY_LARGE_MM: f32 = 500.0;
 /// What an implausible model is rescaled to, longest dimension.
-const REFIT_LONGEST_MM: f32 = 60.0;
+///
+/// Chosen against what the detail survives rather than against what prints
+/// conveniently. A model whose file states no usable size is almost always a
+/// generated or exported mesh in some normalised unit, and those carry thin
+/// features -- membranes, fins, cloth -- that are the first thing to fall
+/// between voxels. Whether they survive is decided by how many voxels lie
+/// across them, so the size the model is brought in at is the lever, and a
+/// larger one is strictly more forgiving at the same voxel size.
+///
+/// Measured, on `Meshy_AI_Prismatic_Nightwing_...obj` (1,978,591 triangles,
+/// membrane wings): at 60 mm and a 0.25 mm voxel, **4.0% of the surface was
+/// thinner than a voxel and was lost** and the wings came through perforated.
+/// 200 mm puts 3.3 times as many voxels through every thin feature for the same
+/// voxel size.
+///
+/// The ceiling on raising it further is [`preflight`], which refuses an import
+/// whose estimated vertices exceed [`VERTEX_CAPACITY`]; that estimate grows
+/// with the square of the size.
+const REFIT_LONGEST_MM: f32 = 200.0;
 
 /// Vertices the GPU mesh pool can hold.
 ///

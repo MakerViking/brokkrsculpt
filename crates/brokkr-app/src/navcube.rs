@@ -209,6 +209,22 @@ pub fn build(batch: &mut OverlayBatch, camera: &OrbitCamera, hovered: Option<Par
     }
 }
 
+/// The label a direction carries on the cube.
+///
+/// The same vocabulary the cube's own faces are lettered with, so the menu that
+/// opens on a face names things the way the face beside it does. `Down` rather
+/// than `Bottom` for the same reason the cube uses `D`: `B` already means back.
+pub fn facing_label(facing: brokkr_core::Facing) -> &'static str {
+    match facing {
+        brokkr_core::Facing::Right => "Right",
+        brokkr_core::Facing::Left => "Left",
+        brokkr_core::Facing::Up => "Top",
+        brokkr_core::Facing::Down => "Down",
+        brokkr_core::Facing::Front => "Front",
+        brokkr_core::Facing::Back => "Back",
+    }
+}
+
 /// Which part of the cube a widget local point is over, if any.
 pub fn pick(camera: &OrbitCamera, viewport: Vec2, at: Vec2) -> Option<Part> {
     if !contains(viewport, at) {
