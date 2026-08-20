@@ -44,6 +44,42 @@ qdbus6 org.kde.KWin /Scripting org.kde.kwin.Scripting.unloadScript "$NAME" >/dev
 
 # The compositor needs a moment to raise and refocus before the grab.
 sleep 1.5
+
+# Then CHECK it worked, because activation is a request and not a guarantee.
+#
+# `spectacle -a` captures whatever is active at the moment it runs, so if the
+# activation above lost a race -- a busy desktop, a video player taking focus
+# back, a window that was still mapping -- the capture silently becomes a
+# picture of somebody else's window. That is not a wasted screenshot: on
+# 2026-08-19 it captured a media player mid-playback and put it in an agent's
+# context. Whatever is on this desktop is nobody's business but its owner's, so
+# this asks the compositor what is actually focused and refuses rather than
+# guessing.
+MARKER="brokkr-active-$$-$RANDOM"
+PROBE=$(mktemp /tmp/kwin-probe-XXXXXX.js)
+cat >"$PROBE" <<EOF
+const active = workspace.activeWindow;
+print("${MARKER} " + (active ? active.resourceClass : "none"));
+EOF
+PROBE_NAME="brokkr-probe-$$-$RANDOM"
+PROBE_ID=$(qdbus6 org.kde.KWin /Scripting org.kde.kwin.Scripting.loadScript "$PROBE" "$PROBE_NAME")
+qdbus6 org.kde.KWin "/Scripting/Script${PROBE_ID}" org.kde.kwin.Script.run
+qdbus6 org.kde.KWin /Scripting org.kde.kwin.Scripting.unloadScript "$PROBE_NAME" >/dev/null
+rm -f "$PROBE"
+
+ACTIVE=$(journalctl --user -b --since "-20s" 2>/dev/null |
+    grep -o "${MARKER} .*" | tail -1 | cut -d' ' -f2- | tr -d '\r')
+
+if [[ -z "$ACTIVE" ]]; then
+    echo "could not ask the compositor what is focused, so not taking a screenshot" >&2
+    exit 1
+fi
+if [[ "${ACTIVE,,}" != *"${CLASS,,}"* ]]; then
+    echo "refusing to capture: '${ACTIVE}' has focus, not '${CLASS}'" >&2
+    echo "the window did not come forward -- raise it by hand and try again" >&2
+    exit 1
+fi
+
 # -b background, -n no notification, -a active window. NOT -f: full screen
 # captures the whole desktop, including whatever else is on the other monitor.
 spectacle -b -n -a -o "$OUT" >/dev/null 2>&1
