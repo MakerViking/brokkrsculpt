@@ -955,20 +955,28 @@ mod uinput_tests {
         false
     }
 
-    /// Whether a `/dev/input` node was ever created for a virtual device.
+    /// Whether this process can actually OPEN the node of a device it created.
     ///
     /// This is what tells "the scanner is broken" apart from "this machine
-    /// cannot do the test", and the two are otherwise indistinguishable at the
-    /// assertion. Write access to `/dev/uinput` is enough to CREATE a device,
-    /// so on a CI runner `build` succeeds and the skip below does not fire --
-    /// but with no udev running, no `eventN` node is ever made, and nothing can
-    /// see the device however correct the scanner is.
+    /// cannot do the test", and the two are indistinguishable at the assertion
+    /// itself. Two things have to go right and only the first is obvious:
     ///
-    /// Asking the device for its own nodes settles it. **A device with no node
-    /// is an environment fact and is worth skipping over; a device WITH a node
-    /// that the scanner still missed is a real failure and must stay one.**
-    fn made_a_node(device: &mut VirtualDevice) -> bool {
-        device.enumerate_dev_nodes_blocking().is_ok_and(|mut nodes| nodes.next().is_some())
+    /// 1. Write access to `/dev/uinput`, which is enough to CREATE a device --
+    ///    so `build` succeeds and the earlier skip never fires.
+    /// 2. Read access to the `/dev/input/eventN` node udev then makes for it,
+    ///    which is what the scanner opens. On a CI runner the node appears and
+    ///    is owned by root, so opening it fails and no scanner however correct
+    ///    could ever have seen the device. (Checking only that the node EXISTS
+    ///    is not enough, and was measured not to be: it came back true on the
+    ///    runner and the test failed anyway.)
+    ///
+    /// **A node this process cannot open is a fact about the machine and is
+    /// worth skipping over; a node it CAN open that the scanner still missed is
+    /// a real failure and must stay one.**
+    fn can_read_own_node(device: &mut VirtualDevice) -> bool {
+        device
+            .enumerate_dev_nodes_blocking()
+            .is_ok_and(|nodes| nodes.flatten().any(|path| std::fs::File::open(path).is_ok()))
     }
 
     #[test]
@@ -990,11 +998,11 @@ mod uinput_tests {
             tablet.devices().iter().any(|device| device.name == "BrokkrSculpt test stylus")
         });
         if !found {
-            if !made_a_node(&mut stylus) {
+            if !can_read_own_node(&mut stylus) {
                 eprintln!(
-                    "skipping: the virtual stylus was created but no /dev/input node ever \
-                     appeared for it, so nothing could have seen it. That needs a udev, \
-                     which a CI container generally has not got."
+                    "skipping: the virtual stylus was created but its /dev/input node cannot be opened by \
+                     this process, so nothing could have seen it. That needs udev and \
+                     membership of the input group, which a CI container has not got."
                 );
                 return;
             }
