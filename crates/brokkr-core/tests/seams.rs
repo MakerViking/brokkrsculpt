@@ -104,7 +104,7 @@ fn per_brick_meshing_produces_a_closed_surface() {
          First few: {:?}",
         open.len(),
         edges.len(),
-        &open.iter().take(5).collect::<Vec<_>>()
+        open.iter().take(5).collect::<Vec<_>>()
     );
 }
 
@@ -173,7 +173,7 @@ fn sculpting_keeps_the_surface_closed() {
         "sculpting opened {} of {} edges. First few: {:?}",
         open.len(),
         edges.len(),
-        &open.iter().take(5).collect::<Vec<_>>()
+        open.iter().take(5).collect::<Vec<_>>()
     );
 }
 
@@ -286,7 +286,7 @@ fn patterned_sculpting_keeps_the_surface_closed() {
         "patterned sculpting opened {} of {} edges. First few: {:?}",
         open.len(),
         edges.len(),
-        &open.iter().take(5).collect::<Vec<_>>()
+        open.iter().take(5).collect::<Vec<_>>()
     );
 }
 
@@ -354,6 +354,6 @@ fn a_voxelised_import_produces_a_closed_surface() {
         "a voxelised import left {} of {} edges open. First few: {:?}",
         open.len(),
         edges.len(),
-        &open.iter().take(5).collect::<Vec<_>>()
+        open.iter().take(5).collect::<Vec<_>>()
     );
 }
