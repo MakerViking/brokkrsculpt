@@ -1618,6 +1618,22 @@ mod uinput_tests {
         false
     }
 
+    /// Whether a `/dev/input` node was ever created for a virtual device.
+    ///
+    /// This is what tells "the scanner is broken" apart from "this machine
+    /// cannot do the test", and the two are otherwise indistinguishable at the
+    /// assertion. Write access to `/dev/uinput` is enough to CREATE a device,
+    /// so on a CI runner `build` succeeds and the skip above does not fire --
+    /// but with no udev running, no `eventN` node is ever made, and nothing can
+    /// see the device however correct the scanner is.
+    ///
+    /// Asking the device for its own nodes settles it. **A device with no node
+    /// is an environment fact and is worth skipping over; a device WITH a node
+    /// that the scanner still missed is a real failure and must stay one.**
+    fn made_a_node(device: &mut VirtualDevice) -> bool {
+        device.enumerate_dev_nodes_blocking().is_ok_and(|mut nodes| nodes.next().is_some())
+    }
+
     #[test]
     fn a_virtual_puck_is_found_and_drives_the_camera() {
         let Some(mut device) = build("BrokkrSculpt test puck", &puck_axes(), 2) else {
@@ -1638,10 +1654,17 @@ mod uinput_tests {
 
         let mut puck = SpaceMouse::start();
 
-        assert!(
-            wait_for(|| puck.devices().iter().any(|d| d.name == "BrokkrSculpt test puck")),
-            "the scanner never picked up the virtual puck"
-        );
+        if !wait_for(|| puck.devices().iter().any(|d| d.name == "BrokkrSculpt test puck")) {
+            if !made_a_node(&mut device) {
+                eprintln!(
+                    "skipping: the virtual puck was created but no /dev/input node ever \
+                     appeared for it, so nothing could have seen it. That needs a udev, \
+                     which a CI container generally has not got."
+                );
+                return;
+            }
+            panic!("the scanner never picked up the virtual puck");
+        }
         assert!(
             !puck.devices().iter().any(|d| d.name == "BrokkrSculpt test mouse"),
             "a two axis mouse was mistaken for a 6DOF puck"
