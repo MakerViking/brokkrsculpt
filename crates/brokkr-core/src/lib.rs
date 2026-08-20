@@ -23,6 +23,7 @@
 pub mod apron;
 pub mod brick;
 pub mod brush;
+pub mod cavity;
 pub mod clip;
 pub mod export;
 pub mod import;

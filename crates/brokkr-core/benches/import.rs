@@ -119,7 +119,12 @@ fn main() {
 
     println!("\nvoxelising, by voxel size");
     for voxel_size in [0.5f32, 0.25, 0.125] {
-        let options = VoxeliseOptions { voxel_size, centre: false, refit_if_implausible: false };
+        let options = VoxeliseOptions {
+            voxel_size,
+            centre: false,
+            refit_if_implausible: false,
+            fill_sealed_cavities: true,
+        };
         let (built, taken) = timed(|| voxelise(&read_stl, &options));
         let (volume, voxel_report) = built.expect("the fixture should voxelise");
         let stats = volume.stats();
@@ -153,7 +158,12 @@ fn main() {
     }
 
     println!("\nround trip");
-    let options = VoxeliseOptions { voxel_size: 0.25, centre: false, refit_if_implausible: false };
+    let options = VoxeliseOptions {
+        voxel_size: 0.25,
+        centre: false,
+        refit_if_implausible: false,
+        fill_sealed_cavities: true,
+    };
     let (rebuilt, _) = voxelise(&read_stl, &options).expect("the fixture should voxelise");
     let (again, again_report) = rebuilt.export_mesh();
     println!(

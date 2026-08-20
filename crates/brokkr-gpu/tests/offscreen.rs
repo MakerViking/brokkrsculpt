@@ -756,7 +756,12 @@ fn an_imported_mesh_renders() {
     assert!(report.is_printable(), "the fixture is not printable: {}", report.summary());
     let (mut imported, _) = voxelise(
         &mesh,
-        &VoxeliseOptions { voxel_size: VOXEL_SIZE, centre: false, refit_if_implausible: false },
+        &VoxeliseOptions {
+            voxel_size: VOXEL_SIZE,
+            centre: false,
+            refit_if_implausible: false,
+            fill_sealed_cavities: true,
+        },
     )
     .expect("the exported sphere should voxelise");
 

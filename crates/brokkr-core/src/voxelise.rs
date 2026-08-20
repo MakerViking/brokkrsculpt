@@ -121,11 +121,22 @@ pub struct VoxeliseOptions {
     /// quietly resize a model that states a real size -- the millimetre figure
     /// is the one number that matters in the whole file.
     pub refit_if_implausible: bool,
+    /// Make solid any void the outside cannot reach.
+    ///
+    /// A generated mesh is often a thin skin around a hollow interior, and a
+    /// wall a voxel or two thick cannot be held as a distance field -- it
+    /// perforates. Filling the void means only the outer surface has to be
+    /// represented. See [`crate::cavity`] for why the flood that finds the void
+    /// has to be sealed against the very holes it is there to cure.
+    ///
+    /// A field rather than a hardcoded step so a test can compare with and
+    /// without.
+    pub fill_sealed_cavities: bool,
 }
 
 impl VoxeliseOptions {
     pub fn at(voxel_size: f32) -> Self {
-        Self { voxel_size, centre: true, refit_if_implausible: true }
+        Self { voxel_size, centre: true, refit_if_implausible: true, fill_sealed_cavities: true }
     }
 }
 
@@ -144,6 +155,13 @@ pub struct VoxeliseReport {
     /// Voxels whose sign disagrees with all six of their in-brick neighbours.
     /// The cheapest available signal for hole-leak or duplicate-face corruption.
     pub isolated_sign_flips: usize,
+    /// Voxels turned solid because nothing outside the model could reach them.
+    ///
+    /// Zero means either that the model was solid already or that the flood
+    /// leaked through a hole in it; see [`crate::cavity`]. Worth reporting
+    /// either way, because a model that silently did not get filled looks like
+    /// one that did not need it.
+    pub filled_voxels: usize,
 }
 
 impl VoxeliseReport {
@@ -163,6 +181,9 @@ impl VoxeliseReport {
         }
         if self.isolated_sign_flips > 0 {
             out.push_str(&format!(", {} isolated sign flips", self.isolated_sign_flips));
+        }
+        if self.filled_voxels > 0 {
+            out.push_str(&format!(", filled a sealed cavity of {} voxels", self.filled_voxels));
         }
         out
     }
@@ -253,6 +274,21 @@ pub fn voxelise(
         return Err(ImportError::Malformed(
             "there is no enclosed volume in it, only an open surface".into(),
         ));
+    }
+
+    // Filling has to come AFTER the open-sheet refusal above, or a flood that
+    // leaked would rescue a sheet the code deliberately rejects, and BEFORE
+    // `mark_everything_dirty` below, or the bricks it inserts are never marked
+    // and the model is invisible.
+    if options.fill_sealed_cavities {
+        report.filled_voxels = crate::cavity::fill_sealed_cavities(&mut volume, b_min, b_max);
+        if report.filled_voxels > 0 {
+            // The counters gathered in the insertion loop are stale now: the
+            // fill turns absent bricks into tiles and can collapse a dense one.
+            let stats = volume.stats();
+            report.uniform_bricks = stats.uniform_bricks;
+            report.dense_bricks = stats.dense_bricks;
+        }
     }
 
     // One call, over everything. It does the plus or minus one expansion across
@@ -1293,7 +1329,12 @@ mod tests {
 
         let (rebuilt, rebuilt_report) = voxelise(
             &mesh,
-            &VoxeliseOptions { voxel_size: VOXEL, centre: false, refit_if_implausible: false },
+            &VoxeliseOptions {
+                voxel_size: VOXEL,
+                centre: false,
+                refit_if_implausible: false,
+                fill_sealed_cavities: true,
+            },
         )
         .expect("a sphere should voxelise");
 
@@ -1395,7 +1436,12 @@ mod tests {
         let mesh = cube(Vec3::splat(-2500.0), Vec3::splat(2500.0));
         let outcome = voxelise(
             &mesh,
-            &VoxeliseOptions { voxel_size: 0.05, centre: true, refit_if_implausible: false },
+            &VoxeliseOptions {
+                voxel_size: 0.05,
+                centre: true,
+                refit_if_implausible: false,
+                fill_sealed_cavities: true,
+            },
         );
         // `Volume` has no `Debug`, so the success case cannot be unwrapped into
         // a message; match instead.
@@ -1478,7 +1524,12 @@ mod preflight_calibration {
 
             let (built, report) = voxelise(
                 &mesh,
-                &VoxeliseOptions { voxel_size: voxel, centre: false, refit_if_implausible: false },
+                &VoxeliseOptions {
+                    voxel_size: voxel,
+                    centre: false,
+                    refit_if_implausible: false,
+                    fill_sealed_cavities: true,
+                },
             )
             .expect("the fixture should voxelise");
 

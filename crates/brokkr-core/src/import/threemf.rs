@@ -70,8 +70,16 @@ const REFUSED_EXTENSIONS: [(&str, &str); 2] = [
 ///
 /// Cycles are caught exactly, by the identifiers on the stack, so this only
 /// bounds the legitimate-but-absurd case -- a chain deep enough to overflow the
-/// stack while never repeating an object.
+/// stack while never repeating an object. Counted across model parts, not
+/// within one, because a chain that hops between parts is still a chain.
 const MAX_COMPONENT_DEPTH: usize = 64;
+
+/// Model parts a package may hold before it is called a mistake.
+///
+/// The production extension splits a scene across parts, and every one of them
+/// is inflated and parsed. A package naming thousands would be asking this
+/// reader to do a great deal of work from a very small file.
+const MAX_MODEL_PARTS: usize = 256;
 
 pub fn read(bytes: &[u8]) -> Result<ExportMesh, ImportError> {
     let archive = zip::Archive::open(bytes)?;
@@ -81,17 +89,206 @@ pub fn read(bytes: &[u8]) -> Result<ExportMesh, ImportError> {
             "it is a ZIP but has no `_rels/.rels`, so it is not an OPC package".to_string(),
         )
     })?;
-    let part = model_part(&relationships)?;
+    let root = model_part(&relationships)?;
 
-    let model = archive.read(&part)?.ok_or_else(|| {
+    // Every model part the package reaches, root first. Inflated up front
+    // rather than as the walk discovers them, for two reasons: a part reached
+    // from a hundred components would otherwise be inflated and CRC checked a
+    // hundred times, and the borrow checker will not let an `objects` map hold
+    // nodes from a document whose backing text is still being pushed into a
+    // growing collection.
+    let parts = gather_parts(&archive, root)?;
+    read_parts(&parts)
+}
+
+/// Inflate the root model part and everything it reaches through `path`.
+///
+/// The production extension lets a build item or a component name geometry in
+/// another part. This follows those, transitively, refusing a package that
+/// names one it does not contain rather than importing a model with a piece
+/// missing.
+fn gather_parts(
+    archive: &zip::Archive,
+    root: String,
+) -> Result<Vec<(String, String)>, ImportError> {
+    let mut parts: Vec<(String, String)> = Vec::new();
+    let mut seen: FxHashMap<String, ()> = FxHashMap::default();
+    let mut pending = vec![root];
+
+    while let Some(name) = pending.pop() {
+        if seen.insert(part_key(&name), ()).is_some() {
+            continue;
+        }
+        if parts.len() >= MAX_MODEL_PARTS {
+            return Err(ImportError::Malformed(format!(
+                "it is split across more than {MAX_MODEL_PARTS} model parts"
+            )));
+        }
+
+        let bytes = archive.read(&name)?.ok_or_else(|| {
+            ImportError::Malformed(format!(
+                "it points at model part `{name}`, which is not in the package"
+            ))
+        })?;
+        let text = String::from_utf8(bytes).map_err(|_| {
+            ImportError::Malformed(format!("its model part `{name}` is not valid UTF-8"))
+        })?;
+
+        // Scanned rather than walked: this pass only needs the names, and
+        // reaching them through the component structure would mean resolving
+        // ids before every part is available.
+        //
+        // The substring test in front of it is not micro-optimisation. Almost
+        // every 3MF in existence is a single part with no `path` anywhere, and
+        // parsing one twice -- once to find nothing, once to read it -- put
+        // 235 ms on a 41 MB package in the import bench. Scanning the bytes for
+        // the attribute name costs a memchr pass. A false positive only means
+        // doing the parse that used to happen unconditionally.
+        if text.contains("path") {
+            let document = parse(&text, "model")?;
+            for node in document.descendants() {
+                if !matches!(local(node), "component" | "item") {
+                    continue;
+                }
+                if let Some(path) = node.attributes().find(|a| a.name() == "path") {
+                    pending.push(path.value().to_string());
+                }
+            }
+        }
+        parts.push((name, text));
+    }
+    Ok(parts)
+}
+
+/// How a part name is compared, matching what [`zip::Archive::read`] does.
+fn part_key(name: &str) -> String {
+    name.trim_start_matches('/').to_ascii_lowercase()
+}
+
+/// One part's resources, ready to be walked.
+struct Part<'a> {
+    model: Node<'a, 'a>,
+    objects: FxHashMap<&'a str, Node<'a, 'a>>,
+}
+
+fn read_parts(parts: &[(String, String)]) -> Result<ExportMesh, ImportError> {
+    let documents: Vec<Document> =
+        parts.iter().map(|(_, text)| parse(text, "model")).collect::<Result<Vec<_>, _>>()?;
+
+    let mut resolved: Vec<Part> = Vec::with_capacity(documents.len());
+    let mut unit = 1.0f32;
+    for (index, document) in documents.iter().enumerate() {
+        let model = document.root_element();
+        if local(model) != "model" {
+            return Err(ImportError::Malformed(format!(
+                "its model part starts with `<{}>` rather than `<model>`",
+                local(model)
+            )));
+        }
+        // Every part, not only the root: a part is free to declare that its own
+        // geometry needs an extension this reader cannot follow.
+        refuse_unreadable_extensions(model)?;
+
+        let scale = unit_scale(model)?;
+        if index == 0 {
+            unit = scale;
+        } else if scale != unit {
+            // Refused rather than honoured per part. The specification puts
+            // `unit` on the root model and says nothing useful about a sub-part
+            // disagreeing, so either answer is a guess -- and a guess here is
+            // the wrong-solid failure this module exists to avoid. No writer in
+            // practice emits a mismatch.
+            return Err(ImportError::Unsupported(format!(
+                "its model parts disagree about units, `{}` against the root's `{}`",
+                model.attribute("unit").unwrap_or("millimeter"),
+                documents[0].root_element().attribute("unit").unwrap_or("millimeter"),
+            )));
+        }
+
+        let mut objects: FxHashMap<&str, Node> = FxHashMap::default();
+        match child(model, "resources") {
+            Some(resources) => {
+                for object in children(resources, "object") {
+                    let id = object.attribute("id").ok_or_else(|| {
+                        ImportError::Malformed("an object in it has no id".to_string())
+                    })?;
+                    objects.insert(id, object);
+                }
+            }
+            // Only the root has to carry one. A part that holds nothing is
+            // pointless rather than malformed, and the build walk will say so
+            // if something references into it.
+            None if index == 0 => {
+                return Err(ImportError::Malformed(
+                    "its model part has no resources section".to_string(),
+                ));
+            }
+            None => {}
+        }
+        resolved.push(Part { model, objects });
+    }
+
+    // Units are folded into the root transform rather than applied afterwards,
+    // so that there is exactly one place where a coordinate becomes millimetres
+    // and no chance of a path that skips it.
+    let root = Mat4::from_scale(Vec3::splat(unit));
+
+    let mut welder = SoupWelder::new();
+    let mut stack: Vec<(usize, &str)> = Vec::new();
+    let mut items = 0usize;
+    // Only the ROOT part's build is the scene. A sub-part written by a slicer
+    // usually has no build at all, and where it has one it describes that
+    // part's own plate rather than this import.
+    if let Some(build) = child(resolved[0].model, "build") {
+        for item in children(build, "item") {
+            let part = referenced_part(item, 0, parts)?;
+            let id = item.attribute("objectid").ok_or_else(|| {
+                ImportError::Malformed("a build item in it names no object".to_string())
+            })?;
+            items += 1;
+            emit(
+                parts,
+                &resolved,
+                part,
+                id,
+                root * instance_transform(item)?,
+                &mut stack,
+                &mut welder,
+            )?;
+        }
+    }
+
+    if items == 0 {
+        return Err(ImportError::Malformed(
+            "its build section is empty, so the file describes nothing to print".to_string(),
+        ));
+    }
+    welder.finish()
+}
+
+/// Which part a build item or component names, defaulting to the one it is in.
+///
+/// The attribute is matched on its local name because its prefix is whatever
+/// the file declared -- `p:path` in every writer seen, but the specification
+/// only fixes the namespace.
+fn referenced_part(
+    node: Node,
+    current: usize,
+    parts: &[(String, String)],
+) -> Result<usize, ImportError> {
+    let Some(path) = node.attributes().find(|attribute| attribute.name() == "path") else {
+        // No path: it resolves against the part it appears in, NOT against the
+        // root. Ids are unique only within a part, so treating them as global
+        // would silently pick up whichever object happened to share the number.
+        return Ok(current);
+    };
+    let wanted = part_key(path.value());
+    parts.iter().position(|(name, _)| part_key(name) == wanted).ok_or_else(|| {
         ImportError::Malformed(format!(
-            "its relationships point at `{part}`, which is not in the package"
+            "it points at model part `{}`, which is not in the package",
+            path.value()
         ))
-    })?;
-    let text = std::str::from_utf8(&model)
-        .map_err(|_| ImportError::Malformed("its model part is not valid UTF-8".to_string()))?;
-
-    read_model(text)
+    })
 }
 
 /// Find the model part by following `_rels/.rels`.
@@ -119,56 +316,6 @@ fn model_part(relationships: &[u8]) -> Result<String, ImportError> {
     ))
 }
 
-fn read_model(text: &str) -> Result<ExportMesh, ImportError> {
-    let document = parse(text, "model")?;
-    let model = document.root_element();
-    if local(model) != "model" {
-        return Err(ImportError::Malformed(format!(
-            "its model part starts with `<{}>` rather than `<model>`",
-            local(model)
-        )));
-    }
-
-    refuse_unreadable_extensions(model)?;
-
-    // Units are folded into the root transform rather than applied afterwards,
-    // so that there is exactly one place where a coordinate becomes millimetres
-    // and no chance of a path that skips it.
-    let root = Mat4::from_scale(Vec3::splat(unit_scale(model)?));
-
-    let resources = child(model, "resources").ok_or_else(|| {
-        ImportError::Malformed("its model part has no resources section".to_string())
-    })?;
-    let mut objects: FxHashMap<&str, Node> = FxHashMap::default();
-    for object in children(resources, "object") {
-        let id = object
-            .attribute("id")
-            .ok_or_else(|| ImportError::Malformed("an object in it has no id".to_string()))?;
-        objects.insert(id, object);
-    }
-
-    let mut welder = SoupWelder::new();
-    let mut stack: Vec<&str> = Vec::new();
-    let mut items = 0usize;
-    if let Some(build) = child(model, "build") {
-        for item in children(build, "item") {
-            refuse_other_part(item, "build item")?;
-            let id = item.attribute("objectid").ok_or_else(|| {
-                ImportError::Malformed("a build item in it names no object".to_string())
-            })?;
-            items += 1;
-            emit(&objects, id, root * instance_transform(item)?, &mut stack, &mut welder)?;
-        }
-    }
-
-    if items == 0 {
-        return Err(ImportError::Malformed(
-            "its build section is empty, so the file describes nothing to print".to_string(),
-        ));
-    }
-    welder.finish()
-}
-
 /// Refuse a file whose geometry is in an extension this reader does not read.
 ///
 /// `requiredextensions` holds namespace *prefixes*, not the namespace URIs
@@ -192,24 +339,6 @@ fn refuse_unreadable_extensions(model: Node) -> Result<(), ImportError> {
                 )));
             }
         }
-    }
-    Ok(())
-}
-
-/// Refuse an instance whose geometry lives in another model part.
-///
-/// The production extension lets a build item or component carry a `path` that
-/// points into a second model part, which is how a large assembly is split
-/// across files. This reader opens one model part, so an instance with a path
-/// would silently contribute nothing and the import would come out missing a
-/// piece rather than failing. The attribute is matched on its local name
-/// because its prefix is whatever the file declared.
-fn refuse_other_part(node: Node, what: &str) -> Result<(), ImportError> {
-    if node.attributes().any(|attribute| attribute.name() == "path") {
-        return Err(ImportError::Unsupported(format!(
-            "a {what} in it points at geometry in another model part, which needs the production \
-             extension this reader does not implement"
-        )));
     }
     Ok(())
 }
@@ -277,16 +406,23 @@ fn instance_transform(node: Node) -> Result<Mat4, ImportError> {
 
 /// Add one object, and everything it is built out of, to the soup.
 fn emit<'a>(
-    objects: &FxHashMap<&'a str, Node<'a, 'a>>,
+    parts: &[(String, String)],
+    resolved: &[Part<'a>],
+    part: usize,
     id: &'a str,
     world: Mat4,
-    stack: &mut Vec<&'a str>,
+    stack: &mut Vec<(usize, &'a str)>,
     welder: &mut SoupWelder,
 ) -> Result<(), ImportError> {
     // An object that contains itself, directly or through a chain, would
     // recurse until the stack ran out. That is a crash rather than an error
     // message, and a hand written file can reach it by accident.
-    if stack.contains(&id) {
+    //
+    // The key is the PART and the id together. Ids are unique only within a
+    // part, so on the id alone a legitimate chain from part A's object 1 into
+    // part B's object 1 reads as an object containing itself -- and a genuine
+    // A:1 -> B:1 -> A:1 cycle would slip through.
+    if stack.contains(&(part, id)) {
         return Err(ImportError::Malformed(format!(
             "object {id} in it contains itself, so it cannot be flattened"
         )));
@@ -296,23 +432,31 @@ fn emit<'a>(
             "its components nest more than {MAX_COMPONENT_DEPTH} deep"
         )));
     }
-    let object = *objects.get(id).ok_or_else(|| {
+    let object = *resolved[part].objects.get(id).ok_or_else(|| {
         ImportError::Malformed(format!("it references object {id}, which it does not contain"))
     })?;
 
-    stack.push(id);
+    stack.push((part, id));
     if let Some(mesh) = child(object, "mesh") {
         emit_mesh(mesh, world, welder)?;
     }
     if let Some(components) = child(object, "components") {
         for component in children(components, "component") {
-            refuse_other_part(component, "component")?;
+            let into = referenced_part(component, part, parts)?;
             let child_id = component.attribute("objectid").ok_or_else(|| {
                 ImportError::Malformed("a component in it names no object".to_string())
             })?;
             // The child's own transform applies first and the parent's on top,
             // which in glam's column convention is the parent on the left.
-            emit(objects, child_id, world * instance_transform(component)?, stack, welder)?;
+            emit(
+                parts,
+                resolved,
+                into,
+                child_id,
+                world * instance_transform(component)?,
+                stack,
+                welder,
+            )?;
         }
     }
     stack.pop();
@@ -808,18 +952,284 @@ mod tests {
         assert!(read(&packaged(&one_tetrahedron(attributes, ""))).is_ok());
     }
 
+    /// Package a root part plus one named sub-part, the way the production
+    /// extension splits a scene and the way every Bambu Studio and OrcaSlicer
+    /// project file on disk is laid out.
+    fn packaged_with_part(root: &str, name: &str, part: &str) -> Vec<u8> {
+        let relationships = rels("/3D/3dmodel.model");
+        package(&[
+            ("_rels/.rels", relationships.as_bytes(), How::Deflated),
+            ("3D/3dmodel.model", root.as_bytes(), How::Deflated),
+            (name, part.as_bytes(), How::Deflated),
+        ])
+    }
+
+    /// The production namespace declaration, which every such file carries.
+    const PRODUCTION: &str =
+        "xmlns:p=\"http://schemas.microsoft.com/3dmanufacturing/production/2015/06\"";
+
     #[test]
-    fn a_build_item_pointing_into_another_model_part_is_refused() {
-        let attributes =
-            "xmlns:p=\"http://schemas.microsoft.com/3dmanufacturing/production/2015/06\"";
+    fn geometry_in_another_model_part_is_followed() {
+        // The layout of `Howling-Wolf-solid.3mf` and of every project file
+        // Bambu Studio or OrcaSlicer writes: a root part of a few hundred bytes
+        // whose object is a single component pointing into the part that
+        // actually holds the mesh.
+        let root = model(
+            PRODUCTION,
+            "  <object id=\"2\" type=\"model\">\n   <components>\n    \
+             <component p:path=\"/3D/Objects/wolf.model\" objectid=\"1\"/>\n   \
+             </components>\n  </object>\n",
+            "  <item objectid=\"2\"/>\n",
+        );
+        let part = model(
+            PRODUCTION,
+            &format!(
+                "  <object id=\"1\" type=\"model\">\n   <mesh>\n{TETRAHEDRON}\n   </mesh>\n  </object>\n"
+            ),
+            "",
+        );
+
+        let mesh = read(&packaged_with_part(&root, "3D/Objects/wolf.model", &part))
+            .expect("a package split across parts should read");
+        assert_eq!(mesh.triangles.len(), 4, "the tetrahedron did not come through");
+        assert_eq!(mesh.positions.len(), 4);
+    }
+
+    #[test]
+    fn a_sub_part_needs_no_build_of_its_own() {
+        // Only the root's build is the scene. A sub-part written by a slicer
+        // usually has no build at all, and the single-part reader required a
+        // non-empty one -- so this is the check that the requirement was moved
+        // rather than merely relaxed everywhere.
+        let root = model(
+            PRODUCTION,
+            "  <object id=\"9\" type=\"model\">\n   <components>\n    \
+             <component p:path=\"/3D/sub.model\" objectid=\"1\"/>\n   \
+             </components>\n  </object>\n",
+            "  <item objectid=\"9\"/>\n",
+        );
+        // No <build> element at all.
+        let part = format!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+             <model xmlns=\"http://schemas.microsoft.com/3dmanufacturing/core/2015/02\" \
+             {PRODUCTION}>\n<resources>\n  \
+             <object id=\"1\" type=\"model\">\n   <mesh>\n{TETRAHEDRON}\n   </mesh>\n  </object>\n\
+             </resources>\n</model>\n"
+        );
+        assert!(read(&packaged_with_part(&root, "3D/sub.model", &part)).is_ok());
+    }
+
+    #[test]
+    fn a_transform_composes_across_a_part_boundary() {
+        // The multi-part twin of `nested_component_transforms_compose_outermost_last`,
+        // and the reason it matters here: the wolf's build item carries a 2x
+        // scale that has to reach geometry living in a different file.
+        let root = model(
+            PRODUCTION,
+            "  <object id=\"2\" type=\"model\">\n   <components>\n    \
+             <component p:path=\"/3D/sub.model\" objectid=\"1\" \
+             transform=\"1 0 0 0 1 0 0 0 1 10 0 0\"/>\n   </components>\n  </object>\n",
+            "  <item objectid=\"2\" transform=\"2 0 0 0 2 0 0 0 2 0 0 0\"/>\n",
+        );
+        let part = model(
+            PRODUCTION,
+            &format!(
+                "  <object id=\"1\" type=\"model\">\n   <mesh>\n{TETRAHEDRON}\n   </mesh>\n  </object>\n"
+            ),
+            "",
+        );
+
+        let mesh = read(&packaged_with_part(&root, "3D/sub.model", &part)).expect("it should read");
+        // The component shifts by 10 and the item then doubles everything, so
+        // the origin vertex lands at 20 rather than at 10.
+        let origin = mesh
+            .positions
+            .iter()
+            .find(|p| p.y.abs() < 1.0e-5 && p.z.abs() < 1.0e-5)
+            .expect("the tetrahedron's origin corner");
+        assert!(
+            (origin.x - 20.0).abs() < 1.0e-4,
+            "the outer transform did not reach across the part boundary: {origin}"
+        );
+    }
+
+    #[test]
+    fn object_ids_are_local_to_their_part() {
+        // Ids are unique only within a part, and both parts here call their
+        // object 1. Flattening every part into one map would make the root's
+        // own object 1 shadow the sub-part's, and the import would silently
+        // come out as the wrong geometry rather than as an error.
+        let root = model(
+            PRODUCTION,
+            // The root has its own object 1 -- a mesh, not the one wanted.
+            &format!(
+                "  <object id=\"1\" type=\"model\">\n   <mesh>\n{TETRAHEDRON}\n   </mesh>\n  </object>\n  \
+                 <object id=\"2\" type=\"model\">\n   <components>\n    \
+                 <component p:path=\"/3D/sub.model\" objectid=\"1\"/>\n   </components>\n  </object>\n"
+            ),
+            "  <item objectid=\"2\"/>\n",
+        );
+        // The sub-part's object 1 is a single triangle, so it is telling apart
+        // from the root's four.
+        let part = model(
+            PRODUCTION,
+            "  <object id=\"1\" type=\"model\">\n   <mesh>\n   <vertices>\n    \
+             <vertex x=\"0\" y=\"0\" z=\"0\"/>\n    <vertex x=\"5\" y=\"0\" z=\"0\"/>\n    \
+             <vertex x=\"0\" y=\"5\" z=\"0\"/>\n   </vertices>\n   <triangles>\n    \
+             <triangle v1=\"0\" v2=\"1\" v3=\"2\"/>\n   </triangles>\n   </mesh>\n  </object>\n",
+            "",
+        );
+
+        let mesh = read(&packaged_with_part(&root, "3D/sub.model", &part)).expect("it should read");
+        assert_eq!(
+            mesh.triangles.len(),
+            1,
+            "the root's object 1 was used instead of the sub-part's"
+        );
+    }
+
+    #[test]
+    fn a_cycle_across_two_parts_is_refused() {
+        // The cycle guard keys on (part, id). On the id alone this would either
+        // recurse until the stack ran out, or -- with the naive fix -- report
+        // the legitimate A:1 -> B:1 hop as an object containing itself.
+        let root = model(
+            PRODUCTION,
+            "  <object id=\"1\" type=\"model\">\n   <components>\n    \
+             <component p:path=\"/3D/sub.model\" objectid=\"1\"/>\n   </components>\n  </object>\n",
+            "  <item objectid=\"1\"/>\n",
+        );
+        let part = model(
+            PRODUCTION,
+            "  <object id=\"1\" type=\"model\">\n   <components>\n    \
+             <component p:path=\"/3D/3dmodel.model\" objectid=\"1\"/>\n   </components>\n  </object>\n",
+            "",
+        );
+        assert!(
+            matches!(
+                read(&packaged_with_part(&root, "3D/sub.model", &part)),
+                Err(ImportError::Malformed(_))
+            ),
+            "a cycle that hops between parts has to be an error, not a stack overflow"
+        );
+    }
+
+    #[test]
+    fn the_same_id_in_two_parts_is_not_a_cycle() {
+        // The control for the test above: keying the stack on the id alone
+        // would refuse this, and it is exactly what the wolf does.
+        let root = model(
+            PRODUCTION,
+            "  <object id=\"1\" type=\"model\">\n   <components>\n    \
+             <component p:path=\"/3D/sub.model\" objectid=\"1\"/>\n   </components>\n  </object>\n",
+            "  <item objectid=\"1\"/>\n",
+        );
+        let part = model(
+            PRODUCTION,
+            &format!(
+                "  <object id=\"1\" type=\"model\">\n   <mesh>\n{TETRAHEDRON}\n   </mesh>\n  </object>\n"
+            ),
+            "",
+        );
+        assert!(
+            read(&packaged_with_part(&root, "3D/sub.model", &part)).is_ok(),
+            "part A's object 1 pointing at part B's object 1 is not a cycle"
+        );
+    }
+
+    #[test]
+    fn a_path_naming_a_part_that_is_not_there_is_refused_rather_than_dropped() {
+        // The failure this replaces the old blanket refusal with. Silently
+        // emitting nothing would hand back a model missing a piece, with a
+        // success message.
         let text = model(
-            attributes,
+            PRODUCTION,
             &format!(
                 "  <object id=\"1\" type=\"model\">\n   <mesh>\n{TETRAHEDRON}\n   </mesh>\n  </object>\n"
             ),
             "  <item objectid=\"1\" p:path=\"/3D/other.model\"/>\n",
         );
-        assert!(matches!(read(&packaged(&text)), Err(ImportError::Unsupported(_))));
+        let error = read(&packaged(&text)).expect_err("a missing part must not read as a success");
+        assert!(
+            matches!(error, ImportError::Malformed(ref message) if message.contains("other.model")),
+            "the error should name the part that is missing: {error}"
+        );
+    }
+
+    #[test]
+    fn model_parts_that_disagree_about_units_are_refused() {
+        // Either answer -- honour the sub-part's unit, or inherit the root's --
+        // is a guess, and a guess about units is the thousand-times-too-small
+        // import this module's header warns about.
+        let root = model(
+            &format!("{PRODUCTION} unit=\"millimeter\""),
+            "  <object id=\"2\" type=\"model\">\n   <components>\n    \
+             <component p:path=\"/3D/sub.model\" objectid=\"1\"/>\n   </components>\n  </object>\n",
+            "  <item objectid=\"2\"/>\n",
+        );
+        let part = model(
+            &format!("{PRODUCTION} unit=\"meter\""),
+            &format!(
+                "  <object id=\"1\" type=\"model\">\n   <mesh>\n{TETRAHEDRON}\n   </mesh>\n  </object>\n"
+            ),
+            "",
+        );
+        assert!(matches!(
+            read(&packaged_with_part(&root, "3D/sub.model", &part)),
+            Err(ImportError::Unsupported(_))
+        ));
+    }
+
+    #[test]
+    fn a_sub_part_requiring_an_unreadable_extension_is_refused_too() {
+        // The extension check used to run on the root only. A sub-part is free
+        // to declare that its geometry is a strut graph, and that is exactly
+        // the part the geometry is coming from.
+        let root = model(
+            PRODUCTION,
+            "  <object id=\"2\" type=\"model\">\n   <components>\n    \
+             <component p:path=\"/3D/sub.model\" objectid=\"1\"/>\n   </components>\n  </object>\n",
+            "  <item objectid=\"2\"/>\n",
+        );
+        let part = model(
+            &format!(
+                "{PRODUCTION} xmlns:b=\"{}\" requiredextensions=\"b\"",
+                REFUSED_EXTENSIONS[0].0
+            ),
+            &format!(
+                "  <object id=\"1\" type=\"model\">\n   <mesh>\n{TETRAHEDRON}\n   </mesh>\n  </object>\n"
+            ),
+            "",
+        );
+        assert!(matches!(
+            read(&packaged_with_part(&root, "3D/sub.model", &part)),
+            Err(ImportError::Unsupported(_))
+        ));
+    }
+
+    #[test]
+    fn a_part_reached_twice_is_inflated_once() {
+        // Two components naming the same part. Reading it per reference would
+        // make a small package cost arbitrarily much work, which is the same
+        // class of thing the zip bomb ceiling exists to stop -- and the
+        // geometry still has to arrive twice.
+        let root = model(
+            PRODUCTION,
+            "  <object id=\"2\" type=\"model\">\n   <components>\n    \
+             <component p:path=\"/3D/sub.model\" objectid=\"1\"/>\n    \
+             <component p:path=\"/3D/sub.model\" objectid=\"1\" \
+             transform=\"1 0 0 0 1 0 0 0 1 50 0 0\"/>\n   </components>\n  </object>\n",
+            "  <item objectid=\"2\"/>\n",
+        );
+        let part = model(
+            PRODUCTION,
+            &format!(
+                "  <object id=\"1\" type=\"model\">\n   <mesh>\n{TETRAHEDRON}\n   </mesh>\n  </object>\n"
+            ),
+            "",
+        );
+        let mesh = read(&packaged_with_part(&root, "3D/sub.model", &part)).expect("it should read");
+        assert_eq!(mesh.triangles.len(), 8, "both instances should be present");
     }
 
     #[test]
