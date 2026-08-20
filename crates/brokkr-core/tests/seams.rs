@@ -333,7 +333,12 @@ fn a_voxelised_import_produces_a_closed_surface() {
         [1, 2, 6],
         [1, 6, 5],
     ];
-    let mesh = ExportMesh { positions: c.to_vec(), normals: Vec::new(), triangles: faces.to_vec() };
+    let mesh = ExportMesh {
+        positions: c.to_vec(),
+        normals: Vec::new(),
+        triangles: faces.to_vec(),
+        slots: Vec::new(),
+    };
 
     let (volume, report) =
         voxelise(&mesh, &VoxeliseOptions::at(0.25)).expect("an off-lattice cube should voxelise");

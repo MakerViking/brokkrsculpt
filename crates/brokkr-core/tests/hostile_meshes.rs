@@ -66,6 +66,7 @@ fn seed_mesh() -> ExportMesh {
         ],
         normals: Vec::new(),
         triangles: vec![[0, 2, 1], [0, 1, 3], [0, 3, 2], [1, 2, 3]],
+        slots: Vec::new(),
     }
 }
 
@@ -323,6 +324,7 @@ fn a_mesh_the_lattice_cannot_hold_is_refused_rather_than_built() {
                 ],
                 normals: Vec::new(),
                 triangles: vec![[0, 2, 1], [0, 1, 3], [0, 3, 2], [1, 2, 3]],
+                slots: Vec::new(),
             },
         ),
         (
@@ -336,6 +338,7 @@ fn a_mesh_the_lattice_cannot_hold_is_refused_rather_than_built() {
                 ],
                 normals: Vec::new(),
                 triangles: vec![[0, 2, 1], [0, 1, 3], [0, 3, 2], [1, 2, 3]],
+                slots: Vec::new(),
             },
         ),
         (
@@ -344,6 +347,7 @@ fn a_mesh_the_lattice_cannot_hold_is_refused_rather_than_built() {
                 positions: vec![Vec3::ZERO, Vec3::ZERO, Vec3::ZERO],
                 normals: Vec::new(),
                 triangles: vec![[0, 1, 2], [0, 1, 2]],
+                slots: Vec::new(),
             },
         ),
         (
@@ -352,6 +356,7 @@ fn a_mesh_the_lattice_cannot_hold_is_refused_rather_than_built() {
                 positions: vec![Vec3::ZERO, Vec3::X * 10.0, Vec3::Y * 10.0],
                 normals: Vec::new(),
                 triangles: vec![[0, 1, 2]],
+                slots: Vec::new(),
             },
         ),
     ];

@@ -1091,6 +1091,7 @@ mod tests {
             positions: c.to_vec(),
             normals: Vec::new(),
             triangles: faces.iter().map(|[a, b, cc]| [*a as u32, *b as u32, *cc as u32]).collect(),
+            slots: Vec::new(),
         }
     }
 
@@ -1463,6 +1464,7 @@ mod tests {
             ],
             normals: Vec::new(),
             triangles: vec![[0, 1, 2], [0, 2, 3]],
+            slots: Vec::new(),
         };
         assert!(
             voxelise(&mesh, &VoxeliseOptions::at(VOXEL)).is_err(),

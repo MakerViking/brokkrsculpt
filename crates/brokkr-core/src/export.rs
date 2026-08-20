@@ -54,6 +54,16 @@ pub struct ExportMesh {
     /// Averaged unit normal per position, for formats that carry them.
     pub normals: Vec<Vec3>,
     pub triangles: Vec<[u32; 3]>,
+    /// Filament slot per position, 1-based, or 0 for "not assigned".
+    ///
+    /// **Empty means the whole mesh is unassigned**, which is what every caller
+    /// produces today. A writer that carries colour must treat an empty vector
+    /// and a vector of zeros the same way rather than indexing blindly.
+    ///
+    /// A slot, not a colour. What a 3MF carries per triangle is which filament
+    /// prints it; the RGB lives in the slicer's own filament setup. See
+    /// [`super::export::threemf`] for why that is the contract.
+    pub slots: Vec<u8>,
 }
 
 /// What the mesh turned out to be.

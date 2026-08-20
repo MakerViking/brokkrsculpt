@@ -8,11 +8,11 @@
 //!
 //! # Why the ZIP is written by hand
 //!
-//! Only three small entries are needed and 3MF permits them stored rather than
-//! deflated, so the whole container is a few hundred lines of well specified
-//! header layout and one CRC. That is a poor trade against pulling in a zip
-//! crate and a compression crate, and the format is fixed forever, so there is
-//! nothing here to keep up with.
+//! Only a handful of small entries are needed and 3MF permits them stored
+//! rather than deflated, so the whole container is a few hundred lines of well
+//! specified header layout and one CRC. That is a poor trade against pulling in
+//! a zip crate and a compression crate, and the format is fixed forever, so
+//! there is nothing here to keep up with.
 //!
 //! What this writer produces is a deliberately degenerate subset of the format:
 //! stored entries only, one namespace, always millimetres, one object and no
@@ -20,6 +20,20 @@
 //! what stops this module being checked only against its own assumptions -- but
 //! that reader is not tested against this writer alone, precisely because
 //! agreeing with it would prove nothing about a real file.
+//!
+//! # Colour is not in the specification's terms
+//!
+//! Two of the five entries -- `Metadata/model_settings.config` and
+//! `Metadata/project_settings.config` -- are not 3MF at all. They are the
+//! slicer's own sidecars, and together with the `paint_color` attribute on each
+//! `<triangle>` they are how per-filament colour actually travels. The
+//! specification's materials extension is not read by the target and is not
+//! written here; see [`PAINT_CODE`] for the evidence and the encoding.
+//!
+//! **Verified against OrcaSlicer 2.4.0-alpha on 2026-08-20**, not merely
+//! believed: a four-band sphere written by `a_banded_sphere_is_written_for_a_slicer_to_judge`
+//! opens with its bands on filaments 1 to 4, the unpainted cap on the base
+//! filament, and the four slot colours taken from our settings part.
 //!
 //! Coordinates are rotated to Z-up on the way out. See [`crate::orientation`].
 //! 3MF carries no vertex normals, so positions are all there is to rotate.
@@ -31,6 +45,74 @@ use crate::orientation::to_print_space;
 
 /// The core specification namespace, which every consumer keys off.
 const CORE_NAMESPACE: &str = "http://schemas.microsoft.com/3dmanufacturing/core/2015/02";
+
+/// The filament slot a triangle is printed with, as the slicers in the
+/// PrusaSlicer lineage encode it.
+///
+/// # Why not the specification's own materials extension
+///
+/// Because it is not what the target reads. Measured against two real
+/// multi-colour projects -- `Happy_Piglet_Multi-Color.3mf` (46.9 MB of model
+/// XML) and `1plate+3color+3MF.3mf` -- there are **zero** occurrences of
+/// `basematerials`, `colorgroup`, `texture2d` or `pid=` between them. Not rare:
+/// absent. What they carry is a `paint_color` attribute on nearly every
+/// `<triangle>`. Writing the specification's route instead produces a file that
+/// validates perfectly and prints in one colour.
+///
+/// # The encoding
+///
+/// From PrusaSlicer's `TriangleSelector::serialize`, which BambuStudio and
+/// OrcaSlicer inherit: nibbles are consumed in reverse string order and bits
+/// LSB-first. Two bits of split count (always `00` here -- see below), then two
+/// bits of state, and a state of 3 or more escapes to `11` followed by four
+/// bits of *state - 3*.
+///
+/// **This writer only ever emits leaf codes.** The long strings in real files
+/// (`"84886844AA84886844AA848828823"`) are a subdivision tree for painting
+/// *finer* than a source triangle. Surface nets already produces triangles
+/// smaller than any paint feature, so there is nothing to subdivide -- a
+/// structural advantage of a voxel sculptor over a mesh painter, and the reason
+/// the recursive encoder is not here. A *reader* would still need it.
+///
+/// Verified by decoding both files above; the codes for slots 1-4 appear there
+/// as `"4"`, `"8"`, `"0C"` and `"1C"`.
+const PAINT_CODE: [&str; 16] =
+    ["4", "8", "0C", "1C", "2C", "3C", "4C", "5C", "6C", "7C", "8C", "9C", "AC", "BC", "CC", "DC"];
+
+/// The code for a 1-based filament slot, or `None` when the slot is unassigned
+/// or out of range.
+fn paint_code(slot: u8) -> Option<&'static str> {
+    if slot == 0 { None } else { PAINT_CODE.get(slot as usize - 1).copied() }
+}
+
+/// The filament slots a package declares, so a slicer opening it shows the
+/// colours the sculpt was painted with rather than whatever is loaded.
+///
+/// **Slot number is the contract; the colours here are a hint.** A 3MF carries
+/// which filament prints a triangle, not what colour it is, so if the slicer
+/// ignores this the assignment still lands -- the user just sees their own
+/// slot colours instead of ours.
+#[derive(Debug, Clone)]
+pub struct Filaments {
+    /// `#RRGGBB` per slot, in slot order.
+    pub colours: Vec<String>,
+    /// Material per slot, in slot order. Padded with `PLA` when short.
+    pub materials: Vec<String>,
+    /// The slot an unpainted triangle prints with, 1-based.
+    pub base: u8,
+}
+
+impl Default for Filaments {
+    /// Four slots, the U1's count, in colours that are obvious when they land
+    /// on the wrong one.
+    fn default() -> Self {
+        Self {
+            colours: ["#FFFFFF", "#FF0000", "#00B050", "#2850E0"].map(str::to_string).to_vec(),
+            materials: vec!["PLA".to_string(); 4],
+            base: 1,
+        }
+    }
+}
 
 /// Build the model XML for a mesh.
 ///
@@ -57,7 +139,19 @@ fn model_xml(mesh: &ExportMesh) -> String {
 
     xml.push_str("    <triangles>\n");
     for [a, b, c] in &mesh.triangles {
-        xml.push_str(&format!("     <triangle v1=\"{a}\" v2=\"{b}\" v3=\"{c}\"/>\n"));
+        // The triangle's filament is the slot of its FIRST corner, which is the
+        // same rule the renderer's provoking vertex uses. Picking a different
+        // corner here would let the preview and the file disagree at every
+        // colour boundary, and nothing would catch it but the eye.
+        let slot = mesh.slots.get(*a as usize).copied().unwrap_or(0);
+        match paint_code(slot) {
+            Some(code) => xml.push_str(&format!(
+                "     <triangle v1=\"{a}\" v2=\"{b}\" v3=\"{c}\" paint_color=\"{code}\"/>\n"
+            )),
+            // Unassigned. The object's own `extruder` metadata decides, which is
+            // what an unpainted triangle means in a real file.
+            None => xml.push_str(&format!("     <triangle v1=\"{a}\" v2=\"{b}\" v3=\"{c}\"/>\n")),
+        }
     }
     xml.push_str("    </triangles>\n");
 
@@ -80,14 +174,70 @@ const RELATIONSHIPS: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
 </Relationships>
 "#;
 
-/// Write `mesh` as a 3MF package.
+/// Which filament an object prints with when a triangle says nothing.
+///
+/// Not part of the 3MF specification: it is the slicer's own sidecar, and the
+/// reference for its shape is a real project file rather than a document.
+///
+/// **`[Content_Types].xml` deliberately does not declare a `config`
+/// extension.** The real packages ship these parts undeclared and are read
+/// anyway, so declaring one would be inventing a rule the target does not
+/// follow.
+fn model_settings_xml(filaments: &Filaments) -> String {
+    format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<config>\n  <object id=\"1\">\n    \
+         <metadata key=\"name\" value=\"BrokkrSculpt\"/>\n    \
+         <metadata key=\"extruder\" value=\"{}\"/>\n  </object>\n</config>\n",
+        filaments.base.max(1)
+    )
+}
+
+/// The slot colours, so the slicer shows what the sculpt was painted with.
+///
+/// A real one of these is a 437-key versioned preset blob, and coupling to all
+/// of it would break on every slicer release. This writes the three keys that
+/// carry the answer and nothing else, on the theory that a settings file is
+/// merged over the active preset rather than replacing it.
+///
+/// **Whether that theory holds is exactly what the first export spike
+/// measures.** If the slicer refuses a partial file, drop this part entirely
+/// and keep [`model_settings_xml`]; the slot assignment still lands and only
+/// the colours come from the user's own setup instead of ours.
+fn project_settings_json(filaments: &Filaments) -> String {
+    let list = |values: &[String]| {
+        let quoted: Vec<String> = values.iter().map(|v| format!("\"{v}\"")).collect();
+        quoted.join(", ")
+    };
+    let mut materials = filaments.materials.clone();
+    materials.resize(filaments.colours.len(), "PLA".to_string());
+    format!(
+        "{{\n  \"from\": \"project\",\n  \"filament_colour\": [{}],\n  \"filament_type\": [{}]\n}}\n",
+        list(&filaments.colours),
+        list(&materials)
+    )
+}
+
+/// Write `mesh` as a 3MF package, with default filament slots.
 pub fn write(mesh: &ExportMesh, out: &mut impl Write) -> io::Result<()> {
+    write_with(mesh, &Filaments::default(), out)
+}
+
+/// Write `mesh` as a 3MF package, declaring `filaments` as the slot setup.
+pub fn write_with(
+    mesh: &ExportMesh,
+    filaments: &Filaments,
+    out: &mut impl Write,
+) -> io::Result<()> {
     let model = model_xml(mesh);
+    let model_settings = model_settings_xml(filaments);
+    let project_settings = project_settings_json(filaments);
     let mut zip = ZipWriter::new();
     // Order matters to some readers: the content types part has to come first.
     zip.add("[Content_Types].xml", CONTENT_TYPES.as_bytes());
     zip.add("_rels/.rels", RELATIONSHIPS.as_bytes());
     zip.add("3D/3dmodel.model", model.as_bytes());
+    zip.add("Metadata/model_settings.config", model_settings.as_bytes());
+    zip.add("Metadata/project_settings.config", project_settings.as_bytes());
     out.write_all(&zip.finish())
 }
 
@@ -311,19 +461,152 @@ mod tests {
     }
 
     #[test]
-    fn the_central_directory_lists_all_three_parts() {
+    fn the_central_directory_lists_every_part() {
         let mut bytes = Vec::new();
         write(&exported(), &mut bytes).unwrap();
 
         let signatures =
             bytes.windows(4).filter(|window| *window == 0x0201_4b50u32.to_le_bytes()).count();
-        assert_eq!(signatures, 3, "expected three central directory entries");
+        assert_eq!(signatures, 5, "expected five central directory entries");
 
-        for name in ["[Content_Types].xml", "_rels/.rels", "3D/3dmodel.model"] {
+        for name in [
+            "[Content_Types].xml",
+            "_rels/.rels",
+            "3D/3dmodel.model",
+            "Metadata/model_settings.config",
+            "Metadata/project_settings.config",
+        ] {
             assert!(
                 bytes.windows(name.len()).any(|window| window == name.as_bytes()),
                 "{name} is missing from the package"
             );
         }
+    }
+
+    // --- filament slots --------------------------------------------------
+
+    /// A mesh whose vertices are assigned slots by a closure of their index.
+    fn with_slots(slot_of: impl Fn(usize) -> u8) -> ExportMesh {
+        let mut mesh = exported();
+        mesh.slots = (0..mesh.positions.len()).map(&slot_of).collect();
+        mesh
+    }
+
+    #[test]
+    fn the_paint_codes_are_the_ones_real_files_carry() {
+        // Decoded from `Happy_Piglet_Multi-Color.3mf` and
+        // `1plate+3color+3MF.3mf`, which between them use slots 1 through 5.
+        // Getting these wrong produces a file that opens, slices, and prints in
+        // the wrong colours -- there is no error anywhere in that chain.
+        assert_eq!(paint_code(1), Some("4"));
+        assert_eq!(paint_code(2), Some("8"));
+        assert_eq!(paint_code(3), Some("0C"));
+        assert_eq!(paint_code(4), Some("1C"));
+        assert_eq!(paint_code(5), Some("2C"));
+        assert_eq!(paint_code(16), Some("DC"));
+
+        // The escape rule the table encodes, re-derived rather than copied:
+        // states of 3 and above are "11" plus four bits of state - 3, which in
+        // the reversed-nibble form is the hex digit of (slot - 3) then "C".
+        for slot in 3..=16u8 {
+            assert_eq!(
+                paint_code(slot),
+                Some(format!("{:X}C", slot - 3).as_str()),
+                "slot {slot} does not follow the escape rule"
+            );
+        }
+    }
+
+    #[test]
+    fn slot_zero_and_out_of_range_carry_no_code() {
+        assert_eq!(paint_code(0), None, "0 means unassigned, not filament zero");
+        assert_eq!(paint_code(17), None);
+        assert_eq!(paint_code(255), None);
+    }
+
+    #[test]
+    fn a_triangle_takes_the_slot_of_its_first_corner() {
+        // The same rule the renderer's provoking vertex uses. If the writer
+        // picked a different corner the file and the preview would disagree at
+        // every colour boundary, silently.
+        let mut mesh = exported();
+        mesh.slots = vec![0; mesh.positions.len()];
+        let [a, b, c] = mesh.triangles[0];
+        mesh.slots[a as usize] = 2;
+        mesh.slots[b as usize] = 4;
+        mesh.slots[c as usize] = 4;
+
+        let xml = model_xml(&mesh);
+        let line = xml
+            .lines()
+            .find(|line| line.contains(&format!("v1=\"{a}\" v2=\"{b}\" v3=\"{c}\"")))
+            .expect("the triangle should be in the file");
+        assert!(line.contains("paint_color=\"8\""), "took a corner other than the first: {line}");
+    }
+
+    #[test]
+    fn an_unassigned_mesh_writes_exactly_what_it_used_to() {
+        // The property that keeps every existing export byte-identical: a mesh
+        // nobody painted must not gain a single attribute.
+        let xml = model_xml(&exported());
+        assert!(!xml.contains("paint_color"), "an unpainted mesh grew colour attributes");
+
+        // And an all-zero slots vector is the same thing as an empty one.
+        let zeroed = with_slots(|_| 0);
+        assert_eq!(model_xml(&zeroed), xml, "zeros are not the same as unassigned");
+    }
+
+    #[test]
+    fn every_assigned_triangle_is_painted_including_the_base_slot() {
+        // Deliberately NOT omitting the base extruder's triangles. The real
+        // piglet file carries `paint_color` on 469,982 of its 469,983
+        // triangles, including the 430,995 painted with its own base extruder,
+        // so omission is an optimisation nothing in the target relies on. Until
+        // a round trip proves the slicer reads "absent" as "base", write it.
+        let mesh = with_slots(|index| (index % 4 + 1) as u8);
+        let xml = model_xml(&mesh);
+        let painted = xml.matches("paint_color=").count();
+        assert_eq!(painted, mesh.triangles.len(), "some assigned triangles came out unpainted");
+    }
+
+    #[test]
+    fn the_settings_parts_say_which_filament_and_what_colour() {
+        let filaments = Filaments {
+            colours: vec!["#112233".into(), "#445566".into()],
+            materials: vec!["PETG".into()],
+            base: 2,
+        };
+        let model_settings = model_settings_xml(&filaments);
+        assert!(model_settings.contains("key=\"extruder\" value=\"2\""), "{model_settings}");
+
+        let project = project_settings_json(&filaments);
+        assert!(project.contains("\"#112233\", \"#445566\""), "{project}");
+        // Short material lists are padded rather than mismatched, because a
+        // slicer reading two colours and one type has to guess.
+        assert!(project.contains("\"PETG\", \"PLA\""), "{project}");
+        assert!(project.contains("\"from\": \"project\""));
+    }
+
+    #[test]
+    fn a_painted_mesh_still_reads_back_as_the_same_geometry() {
+        // The reader ignores `paint_color`, and must keep ignoring it rather
+        // than choking: this is the guard that adding colour did not break the
+        // round trip the writer is otherwise only checked by.
+        let mesh = with_slots(|index| (index % 4 + 1) as u8);
+        let mut bytes = Vec::new();
+        write(&mesh, &mut bytes).unwrap();
+        let read_back = crate::import::threemf::read(&bytes).expect("it should read back");
+        assert_eq!(read_back.positions.len(), mesh.positions.len());
+        assert_eq!(read_back.triangles.len(), mesh.triangles.len());
+    }
+
+    #[test]
+    fn a_painted_mesh_is_written_deterministically_too() {
+        let mesh = with_slots(|index| (index % 4 + 1) as u8);
+        let mut first = Vec::new();
+        let mut second = Vec::new();
+        write(&mesh, &mut first).unwrap();
+        write(&mesh, &mut second).unwrap();
+        assert_eq!(first, second);
     }
 }

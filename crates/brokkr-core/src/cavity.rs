@@ -599,7 +599,7 @@ mod tests {
                 }
             })
             .collect();
-        ExportMesh { positions: c.to_vec(), normals: Vec::new(), triangles }
+        ExportMesh { positions: c.to_vec(), normals: Vec::new(), triangles, slots: Vec::new() }
     }
 
     fn join(mut a: ExportMesh, b: ExportMesh) -> ExportMesh {
