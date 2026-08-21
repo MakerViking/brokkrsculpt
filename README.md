@@ -21,11 +21,11 @@
 
 ---
 
-**This one started with a scan that came out wrong.** Anyone who has pointed a
-scanner at a real object knows the result: holes where the light did not reach,
-a shell that is not quite closed, a lump of noise where the turntable moved.
-Mesh tools will let you push vertices around it, and every push is a chance to
-tear something that was already fragile.
+**Models arrive broken.** A scan comes back with holes where the light did not
+reach, a shell that is not quite closed, a lump of noise where the turntable
+moved. A generated or downloaded model turns out to be a paper-thin skin around
+nothing. Mesh tools will let you push vertices around it, and every push is a
+chance to tear something that was already fragile.
 
 BrokkrSculpt does not work on the mesh. It works on a **signed distance field**,
 which is a fancy way of saying it works on solid material rather than on a
@@ -34,13 +34,19 @@ closes itself, because a solid with a slice taken out of it is still a solid.
 That is the whole reason to build a sculpting tool this way when what comes out
 of it has to be printed.
 
-It is **Linux first**, it is free and open source, and it is **honestly not
-finished**. It is being built in the open by one person.
+It is free and open source, and it is **honestly not finished**. It is being
+built in the open by one person.
 
 Sibling to [SindriCAD](https://tinkeratlas.com/sindricad). Brokkr and Sindri
 forged Mjolnir together; SindriCAD does parametric CAD, BrokkrSculpt does clay.
-Nomad Sculpt ships for Windows and macOS but not Linux, and that gap is why this
-exists — it is why Linux comes first and stays first.
+
+**On platforms.** Linux is where this is built and tested every day, so it is
+what works today and it is what the code is honest about. It is not where this
+stops: **Windows and macOS builds are wanted**, the way SindriCAD already ships
+them, and tablets — Android and iPad — are wanted after that, because sculpting
+with a finger or a pen on glass is the right way to do this and there is no good
+reason a voxel engine cannot go there. None of it is done. Saying so is not the
+same as not caring about it.
 
 ## See it in action
 
@@ -152,7 +158,8 @@ every one of them in the source:
 packaged build is the specific thing waiting on funding; until it exists,
 running BrokkrSculpt means building it.
 
-You need Linux, a **Vulkan-capable GPU**, and a Rust toolchain at least as new
+Today you need Linux, a **Vulkan-capable GPU**, and a Rust toolchain at least as
+new
 as the `rust-version` in the workspace manifest.
 
 ```fish
@@ -200,16 +207,27 @@ Milestones M0 through M3 of [docs/BUILD-SPEC.md](docs/BUILD-SPEC.md) are
 complete, and a good deal beyond them. **585 tests pass**, clippy is at zero
 warnings, and three separate performance gates hold.
 
-What is *not* there: masking, procedural primitives, a packaged build, and
-Windows or macOS. Those are intended rather than promised.
+What is *not* there yet: masking, procedural primitives, a packaged build, and
+builds for Windows, macOS and tablets. All of those are on the list rather than
+ruled out — see the note on platforms above.
 
-**One known defect is worth stating up front, because it is the case the
-application exists for.** A large, badly defective scan can exhaust the GPU mesh
-pool, and the model then quietly loses parts of itself on screen. A noisy
-scanned surface carries several times more geometry per brick than a sculpted
-one, and the pool is sized for the sculpted case. Coarsening the voxel size
-works around it today. Every measurement below was taken on sculpted geometry
-and shares that blind spot.
+**Two known limits are worth stating up front**, because both are the case the
+application exists for rather than edge cases.
+
+A large, badly defective model can **exhaust the GPU mesh pool**, and the model
+then quietly loses parts of itself on screen. A noisy scanned surface carries
+several times more geometry per brick than a sculpted one, and the pool is sized
+for the sculpted case.
+
+And the same ceiling limits **how fine a detail you can add**. Resolution is
+uniform, so a brush narrower than about three voxels has nowhere to put what it
+is drawing — and halving the voxel size to make room roughly quadruples the
+triangle count, which on a large imported model runs straight into the pool. In
+practice that means a big model imports and sculpts at broad scale but resists
+fine detail. Raising and growing that pool is the current priority.
+
+Every measurement below was taken on sculpted geometry and shares that blind
+spot: a scan and a sculpted ball are not the same shape of problem.
 
 All figures on a Radeon RX 6900 XT and a Ryzen 9 7900X.
 
