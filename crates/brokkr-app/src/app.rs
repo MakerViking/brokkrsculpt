@@ -1969,15 +1969,28 @@ impl Brokkr {
 
     /// Rebuild the volume at a different voxel size.
     fn resample(&mut self, voxel_size: f32) {
-        let voxel_size = Self::clamped_voxel_size(voxel_size);
+        let mut voxel_size = Self::clamped_voxel_size(voxel_size);
         if (voxel_size - self.voxel_size).abs() < 1.0e-6 {
             return;
         }
 
-        if let Some(why) = self.too_fine_for_the_pool(voxel_size) {
-            self.status = why;
-            log::warn!("{}", self.status);
-            return;
+        // A step the pool cannot hold LANDS ON THE FINEST THAT FITS instead
+        // of refusing. The refusal named that size and then made the user go
+        // there by hand -- which they could not: the button only halves, so
+        // the message pointed at a rung the interface had no way to reach.
+        // Observed live at 0.062 mm with 0.043 mm reachable and no path to it.
+        let mut capped = None;
+        if let Some((why, finest)) = self.too_fine_for_the_pool(voxel_size) {
+            let fallback = Self::clamped_voxel_size(finest);
+            if fallback < self.voxel_size * 0.98 {
+                capped = Some(voxel_size);
+                voxel_size = fallback;
+            } else {
+                // Already at the fit limit: there is nowhere finer to land.
+                self.status = why;
+                log::warn!("{}", self.status);
+                return;
+            }
         }
 
         let started = Instant::now();
@@ -2001,12 +2014,21 @@ impl Brokkr {
         self.remesh_dirty();
         self.refresh_detail_advice();
 
-        self.status = format!(
-            "resampled to {voxel_size:.3} mm, {} dense bricks, {:.0} MB, {:.0} ms",
-            self.volume_stats.dense_bricks,
-            self.volume_stats.resident_bytes as f64 / (1024.0 * 1024.0),
-            started.elapsed().as_secs_f64() * 1000.0
-        );
+        self.status = match capped {
+            Some(wanted) => format!(
+                "resampled to {voxel_size:.3} mm -- the finest the mesh pool holds at this size \
+                 ({wanted:.3} mm did not fit), {} dense bricks, {:.0} MB, {:.0} ms",
+                self.volume_stats.dense_bricks,
+                self.volume_stats.resident_bytes as f64 / (1024.0 * 1024.0),
+                started.elapsed().as_secs_f64() * 1000.0
+            ),
+            None => format!(
+                "resampled to {voxel_size:.3} mm, {} dense bricks, {:.0} MB, {:.0} ms",
+                self.volume_stats.dense_bricks,
+                self.volume_stats.resident_bytes as f64 / (1024.0 * 1024.0),
+                started.elapsed().as_secs_f64() * 1000.0
+            ),
+        };
         log::info!("{}", self.status);
     }
 
@@ -2024,7 +2046,7 @@ impl Brokkr {
     /// halving the voxel size quadruples the vertices on it -- and starting
     /// from a measured reservation means the allocator's own padding is already
     /// baked into the figure rather than guessed at.
-    fn too_fine_for_the_pool(&self, wanted: f32) -> Option<String> {
+    fn too_fine_for_the_pool(&self, wanted: f32) -> Option<(String, f32)> {
         if wanted >= self.voxel_size {
             return None;
         }
@@ -2039,18 +2061,20 @@ impl Brokkr {
             return None;
         }
 
-        // The finest size that would fit, from the same square law, rounded to
-        // something the interface can actually show.
+        // The finest size that would fit, from the same square law, with three
+        // percent on top because a prediction that lands at exactly 100% of a
+        // ceiling helps nobody. Returned so `resample` can GO there rather
+        // than tell the user to.
         let headroom = (pool.vertex_capacity as f64 / pool.vertices_reserved as f64)
             .min(pool.index_capacity as f64 / pool.indices_reserved as f64);
-        let finest = self.voxel_size / headroom.sqrt() as f32;
-        Some(format!(
+        let finest = self.voxel_size / headroom.sqrt() as f32 * 1.03;
+        let why = format!(
             "could not resample to {wanted:.3} mm: it needs about {:.1}M vertices against a pool \
-             of {:.1}M -- {:.3} mm is the finest that fits at this size",
+             of {:.1}M -- {finest:.3} mm is the finest that fits at this size",
             vertices / 1.0e6,
             pool.vertex_capacity as f64 / 1.0e6,
-            finest,
-        ))
+        );
+        Some((why, finest))
     }
 
     /// Scale the model so its longest dimension is `longest_mm`.
@@ -5311,6 +5335,57 @@ mod working_size_tests {
             app.brush.radius,
             app.max_radius()
         );
+    }
+
+    /// A finer step the pool cannot hold lands on the finest that fits,
+    /// rather than refusing with directions to a rung the buttons cannot
+    /// reach. The refusal is kept only for when there is nowhere finer left.
+    #[test]
+    fn a_step_that_does_not_fit_lands_on_the_finest_that_does() {
+        let mut app = app();
+        // A pool measured at 6M of 11M vertices: one halving would predict
+        // 24M, far over, but there is real room above the current size.
+        app.shared.set_stats_for_tests(brokkr_gpu::PoolStats {
+            vertices_reserved: 6_000_000,
+            indices_reserved: 33_000_000,
+            vertex_capacity: 11_000_000,
+            index_capacity: 66_000_000,
+            ..Default::default()
+        });
+
+        update(&mut app, Message::Resample(VOXEL_SIZE_MM / 2.0));
+
+        let expected = VOXEL_SIZE_MM / (11.0f32 / 6.0).sqrt() * 1.03;
+        assert!(
+            (app.voxel_size - expected).abs() < 1.0e-3,
+            "expected to land near {expected:.3} mm, landed at {:.3}",
+            app.voxel_size
+        );
+        assert!(
+            app.status.contains("finest the mesh pool holds"),
+            "the status must say the step was capped: {}",
+            app.status
+        );
+    }
+
+    /// And when the current size already sits at the fit limit, the refusal
+    /// stays a refusal -- there is nowhere finer to land.
+    #[test]
+    fn at_the_fit_limit_the_refusal_remains() {
+        let mut app = app();
+        app.shared.set_stats_for_tests(brokkr_gpu::PoolStats {
+            vertices_reserved: 10_800_000,
+            indices_reserved: 64_000_000,
+            vertex_capacity: 11_000_000,
+            index_capacity: 66_000_000,
+            ..Default::default()
+        });
+        let before = app.voxel_size;
+
+        update(&mut app, Message::Resample(before / 2.0));
+
+        assert_eq!(app.voxel_size, before, "there was no room, so nothing should move");
+        assert!(app.status.contains("could not resample"), "{}", app.status);
     }
 
     /// The readout has to name both numbers, because either alone is the

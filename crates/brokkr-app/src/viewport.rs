@@ -118,6 +118,13 @@ impl SharedFrame {
     pub fn stats(&self) -> PoolStats {
         *self.stats.lock().expect("shared frame poisoned")
     }
+
+    /// Tests have no GPU and so no renderer to fill the counters in; this is
+    /// how they stand in for one. The resample guard reads these numbers.
+    #[cfg(test)]
+    pub fn set_stats_for_tests(&self, stats: PoolStats) {
+        *self.stats.lock().expect("shared frame poisoned") = stats;
+    }
 }
 
 /// The `shader` widget program. Cheap to construct: `view` rebuilds it every
@@ -209,8 +216,9 @@ pub(crate) fn shortcut(character: &str, command: bool, shift: bool) -> Option<Me
 /// **Only events that are bounds-checked may capture.** The viewport
 /// deliberately handles cursor moves and button releases wherever the cursor
 /// is, because a sculpting drag that leaves the viewport must keep sculpting
-/// and its release must still end the stroke. For a year this function
-/// captured those too — and `iced`'s `button` is exactly the widget that
+/// and its release must still end the stroke. From the day the viewport
+/// existed (M0, 2026-08-17) this function captured those too — and `iced`'s
+/// `button` is exactly the widget that
 /// honours capture (`if shell.is_event_captured() { return; }`), while slider,
 /// checkbox and text_input ignore it. The shader traverses before the right
 /// panel, so every release anywhere in the window was swallowed before a panel

@@ -153,6 +153,16 @@ pub struct VoxeliseOptions {
     /// [`Self::fill_sealed_cavities`] and for the same reason: a test has to be
     /// able to show the filament appearing without it.
     pub repair_broken_scan_lines: bool,
+    /// When the requested voxel size would blow the import ceilings, import at
+    /// the finest size that fits instead of refusing.
+    ///
+    /// The refusal named the size that would work and then made the user go
+    /// there by hand -- observed live: a session sitting at 0.062 mm after a
+    /// detail experiment could not re-import a 200 mm model at all, and the
+    /// "fix" the message offered was to coarsen an unrelated sculpt first.
+    /// Off in tests that assert the refusal, because the coarsened build of a
+    /// genuinely too-fine import is by construction at capacity scale.
+    pub coarsen_to_fit: bool,
 }
 
 impl VoxeliseOptions {
@@ -163,6 +173,7 @@ impl VoxeliseOptions {
             refit_if_implausible: true,
             fill_sealed_cavities: true,
             repair_broken_scan_lines: true,
+            coarsen_to_fit: true,
         }
     }
 }
@@ -203,6 +214,11 @@ pub struct VoxeliseReport {
     /// `repaired_scan_lines` is the normal shape of an import from a mesh with
     /// holes in it.
     pub erased_filament_voxels: usize,
+    /// The voxel size the volume was actually built at, in millimetres.
+    pub voxel_mm: f32,
+    /// The size that was ASKED for, when the import had to coarsen to fit.
+    /// Zero when it did not.
+    pub coarsened_from_mm: f32,
 }
 
 impl VoxeliseReport {
@@ -225,6 +241,12 @@ impl VoxeliseReport {
         }
         if self.filled_voxels > 0 {
             out.push_str(&format!(", filled a sealed cavity of {} voxels", self.filled_voxels));
+        }
+        if self.coarsened_from_mm > 0.0 {
+            out.push_str(&format!(
+                ", voxel coarsened {:.3} -> {:.3} mm to fit",
+                self.coarsened_from_mm, self.voxel_mm
+            ));
         }
         out
     }
@@ -250,10 +272,29 @@ pub fn voxelise(
     let mut report = VoxeliseReport { triangles: mesh.triangles.len(), ..Default::default() };
     let corners = place(mesh, options, &mut report)?;
 
-    let band_mm = NARROW_BAND * voxel_size;
     let (aabb_min, aabb_max) = bounds(&corners);
 
-    preflight(&corners, aabb_min, aabb_max, voxel_size)?;
+    // The preflight names the finest voxel that fits; from here on it is used
+    // rather than merely printed. A request the ceilings cannot hold imports
+    // at that size instead of refusing -- refusal is reserved for callers that
+    // asked for exactness (`coarsen_to_fit: false`) and for the pathological
+    // case where even the coarsened estimate does not settle.
+    let mut voxel_size = voxel_size;
+    if let Err(refusal) = preflight(&corners, aabb_min, aabb_max, voxel_size) {
+        if !options.coarsen_to_fit {
+            return Err(refusal);
+        }
+        let workable = workable_voxel_for(surface_area(&corners), voxel_size)
+            .expect("preflight refused, so a workable size exists");
+        // Five percent over the exact fit, because the estimate is an
+        // estimate and landing at 100% of a ceiling helps nobody.
+        report.coarsened_from_mm = voxel_size;
+        voxel_size = workable * 1.05;
+        preflight(&corners, aabb_min, aabb_max, voxel_size)?;
+    }
+    report.voxel_mm = voxel_size;
+
+    let band_mm = NARROW_BAND * voxel_size;
 
     // The grid is snapped to whole bricks, not to the expanded voxel box. This
     // is the one alignment that matters: brick origins are multiples of 32
@@ -468,25 +509,40 @@ fn erase_impossible_filaments(volume: &mut Volume) -> usize {
     doomed.len()
 }
 
+/// Total surface area of the placed triangles, in mm squared.
+fn surface_area(corners: &Corners) -> f64 {
+    corners.par_iter().map(|[a, b, c]| 0.5 * (*b - *a).cross(*c - *a).length() as f64).sum()
+}
+
+/// Estimated bytes of voxel data for a surface of `area` at `voxel_size`.
+fn estimated_bytes(area: f64, voxel_size: f32) -> f64 {
+    let brick_mm = BRICK_DIM as f64 * voxel_size as f64;
+    area / (brick_mm * brick_mm) * SHELL_FACTOR * BRICK_VOXELS as f64 * 4.0
+}
+
+/// The finest voxel size the import ceilings can hold for a surface of
+/// `area`, or `None` when `voxel_size` already fits.
+///
+/// Both ceilings scale with the square of the voxel size, so the factor to
+/// grow by is the square root of the overshoot. Split out of [`preflight`] so
+/// the number can be USED -- the coarsen-to-fit retry imports at it -- and so
+/// the arithmetic is testable without building a capacity-sized volume, which
+/// is by construction what any input that trips it produces.
+fn workable_voxel_for(area: f64, voxel_size: f32) -> Option<f32> {
+    let vertices = area / (voxel_size as f64 * voxel_size as f64) * VERTEX_FACTOR;
+    let over =
+        (estimated_bytes(area, voxel_size) / MAX_IMPORT_BYTES).max(vertices / VERTEX_CAPACITY);
+    (over > 1.0).then(|| (voxel_size as f64 * over.sqrt()) as f32)
+}
+
 fn preflight(
     corners: &Corners,
     minimum: Vec3,
     maximum: Vec3,
     voxel_size: f32,
 ) -> Result<(), ImportError> {
-    let area: f64 =
-        corners.par_iter().map(|[a, b, c]| 0.5 * (*b - *a).cross(*c - *a).length() as f64).sum();
-
-    let brick_mm = BRICK_DIM as f64 * voxel_size as f64;
-    let shell_bricks = area / (brick_mm * brick_mm) * SHELL_FACTOR;
-    let bytes = shell_bricks * BRICK_VOXELS as f64 * 4.0;
-    let vertices = area / (voxel_size as f64 * voxel_size as f64) * VERTEX_FACTOR;
-
-    // What voxel size would fit? Both limits scale as the square of it, so the
-    // factor to grow by is the square root of the overshoot.
-    let over = (bytes / MAX_IMPORT_BYTES).max(vertices / VERTEX_CAPACITY);
-    if over > 1.0 {
-        let workable = voxel_size as f64 * over.sqrt();
+    let area = surface_area(corners);
+    if let Some(workable) = workable_voxel_for(area, voxel_size) {
         let extent = maximum - minimum;
         return Err(ImportError::Malformed(format!(
             "it is {:.0} x {:.0} x {:.0} mm, which at {:.3} mm would need about {:.1} GB -- \
@@ -495,7 +551,7 @@ fn preflight(
             extent.y,
             extent.z,
             voxel_size,
-            bytes / (1024.0 * 1024.0 * 1024.0),
+            estimated_bytes(area, voxel_size) / (1024.0 * 1024.0 * 1024.0),
             workable,
         )));
     }
@@ -1263,6 +1319,28 @@ mod tests {
 
     const VOXEL: f32 = 0.5;
 
+    /// The workable-size arithmetic, tested without building anything: any
+    /// input that actually trips the ceilings produces, by construction, a
+    /// capacity-scale volume, which is not something a unit test should build.
+    #[test]
+    fn the_workable_voxel_grows_with_the_square_root_of_the_overshoot() {
+        // A modest surface at a sane voxel fits and asks for nothing.
+        assert_eq!(workable_voxel_for(600.0, 0.25), None, "a 10 mm cube at 0.25 mm fits");
+
+        // A surface big enough to blow the vertex ceiling names a size...
+        let area = 500_000.0; // mm^2, a large scanned model
+        let workable = workable_voxel_for(area, 0.05).expect("this cannot fit at 0.05 mm");
+        assert!(workable > 0.05, "workable must be coarser than the refused size");
+
+        // ...and that size, with the retry's own five percent margin, fits --
+        // the fixpoint the coarsen-to-fit path depends on.
+        assert_eq!(
+            workable_voxel_for(area, workable * 1.05),
+            None,
+            "the size the preflight names must itself pass the preflight"
+        );
+    }
+
     /// Lay a one voxel thick run of material along X at a chosen depth.
     ///
     /// `depth` is the distance value written, which is the whole point of the
@@ -1584,6 +1662,7 @@ mod tests {
                 refit_if_implausible: false,
                 fill_sealed_cavities: true,
                 repair_broken_scan_lines: true,
+                coarsen_to_fit: false,
             },
         )
         .expect("a sphere should voxelise");
@@ -1692,6 +1771,7 @@ mod tests {
                 refit_if_implausible: false,
                 fill_sealed_cavities: true,
                 repair_broken_scan_lines: true,
+                coarsen_to_fit: false,
             },
         );
         // `Volume` has no `Debug`, so the success case cannot be unwrapped into
@@ -1782,6 +1862,7 @@ mod preflight_calibration {
                     refit_if_implausible: false,
                     fill_sealed_cavities: true,
                     repair_broken_scan_lines: true,
+                    coarsen_to_fit: false,
                 },
             )
             .expect("the fixture should voxelise");
