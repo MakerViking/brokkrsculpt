@@ -686,7 +686,7 @@ impl Brokkr {
             numeric(
                 "Radius mm",
                 SizingTarget::Radius,
-                super::MIN_RADIUS_MM..=super::MAX_RADIUS_MM,
+                super::MIN_RADIUS_MM..=self.max_radius(),
                 0.05,
                 Message::BrushRadiusChanged
             ),
@@ -925,7 +925,7 @@ impl Brokkr {
                 .size(theme::TEXT_SIZE_SMALL)
                 .color(theme::TEXT_DIM),
             slider(
-                super::MIN_RADIUS_MM..=super::MAX_RADIUS_MM,
+                super::MIN_RADIUS_MM..=self.max_radius(),
                 self.brush.radius,
                 Message::BrushRadiusChanged
             )

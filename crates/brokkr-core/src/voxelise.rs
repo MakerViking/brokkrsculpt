@@ -105,7 +105,17 @@ const SHELL_FACTOR: f64 = 2.5;
 const VERTEX_FACTOR: f64 = 2.0;
 
 /// How much a single import may allocate for voxel data.
-const MAX_IMPORT_BYTES: f64 = 2.0 * 1024.0 * 1024.0 * 1024.0;
+///
+/// Raised from 2 GB on 2026-08-21 for resin resolutions: the reference dragon
+/// at 100 mm and a 0.03125 mm voxel comes to about 3.1 GB, and 2 GB refused it.
+/// 4 GB is that with margin.
+///
+/// **This is a fixed number and it should not be.** It is a guess at what a
+/// machine can spare, made without asking the machine, so it is simultaneously
+/// too generous for a laptop with 8 GB and too mean for a workstation with 64.
+/// Reading the available memory and taking a fraction of it is the honest
+/// version and is not done.
+const MAX_IMPORT_BYTES: f64 = 4.0 * 1024.0 * 1024.0 * 1024.0;
 
 /// How an imported mesh should be placed on the lattice.
 #[derive(Debug, Clone, Copy)]

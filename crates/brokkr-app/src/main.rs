@@ -44,8 +44,15 @@ fn main() -> iced::Result {
         return Ok(());
     }
 
+    // `brokkrsculpt`, not `brokkr_app`: env_logger filters on the MODULE PATH,
+    // and the module path is the crate root name, which for a binary target is
+    // the `[[bin]] name` rather than the package name. It read `brokkr_app`
+    // until 2026-08-21, matched nothing, and so every `log::info!` in this
+    // crate had been invisible since the day it was written -- which is why an
+    // import or a resample left no trace in a log people were being told to
+    // read. `brokkr_gpu` IS correct: that one is a library.
     env_logger::Builder::from_env(
-        env_logger::Env::default().default_filter_or("warn,brokkr_app=info,brokkr_gpu=info"),
+        env_logger::Env::default().default_filter_or("warn,brokkrsculpt=info,brokkr_gpu=info"),
     )
     .init();
 

@@ -63,6 +63,28 @@ const VOXEL_SIZE_MM: f32 = 0.25;
 pub(crate) const MIN_RADIUS_MM: f32 = 0.25;
 pub(crate) const MAX_RADIUS_MM: f32 = 20.0;
 
+/// The most voxels of radius a brush may reach, whatever that is in
+/// millimetres.
+///
+/// **A brush costs what it costs in VOXELS, and the ceiling beside this one is
+/// in millimetres, so the two disconnect the moment the voxel size moves.**
+/// Measured 2026-08-21, one Draw stamp, with the application running so
+/// pessimistic: 80 voxels of radius took 5.01 ms, 96 took 5.22 ms, and 192 took
+/// **21.04 ms**. The cost tracks the voxel radius and nothing else -- doubling
+/// it costs four times as much, because the work is the surface inside the
+/// brush.
+///
+/// At the 0.25 mm default, 100 voxels is 25 mm, which is above
+/// [`MAX_RADIUS_MM`] and so changes nothing at all. At the 0.03125 mm a resin
+/// print wants, it is 3.1 mm -- and without it the 20 mm slider would reach 640
+/// voxels, which is roughly a quarter of a second per stamp and not a usable
+/// tool.
+///
+/// The budget bench sweeps radius in millimetres at one voxel size, so it has
+/// never covered this. Sweeping voxel radius instead is the honest fix and is
+/// not done.
+pub(crate) const MAX_RADIUS_VOXELS: f32 = 100.0;
+
 /// Range the brush strength may take, matching the slider.
 pub(crate) const MIN_STRENGTH: f32 = 0.02;
 pub(crate) const MAX_STRENGTH: f32 = 0.80;
@@ -76,11 +98,19 @@ const STRENGTH_PER_PIXEL: f32 = 0.002;
 
 /// Range the voxel size may be resampled to, in millimetres.
 ///
-/// The lower bound is where the mesh pool has been measured to hold the result:
-/// a 60 mm ball at 0.055 mm comes to 11.2 million triangles and 6.2 million
-/// vertices against a pool of 8 million. Going finer would overflow it and put
-/// an incomplete model on screen, so the interface will not offer it.
-const FINEST_VOXEL_MM: f32 = 0.06;
+/// **The lower bound is a resin printing target, not a pool limit.** It used to
+/// be 0.06 and justified as the most the mesh pool could hold -- which stopped
+/// being the reason the moment `resample` grew a preflight of its own. What
+/// fits is now decided per model, against the real reservation on the GPU, and
+/// refused with a message naming the size that would work. So this bound exists
+/// only to stop the interface offering something absurd.
+///
+/// 0.03 rather than 0.035, which is roughly what a consumer resin printer
+/// resolves, because **the halving ladder from the 0.25 default lands on
+/// 0.03125 and never on 0.035**. A floor of 0.035 would leave the finest step
+/// permanently one press out of reach. The print size field reaches
+/// intermediate sizes continuously; the buttons only halve.
+const FINEST_VOXEL_MM: f32 = 0.03;
 const COARSEST_VOXEL_MM: f32 = 2.0;
 
 /// Roughly what a consumer resin printer resolves in XY, in millimetres.
@@ -924,8 +954,19 @@ impl Brokkr {
         }
         let factor = self.model_radius / previous_model_radius;
         if (factor - 1.0).abs() > 1.0e-4 {
-            self.brush.radius = (self.brush.radius * factor).clamp(MIN_RADIUS_MM, MAX_RADIUS_MM);
+            self.brush.radius =
+                (self.brush.radius * factor).clamp(MIN_RADIUS_MM, self.max_radius());
         }
+    }
+
+    /// The largest brush radius that is usable at the current voxel size.
+    ///
+    /// The lower of the millimetre ceiling and the voxel one. See
+    /// [`MAX_RADIUS_VOXELS`] for why the second exists: at a resin voxel the
+    /// millimetre ceiling alone reaches a brush that takes a quarter of a
+    /// second per stamp.
+    pub(crate) fn max_radius(&self) -> f32 {
+        MAX_RADIUS_MM.min(MAX_RADIUS_VOXELS * self.voxel_size).max(MIN_RADIUS_MM)
     }
 
     /// The world space ray through a point in widget pixels.
@@ -1603,7 +1644,7 @@ impl Brokkr {
             roll: view.camera_roll,
             ..OrbitCamera::framing(Vec3::ZERO, MODEL_RADIUS_MM)
         };
-        self.brush.radius = view.brush_radius.clamp(MIN_RADIUS_MM, MAX_RADIUS_MM);
+        self.brush.radius = view.brush_radius.clamp(MIN_RADIUS_MM, self.max_radius());
         self.brush.strength = view.brush_strength.clamp(MIN_STRENGTH, MAX_STRENGTH);
         self.symmetry = MirrorAxis::ALL
             .into_iter()
@@ -2011,7 +2052,7 @@ impl Brokkr {
         self.voxel_size = self.volume.voxel_size();
         // The brush is in millimetres, so without this a resize leaves it the
         // wrong size relative to the model it is about to be used on.
-        self.brush.radius = (self.brush.radius * factor).clamp(MIN_RADIUS_MM, MAX_RADIUS_MM);
+        self.brush.radius = (self.brush.radius * factor).clamp(MIN_RADIUS_MM, self.max_radius());
         self.unsaved = true;
         // Every brick's world position moved, so everything has to be redrawn
         // even though not one voxel changed.
@@ -2201,7 +2242,7 @@ impl Brokkr {
         {
             match which {
                 SizingTarget::Radius => {
-                    self.brush.radius = value.clamp(MIN_RADIUS_MM, MAX_RADIUS_MM);
+                    self.brush.radius = value.clamp(MIN_RADIUS_MM, self.max_radius());
                 }
                 SizingTarget::Strength => {
                     self.brush.strength = value.clamp(MIN_STRENGTH, MAX_STRENGTH);
@@ -2241,7 +2282,8 @@ impl Brokkr {
             // jump at the other.
             SizingTarget::Radius => {
                 let factor = (travel * RADIUS_PER_PIXEL).exp();
-                self.brush.radius = (sizing.original * factor).clamp(MIN_RADIUS_MM, MAX_RADIUS_MM);
+                self.brush.radius =
+                    (sizing.original * factor).clamp(MIN_RADIUS_MM, self.max_radius());
             }
             // Additive: strength is already a small linear range.
             SizingTarget::Strength => {
@@ -2495,7 +2537,13 @@ impl Brokkr {
                 self.brush.strength = self.strengths[Self::strength_slot(kind)];
             }
             Message::FalloffChanged(curve) => self.brush.falloff = curve,
-            Message::BrushRadiusChanged(radius) => self.brush.radius = radius,
+            // Clamped rather than trusted. The slider's own range is already
+            // voxel-aware, but a message can arrive from a typed field or the
+            // right-click menu too, and at a resin lattice an unclamped 20 mm
+            // is a quarter of a second per stamp.
+            Message::BrushRadiusChanged(radius) => {
+                self.brush.radius = radius.clamp(MIN_RADIUS_MM, self.max_radius())
+            }
             Message::BrushStrengthChanged(strength) => {
                 self.brush.strength = strength;
                 self.strengths[Self::strength_slot(self.brush.kind)] = strength;
@@ -2726,7 +2774,7 @@ impl Brokkr {
             }
             Message::BrushRadiusScaled(factor) => {
                 self.brush.radius =
-                    (self.brush.radius * factor).clamp(MIN_RADIUS_MM, MAX_RADIUS_MM);
+                    (self.brush.radius * factor).clamp(MIN_RADIUS_MM, self.max_radius());
             }
             Message::PressureToggled(on) => self.pressure_enabled = on,
             Message::PressureCurveChanged(curve) => self.pressure_curve = curve,
@@ -3264,8 +3312,11 @@ mod tests {
 
     #[test]
     fn the_sizing_gesture_stays_inside_the_slider_bounds() {
+        // The radius ceiling now depends on the voxel size, so it is asked of a
+        // real app rather than read off a constant.
+        let radius_ceiling = app().max_radius();
         for (target, low, high) in [
-            (SizingTarget::Radius, MIN_RADIUS_MM, MAX_RADIUS_MM),
+            (SizingTarget::Radius, MIN_RADIUS_MM, radius_ceiling),
             (SizingTarget::Strength, MIN_STRENGTH, MAX_STRENGTH),
         ] {
             for direction in [-1.0f32, 1.0] {
@@ -5181,8 +5232,44 @@ mod working_size_tests {
         assert!(app.status.contains("could not resize"), "{}", app.status);
     }
 
+    /// The radius ceiling at the default voxel size must be **exactly what it
+    /// always was**. The voxel rule is there to stop a fine lattice reaching an
+    /// unusable brush, not to change the tool anyone is using today.
+    #[test]
+    fn the_voxel_rule_does_not_touch_the_brush_at_the_default_size() {
+        let app = app();
+        assert_eq!(app.voxel_size, VOXEL_SIZE_MM);
+        assert_eq!(
+            app.max_radius(),
+            MAX_RADIUS_MM,
+            "100 voxels is 25 mm at the default, above the millimetre ceiling, so nothing moves"
+        );
+    }
+
+    /// And at a resin lattice it must bite, because the millimetre ceiling
+    /// there is 640 voxels of radius -- measured at roughly a quarter of a
+    /// second per stamp.
+    #[test]
+    fn the_voxel_rule_caps_the_brush_at_a_resin_lattice() {
+        let mut app = app();
+        app.voxel_size = 0.03125;
+        assert!(
+            (app.max_radius() - 3.125).abs() < 1.0e-6,
+            "expected 100 voxels of radius, got {} mm",
+            app.max_radius()
+        );
+
+        // And a request past it is actually clamped, not merely reported.
+        drop(app.update(Message::BrushRadiusChanged(MAX_RADIUS_MM)));
+        assert!(
+            app.brush.radius <= app.max_radius() + 1.0e-6,
+            "the slider handed out {} mm past a {} mm ceiling",
+            app.brush.radius,
+            app.max_radius()
+        );
+    }
+
     /// The readout has to name both numbers, because either alone is the
-    /// misleading half: millimetres per voxel without voxels-across hides that
     /// scaling changed no detail, and voxels-across without millimetres cannot
     /// answer "is this enough for my printer".
     #[test]
@@ -5344,10 +5431,13 @@ mod export_tests {
         assert_eq!(Brokkr::clamped_voxel_size(1000.0), COARSEST_VOXEL_MM);
         assert_eq!(Brokkr::clamped_voxel_size(0.25), 0.25);
 
-        // And the interface offers a step that lands inside the limits: two
-        // halvings from the default are allowed, three are not.
-        const _: () = assert!(FINEST_VOXEL_MM > VOXEL_SIZE_MM / 8.0);
-        const _: () = assert!(FINEST_VOXEL_MM < VOXEL_SIZE_MM / 2.0);
+        // And the interface offers a step that lands inside the limits. Three
+        // halvings from the default are allowed and four are not: 0.25 halved
+        // three times is 0.03125, which is the finest rung of the ladder and
+        // the one resin work needs. It was two halvings until 2026-08-21, when
+        // the floor came down from 0.06 to 0.03 for exactly that rung.
+        const _: () = assert!(FINEST_VOXEL_MM > VOXEL_SIZE_MM / 16.0);
+        const _: () = assert!(FINEST_VOXEL_MM < VOXEL_SIZE_MM / 4.0);
     }
 
     #[test]
