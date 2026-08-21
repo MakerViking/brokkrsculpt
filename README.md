@@ -296,4 +296,12 @@ choice reversible. CI fails the build if that ever stops being true.
 
 ## Licence
 
-AGPL-3.0-or-later. See [LICENSE](LICENSE).
+AGPL-3.0-only. See [LICENSE](LICENSE).
+
+Every dependency is permissively licensed — there is no GPL, LGPL or MPL
+anywhere in the graph, so nothing about the AGPL here is inherited.
+[NOTICE.md](NOTICE.md) has the full accounting and how to re-check it.
+
+Contributions are welcome under an inbound-relicensing grant; see
+[CONTRIBUTING.md](CONTRIBUTING.md). For anything security-sensitive, see
+[SECURITY.md](SECURITY.md) rather than the issue tracker.
