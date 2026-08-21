@@ -628,6 +628,7 @@ mod tests {
             centre: false,
             refit_if_implausible: false,
             fill_sealed_cavities: fill,
+            repair_broken_scan_lines: true,
         }
     }
 

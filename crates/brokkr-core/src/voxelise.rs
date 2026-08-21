@@ -132,11 +132,24 @@ pub struct VoxeliseOptions {
     /// A field rather than a hardcoded step so a test can compare with and
     /// without.
     pub fill_sealed_cavities: bool,
+    /// Reconstruct the sign of a lattice line whose winding did not balance
+    /// from its neighbours, instead of trusting it.
+    ///
+    /// A field rather than a hardcoded step, the same as
+    /// [`Self::fill_sealed_cavities`] and for the same reason: a test has to be
+    /// able to show the filament appearing without it.
+    pub repair_broken_scan_lines: bool,
 }
 
 impl VoxeliseOptions {
     pub fn at(voxel_size: f32) -> Self {
-        Self { voxel_size, centre: true, refit_if_implausible: true, fill_sealed_cavities: true }
+        Self {
+            voxel_size,
+            centre: true,
+            refit_if_implausible: true,
+            fill_sealed_cavities: true,
+            repair_broken_scan_lines: true,
+        }
     }
 }
 
@@ -162,6 +175,20 @@ pub struct VoxeliseReport {
     /// either way, because a model that silently did not get filled looks like
     /// one that did not need it.
     pub filled_voxels: usize,
+    /// Lattice lines along X whose winding did not balance, and whose sign was
+    /// therefore taken from their neighbours instead.
+    ///
+    /// Non-zero means the mesh has holes a sweep ray passed through. The holes
+    /// are the model's defect and are not repaired; this counts only how many
+    /// scan lines had to be reconstructed so they did not leave a filament of
+    /// material that is in no part of the source file.
+    pub repaired_scan_lines: usize,
+    /// Solid voxels deleted because no closed surface could have produced them.
+    ///
+    /// See [`erase_impossible_filaments`]. Non-zero alongside
+    /// `repaired_scan_lines` is the normal shape of an import from a mesh with
+    /// holes in it.
+    pub erased_filament_voxels: usize,
 }
 
 impl VoxeliseReport {
@@ -230,7 +257,14 @@ pub fn voxelise(
     let lattice_min = b_min.origin();
     let lattice_max = b_max.max_voxel();
 
-    let sign = SignField::build(&corners, lattice_min, lattice_max, voxel_size);
+    let sign = SignField::build(
+        &corners,
+        lattice_min,
+        lattice_max,
+        voxel_size,
+        options.repair_broken_scan_lines,
+    );
+    report.repaired_scan_lines = sign.broken_lines;
     let bins = bin_triangles(&corners, lattice_min, lattice_max, voxel_size);
 
     let flips = std::sync::atomic::AtomicUsize::new(0);
@@ -274,6 +308,10 @@ pub fn voxelise(
         return Err(ImportError::Malformed(
             "there is no enclosed volume in it, only an open surface".into(),
         ));
+    }
+
+    if options.repair_broken_scan_lines {
+        report.erased_filament_voxels = erase_impossible_filaments(&mut volume);
     }
 
     // Filling has to come AFTER the open-sheet refusal above, or a flood that
@@ -364,6 +402,58 @@ fn place(
 ///
 /// The only backstop that exists otherwise is an `assert!` deep in
 /// `FieldRegion::resize`, which is a panic rather than a message.
+/// Delete solid voxels that no closed surface could have produced.
+///
+/// A voxel saturated at [`INSIDE`] is, by the definition of the narrow band,
+/// more than [`NARROW_BAND`] voxels from the nearest surface. A voxel whose
+/// neighbours on BOTH Y and Z read outside is, by inspection, one voxel from a
+/// surface on four sides. **Those two statements cannot both be true**, so a
+/// voxel that satisfies them is not geometry -- it is what a scan line whose
+/// winding went wrong leaves behind, a filament of material that appears in no
+/// triangle of the source file.
+///
+/// This is a proof, not a tolerance, and that is what makes it safe on exactly
+/// the models most at risk. A real membrane wing one voxel thick is *near* a
+/// surface, so its distance is small and it is never saturated; measured on the
+/// dragon this leaves every one of those alone and takes only the invented
+/// material. The holes that caused it are the model's own defect and are
+/// neither repaired nor hidden -- see [`VoxeliseReport::repaired_scan_lines`].
+///
+/// The sweep runs after the sign is resolved and before the cavity fill, so the
+/// flood does not have to reason about filaments that are about to vanish.
+fn erase_impossible_filaments(volume: &mut Volume) -> usize {
+    let solid_elsewhere = |volume: &Volume, voxel: IVec3| volume.sample_voxel(voxel) < 0.0;
+
+    let mut doomed: Vec<IVec3> = Vec::new();
+    for coord in volume.brick_coords().collect::<Vec<_>>() {
+        let origin = coord.origin();
+        for dz in 0..BRICK_DIM as i32 {
+            for dy in 0..BRICK_DIM as i32 {
+                for dx in 0..BRICK_DIM as i32 {
+                    let voxel = origin + IVec3::new(dx, dy, dz);
+                    // Saturated inside: nothing within the band, so nothing
+                    // nearby can explain material here.
+                    if volume.sample_voxel(voxel) > INSIDE {
+                        continue;
+                    }
+                    let pinched = !solid_elsewhere(volume, voxel + IVec3::Y)
+                        && !solid_elsewhere(volume, voxel - IVec3::Y)
+                        && !solid_elsewhere(volume, voxel + IVec3::Z)
+                        && !solid_elsewhere(volume, voxel - IVec3::Z);
+                    if pinched {
+                        doomed.push(voxel);
+                    }
+                }
+            }
+        }
+    }
+
+    for voxel in &doomed {
+        volume.edit_voxels(*voxel, *voxel, |_, _, _| OUTSIDE);
+    }
+    doomed.len()
+}
+
 fn preflight(
     corners: &Corners,
     minimum: Vec3,
@@ -422,6 +512,14 @@ struct SignField {
     voxel_size: f32,
     offsets: Vec<u32>,
     crossings: Vec<(f32, i8)>,
+    /// Lines whose crossings did not balance, indexed by line.
+    ///
+    /// Empty when every line balanced, which is the normal case and the one the
+    /// hot path checks for first. See [`SignField::build`] for what unbalanced
+    /// means and [`SignField::inside_by_neighbours`] for what is done about it.
+    broken: Vec<bool>,
+    /// How many lines are marked in `broken`, for the import report.
+    broken_lines: usize,
 }
 
 impl SignField {
@@ -442,7 +540,13 @@ impl SignField {
         Some(lz * self.span_y + ly)
     }
 
-    fn build(corners: &Corners, lattice_min: IVec3, lattice_max: IVec3, voxel_size: f32) -> Self {
+    fn build(
+        corners: &Corners,
+        lattice_min: IVec3,
+        lattice_max: IVec3,
+        voxel_size: f32,
+        repair: bool,
+    ) -> Self {
         let span_y = (lattice_max.y - lattice_min.y + 1) as usize;
         let span_z = (lattice_max.z - lattice_min.z + 1) as usize;
 
@@ -474,7 +578,52 @@ impl SignField {
         }
         let crossings = found.iter().map(|c| (c.x, c.delta)).collect();
 
-        Self { origin: lattice_min, span_y, span_z, voxel_size, offsets, crossings }
+        // A ray that enters the solid must leave it again, so on a CLOSED mesh
+        // every line's deltas sum to zero. A line where they do not is one the
+        // ray entered through a hole: there is an unmatched crossing, and the
+        // nonzero rule then reads INSIDE from it until the next face, which
+        // lays down a one voxel thick filament of material along X.
+        //
+        // Measured on a real generated model (a 1,978,591 triangle dragon with
+        // 61 boundary edges): exactly 3 lines of 442,368 came out unbalanced,
+        // and those 3 produced exactly the 3 visible filaments, 426, 430 and 23
+        // voxels long. No false positives -- the test is an identity on a
+        // closed mesh, not a tolerance.
+        //
+        // This is NOT the same failure as the top-left tie-break, which fixed
+        // the systematic exact-zero edge hits a lattice aligned model produces
+        // in bulk. This one needs an actual hole and so is rare, which is why
+        // it survived that fix.
+        let mut broken = Vec::new();
+        let mut broken_lines = 0usize;
+        for line in 0..lines {
+            let from = offsets[line] as usize;
+            let to = offsets[line + 1] as usize;
+            if from == to {
+                continue;
+            }
+            if found[from..to].iter().map(|c| c.delta as i32).sum::<i32>() != 0 {
+                broken_lines += 1;
+                if !repair {
+                    continue;
+                }
+                if broken.is_empty() {
+                    broken = vec![false; lines];
+                }
+                broken[line] = true;
+            }
+        }
+
+        Self {
+            origin: lattice_min,
+            span_y,
+            span_z,
+            voxel_size,
+            offsets,
+            crossings,
+            broken,
+            broken_lines,
+        }
     }
 
     /// Winding number at a world x along one line, under the nonzero rule.
@@ -496,10 +645,54 @@ impl SignField {
     #[inline]
     fn inside(&self, voxel: IVec3) -> bool {
         match self.line_of(voxel.y, voxel.z) {
+            Some(line) if !self.broken.is_empty() && self.broken[line] => {
+                self.inside_by_neighbours(voxel, line)
+            }
             Some(line) => self.inside_at(line, voxel.x as f32 * self.voxel_size),
             // Outside the grid entirely, which is outside the padded bounds of
             // the mesh, so it cannot be inside the solid.
             None => false,
+        }
+    }
+
+    /// The sign on a line whose own winding cannot be trusted, taken from the
+    /// four lines beside it.
+    ///
+    /// A broken line is unbalanced by exactly one crossing, and nothing in the
+    /// winding alone says which end of it is wrong. Its neighbours do: they are
+    /// balanced, they run through the same material, and a hole small enough to
+    /// let one ray through is far too small to catch five.
+    ///
+    /// Deliberately conservative. It overrides the line only where a majority
+    /// of usable neighbours agree; on a tie -- which is what a real surface
+    /// boundary looks like -- it keeps the line's own answer rather than
+    /// guessing. The alternative, dropping a broken line's crossings outright,
+    /// would cut a one voxel channel straight through the model wherever the
+    /// line crosses solid material.
+    ///
+    /// This repairs OUR arithmetic, not the mesh. The holes that caused it stay
+    /// in the model and stay reported: see [`VoxeliseReport::repaired_scan_lines`].
+    fn inside_by_neighbours(&self, voxel: IVec3, line: usize) -> bool {
+        let world_x = voxel.x as f32 * self.voxel_size;
+        let mut inside = 0u32;
+        let mut usable = 0u32;
+        for (dy, dz) in [(1, 0), (-1, 0), (0, 1), (0, -1)] {
+            let Some(neighbour) = self.line_of(voxel.y + dy, voxel.z + dz) else {
+                continue;
+            };
+            if self.broken[neighbour] {
+                continue;
+            }
+            usable += 1;
+            if self.inside_at(neighbour, world_x) {
+                inside += 1;
+            }
+        }
+        match (inside * 2).cmp(&usable) {
+            std::cmp::Ordering::Greater => true,
+            std::cmp::Ordering::Less => false,
+            // A tie, or no usable neighbour at all.
+            std::cmp::Ordering::Equal => self.inside_at(line, world_x),
         }
     }
 }
@@ -1056,6 +1249,47 @@ mod tests {
 
     const VOXEL: f32 = 0.5;
 
+    /// Lay a one voxel thick run of material along X at a chosen depth.
+    ///
+    /// `depth` is the distance value written, which is the whole point of the
+    /// pair of tests below: saturated means "nothing within the band", a small
+    /// magnitude means "a real surface is right here".
+    fn filament_along_x(length: i32, depth: f32) -> Volume {
+        let mut volume = Volume::new(VOXEL);
+        volume.edit_voxels(IVec3::new(0, 0, 0), IVec3::new(length - 1, 0, 0), |_, _, _| depth);
+        volume
+    }
+
+    #[test]
+    fn a_saturated_filament_is_impossible_and_is_erased() {
+        let mut volume = filament_along_x(20, INSIDE);
+        let solid =
+            |v: &Volume| (0..20).filter(|x| v.sample_voxel(IVec3::new(*x, 0, 0)) < 0.0).count();
+        assert_eq!(solid(&volume), 20, "the fixture did not lay down what the test needs");
+
+        let erased = erase_impossible_filaments(&mut volume);
+
+        assert_eq!(erased, 20, "every voxel of the run should have been proved impossible");
+        assert_eq!(solid(&volume), 0, "the filament survived the sweep");
+    }
+
+    /// The control, and the one that matters: this must NOT fire on a real thin
+    /// feature. A membrane wing one voxel thick is exactly the geometry the
+    /// dragon this was written for is covered in, and deleting it would be far
+    /// worse than the artifact.
+    #[test]
+    fn a_thin_feature_next_to_a_real_surface_is_left_alone() {
+        let mut volume = filament_along_x(20, -0.5);
+        let solid =
+            |v: &Volume| (0..20).filter(|x| v.sample_voxel(IVec3::new(*x, 0, 0)) < 0.0).count();
+        assert_eq!(solid(&volume), 20);
+
+        let erased = erase_impossible_filaments(&mut volume);
+
+        assert_eq!(erased, 0, "a feature one voxel from a surface is geometry, not an artifact");
+        assert_eq!(solid(&volume), 20, "real thin material was deleted");
+    }
+
     /// An axis aligned cube as twelve triangles, wound counter-clockwise seen
     /// from outside.
     ///
@@ -1335,6 +1569,7 @@ mod tests {
                 centre: false,
                 refit_if_implausible: false,
                 fill_sealed_cavities: true,
+                repair_broken_scan_lines: true,
             },
         )
         .expect("a sphere should voxelise");
@@ -1442,6 +1677,7 @@ mod tests {
                 centre: true,
                 refit_if_implausible: false,
                 fill_sealed_cavities: true,
+                repair_broken_scan_lines: true,
             },
         );
         // `Volume` has no `Debug`, so the success case cannot be unwrapped into
@@ -1531,6 +1767,7 @@ mod preflight_calibration {
                     centre: false,
                     refit_if_implausible: false,
                     fill_sealed_cavities: true,
+                    repair_broken_scan_lines: true,
                 },
             )
             .expect("the fixture should voxelise");
