@@ -57,6 +57,10 @@ pub struct SharedFrame {
     /// The brush ring and the mirror planes, rebuilt by the application
     /// whenever something they depend on changes.
     overlay: Mutex<OverlayBatch>,
+    /// Set by the application when the whole model is being rebuilt, so the
+    /// pool starts from empty instead of fragmenting. See
+    /// [`SharedFrame::request_pool_reset`].
+    reset_pool: std::sync::atomic::AtomicBool,
 }
 
 impl SharedFrame {
@@ -112,6 +116,18 @@ impl SharedFrame {
         if held.is_none() {
             *held = Some(summary);
         }
+    }
+
+    /// Ask the renderer to empty the pool before the next batch of uploads.
+    ///
+    /// For the moments that replace every brick at once -- resample, import,
+    /// open, re-orient. The pool's allocator never splits or merges blocks, so
+    /// those are precisely the moments that fragment it beyond use; emptying it
+    /// first is exact and costs nothing, because none of the old slots survive
+    /// the rebuild anyway. **The caller must mark everything dirty**, or the
+    /// model leaves the GPU and does not come back.
+    pub fn request_pool_reset(&self) {
+        self.reset_pool.store(true, std::sync::atomic::Ordering::Release);
     }
 
     /// The pool counters as of the last frame, for the debug overlay.
@@ -377,6 +393,12 @@ impl shader::Primitive for SculptPrimitive {
         // Culling has to use the same matrix the vertex shader will, or bricks
         // vanish a frame before or after they should.
         pipeline.frustum = Frustum::from_view_projection(view_projection);
+
+        // Before the uploads, never after: the reset drops every slot, so a
+        // brick uploaded first would be thrown away and never redrawn.
+        if self.shared.reset_pool.swap(false, std::sync::atomic::Ordering::AcqRel) {
+            pipeline.renderer.reset_pool();
+        }
 
         let drained: Vec<PendingUpload> = {
             let mut pending = self.shared.pending.lock().expect("shared frame poisoned");

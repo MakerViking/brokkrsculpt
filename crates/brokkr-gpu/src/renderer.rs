@@ -304,6 +304,14 @@ impl SculptRenderer {
         self.srgb_target
     }
 
+    /// Throw away every brick in the pool and reset its allocator.
+    ///
+    /// For a whole-model rebuild only, and the caller must re-upload
+    /// everything afterwards. See [`MeshPool::reset`].
+    pub fn reset_pool(&mut self) {
+        self.pool.reset();
+    }
+
     /// Replace one brick's mesh in the pool.
     pub fn upload_brick(&mut self, queue: &wgpu::Queue, coord: BrickCoord, mesh: &BrickMesh) {
         self.pool.upload(queue, coord, mesh);

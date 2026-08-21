@@ -90,8 +90,21 @@ struct Block {
 /// Fixed granularity suballocator over a fixed range.
 ///
 /// Blocks are never split or merged, so a freed block can only be reused by a
-/// request that rounds to the same size. Brick meshes cluster tightly in size,
-/// which is what makes that acceptable.
+/// request that rounds to the same size. Brick meshes cluster tightly in size
+/// AT ONE VOXEL SIZE, which is what makes that acceptable -- and it stops being
+/// true the moment the voxel size changes.
+///
+/// # Why [`BlockAllocator::reset`] exists
+///
+/// Resampling changes every brick's mesh size at once, so the free lists fill
+/// with granule classes nothing will ask for again while `bump` climbs toward
+/// the ceiling. Going up and down the detail buttons a few times therefore
+/// exhausts the pool with most of it free: observed 2026-08-22 on the dragon,
+/// `MESH POOL FULL: 2755 bricks missing` while `live` was around 7.4M of 11M.
+///
+/// It is not worth a splitting-and-coalescing allocator, because the moment
+/// fragmentation appears is also the moment nothing in the pool is worth
+/// keeping: a resample rebuilds every brick. Reset is exact and free.
 #[derive(Debug)]
 struct BlockAllocator {
     capacity: u64,
@@ -145,6 +158,26 @@ impl BlockAllocator {
     fn live(&self) -> u64 {
         self.live
     }
+
+    /// The high-water mark: how far the bump pointer has run. **This, not
+    /// [`Self::live`], is what runs the pool out of room** -- an allocation
+    /// fails when `bump + capacity` passes the ceiling, however much has been
+    /// freed behind it.
+    fn watermark(&self) -> u64 {
+        self.bump
+    }
+
+    /// Forget every block and start again from zero.
+    ///
+    /// Only sound when the caller is discarding every slot in the same breath;
+    /// [`MeshPool::reset`] is the one caller and it does exactly that.
+    fn reset(&mut self) {
+        self.bump = 0;
+        self.live = 0;
+        for class in &mut self.free {
+            class.clear();
+        }
+    }
 }
 
 /// Where one brick's mesh lives in the pool.
@@ -186,6 +219,13 @@ pub struct PoolStats {
     /// it is what runs the pool out of room, so both are worth showing.
     pub vertices_reserved: u64,
     pub indices_reserved: u64,
+    /// How far the bump pointer has run. **The number that decides whether the
+    /// next allocation fits**, and it can be far above `*_reserved` once the
+    /// free lists hold granule classes nothing asks for -- which is what a
+    /// resample leaves behind. A prediction made against `*_reserved` will say
+    /// a model fits and then watch it overflow; predict against these.
+    pub vertices_watermark: u64,
+    pub indices_watermark: u64,
     pub vertex_capacity: u64,
     pub index_capacity: u64,
     /// Bricks skipped because the pool was full. Any value above zero means
@@ -365,6 +405,25 @@ impl MeshPool {
         self.culled.store(culled, Ordering::Relaxed);
     }
 
+    /// Discard every brick and start the allocator over.
+    ///
+    /// For the moments that rebuild the WHOLE model -- a resample, an import,
+    /// opening a file, re-orienting -- where every slot is about to be replaced
+    /// anyway. Without it those are exactly the moments that fragment the pool
+    /// beyond use: see [`BlockAllocator`].
+    ///
+    /// **The caller must remesh everything after this**, or the model is not on
+    /// the GPU any more. `Volume::mark_everything_dirty` is the partner.
+    pub fn reset(&mut self) {
+        self.slots.clear();
+        self.vertex_allocator.reset();
+        self.index_allocator.reset();
+        self.triangles = 0;
+        self.vertices = 0;
+        self.overflowed = 0;
+        self.warned_about_overflow = false;
+    }
+
     pub fn stats(&self) -> PoolStats {
         PoolStats {
             bricks: self.slots.len(),
@@ -373,6 +432,8 @@ impl MeshPool {
             indices: self.triangles * 3,
             vertices_reserved: self.vertex_allocator.live(),
             indices_reserved: self.index_allocator.live(),
+            vertices_watermark: self.vertex_allocator.watermark(),
+            indices_watermark: self.index_allocator.watermark(),
             vertex_capacity: VERTEX_CAPACITY,
             index_capacity: INDEX_CAPACITY,
             overflowed: self.overflowed,
@@ -422,6 +483,54 @@ mod tests {
         allocator.release(first);
         let third = allocator.allocate(1000).expect("the freed block is reusable");
         assert_eq!(third.offset, first.offset, "should have come off the free list");
+    }
+
+    /// The failure that put holes in the dragon: going up and down the detail
+    /// buttons exhausts the pool while most of it is free.
+    ///
+    /// Blocks are never split or merged, so a freed block only serves a
+    /// request of the same granule count. A resample changes every brick's
+    /// size at once, so the free lists fill with classes nothing asks for
+    /// again and the bump pointer climbs regardless of how much was returned.
+    #[test]
+    fn alternating_block_sizes_exhaust_the_pool_while_most_of_it_is_free() {
+        let mut allocator = BlockAllocator::new(GRANULARITY * 64);
+
+        // Two rounds of "coarse" then "fine", each freed before the next.
+        let mut blocks: Vec<Block> = Vec::new();
+        for round in 0..2 {
+            let size = if round % 2 == 0 { GRANULARITY } else { GRANULARITY * 3 };
+            for _ in 0..8 {
+                blocks.push(allocator.allocate(size).expect("early rounds fit"));
+            }
+            for block in blocks.drain(..) {
+                allocator.release(block);
+            }
+        }
+
+        assert_eq!(allocator.live(), 0, "everything was returned");
+        assert!(
+            allocator.watermark() > 0,
+            "yet the bump pointer has run on -- this is the leak the reset exists for"
+        );
+
+        // A size neither round used cannot reuse any of it.
+        let fresh = GRANULARITY * 7;
+        let before = allocator.watermark();
+        allocator.allocate(fresh).expect("still room here");
+        assert!(
+            allocator.watermark() > before,
+            "a new size class had to bump past everything freed"
+        );
+
+        // Reset makes the whole pool available again, which is the fix.
+        allocator.reset();
+        assert_eq!(allocator.watermark(), 0);
+        assert_eq!(allocator.live(), 0);
+        assert!(
+            allocator.allocate(GRANULARITY * 64).is_some(),
+            "after a reset the entire pool is one contiguous run again"
+        );
     }
 
     #[test]

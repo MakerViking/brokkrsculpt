@@ -931,6 +931,23 @@ impl Brokkr {
 
     /// Mesh every brick the volume has marked dirty and hand the results to the
     /// renderer. Never touches a brick that was not marked.
+    /// Remesh after the WHOLE model has been replaced.
+    ///
+    /// Empties the mesh pool first, because the pool's allocator never splits
+    /// or merges blocks: a rebuild changes every brick's mesh size at once, so
+    /// the free lists fill with granule classes nothing asks for again while
+    /// the bump pointer climbs. Two or three trips up and down the detail
+    /// buttons exhausted an 11M vertex pool with roughly 7.4M live -- observed
+    /// on the dragon, 2755 bricks missing from the screen, on 2026-08-22.
+    ///
+    /// The reset is only sound paired with marking everything dirty, so the
+    /// two live in one function and neither is callable by accident.
+    fn rebuild_everything(&mut self) {
+        self.shared.request_pool_reset();
+        self.volume.mark_everything_dirty();
+        self.remesh_dirty();
+    }
+
     fn remesh_dirty(&mut self) {
         self.volume.take_dirty(&mut self.dirty);
         self.perf.dirty_bricks = self.dirty.len();
@@ -1499,7 +1516,7 @@ impl Brokkr {
         self.unsaved = false;
         self.status = String::new();
         self.publish_camera();
-        self.remesh_dirty();
+        self.rebuild_everything();
         self.refresh_detail_advice();
         self.refresh_overlay();
     }
@@ -1768,7 +1785,7 @@ impl Brokkr {
         self.recent.record(path);
         self.status = format!("opened {}", path.display());
         self.publish_camera();
-        self.remesh_dirty();
+        self.rebuild_everything();
         self.refresh_detail_advice();
         self.refresh_overlay();
     }
@@ -1830,7 +1847,7 @@ impl Brokkr {
         // was already standing raises nothing.
         self.orient_prompt = imported.resting_up.filter(|up| *up != brokkr_core::Facing::Up);
         self.publish_camera();
-        self.remesh_dirty();
+        self.rebuild_everything();
         self.refresh_detail_advice();
         self.refresh_overlay();
     }
@@ -2011,7 +2028,7 @@ impl Brokkr {
         // different resolution, so keeping it would splice nonsense back in.
         self.history.clear();
         self.history_stats = self.history.stats();
-        self.remesh_dirty();
+        self.rebuild_everything();
         self.refresh_detail_advice();
 
         self.status = match capped {
@@ -2054,6 +2071,12 @@ impl Brokkr {
         if pool.vertices_reserved == 0 {
             return None;
         }
+        // Predicted from what is LIVE, because a resample resets the pool and
+        // so starts from a clean bump pointer -- the watermark before the
+        // reset says nothing about the space after it. Scaling `live` is
+        // therefore the honest basis, and it is only honest BECAUSE of the
+        // reset; before that existed this prediction was blind to
+        // fragmentation and let the pool overflow.
         let growth = (self.voxel_size / wanted).powi(2) as f64;
         let vertices = pool.vertices_reserved as f64 * growth;
         let indices = pool.indices_reserved as f64 * growth;
@@ -2125,7 +2148,7 @@ impl Brokkr {
         // Every brick's world position moved, so everything has to be redrawn
         // even though not one voxel changed.
         self.volume.mark_everything_dirty();
-        self.remesh_dirty();
+        self.rebuild_everything();
         let _ = previous_radius;
         self.camera = OrbitCamera::framing(Vec3::ZERO, self.model_radius.max(1.0e-3));
         self.publish_camera();
@@ -2199,7 +2222,7 @@ impl Brokkr {
         // turning back is the undo, and it is exact.
         self.history.clear();
         self.history_stats = self.history.stats();
-        self.remesh_dirty();
+        self.rebuild_everything();
         self.refresh_overlay();
 
         self.status = format!(
