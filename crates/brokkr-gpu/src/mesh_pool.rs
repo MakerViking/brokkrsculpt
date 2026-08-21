@@ -15,19 +15,58 @@ use rustc_hash::FxHashMap;
 
 use crate::frustum::Frustum;
 
-/// Vertices the pool can hold. At 24 bytes each this is 192 MB.
+/// Vertices the pool can hold. At 24 bytes each this is 264 MB.
 ///
-/// Sized from measurement rather than guessed: a 30 mm sphere at a 0.055 mm
-/// voxel comes to 11.2 million triangles, 6.2 million vertices and 33.6 million
-/// indices, which is the scale M2 targets. This leaves about a quarter again on
-/// top of that.
+/// **The binding constraint is `wgpu`'s default `max_buffer_size`, which is
+/// 256 MiB (268,435,456 bytes)** -- not VRAM, and not a measurement. That is
+/// what really set the previous 8,000,000, whose 192 MB sat under the same
+/// ceiling; the M2 sphere it was documented against merely happened to fit.
+/// Iced creates the device here, so this crate cannot request a larger limit,
+/// and exceeding it is a validation error at buffer creation rather than
+/// anything subtle. 11,000,000 x 24 = 264,000,000 bytes, which is as close to
+/// the ceiling as a round number gets.
 ///
-/// Reserved up front. Growing a wgpu buffer means making a new one and copying,
-/// and the pool reports an overflow loudly rather than doing that mid stroke.
-pub const VERTEX_CAPACITY: u64 = 8_000_000;
+/// The figure that forced the change: the Nightwing dragon at 1600 voxels
+/// across meshes to 14.3 million triangles and 7.83 million vertices, and the
+/// allocator's 256 element granularity takes the reservation to 8,525,824 --
+/// 106.6% of the old capacity. The detail button ran, built a correct volume,
+/// and then silently dropped part of the model on the floor. Against this it
+/// reserves 78%, which fits with room but not with a great deal.
+///
+/// Past this needs the pool split over several buffers, or iced persuaded to
+/// request a larger `max_buffer_size` from the adapter (most desktop GPUs allow
+/// far more). Neither is done. Until one is, this is a hard ceiling at roughly
+/// 1700 voxels across a model, and the resample guard in `brokkr-app` is what
+/// keeps hitting it an error message rather than a vanishing model.
+pub const VERTEX_CAPACITY: u64 = 11_000_000;
 
-/// Indices the pool can hold. At 4 bytes each this is 176 MB.
-pub const INDEX_CAPACITY: u64 = 44_000_000;
+/// Indices the pool can hold. At 4 bytes each this is 264 MB, under the same
+/// 256 MiB `max_buffer_size` ceiling as the vertices above.
+///
+/// Six times the vertex capacity, which is what the measurements show a closed
+/// surface produces: the dragon above reserved 43.5 million indices against
+/// 8.5 million vertices.
+pub const INDEX_CAPACITY: u64 = 66_000_000;
+
+/// `wgpu`'s default `max_buffer_size`, which neither pool buffer may exceed.
+///
+/// Not a number this crate chooses -- it is the guaranteed floor of the limit
+/// every adapter reports, and iced creates the device, so it is what we get.
+const MAX_BUFFER_BYTES: u64 = 268_435_456;
+
+// Exceeding it is a validation error inside `Device::create_buffer` -- which is
+// to say the application dies on startup, on every machine, in a way no unit
+// test that avoids the GPU would catch. Raising a capacity without doing the
+// arithmetic is an easy mistake and this is what makes it a compile error
+// instead.
+const _: () = assert!(
+    VERTEX_CAPACITY * size_of::<Vertex>() as u64 <= MAX_BUFFER_BYTES,
+    "the vertex buffer would exceed wgpu's default max_buffer_size"
+);
+const _: () = assert!(
+    INDEX_CAPACITY * size_of::<u32>() as u64 <= MAX_BUFFER_BYTES,
+    "the index buffer would exceed wgpu's default max_buffer_size"
+);
 
 /// Allocation granularity, in elements.
 ///

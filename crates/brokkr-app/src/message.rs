@@ -345,6 +345,13 @@ pub enum Message {
     /// Rebuild the volume at a different voxel size, which is the explicit
     /// operation that increases or reduces detail.
     Resample(f32),
+    /// Typing in the working-size field. Held as text so a half-typed number
+    /// is not rounded or rejected mid-keystroke.
+    WorkingSizeTyped(String),
+    /// Commit the working-size field: scale the model so its longest dimension
+    /// is that many millimetres. Free, and buys no detail -- see
+    /// `Volume::rescale`.
+    WorkingSizeCommitted,
     /// The window manager asked to close. Carries the window, because
     /// `exit_on_close_request(false)` means nothing closes it but us.
     CloseRequested(iced::window::Id),

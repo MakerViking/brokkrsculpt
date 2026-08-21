@@ -86,10 +86,14 @@ const REFIT_LONGEST_MM: f32 = 200.0;
 
 /// Vertices the GPU mesh pool can hold.
 ///
+/// Must track `brokkr_gpu::mesh_pool::VERTEX_CAPACITY`. It is repeated rather
+/// than imported because `brokkr-core` may not depend on the GPU crate, and CI
+/// fails the build if it ever does.
+///
 /// Past this the pool logs an error and returns, leaving the model silently
 /// incomplete on screen, so an import that would exceed it is refused up front
 /// with a voxel size that would fit instead.
-const VERTEX_CAPACITY: f64 = 8_000_000.0;
+const VERTEX_CAPACITY: f64 = 11_000_000.0;
 
 /// Rough dense bricks per unit of surface area, used only by the preflight.
 ///

@@ -83,6 +83,20 @@ const STRENGTH_PER_PIXEL: f32 = 0.002;
 const FINEST_VOXEL_MM: f32 = 0.06;
 const COARSEST_VOXEL_MM: f32 = 2.0;
 
+/// Roughly what a consumer resin printer resolves in XY, in millimetres.
+///
+/// A reference point for the detail advice, not a limit on anything. Mono LCD
+/// panels in the 8K class land near this; the exact figure varies by machine
+/// and it is used only to say "you are at or below this", which does not need
+/// to be exact.
+const RESIN_XY_MM: f32 = 0.035;
+
+/// A typical filament nozzle's extrusion width, in millimetres. The other end
+/// of the same comparison: detail finer than this cannot be printed by FDM at
+/// all, so a voxel well under it is being spent on nothing unless the model is
+/// bound for resin.
+const FDM_LINE_MM: f32 = 0.4;
+
 /// Largest angle a fully tilted pen steers the stroke by.
 ///
 /// Tablets report tilt against their own range, so this is applied to the
@@ -263,6 +277,19 @@ pub struct Brokkr {
     /// The model's bounding radius, refreshed on remesh. `Volume::bounding_radius`
     /// walks the brick map, so it is not something to call per frame.
     model_radius: f32,
+    /// What is typed in the working-size field, before it is committed. Held as
+    /// text so a half-typed number is not rounded or rejected mid-keystroke.
+    pub(crate) working_size_field: String,
+    /// The cached one-line readout of what the current resolution means.
+    ///
+    /// CACHED because computing it walks every dense brick, and the widget tree
+    /// is rebuilt every frame. Refreshed only when something that changes the
+    /// answer happens -- import, open, resample, resize, re-orient. Sculpting
+    /// moves the model's extent slightly and deliberately does NOT refresh it:
+    /// a per-stroke scan of the whole volume is exactly the shape of work this
+    /// engine exists to avoid, and a millimetre of drift in a readout that
+    /// exists to answer "is 0.25 mm fine enough" changes nothing.
+    pub(crate) detail_advice: String,
     /// Stored views on the strip above the viewport, and the state of
     /// scrubbing through them.
     timeline: crate::timeline::Timeline,
@@ -627,6 +654,8 @@ impl Brokkr {
             sizing: None,
             dynamic_radius: false,
             model_radius: MODEL_RADIUS_MM,
+            working_size_field: String::new(),
+            detail_advice: String::new(),
             timeline: crate::timeline::Timeline::new(),
             breadcrumbs: crate::breadcrumbs::Breadcrumbs::new(),
             crumbed_status: String::new(),
@@ -657,6 +686,7 @@ impl Brokkr {
         app.perf.remesh_ms = 0.0;
         app.perf.dirty_bricks = 0;
         app.publish_camera();
+        app.refresh_detail_advice();
         app.refresh_overlay();
         // A crash net left by a previous session is worth nothing if nobody
         // knows it is there, and the File menu is not somewhere you look
@@ -1385,6 +1415,7 @@ impl Brokkr {
         self.status = String::new();
         self.publish_camera();
         self.remesh_dirty();
+        self.refresh_detail_advice();
         self.refresh_overlay();
     }
 
@@ -1653,6 +1684,7 @@ impl Brokkr {
         self.status = format!("opened {}", path.display());
         self.publish_camera();
         self.remesh_dirty();
+        self.refresh_detail_advice();
         self.refresh_overlay();
     }
 
@@ -1714,6 +1746,7 @@ impl Brokkr {
         self.orient_prompt = imported.resting_up.filter(|up| *up != brokkr_core::Facing::Up);
         self.publish_camera();
         self.remesh_dirty();
+        self.refresh_detail_advice();
         self.refresh_overlay();
     }
 
@@ -1856,6 +1889,12 @@ impl Brokkr {
             return;
         }
 
+        if let Some(why) = self.too_fine_for_the_pool(voxel_size) {
+            self.status = why;
+            log::warn!("{}", self.status);
+            return;
+        }
+
         let started = Instant::now();
         let mut resampled = self.volume.resampled(voxel_size);
         // The old bricks have to be cleared out of the renderer's pool, and
@@ -1875,6 +1914,7 @@ impl Brokkr {
         self.history.clear();
         self.history_stats = self.history.stats();
         self.remesh_dirty();
+        self.refresh_detail_advice();
 
         self.status = format!(
             "resampled to {voxel_size:.3} mm, {} dense bricks, {:.0} MB, {:.0} ms",
@@ -1883,6 +1923,142 @@ impl Brokkr {
             started.elapsed().as_secs_f64() * 1000.0
         );
         log::info!("{}", self.status);
+    }
+
+    /// Why a resample to `wanted` would not fit the mesh pool, if it would not.
+    ///
+    /// This is the guard the import path has had all along and this one never
+    /// did, and its absence was not theoretical: on the Nightwing dragon the
+    /// "finer" button resampled correctly in 296 ms and then reserved 8,525,824
+    /// vertices against a pool of 8,000,000. The volume was right, the model on
+    /// screen lost parts of itself, and the only thing that said so was a line
+    /// on stderr. From the user's chair the button did nothing.
+    ///
+    /// The prediction is a square law over what is ACTUALLY on the GPU right
+    /// now, not an estimate from surface area. A surface has a fixed area, so
+    /// halving the voxel size quadruples the vertices on it -- and starting
+    /// from a measured reservation means the allocator's own padding is already
+    /// baked into the figure rather than guessed at.
+    fn too_fine_for_the_pool(&self, wanted: f32) -> Option<String> {
+        if wanted >= self.voxel_size {
+            return None;
+        }
+        let pool = self.shared.stats();
+        if pool.vertices_reserved == 0 {
+            return None;
+        }
+        let growth = (self.voxel_size / wanted).powi(2) as f64;
+        let vertices = pool.vertices_reserved as f64 * growth;
+        let indices = pool.indices_reserved as f64 * growth;
+        if vertices <= pool.vertex_capacity as f64 && indices <= pool.index_capacity as f64 {
+            return None;
+        }
+
+        // The finest size that would fit, from the same square law, rounded to
+        // something the interface can actually show.
+        let headroom = (pool.vertex_capacity as f64 / pool.vertices_reserved as f64)
+            .min(pool.index_capacity as f64 / pool.indices_reserved as f64);
+        let finest = self.voxel_size / headroom.sqrt() as f32;
+        Some(format!(
+            "could not resample to {wanted:.3} mm: it needs about {:.1}M vertices against a pool \
+             of {:.1}M -- {:.3} mm is the finest that fits at this size",
+            vertices / 1.0e6,
+            pool.vertex_capacity as f64 / 1.0e6,
+            finest,
+        ))
+    }
+
+    /// Scale the model so its longest dimension is `longest_mm`.
+    ///
+    /// Free and lossless: distances are stored in voxels, so this is a change
+    /// to `voxel_size` and nothing else, and the bricks are bit-identical
+    /// afterwards. It buys **no** detail -- the model has the same number of
+    /// voxels across it as before. What it changes is what one voxel measures,
+    /// which is what decides whether the detail already there is enough for a
+    /// given printer. [`Brokkr::detail_advice`] is what tells the user that.
+    fn set_working_size(&mut self, longest_mm: f32) {
+        if !(longest_mm.is_finite() && longest_mm > 0.0) {
+            self.status = "could not resize: that is not a length".into();
+            return;
+        }
+        let Some((lo, hi)) = self.volume.surface_bounds() else {
+            self.status = "could not resize: there is no model".into();
+            return;
+        };
+        let current = (hi - lo).max_element();
+        if current <= 0.0 {
+            self.status = "could not resize: the model has no size".into();
+            return;
+        }
+
+        let factor = longest_mm / current;
+        // The voxel size travels with the model, so the range that bounds it
+        // bounds this too -- otherwise a resize could land somewhere the finer
+        // and coarser buttons can never get back from.
+        let wanted_voxel = self.voxel_size * factor;
+        let clamped = Self::clamped_voxel_size(wanted_voxel);
+        if (clamped - wanted_voxel).abs() > 1.0e-9 {
+            self.status = format!(
+                "could not resize to {longest_mm:.1} mm: that would put the voxel at {:.4} mm, \
+                 outside the {FINEST_VOXEL_MM:.2}-{COARSEST_VOXEL_MM:.2} mm range",
+                wanted_voxel,
+            );
+            return;
+        }
+
+        let previous_radius = self.model_radius;
+        self.volume.rescale(factor);
+        self.voxel_size = self.volume.voxel_size();
+        // The brush is in millimetres, so without this a resize leaves it the
+        // wrong size relative to the model it is about to be used on.
+        self.brush.radius = (self.brush.radius * factor).clamp(MIN_RADIUS_MM, MAX_RADIUS_MM);
+        self.unsaved = true;
+        // Every brick's world position moved, so everything has to be redrawn
+        // even though not one voxel changed.
+        self.volume.mark_everything_dirty();
+        self.remesh_dirty();
+        let _ = previous_radius;
+        self.camera = OrbitCamera::framing(Vec3::ZERO, self.model_radius.max(1.0e-3));
+        self.publish_camera();
+        self.refresh_overlay();
+        self.refresh_detail_advice();
+        self.status = format!("working size {longest_mm:.1} mm, {}", self.detail_advice);
+        log::info!("{}", self.status);
+    }
+
+    /// Recompute the cached readout. See the field for why it is cached.
+    fn refresh_detail_advice(&mut self) {
+        self.detail_advice = self.measure_detail_advice();
+    }
+
+    /// What the current resolution actually means for a print, in one line.
+    ///
+    /// Detail is decided by how many voxels lie across the model, which does
+    /// not change when it is scaled. What a printer cares about is what one
+    /// voxel MEASURES. Saying both, side by side, is the whole point: it turns
+    /// "is 0.25 mm fine enough?" from a guess into arithmetic.
+    ///
+    /// The resin figure is the comparison worth drawing because it is the
+    /// demanding one -- a consumer resin printer resolves around 0.03 mm in XY,
+    /// where a filament nozzle lays down 0.4 mm lines and cannot use anything
+    /// like this much.
+    fn measure_detail_advice(&self) -> String {
+        let Some((lo, hi)) = self.volume.surface_bounds() else {
+            return "no model".into();
+        };
+        let longest = (hi - lo).max_element();
+        let across = (longest / self.voxel_size).round() as i64;
+        let verdict = if self.voxel_size <= RESIN_XY_MM {
+            "at or below what a resin printer resolves"
+        } else if self.voxel_size <= FDM_LINE_MM {
+            "finer than a filament nozzle, coarser than resin"
+        } else {
+            "coarse: a filament nozzle would not see the difference"
+        };
+        format!(
+            "{longest:.1} mm across, voxel {:.3} mm, {across} voxels wide -- {verdict}",
+            self.voxel_size
+        )
     }
 
     /// Turn the whole model, so that a face the user picked becomes the
@@ -2564,6 +2740,16 @@ impl Brokkr {
                 });
             }
             Message::Resample(voxel_size) => self.resample(voxel_size),
+            Message::WorkingSizeTyped(text) => self.working_size_field = text,
+            Message::WorkingSizeCommitted => {
+                match self.working_size_field.trim().parse::<f32>() {
+                    Ok(mm) => self.set_working_size(mm),
+                    Err(_) => {
+                        self.status = "could not resize: type a size in millimetres".into();
+                    }
+                }
+                self.working_size_field.clear();
+            }
             Message::SpaceMouse(setting) => self.configure_spacemouse(setting),
             Message::SectionToggled(section) => {
                 let open = &mut self.expanded[section as usize];
@@ -4901,6 +5087,111 @@ mod tests {
 
         assert!(app.orient_prompt.is_none(), "escape did not dismiss it");
         assert_eq!(app.volume.sample_world(above), before, "escape turned the model");
+    }
+}
+
+#[cfg(test)]
+mod working_size_tests {
+    use super::*;
+
+    fn update(app: &mut Brokkr, message: Message) {
+        drop(app.update(message));
+    }
+
+    fn app() -> Brokkr {
+        Brokkr::with_tablet(crate::tablet::Tablet::inert())
+    }
+
+    /// Scaling is a change to `voxel_size` and nothing else, so the field has
+    /// to come through it untouched. If this ever fails, the operation stopped
+    /// being free and started resampling.
+    #[test]
+    fn resizing_scales_the_model_without_touching_a_voxel() {
+        let mut app = app();
+        let before: Vec<_> =
+            app.volume.brick_coords().map(|c| (c, app.volume.sample_voxel(c.origin()))).collect();
+        let was = app.volume.surface_bounds().expect("the starting ball has a surface");
+        let longest_before = (was.1 - was.0).max_element();
+        let voxel_before = app.voxel_size;
+
+        app.working_size_field = "30".into();
+        update(&mut app, Message::WorkingSizeCommitted);
+
+        let now = app.volume.surface_bounds().expect("still a surface");
+        let longest_after = (now.1 - now.0).max_element();
+        assert!(
+            (longest_after - 30.0).abs() < 0.5,
+            "asked for 30 mm and got {longest_after:.2} mm (from {longest_before:.2})"
+        );
+
+        let factor = 30.0 / longest_before;
+        assert!(
+            (app.voxel_size - voxel_before * factor).abs() < 1.0e-6,
+            "the voxel size should have scaled with the model"
+        );
+        for (coord, value) in before {
+            assert_eq!(
+                app.volume.sample_voxel(coord.origin()),
+                value,
+                "a voxel changed, so this resampled instead of rescaling"
+            );
+        }
+    }
+
+    /// The detail did NOT improve, and the interface must not imply it did.
+    #[test]
+    fn resizing_buys_no_extra_detail() {
+        let mut app = app();
+        let bounds = app.volume.surface_bounds().expect("a surface");
+        let across_before = ((bounds.1 - bounds.0).max_element() / app.voxel_size).round() as i64;
+
+        app.working_size_field = "12".into();
+        update(&mut app, Message::WorkingSizeCommitted);
+
+        let bounds = app.volume.surface_bounds().expect("a surface");
+        let across_after = ((bounds.1 - bounds.0).max_element() / app.voxel_size).round() as i64;
+        assert_eq!(
+            across_before, across_after,
+            "the model has the same number of voxels across it, whatever size it is"
+        );
+    }
+
+    /// A size that would push the voxel outside the range the finer and coarser
+    /// buttons work in has to be refused, or the model lands somewhere those
+    /// buttons can never bring it back from.
+    #[test]
+    fn a_size_that_would_put_the_voxel_out_of_range_is_refused() {
+        let mut app = app();
+        let voxel_before = app.voxel_size;
+
+        app.working_size_field = "0.001".into();
+        update(&mut app, Message::WorkingSizeCommitted);
+
+        assert_eq!(app.voxel_size, voxel_before, "the model was resized anyway");
+        assert!(app.status.contains("could not resize"), "no refusal shown: {}", app.status);
+    }
+
+    #[test]
+    fn nonsense_in_the_field_is_refused_rather_than_parsed_as_zero() {
+        let mut app = app();
+        let voxel_before = app.voxel_size;
+        app.working_size_field = "big".into();
+        update(&mut app, Message::WorkingSizeCommitted);
+        assert_eq!(app.voxel_size, voxel_before);
+        assert!(app.status.contains("could not resize"), "{}", app.status);
+    }
+
+    /// The readout has to name both numbers, because either alone is the
+    /// misleading half: millimetres per voxel without voxels-across hides that
+    /// scaling changed no detail, and voxels-across without millimetres cannot
+    /// answer "is this enough for my printer".
+    #[test]
+    fn the_advice_names_both_the_resolution_and_what_it_measures() {
+        let app = app();
+        let advice = app.measure_detail_advice();
+        assert!(advice.contains("voxels wide"), "no voxel count: {advice}");
+        assert!(advice.contains("mm across"), "no physical size: {advice}");
+        assert!(advice.contains("voxel "), "no voxel size: {advice}");
     }
 }
 

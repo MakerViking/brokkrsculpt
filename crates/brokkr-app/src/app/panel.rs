@@ -1313,6 +1313,20 @@ impl Brokkr {
                 ),
             ]
             .spacing(theme::S2),
+            text("Print size").size(theme::TEXT_SIZE_SMALL).color(theme::TEXT_DIM),
+            row![
+                text_input("longest mm", &self.working_size_field)
+                    .on_input(Message::WorkingSizeTyped)
+                    .on_submit(Message::WorkingSizeCommitted)
+                    .size(theme::TEXT_SIZE_SMALL),
+                button(text("set").size(theme::TEXT_SIZE_SMALL))
+                    .on_press(Message::WorkingSizeCommitted),
+            ]
+            .spacing(theme::S2),
+            // Scaling is free and changes no voxel, so the only honest thing to
+            // show beside it is what the current resolution MEANS at that size.
+            // Without this the field reads as a detail control, which it is not.
+            text(&self.detail_advice).size(theme::TEXT_SIZE_SMALL).color(theme::TEXT_DIM),
         ]
         .spacing(theme::S2)
         .into()

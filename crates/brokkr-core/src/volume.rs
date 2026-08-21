@@ -291,6 +291,25 @@ impl Volume {
         self.voxel_size
     }
 
+    /// Scale the whole model in world space, without touching a single voxel.
+    ///
+    /// This is free, and the reason is worth stating because it is not obvious:
+    /// **distances are stored in voxels, not in millimetres.** The field is
+    /// therefore scale-free, and how big the model is in the world is decided
+    /// entirely by `voxel_size`. Making the model 2.7 times smaller is the same
+    /// operation as making the voxel 2.7 times smaller, and neither resamples
+    /// anything -- the bricks are bit-identical afterwards.
+    ///
+    /// **It buys no detail.** The model still has exactly as many voxels across
+    /// it as it did before, so the finest feature it can hold is unchanged. What
+    /// it changes is what one voxel MEASURES, which is the only thing that
+    /// decides whether the detail already there is enough for a given printer.
+    /// A caller offering this to a user should say so; see the detail panel.
+    pub fn rescale(&mut self, factor: f32) {
+        assert!(factor.is_finite() && factor > 0.0, "a scale factor must be finite and positive");
+        self.voxel_size *= factor;
+    }
+
     // ---------------------------------------------------------------- sampling
 
     /// Distance value at a world voxel coordinate.
@@ -1194,6 +1213,46 @@ impl Volume {
     /// is both the correct answer and the free one.
     pub(crate) fn remove_brick(&mut self, coord: BrickCoord) {
         self.bricks.remove(&coord);
+    }
+
+    /// World space bounds of the SURFACE, or `None` when there is none.
+    ///
+    /// [`Volume::world_bounds`] answers from brick extents, which round out to
+    /// whole 32 voxel bricks and so over-report by up to 8 mm a side at a
+    /// 0.25 mm voxel. That is fine for framing a camera and useless for telling
+    /// someone how big their print will be, which is what this is for.
+    ///
+    /// Costs a scan of every dense brick, so it is a user-action operation and
+    /// must not be called per frame.
+    pub fn surface_bounds(&self) -> Option<(Vec3, Vec3)> {
+        let coords: Vec<BrickCoord> = self.brick_coords().collect();
+        let found = coords
+            .par_iter()
+            .filter_map(|coord| {
+                // A uniform tile is entirely interior or entirely empty, so it
+                // holds no surface and contributes no bound of its own.
+                let Some(Brick::Dense(data)) = self.brick(*coord) else {
+                    return None;
+                };
+                let origin = coord.origin();
+                let mut lo = IVec3::MAX;
+                let mut hi = IVec3::MIN;
+                for (index, value) in data.iter().enumerate() {
+                    if value.abs() >= NARROW_BAND {
+                        continue;
+                    }
+                    let local = IVec3::new(
+                        (index % BRICK_DIM) as i32,
+                        ((index / BRICK_DIM) % BRICK_DIM) as i32,
+                        (index / (BRICK_DIM * BRICK_DIM)) as i32,
+                    );
+                    lo = lo.min(origin + local);
+                    hi = hi.max(origin + local);
+                }
+                (lo != IVec3::MAX).then_some((lo, hi))
+            })
+            .reduce_with(|a, b| (a.0.min(b.0), a.1.max(b.1)));
+        found.map(|(lo, hi)| (self.voxel_position(lo), self.voxel_position(hi)))
     }
 
     /// World space bounds of every stored brick, or `None` when empty.
