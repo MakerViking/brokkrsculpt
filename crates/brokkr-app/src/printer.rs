@@ -153,14 +153,14 @@ mod tests {
 
     #[test]
     fn a_host_is_a_bare_name_and_nothing_else() {
-        assert!(valid_host("192.168.0.46"));
+        assert!(valid_host("192.0.2.46"));
         assert!(valid_host("printer.local"));
         assert!(valid_host("my-printer"));
         // Every one of these would turn `http://{host}:{port}` into a URL
         // pointing somewhere other than the printer.
         assert!(!valid_host(""));
-        assert!(!valid_host("http://192.168.0.46"));
-        assert!(!valid_host("192.168.0.46/evil"));
+        assert!(!valid_host("http://192.0.2.46"));
+        assert!(!valid_host("192.0.2.46/evil"));
         assert!(!valid_host("user@elsewhere.example"));
         assert!(!valid_host("host:1234"));
         assert!(!valid_host("a host"));
@@ -169,7 +169,7 @@ mod tests {
 
     #[test]
     fn a_bad_host_is_refused_before_a_request_is_built() {
-        let why = status("192.168.0.1/evil", MOONRAKER_PORT).expect_err("that is not a host");
+        let why = status("192.0.2.1/evil", MOONRAKER_PORT).expect_err("that is not a host");
         assert!(why.contains("is not a host"), "it tried to connect anyway: {why}");
     }
 
@@ -215,7 +215,7 @@ mod tests {
     /// way the uinput device tests do, because a test that needs hardware must
     /// not fail on a machine that does not have it.
     ///
-    /// Point it somewhere with `BROKKR_TEST_PRINTER=192.168.0.46`. This is what
+    /// Point it somewhere with `BROKKR_TEST_PRINTER=192.0.2.46`. This is what
     /// turns every fact in the module docs from something read in another
     /// codebase into something observed here.
     #[test]
@@ -243,7 +243,7 @@ mod tests {
 /// format is a dependency and a second thing to get wrong. Two keys:
 ///
 /// ```text
-/// host = 192.168.0.46
+/// host = 192.0.2.46
 /// port = 7125
 /// ```
 ///
@@ -311,13 +311,13 @@ mod config_tests {
     fn a_written_down_printer_is_read_back() {
         let path = write(
             "# my machine
-host = 192.168.0.46
+host = 192.0.2.46
 port = 7125
 ",
         );
         assert_eq!(
             configured(Some(&path)),
-            Some(Printer { host: "192.168.0.46".into(), port: 7125 })
+            Some(Printer { host: "192.0.2.46".into(), port: 7125 })
         );
         let _ = std::fs::remove_file(path);
     }

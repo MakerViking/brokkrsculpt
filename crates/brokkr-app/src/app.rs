@@ -2376,7 +2376,7 @@ impl Brokkr {
                     // or it may as well not exist.
                     self.status = match crate::paths::config_file("printer") {
                         Some(path) => format!(
-                            "no printer set — put `host = 192.168.0.46` in {}",
+                            "no printer set — put `host = 192.0.2.46` in {}",
                             path.display()
                         ),
                         None => "could not work out where the printer config lives".to_string(),
