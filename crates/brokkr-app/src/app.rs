@@ -760,6 +760,50 @@ impl Brokkr {
             // ends the application -- if this subscription is ever dropped the
             // window becomes unclosable.
             iced::window::close_requests().map(Message::CloseRequested),
+            // Keyboard shortcuts, on events the widget tree IGNORED. They
+            // lived in the shader widget for a year, captured window-wide,
+            // "because the shader already receives every event" -- and that
+            // capture stole 1-7, s, u, x, y and z from every text field in
+            // the application, because the shader traverses before the panel.
+            // Filtering on Ignored is what makes them focus-aware: a focused
+            // text input consumes its keystrokes, and a shortcut fires only
+            // when nothing else wanted the key.
+            iced::event::listen_with(|event, status, _window| {
+                if status == iced::event::Status::Captured {
+                    return None;
+                }
+                match event {
+                    iced::Event::Keyboard(iced::keyboard::Event::KeyPressed {
+                        key,
+                        modifiers,
+                        ..
+                    }) => match key {
+                        iced::keyboard::Key::Named(iced::keyboard::key::Named::Escape) => {
+                            Some(Message::MenuClosed)
+                        }
+                        iced::keyboard::Key::Character(character) => crate::viewport::shortcut(
+                            character.as_str(),
+                            modifiers.command(),
+                            modifiers.shift(),
+                        ),
+                        _ => None,
+                    },
+                    // Releasing a sizing key ends the gesture. Without this
+                    // the pointer would keep resizing the brush instead of
+                    // going back to sculpting.
+                    iced::Event::Keyboard(iced::keyboard::Event::KeyReleased { key, .. }) => {
+                        match key {
+                            iced::keyboard::Key::Character(character)
+                                if matches!(character.to_ascii_lowercase().as_str(), "s" | "u") =>
+                            {
+                                Some(Message::SizingEnded)
+                            }
+                            _ => None,
+                        }
+                    }
+                    _ => None,
+                }
+            }),
         ])
     }
 

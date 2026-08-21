@@ -166,7 +166,7 @@ const RADIUS_STEP: f32 = 1.15;
 /// or a window, which on this machine is the only way to test input at all:
 /// it is a Wayland session, and XTEST pointer and key synthesis silently does
 /// nothing there.
-fn shortcut(character: &str, command: bool, shift: bool) -> Option<Message> {
+pub(crate) fn shortcut(character: &str, command: bool, shift: bool) -> Option<Message> {
     if command {
         // The only chorded shortcuts. Anything else with control held belongs
         // to the toolkit or the window manager.
@@ -200,6 +200,82 @@ fn shortcut(character: &str, command: bool, shift: bool) -> Option<Message> {
     }
 }
 
+/// Translate an event into the pointer event the application should see, and
+/// whether the viewport may CAPTURE it — which stops every widget after it in
+/// traversal order from seeing the event at all.
+///
+/// # Capture is the whole bug surface here, so the rule is stated once
+///
+/// **Only events that are bounds-checked may capture.** The viewport
+/// deliberately handles cursor moves and button releases wherever the cursor
+/// is, because a sculpting drag that leaves the viewport must keep sculpting
+/// and its release must still end the stroke. For a year this function
+/// captured those too — and `iced`'s `button` is exactly the widget that
+/// honours capture (`if shell.is_event_captured() { return; }`), while slider,
+/// checkbox and text_input ignore it. The shader traverses before the right
+/// panel, so every release anywhere in the window was swallowed before a panel
+/// button could see it: presses armed the buttons (that arm is bounds-gated),
+/// releases never arrived, and **every button in the properties panel was
+/// unclickable** while every slider beside them worked. Verified live on
+/// 2026-08-21 with a raw-event probe: ~20 presses over panel buttons, zero
+/// messages dispatched.
+///
+/// Publishing without capturing is safe from misfires by iced's own design: a
+/// button only fires when the press STARTED on it, so a sculpt release passing
+/// over the panel cannot click anything.
+///
+/// Keyboard shortcuts used to be captured here too, which was its own bug —
+/// the capture stole `1`–`7`, `s`, `u`, `x`, `y`, `z` from every text field in
+/// the application, because the shader traverses first. They now live in a
+/// subscription over events the widget tree IGNORED (`app.rs`), which is what
+/// makes them focus-aware: a focused text input consumes its keystrokes, and
+/// the shortcut only fires when nothing wanted the key.
+fn route_pointer(
+    event: &iced::Event,
+    bounds: Rectangle,
+    cursor: mouse::Cursor,
+) -> Option<(PointerEvent, bool)> {
+    let routed = match event {
+        iced::Event::Mouse(mouse::Event::CursorMoved { .. }) => {
+            let (position, size) = pointer_position(bounds, cursor)?;
+            (PointerEvent::Moved { position, size }, false)
+        }
+        iced::Event::Mouse(mouse::Event::ButtonPressed(button)) => {
+            // Only start a drag that began inside the viewport, so a click
+            // on a panel does not sculpt.
+            cursor.position_in(bounds)?;
+            let (position, size) = pointer_position(bounds, cursor)?;
+            (PointerEvent::Pressed { button: button_of(*button)?, position, size }, true)
+        }
+        iced::Event::Mouse(mouse::Event::ButtonReleased(button)) => {
+            // Handled wherever the cursor is: releasing outside the widget
+            // still has to end the drag. NOT captured, for the reason above.
+            (PointerEvent::Released { button: button_of(*button)? }, false)
+        }
+        iced::Event::Mouse(mouse::Event::WheelScrolled { delta }) => {
+            cursor.position_in(bounds)?;
+            let amount = match delta {
+                mouse::ScrollDelta::Lines { y, .. } => *y,
+                // Pixel deltas are far larger per notch than line deltas.
+                mouse::ScrollDelta::Pixels { y, .. } => *y / 40.0,
+            };
+            (PointerEvent::Scrolled { amount }, true)
+        }
+        iced::Event::Keyboard(iced::keyboard::Event::ModifiersChanged(modifiers)) => (
+            PointerEvent::Modifiers {
+                shift: modifiers.shift(),
+                control: modifiers.control(),
+                alt: modifiers.alt(),
+            },
+            // Broadcast state, not an interaction: capturing it would starve
+            // every other widget of the same update.
+            false,
+        ),
+        _ => return None,
+    };
+    Some(routed)
+}
+
 impl shader::Program<Message> for Viewport {
     // Drag state lives in the application, not the widget, because sculpting
     // mutates the volume and that is the application's to own.
@@ -217,73 +293,9 @@ impl shader::Program<Message> for Viewport {
         bounds: Rectangle,
         cursor: mouse::Cursor,
     ) -> Option<shader::Action<Message>> {
-        use iced::keyboard;
-
-        let pointer = match event {
-            iced::Event::Mouse(mouse::Event::CursorMoved { .. }) => {
-                let (position, size) = pointer_position(bounds, cursor)?;
-                PointerEvent::Moved { position, size }
-            }
-            iced::Event::Mouse(mouse::Event::ButtonPressed(button)) => {
-                // Only start a drag that began inside the viewport, so a click
-                // on a panel does not sculpt.
-                cursor.position_in(bounds)?;
-                let (position, size) = pointer_position(bounds, cursor)?;
-                PointerEvent::Pressed { button: button_of(*button)?, position, size }
-            }
-            iced::Event::Mouse(mouse::Event::ButtonReleased(button)) => {
-                // Handled wherever the cursor is: releasing outside the widget
-                // still has to end the drag.
-                PointerEvent::Released { button: button_of(*button)? }
-            }
-            iced::Event::Mouse(mouse::Event::WheelScrolled { delta }) => {
-                cursor.position_in(bounds)?;
-                let amount = match delta {
-                    mouse::ScrollDelta::Lines { y, .. } => *y,
-                    // Pixel deltas are far larger per notch than line deltas.
-                    mouse::ScrollDelta::Pixels { y, .. } => *y / 40.0,
-                };
-                PointerEvent::Scrolled { amount }
-            }
-            iced::Event::Keyboard(keyboard::Event::ModifiersChanged(modifiers)) => {
-                PointerEvent::Modifiers {
-                    shift: modifiers.shift(),
-                    control: modifiers.control(),
-                    alt: modifiers.alt(),
-                }
-            }
-            // Shortcuts are handled here rather than through a global one
-            // because the shader widget already receives every event, wherever
-            // the cursor happens to be.
-            iced::Event::Keyboard(keyboard::Event::KeyPressed { key, modifiers, .. }) => {
-                // Escape closes the right-click menu. Handled before the
-                // character keys because it is a named key, not a character.
-                if matches!(key, keyboard::Key::Named(keyboard::key::Named::Escape)) {
-                    return Some(shader::Action::publish(Message::MenuClosed).and_capture());
-                }
-                let keyboard::Key::Character(character) = key else {
-                    return None;
-                };
-                let message = shortcut(character, modifiers.command(), modifiers.shift())?;
-                return Some(shader::Action::publish(message).and_capture());
-            }
-            // Releasing a sizing key ends the gesture. Without this the pointer
-            // would keep resizing the brush instead of going back to sculpting,
-            // which is the failure the user would report as "it stopped
-            // working".
-            iced::Event::Keyboard(keyboard::Event::KeyReleased { key, .. }) => {
-                let keyboard::Key::Character(character) = key else {
-                    return None;
-                };
-                if !matches!(character.to_ascii_lowercase().as_str(), "s" | "u") {
-                    return None;
-                }
-                return Some(shader::Action::publish(Message::SizingEnded).and_capture());
-            }
-            _ => return None,
-        };
-
-        Some(shader::Action::publish(Message::Pointer(pointer)).and_capture())
+        let (pointer, captures) = route_pointer(event, bounds, cursor)?;
+        let action = shader::Action::publish(Message::Pointer(pointer));
+        Some(if captures { action.and_capture() } else { action })
     }
 
     fn mouse_interaction(
@@ -434,6 +446,66 @@ mod tests {
     use super::*;
     use iced::widget::shader::Program;
     use iced::{Point, Size};
+
+    /// The capture rule, pinned: **only bounds-checked events may capture.**
+    ///
+    /// The failure this guards against was live for a year and looked like a
+    /// broken panel, not a broken viewport: the shader traverses before the
+    /// properties panel, `button` honours capture, and a captured release
+    /// anywhere in the window meant no panel button could ever fire. If one of
+    /// these assertions starts failing, read `route_pointer`'s comment before
+    /// "fixing" the test.
+    #[test]
+    fn only_bounds_checked_events_capture() {
+        let inside = mouse::Cursor::Available(Point::new(500.0, 300.0));
+        let outside = mouse::Cursor::Available(Point::new(950.0, 690.0));
+
+        let moved = iced::Event::Mouse(mouse::Event::CursorMoved { position: Point::ORIGIN });
+        let pressed = iced::Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left));
+        let released = iced::Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left));
+
+        // A move is wanted wherever the cursor is, and must never capture:
+        // hover in every widget after the shader depends on seeing it.
+        let (_, captures) = route_pointer(&moved, bounds(), outside).expect("moves are routed");
+        assert!(!captures, "a cursor move outside the viewport was captured");
+        let (_, captures) = route_pointer(&moved, bounds(), inside).expect("moves are routed");
+        assert!(!captures, "even inside the viewport, capturing moves starves the panel");
+
+        // A release must arrive wherever the cursor is -- it ends a drag that
+        // left the widget -- and must never capture: it is the event a button
+        // fires on.
+        let (_, captures) =
+            route_pointer(&released, bounds(), outside).expect("releases are routed");
+        assert!(!captures, "a release outside the viewport was captured");
+
+        // A press inside the viewport is genuinely ours and may capture...
+        let (_, captures) = route_pointer(&pressed, bounds(), inside).expect("press inside");
+        assert!(captures, "a press inside the viewport should be claimed");
+        // ...and a press outside is none of our business at all.
+        assert!(
+            route_pointer(&pressed, bounds(), outside).is_none(),
+            "a press outside the viewport must not reach the sculpt at all"
+        );
+    }
+
+    /// Keyboard events are none of `route_pointer`'s business: shortcuts fire
+    /// from a subscription over IGNORED events, so a focused text field eats
+    /// its own keystrokes. This is what keeps `1`-`7`, `s`, `u`, `x`, `y`, `z`
+    /// typeable in the print-size field.
+    #[test]
+    fn keyboard_events_are_not_routed_by_the_viewport() {
+        let key = iced::Event::Keyboard(iced::keyboard::Event::KeyPressed {
+            key: iced::keyboard::Key::Character("s".into()),
+            modified_key: iced::keyboard::Key::Character("s".into()),
+            physical_key: iced::keyboard::key::Physical::Code(iced::keyboard::key::Code::KeyS),
+            location: iced::keyboard::Location::Standard,
+            modifiers: iced::keyboard::Modifiers::default(),
+            text: None,
+            repeat: false,
+        });
+        let cursor = mouse::Cursor::Available(Point::new(500.0, 300.0));
+        assert!(route_pointer(&key, bounds(), cursor).is_none());
+    }
 
     fn bounds() -> Rectangle {
         Rectangle::new(Point::new(100.0, 50.0), Size::new(800.0, 600.0))
