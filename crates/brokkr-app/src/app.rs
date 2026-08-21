@@ -113,6 +113,17 @@ const STRENGTH_PER_PIXEL: f32 = 0.002;
 const FINEST_VOXEL_MM: f32 = 0.03;
 const COARSEST_VOXEL_MM: f32 = 2.0;
 
+/// How much system memory one volume may occupy.
+///
+/// The mesh pool grows itself buffers now, so it is no longer the first thing
+/// a fine resample runs out of: the dragon at 0.0565 mm sits at 48% of the
+/// pool and 4.15 GB of RAM. Without this the detail buttons would walk a
+/// machine into swap.
+///
+/// Matches `voxelise`'s own import ceiling, and carries the same caveat: it is
+/// a guess at what a machine can spare, made without asking the machine.
+const MAX_VOLUME_BYTES: f64 = 6.0 * 1024.0 * 1024.0 * 1024.0;
+
 /// Roughly what a consumer resin printer resolves in XY, in millimetres.
 ///
 /// A reference point for the detail advice, not a limit on anything. Mono LCD
@@ -2067,6 +2078,28 @@ impl Brokkr {
         if wanted >= self.voxel_size {
             return None;
         }
+
+        // System memory first, because the GPU pool is no longer the tighter
+        // of the two. Measured on the dragon: 0.0565 mm fits the pool at 48%
+        // and costs 4.15 GB of RAM, so a pool-only guard would happily walk a
+        // machine into swap or the OOM killer. Same square law -- a surface
+        // has fixed area, so halving the voxel quadruples the shell.
+        let growth = (self.voxel_size / wanted).powi(2) as f64;
+        let bytes = self.volume_stats.resident_bytes as f64 * growth;
+        if bytes > MAX_VOLUME_BYTES {
+            let headroom = MAX_VOLUME_BYTES / self.volume_stats.resident_bytes.max(1) as f64;
+            let finest = self.voxel_size / headroom.sqrt() as f32 * 1.03;
+            return Some((
+                format!(
+                    "could not resample to {wanted:.3} mm: it needs about {:.1} GB of memory \
+                     against a {:.0} GB ceiling -- {finest:.3} mm is the finest that fits",
+                    bytes / (1024.0 * 1024.0 * 1024.0),
+                    MAX_VOLUME_BYTES / (1024.0 * 1024.0 * 1024.0),
+                ),
+                finest,
+            ));
+        }
+
         let pool = self.shared.stats();
         if pool.vertices_reserved == 0 {
             return None;
@@ -2077,7 +2110,6 @@ impl Brokkr {
         // therefore the honest basis, and it is only honest BECAUSE of the
         // reset; before that existed this prediction was blind to
         // fragmentation and let the pool overflow.
-        let growth = (self.voxel_size / wanted).powi(2) as f64;
         let vertices = pool.vertices_reserved as f64 * growth;
         let indices = pool.indices_reserved as f64 * growth;
         if vertices <= pool.vertex_capacity as f64 && indices <= pool.index_capacity as f64 {
@@ -5387,6 +5419,35 @@ mod working_size_tests {
         assert!(
             app.status.contains("finest the mesh pool holds"),
             "the status must say the step was capped: {}",
+            app.status
+        );
+    }
+
+    /// Memory is checked before the pool, because since the pool grew itself
+    /// buffers it is no longer the tighter of the two. A step the pool would
+    /// happily hold can still be one that walks the machine into swap.
+    #[test]
+    fn a_step_that_would_exhaust_memory_is_capped_even_when_the_pool_has_room() {
+        let mut app = app();
+        // Plenty of pool...
+        app.shared.set_stats_for_tests(brokkr_gpu::PoolStats {
+            vertices_reserved: 1_000_000,
+            indices_reserved: 6_000_000,
+            vertex_capacity: brokkr_gpu::TOTAL_VERTEX_CAPACITY,
+            index_capacity: brokkr_gpu::TOTAL_INDEX_CAPACITY,
+            ..Default::default()
+        });
+        // ...but the volume is already 4 GB, so one halving would want 16.
+        app.volume_stats.resident_bytes = 4 * 1024 * 1024 * 1024;
+        let before = app.voxel_size;
+
+        update(&mut app, Message::Resample(before / 2.0));
+
+        assert!(app.voxel_size < before, "it should still go finer, just not that fine");
+        assert!(app.voxel_size > before / 2.0, "and not all the way to the requested size");
+        assert!(
+            app.status.contains("finest the mesh pool holds"),
+            "the cap should be reported: {}",
             app.status
         );
     }

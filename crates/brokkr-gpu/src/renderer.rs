@@ -313,8 +313,16 @@ impl SculptRenderer {
     }
 
     /// Replace one brick's mesh in the pool.
-    pub fn upload_brick(&mut self, queue: &wgpu::Queue, coord: BrickCoord, mesh: &BrickMesh) {
-        self.pool.upload(queue, coord, mesh);
+    /// Takes the device as well as the queue because the pool grows itself a
+    /// buffer when the ones it has are full.
+    pub fn upload_brick(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        coord: BrickCoord,
+        mesh: &BrickMesh,
+    ) {
+        self.pool.upload(device, queue, coord, mesh);
     }
 
     pub fn write_uniforms(&self, queue: &wgpu::Queue, uniforms: &Uniforms) {

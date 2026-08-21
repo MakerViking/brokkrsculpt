@@ -92,7 +92,7 @@ fn main() {
 
     let upload_start = Instant::now();
     for (coord, mesh) in coords.iter().zip(meshes.iter()) {
-        renderer.upload_brick(&queue, *coord, mesh);
+        renderer.upload_brick(&device, &queue, *coord, mesh);
     }
     let upload_ms = millis(upload_start.elapsed());
 

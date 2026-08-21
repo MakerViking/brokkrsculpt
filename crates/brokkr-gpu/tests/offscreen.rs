@@ -195,20 +195,30 @@ fn dump(name: &str, pixels: &[u8]) {
 }
 
 /// Mesh every brick that can carry geometry and hand it to the renderer.
-fn upload_all(renderer: &mut SculptRenderer, queue: &wgpu::Queue, volume: &mut Volume) -> usize {
+fn upload_all(
+    renderer: &mut SculptRenderer,
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    volume: &mut Volume,
+) -> usize {
     volume.mark_everything_dirty();
-    upload_dirty(renderer, queue, volume)
+    upload_dirty(renderer, device, queue, volume)
 }
 
 /// Mesh only what the volume says is dirty. Returns how many bricks that was.
-fn upload_dirty(renderer: &mut SculptRenderer, queue: &wgpu::Queue, volume: &mut Volume) -> usize {
+fn upload_dirty(
+    renderer: &mut SculptRenderer,
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    volume: &mut Volume,
+) -> usize {
     let mut scratch = MeshScratch::new();
     let mut mesh = BrickMesh::default();
     let mut dirty: Vec<BrickCoord> = Vec::new();
     volume.take_dirty(&mut dirty);
     for &coord in &dirty {
         volume.mesh_brick(coord, &mut scratch, &mut mesh);
-        renderer.upload_brick(queue, coord, &mesh);
+        renderer.upload_brick(device, queue, coord, &mesh);
     }
     dirty.len()
 }
@@ -254,7 +264,7 @@ fn the_sculpt_loop_renders_and_responds_to_a_stroke() {
 
     let mut volume = Volume::new(VOXEL_SIZE);
     volume.seed_sphere(Vec3::ZERO, MODEL_RADIUS);
-    let bricks = upload_all(&mut renderer, &harness.queue, &mut volume);
+    let bricks = upload_all(&mut renderer, &harness.device, &harness.queue, &mut volume);
     assert!(bricks > 50, "a 60 mm sphere should span many bricks, got {bricks}");
 
     let stats = renderer.stats();
@@ -319,7 +329,7 @@ fn the_sculpt_loop_renders_and_responds_to_a_stroke() {
         brush.apply(&mut volume, &Stamp::new(at, normal, BrushDirection::Add), &mut brush_scratch);
     }
 
-    let dirty = upload_dirty(&mut renderer, &harness.queue, &mut volume);
+    let dirty = upload_dirty(&mut renderer, &harness.device, &harness.queue, &mut volume);
     assert!(dirty > 0, "the stroke dirtied nothing");
     assert!(
         dirty < bricks / 2,
@@ -365,7 +375,7 @@ fn an_empty_volume_draws_nothing() {
     let mut volume = Volume::new(VOXEL_SIZE);
     // Touch a brick without putting a surface in it.
     volume.mark_dirty(BrickCoord(IVec3::ZERO));
-    upload_dirty(&mut renderer, &harness.queue, &mut volume);
+    upload_dirty(&mut renderer, &harness.device, &harness.queue, &mut volume);
 
     let (lit, _) = coverage(&harness.frame(&renderer));
     assert_eq!(lit, 0, "an empty volume drew {lit} pixels");
@@ -409,7 +419,7 @@ fn every_brush_leaves_a_visible_mark() {
                 &mut brush_scratch,
             );
         }
-        upload_all(&mut renderer, &harness.queue, &mut volume);
+        upload_all(&mut renderer, &harness.device, &harness.queue, &mut volume);
         let before = harness.frame(&renderer);
 
         let brush = Brush { kind, radius: 10.0, strength: 0.7, ..Brush::default() };
@@ -427,7 +437,7 @@ fn every_brush_leaves_a_visible_mark() {
             }
         }
 
-        let dirty = upload_dirty(&mut renderer, &harness.queue, &mut volume);
+        let dirty = upload_dirty(&mut renderer, &harness.device, &harness.queue, &mut volume);
         assert!(dirty > 0, "{kind} dirtied nothing");
 
         let after = harness.frame(&renderer);
@@ -487,7 +497,7 @@ fn a_leaned_stroke_looks_different_from_an_upright_one() {
             }
         }
 
-        upload_all(&mut renderer, &harness.queue, &mut volume);
+        upload_all(&mut renderer, &harness.device, &harness.queue, &mut volume);
         let frame = harness.frame(&renderer);
         dump(label, &frame);
         assert!(coverage(&frame).0 > 0, "{label} rendered nothing");
@@ -533,7 +543,7 @@ fn every_pattern_leaves_a_visible_and_distinct_mark() {
 
         let mut volume = Volume::new(VOXEL_SIZE);
         volume.seed_sphere(Vec3::ZERO, MODEL_RADIUS);
-        upload_all(&mut renderer, &harness.queue, &mut volume);
+        upload_all(&mut renderer, &harness.device, &harness.queue, &mut volume);
         let before = harness.frame(&renderer);
 
         let mut brush_scratch = BrushScratch::new();
@@ -560,7 +570,7 @@ fn every_pattern_leaves_a_visible_and_distinct_mark() {
             }
         }
 
-        let dirty = upload_dirty(&mut renderer, &harness.queue, &mut volume);
+        let dirty = upload_dirty(&mut renderer, &harness.device, &harness.queue, &mut volume);
         assert!(dirty > 0, "{kind} dirtied nothing");
 
         let after = harness.frame(&renderer);
@@ -618,7 +628,7 @@ fn overlay_geometry_draws_in_front_and_is_hidden_behind() {
 
     let mut volume = Volume::new(VOXEL_SIZE);
     volume.seed_sphere(Vec3::ZERO, MODEL_RADIUS);
-    upload_all(&mut renderer, &harness.queue, &mut volume);
+    upload_all(&mut renderer, &harness.device, &harness.queue, &mut volume);
 
     let bare = harness.frame(&renderer);
 
@@ -746,7 +756,7 @@ fn an_imported_mesh_renders() {
     let mut seeded = Volume::new(VOXEL_SIZE);
     seeded.seed_sphere(Vec3::ZERO, MODEL_RADIUS);
     seeded.mark_everything_dirty();
-    upload_all(&mut renderer, &harness.queue, &mut seeded);
+    upload_all(&mut renderer, &harness.device, &harness.queue, &mut seeded);
     let (seeded_lit, _) = coverage(&harness.frame(&renderer));
     assert!(seeded_lit > 0, "the reference sphere drew nothing, so this test proves nothing");
     dump("import-reference", &harness.frame(&renderer));
@@ -770,7 +780,7 @@ fn an_imported_mesh_renders() {
     let mut fresh = SculptRenderer::new(&harness.device, &harness.queue, TARGET_FORMAT);
     fresh.resize(&harness.device, WIDTH, HEIGHT);
     fresh.write_uniforms(&harness.queue, &uniforms(MODEL_RADIUS * 3.0));
-    let uploaded = upload_all(&mut fresh, &harness.queue, &mut imported);
+    let uploaded = upload_all(&mut fresh, &harness.device, &harness.queue, &mut imported);
     assert!(uploaded > 0, "the imported volume produced no mesh to upload");
 
     let pixels = harness.frame(&fresh);

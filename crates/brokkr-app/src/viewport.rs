@@ -407,7 +407,7 @@ impl shader::Primitive for SculptPrimitive {
         if !drained.is_empty() {
             let mut spare = self.shared.spare.lock().expect("shared frame poisoned");
             for upload in drained {
-                pipeline.renderer.upload_brick(queue, upload.coord, &upload.mesh);
+                pipeline.renderer.upload_brick(device, queue, upload.coord, &upload.mesh);
                 spare.push(upload.mesh);
             }
         }

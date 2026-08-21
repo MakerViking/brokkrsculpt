@@ -15,38 +15,42 @@ use rustc_hash::FxHashMap;
 
 use crate::frustum::Frustum;
 
-/// Vertices the pool can hold. At 24 bytes each this is 264 MB.
+/// Vertices ONE buffer of the pool holds. At 24 bytes each this is 264 MB.
 ///
 /// **The binding constraint is `wgpu`'s default `max_buffer_size`, which is
-/// 256 MiB (268,435,456 bytes)** -- not VRAM, and not a measurement. That is
-/// what really set the previous 8,000,000, whose 192 MB sat under the same
-/// ceiling; the M2 sphere it was documented against merely happened to fit.
-/// Iced creates the device here, so this crate cannot request a larger limit,
-/// and exceeding it is a validation error at buffer creation rather than
-/// anything subtle. 11,000,000 x 24 = 264,000,000 bytes, which is as close to
-/// the ceiling as a round number gets.
+/// 256 MiB (268,435,456 bytes)** -- not VRAM, and not a measurement. Iced
+/// creates the device (`iced_wgpu::window::compositor` asks for
+/// `wgpu::Limits::default()` with no hook to change it), so this crate cannot
+/// request a larger limit however much the adapter would allow.
 ///
-/// The figure that forced the change: the Nightwing dragon at 1600 voxels
-/// across meshes to 14.3 million triangles and 7.83 million vertices, and the
-/// allocator's 256 element granularity takes the reservation to 8,525,824 --
-/// 106.6% of the old capacity. The detail button ran, built a correct volume,
-/// and then silently dropped part of the model on the floor. Against this it
-/// reserves 78%, which fits with room but not with a great deal.
-///
-/// Past this needs the pool split over several buffers, or iced persuaded to
-/// request a larger `max_buffer_size` from the adapter (most desktop GPUs allow
-/// far more). Neither is done. Until one is, this is a hard ceiling at roughly
-/// 1700 voxels across a model, and the resample guard in `brokkr-app` is what
-/// keeps hitting it an error message rather than a vanishing model.
+/// The answer is more buffers rather than a bigger one: see [`MAX_BUFFERS`].
+/// 11,000,000 x 24 = 264,000,000 bytes, as close to the ceiling as a round
+/// number gets.
 pub const VERTEX_CAPACITY: u64 = 11_000_000;
 
-/// Indices the pool can hold. At 4 bytes each this is 264 MB, under the same
-/// 256 MiB `max_buffer_size` ceiling as the vertices above.
+/// Indices one buffer holds. At 4 bytes each this is 264 MB, under the same
+/// ceiling.
 ///
-/// Six times the vertex capacity, which is what the measurements show a closed
-/// surface produces: the dragon above reserved 43.5 million indices against
-/// 8.5 million vertices.
+/// Six times the vertex capacity, which is what a closed surface produces: the
+/// dragon reserves 51.9 million indices against 8.65 million vertices.
 pub const INDEX_CAPACITY: u64 = 66_000_000;
+
+/// How many buffer pairs the pool may grow to.
+///
+/// Buffers are created **on demand**, so a small model pays for one pair
+/// (528 MB) and only a model that needs more allocates more. Eight pairs is
+/// 4.2 GB of VRAM at full stretch, which is the point at which refusing is
+/// kinder than trying on any card this application is likely to meet.
+///
+/// This is what lifts the ceiling that one buffer imposes. The dragon at
+/// 200 mm and 0.113 mm fills 79% of a single pair; halving the voxel from
+/// there needs four.
+pub const MAX_BUFFERS: usize = 8;
+
+/// Total vertices the pool can reach, across every buffer it may create.
+pub const TOTAL_VERTEX_CAPACITY: u64 = VERTEX_CAPACITY * MAX_BUFFERS as u64;
+/// Total indices the pool can reach.
+pub const TOTAL_INDEX_CAPACITY: u64 = INDEX_CAPACITY * MAX_BUFFERS as u64;
 
 /// `wgpu`'s default `max_buffer_size`, which neither pool buffer may exceed.
 ///
@@ -85,6 +89,8 @@ const GRANULARITY: u64 = 256;
 struct Block {
     offset: u64,
     capacity: u64,
+    /// Which buffer pair of the pool this lives in.
+    buffer: u16,
 }
 
 /// Fixed granularity suballocator over a fixed range.
@@ -112,11 +118,13 @@ struct BlockAllocator {
     /// Free block offsets, indexed by how many granules they hold.
     free: Vec<Vec<u64>>,
     live: u64,
+    /// Which buffer pair this allocator hands out space in.
+    buffer: u16,
 }
 
 impl BlockAllocator {
-    fn new(capacity: u64) -> Self {
-        Self { capacity, bump: 0, free: Vec::new(), live: 0 }
+    fn new(capacity: u64, buffer: u16) -> Self {
+        Self { capacity, bump: 0, free: Vec::new(), live: 0, buffer }
     }
 
     /// Granules needed for a request, never zero.
@@ -133,7 +141,7 @@ impl BlockAllocator {
         }
         if let Some(offset) = self.free[granules].pop() {
             self.live += capacity;
-            return Some(Block { offset, capacity });
+            return Some(Block { offset, capacity, buffer: self.buffer });
         }
 
         if self.bump + capacity > self.capacity {
@@ -142,7 +150,7 @@ impl BlockAllocator {
         let offset = self.bump;
         self.bump += capacity;
         self.live += capacity;
-        Some(Block { offset, capacity })
+        Some(Block { offset, capacity, buffer: self.buffer })
     }
 
     fn release(&mut self, block: Block) {
@@ -176,6 +184,36 @@ impl BlockAllocator {
         self.live = 0;
         for class in &mut self.free {
             class.clear();
+        }
+    }
+}
+
+/// One vertex buffer and its index buffer, with the allocators over them.
+#[derive(Debug)]
+struct BufferPair {
+    vertices: wgpu::Buffer,
+    indices: wgpu::Buffer,
+    vertex_allocator: BlockAllocator,
+    index_allocator: BlockAllocator,
+}
+
+impl BufferPair {
+    fn new(device: &wgpu::Device, index: u16) -> Self {
+        Self {
+            vertices: device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("brokkr brick vertices"),
+                size: VERTEX_CAPACITY * size_of::<Vertex>() as u64,
+                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            }),
+            indices: device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("brokkr brick indices"),
+                size: INDEX_CAPACITY * size_of::<u32>() as u64,
+                usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            }),
+            vertex_allocator: BlockAllocator::new(VERTEX_CAPACITY, index),
+            index_allocator: BlockAllocator::new(INDEX_CAPACITY, index),
         }
     }
 }
@@ -239,11 +277,11 @@ pub struct PoolStats {
 /// The shared mesh buffers and the map from brick to slice.
 #[derive(Debug)]
 pub struct MeshPool {
-    vertex_buffer: wgpu::Buffer,
-    index_buffer: wgpu::Buffer,
+    /// One pair per buffer of the pool, created on demand. Never shrinks: the
+    /// buffers are reused by [`MeshPool::reset`] rather than dropped, because
+    /// a rebuild almost always needs them again immediately.
+    buffers: Vec<BufferPair>,
     slots: FxHashMap<BrickCoord, Slot>,
-    vertex_allocator: BlockAllocator,
-    index_allocator: BlockAllocator,
     triangles: usize,
     vertices: usize,
     overflowed: usize,
@@ -256,25 +294,9 @@ pub struct MeshPool {
 
 impl MeshPool {
     pub fn new(device: &wgpu::Device) -> Self {
-        let vertex_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("brokkr brick vertices"),
-            size: VERTEX_CAPACITY * size_of::<Vertex>() as u64,
-            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-        let index_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("brokkr brick indices"),
-            size: INDEX_CAPACITY * size_of::<u32>() as u64,
-            usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-
         Self {
-            vertex_buffer,
-            index_buffer,
+            buffers: vec![BufferPair::new(device, 0)],
             slots: FxHashMap::default(),
-            vertex_allocator: BlockAllocator::new(VERTEX_CAPACITY),
-            index_allocator: BlockAllocator::new(INDEX_CAPACITY),
             triangles: 0,
             vertices: 0,
             overflowed: 0,
@@ -284,11 +306,58 @@ impl MeshPool {
         }
     }
 
-    /// Replace one brick's mesh.
+    /// Reserve space for one brick, growing the pool by a buffer if the ones
+    /// that exist have no room.
     ///
-    /// An empty mesh releases the brick's slices, which is what happens when a
-    /// stroke carves a brick away entirely.
-    pub fn upload(&mut self, queue: &wgpu::Queue, coord: BrickCoord, mesh: &BrickMesh) {
+    /// Vertices and indices must land in the SAME pair: `draw` binds a pair at
+    /// a time, so a brick split across two could not be drawn. When a pair has
+    /// room for one and not the other the whole request moves on to the next.
+    fn reserve(
+        &mut self,
+        device: &wgpu::Device,
+        need_vertices: u64,
+        need_indices: u64,
+    ) -> Option<(Block, Block)> {
+        for pair in &mut self.buffers {
+            // Ask for the vertices first, and hand them straight back if the
+            // indices do not also fit -- otherwise a near-full pair leaks a
+            // block every time it is passed over.
+            let Some(vertices) = pair.vertex_allocator.allocate(need_vertices) else {
+                continue;
+            };
+            match pair.index_allocator.allocate(need_indices) {
+                Some(indices) => return Some((vertices, indices)),
+                None => pair.vertex_allocator.release(vertices),
+            }
+        }
+
+        if self.buffers.len() >= MAX_BUFFERS {
+            return None;
+        }
+        let index = self.buffers.len() as u16;
+        log::info!(
+            "mesh pool growing to {} buffer pairs ({} MB reserved)",
+            index + 1,
+            (index as u64 + 1)
+                * (VERTEX_CAPACITY * size_of::<Vertex>() as u64
+                    + INDEX_CAPACITY * size_of::<u32>() as u64)
+                / (1024 * 1024)
+        );
+        self.buffers.push(BufferPair::new(device, index));
+        let pair = self.buffers.last_mut()?;
+        Some((
+            pair.vertex_allocator.allocate(need_vertices)?,
+            pair.index_allocator.allocate(need_indices)?,
+        ))
+    }
+
+    pub fn upload(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        coord: BrickCoord,
+        mesh: &BrickMesh,
+    ) {
         if let Some(previous) = self.slots.get(&coord) {
             self.triangles -= previous.index_count as usize / 3;
             self.vertices -= previous.vertex_count as usize;
@@ -296,8 +365,7 @@ impl MeshPool {
 
         if mesh.indices.is_empty() {
             if let Some(slot) = self.slots.remove(&coord) {
-                self.vertex_allocator.release(slot.vertices);
-                self.index_allocator.release(slot.indices);
+                self.release(slot);
             }
             return;
         }
@@ -316,20 +384,18 @@ impl MeshPool {
             }
             other => {
                 if let Some(slot) = other {
-                    self.vertex_allocator.release(slot.vertices);
-                    self.index_allocator.release(slot.indices);
+                    self.release(slot);
                     self.slots.remove(&coord);
                 }
-                let (Some(vertices), Some(indices)) = (
-                    self.vertex_allocator.allocate(need_vertices),
-                    self.index_allocator.allocate(need_indices),
-                ) else {
+                let Some((vertices, indices)) = self.reserve(device, need_vertices, need_indices)
+                else {
                     self.overflowed += 1;
                     if !self.warned_about_overflow {
                         self.warned_about_overflow = true;
                         log::error!(
-                            "mesh pool is full at {VERTEX_CAPACITY} vertices and {INDEX_CAPACITY} \
-                             indices, so parts of the model are missing from the screen"
+                            "mesh pool is full at {MAX_BUFFERS} buffers ({TOTAL_VERTEX_CAPACITY} \
+                             vertices, {TOTAL_INDEX_CAPACITY} indices), so parts of the model are \
+                             missing from the screen"
                         );
                     }
                     return;
@@ -345,13 +411,14 @@ impl MeshPool {
             }
         };
 
+        let pair = &self.buffers[slot.vertices.buffer as usize];
         queue.write_buffer(
-            &self.vertex_buffer,
+            &pair.vertices,
             slot.vertices.offset * size_of::<Vertex>() as u64,
             bytemuck::cast_slice(&mesh.vertices),
         );
         queue.write_buffer(
-            &self.index_buffer,
+            &pair.indices,
             slot.indices.offset * size_of::<u32>() as u64,
             bytemuck::cast_slice(&mesh.indices),
         );
@@ -371,6 +438,13 @@ impl MeshPool {
         );
     }
 
+    /// Hand a slot's space back to the pair it came from.
+    fn release(&mut self, slot: Slot) {
+        let pair = &mut self.buffers[slot.vertices.buffer as usize];
+        pair.vertex_allocator.release(slot.vertices);
+        pair.index_allocator.release(slot.indices);
+    }
+
     /// Record one indexed draw per visible brick.
     ///
     /// Indices are brick local, so the slice's vertex offset goes in as the base
@@ -384,22 +458,38 @@ impl MeshPool {
             return;
         }
 
-        pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
-        pass.set_index_buffer(self.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
-
+        // Grouped by buffer pair, because a bind is per pass and a brick's
+        // vertices and indices always live in the same pair. One pass over the
+        // slots per pair keeps the binds to one each rather than one per brick,
+        // and with a single pair -- the common case -- this is exactly what it
+        // was before.
         let mut drawn = 0;
         let mut culled = 0;
-        for slot in self.slots.values() {
-            if slot.index_count == 0 {
-                continue;
+        for (index, pair) in self.buffers.iter().enumerate() {
+            let index = index as u16;
+            let mut bound = false;
+            for slot in self.slots.values() {
+                if slot.vertices.buffer != index || slot.index_count == 0 {
+                    continue;
+                }
+                if !frustum.intersects(slot.minimum, slot.maximum) {
+                    // Counted once, on the pass that owns the brick.
+                    culled += 1;
+                    continue;
+                }
+                if !bound {
+                    pass.set_vertex_buffer(0, pair.vertices.slice(..));
+                    pass.set_index_buffer(pair.indices.slice(..), wgpu::IndexFormat::Uint32);
+                    bound = true;
+                }
+                drawn += 1;
+                let start = slot.indices.offset as u32;
+                pass.draw_indexed(
+                    start..start + slot.index_count,
+                    slot.vertices.offset as i32,
+                    0..1,
+                );
             }
-            if !frustum.intersects(slot.minimum, slot.maximum) {
-                culled += 1;
-                continue;
-            }
-            drawn += 1;
-            let start = slot.indices.offset as u32;
-            pass.draw_indexed(start..start + slot.index_count, slot.vertices.offset as i32, 0..1);
         }
         self.drawn.store(drawn, Ordering::Relaxed);
         self.culled.store(culled, Ordering::Relaxed);
@@ -416,8 +506,10 @@ impl MeshPool {
     /// the GPU any more. `Volume::mark_everything_dirty` is the partner.
     pub fn reset(&mut self) {
         self.slots.clear();
-        self.vertex_allocator.reset();
-        self.index_allocator.reset();
+        for pair in &mut self.buffers {
+            pair.vertex_allocator.reset();
+            pair.index_allocator.reset();
+        }
         self.triangles = 0;
         self.vertices = 0;
         self.overflowed = 0;
@@ -430,12 +522,12 @@ impl MeshPool {
             triangles: self.triangles,
             vertices: self.vertices,
             indices: self.triangles * 3,
-            vertices_reserved: self.vertex_allocator.live(),
-            indices_reserved: self.index_allocator.live(),
-            vertices_watermark: self.vertex_allocator.watermark(),
-            indices_watermark: self.index_allocator.watermark(),
-            vertex_capacity: VERTEX_CAPACITY,
-            index_capacity: INDEX_CAPACITY,
+            vertices_reserved: self.buffers.iter().map(|p| p.vertex_allocator.live()).sum(),
+            indices_reserved: self.buffers.iter().map(|p| p.index_allocator.live()).sum(),
+            vertices_watermark: self.buffers.iter().map(|p| p.vertex_allocator.watermark()).sum(),
+            indices_watermark: self.buffers.iter().map(|p| p.index_allocator.watermark()).sum(),
+            vertex_capacity: TOTAL_VERTEX_CAPACITY,
+            index_capacity: TOTAL_INDEX_CAPACITY,
             overflowed: self.overflowed,
             drawn: self.drawn.load(Ordering::Relaxed),
             culled: self.culled.load(Ordering::Relaxed),
@@ -449,7 +541,7 @@ mod tests {
 
     #[test]
     fn allocations_round_up_to_one_granule() {
-        let mut allocator = BlockAllocator::new(1 << 20);
+        let mut allocator = BlockAllocator::new(1 << 20, 0);
         let block = allocator.allocate(3).expect("space is available");
         assert_eq!(block.capacity, GRANULARITY);
         assert_eq!(block.offset, 0);
@@ -461,7 +553,7 @@ mod tests {
         // rounded an average brick's 1100 vertices up to 2048, so the pool
         // reserved nearly twice what was in use and ran out of room on a model
         // it had space for.
-        let mut allocator = BlockAllocator::new(1 << 24);
+        let mut allocator = BlockAllocator::new(1 << 24, 0);
         for request in [900_u64, 1100, 1500, 2100, 3300] {
             let block = allocator.allocate(request).expect("space is available");
             let waste = block.capacity - request;
@@ -475,7 +567,7 @@ mod tests {
 
     #[test]
     fn freed_blocks_are_reused_rather_than_bumping() {
-        let mut allocator = BlockAllocator::new(1 << 20);
+        let mut allocator = BlockAllocator::new(1 << 20, 0);
         let first = allocator.allocate(1000).expect("space is available");
         let second = allocator.allocate(1000).expect("space is available");
         assert_ne!(first.offset, second.offset);
@@ -483,6 +575,41 @@ mod tests {
         allocator.release(first);
         let third = allocator.allocate(1000).expect("the freed block is reusable");
         assert_eq!(third.offset, first.offset, "should have come off the free list");
+    }
+
+    /// A block always carries the buffer it came from, and vertices and
+    /// indices for one brick always land in the SAME pair -- `draw` binds a
+    /// pair at a time, so a brick split across two could not be drawn at all.
+    #[test]
+    fn a_brick_never_straddles_two_buffers() {
+        // Two pairs, the first with room for the vertices but not the indices.
+        let mut vertex_pools =
+            [BlockAllocator::new(GRANULARITY * 8, 0), BlockAllocator::new(GRANULARITY * 8, 1)];
+        let mut index_pools =
+            [BlockAllocator::new(GRANULARITY, 0), BlockAllocator::new(GRANULARITY * 8, 1)];
+
+        // Reserve mirrors MeshPool::reserve: take the vertices, and hand them
+        // straight back if the indices do not also fit in the same pair.
+        let mut chosen = None;
+        for pair in 0..2 {
+            let Some(vertices) = vertex_pools[pair].allocate(GRANULARITY * 2) else { continue };
+            match index_pools[pair].allocate(GRANULARITY * 4) {
+                Some(indices) => {
+                    chosen = Some((vertices, indices));
+                    break;
+                }
+                None => vertex_pools[pair].release(vertices),
+            }
+        }
+
+        let (vertices, indices) = chosen.expect("the second pair has room for both");
+        assert_eq!(vertices.buffer, indices.buffer, "a brick must live in one pair");
+        assert_eq!(vertices.buffer, 1, "the first pair could not hold the indices");
+        assert_eq!(
+            vertex_pools[0].live(),
+            0,
+            "passing over a pair must not leak the vertices it had already taken"
+        );
     }
 
     /// The failure that put holes in the dragon: going up and down the detail
@@ -494,7 +621,7 @@ mod tests {
     /// again and the bump pointer climbs regardless of how much was returned.
     #[test]
     fn alternating_block_sizes_exhaust_the_pool_while_most_of_it_is_free() {
-        let mut allocator = BlockAllocator::new(GRANULARITY * 64);
+        let mut allocator = BlockAllocator::new(GRANULARITY * 64, 0);
 
         // Two rounds of "coarse" then "fine", each freed before the next.
         let mut blocks: Vec<Block> = Vec::new();
@@ -535,14 +662,14 @@ mod tests {
 
     #[test]
     fn allocation_fails_rather_than_overrunning_the_buffer() {
-        let mut allocator = BlockAllocator::new(1 << 10);
+        let mut allocator = BlockAllocator::new(1 << 10, 0);
         assert!(allocator.allocate(1 << 10).is_some());
         assert!(allocator.allocate(1).is_none(), "must refuse to hand out space it does not have");
     }
 
     #[test]
     fn live_count_returns_to_zero_after_releasing_everything() {
-        let mut allocator = BlockAllocator::new(1 << 20);
+        let mut allocator = BlockAllocator::new(1 << 20, 0);
         let blocks: Vec<_> = (0..16).map(|n| allocator.allocate(n * 37 + 1).unwrap()).collect();
         assert!(allocator.live() > 0);
         for block in blocks {
