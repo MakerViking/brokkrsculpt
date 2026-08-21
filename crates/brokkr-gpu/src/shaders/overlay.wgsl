@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0-or-later
+// SPDX-License-Identifier: AGPL-3.0-only
 //
 // Flat coloured geometry drawn over the sculpt: the brush cursor ring, the
 // mirror planes, and the navigation cube. No lighting and no textures — every

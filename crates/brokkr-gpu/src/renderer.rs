@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0-or-later
+// SPDX-License-Identifier: AGPL-3.0-only
 
 //! The sculpt viewport renderer: pipeline, uniforms, depth buffer and the draw
 //! call over the mesh pool.

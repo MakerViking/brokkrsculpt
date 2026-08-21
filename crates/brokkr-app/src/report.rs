@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0-or-later
+// SPDX-License-Identifier: AGPL-3.0-only
 
 //! The bug report: what is collected, what is stripped out of it, and the exact
 //! bytes that go to TinkerAtlas.

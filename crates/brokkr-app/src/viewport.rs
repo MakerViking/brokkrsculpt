@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0-or-later
+// SPDX-License-Identifier: AGPL-3.0-only
 
 //! The 3D viewport, embedded in the Iced widget tree through the `shader`
 //! widget.

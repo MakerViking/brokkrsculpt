@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0-or-later
+// SPDX-License-Identifier: AGPL-3.0-only
 //
 // Matcap shading for the sculpt viewport. The whole lighting model is a lookup
 // into a small image by view space normal, which is why there are no lights,

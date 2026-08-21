@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0-or-later
+// SPDX-License-Identifier: AGPL-3.0-only
 
 //! The widget tree.
 //!
@@ -405,7 +405,7 @@ impl Brokkr {
                 text(format!("build {}", super::build_commit()))
                     .size(theme::CAPTION_SIZE)
                     .color(theme::TEXT_MUTE),
-                text("AGPL-3.0-or-later").size(theme::CAPTION_SIZE).color(theme::TEXT_MUTE),
+                text("AGPL-3.0-only").size(theme::CAPTION_SIZE).color(theme::TEXT_MUTE),
                 separator(),
                 entry("Copy diagnostics", Message::DiagnosticsCopied),
                 entry("Report a bug…", Message::BugReportOpened),

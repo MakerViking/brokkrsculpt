@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0-or-later
+// SPDX-License-Identifier: AGPL-3.0-only
 
 //! The apron buffer: a brick's voxels plus the one voxel halo of neighbour
 //! data that meshing requires.

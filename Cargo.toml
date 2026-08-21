@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: AGPL-3.0-or-later
+# SPDX-License-Identifier: AGPL-3.0-only
 
 [workspace]
 resolver = "3"
@@ -7,7 +7,7 @@ members = ["crates/brokkr-core", "crates/brokkr-gpu", "crates/brokkr-app"]
 [workspace.package]
 version = "0.0.1"
 edition = "2024"
-license = "AGPL-3.0-or-later"
+license = "AGPL-3.0-only"
 repository = "https://github.com/MakerViking/brokkrsculpt"
 rust-version = "1.90"
 
