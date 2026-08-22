@@ -105,9 +105,12 @@ impl Brokkr {
             // Split on colour the way the lockup in `assets/brand` is, so the
             // application and the logo read as the same thing.
             row![
-                text("BROKKR").size(theme::CAPTION_SIZE).color(theme::TEXT),
-                text("SCULPT").size(theme::CAPTION_SIZE).color(theme::ACCENT),
+                crate::logo::mark(18.0),
+                text("Brokkr").size(theme::TEXT_SIZE).color(theme::TEXT),
+                text("Sculpt").size(theme::TEXT_SIZE).color(theme::ACCENT),
             ]
+            .align_y(Alignment::Center)
+            .spacing(0)
             .spacing(theme::S4)
             .align_y(Alignment::Center),
             |assembled, menu| {

@@ -36,7 +36,7 @@ use crate::theme;
 const SIZE: u32 = 64;
 
 /// The mark's design space, matching the SVG's `viewBox`.
-const DESIGN: f32 = 256.0;
+pub(crate) const DESIGN: f32 = 256.0;
 
 /// A filled convex polygon in design coordinates.
 struct Face {
@@ -86,6 +86,12 @@ const EDGES: [((f32, f32), (f32, f32)); 9] = [
     ((110.0, 108.0), (166.0, 76.0)),
     ((110.0, 108.0), (110.0, 172.0)),
 ];
+
+/// Undo the mark group's transform, so [`shade`] can be sampled in the design
+/// space the SVG's own coordinates are written in.
+pub(crate) fn to_design(fx: f32, fy: f32) -> (f32, f32) {
+    ((fx - 18.0) / 1.02, (fy - 34.0) / 1.02)
+}
 
 /// An sRGB hex triple as fractions, so the constants below can be read against
 /// the SVG they come from.
@@ -143,10 +149,7 @@ pub fn rgba() -> Vec<u8> {
                 for sx in 0..SS {
                     let fx = (px * SS + sx) as f32 / (SIZE * SS) as f32 * DESIGN;
                     let fy = (py * SS + sy) as f32 / (SIZE * SS) as f32 * DESIGN;
-                    // Undo the group transform so the SVG's own coordinates
-                    // can be used verbatim above.
-                    let x = (fx - 18.0) / 1.02;
-                    let y = (fy - 34.0) / 1.02;
+                    let (x, y) = to_design(fx, fy);
 
                     if let Some(sample) = shade(x, y) {
                         accum[0] += sample[0];
@@ -174,7 +177,7 @@ pub fn rgba() -> Vec<u8> {
 }
 
 /// The colour at a point of the mark, or `None` where the mark is not.
-fn shade(x: f32, y: f32) -> Option<[f32; 3]> {
+pub(crate) fn shade(x: f32, y: f32) -> Option<[f32; 3]> {
     // Chips first: they sit over everything, and they are the accent squares.
     for (cx, cy, size) in CHIPS {
         if x >= cx && x <= cx + size && y >= cy && y <= cy + size {

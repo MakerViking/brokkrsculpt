@@ -9,6 +9,7 @@ mod cursor;
 mod icon;
 #[cfg(target_os = "linux")]
 mod input_watch;
+mod logo;
 mod message;
 mod navcube;
 mod paths;
