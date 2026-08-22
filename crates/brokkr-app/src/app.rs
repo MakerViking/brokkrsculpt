@@ -2948,6 +2948,10 @@ impl Brokkr {
             // Routed through CloseRequested rather than closing directly, so
             // the unsaved-work prompt is the same one the compositor's close
             // button used to reach.
+            Message::ResizeStarted(direction) => {
+                return iced::window::latest()
+                    .and_then(move |id| iced::window::drag_resize(id, direction));
+            }
             Message::WindowClose => {
                 return iced::window::latest()
                     .and_then(|id| Task::done(Message::CloseRequested(id)));

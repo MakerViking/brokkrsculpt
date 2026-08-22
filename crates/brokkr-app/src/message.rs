@@ -360,6 +360,9 @@ pub enum Message {
     TitleBarDoubleClicked,
     WindowMinimise,
     WindowClose,
+    /// A press on one of the window's resize edges. Undecorated windows get no
+    /// resize border from the compositor, so the application draws its own.
+    ResizeStarted(iced::window::Direction),
     /// The window manager asked to close. Carries the window, because
     /// `exit_on_close_request(false)` means nothing closes it but us.
     CloseRequested(iced::window::Id),

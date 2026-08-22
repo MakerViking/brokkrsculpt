@@ -71,21 +71,21 @@ impl Brokkr {
         // The unsaved-work prompt outranks an open menu: it is modal, and a
         // menu drawn over it would be reachable while the prompt is not.
         if let Some(pending) = &self.confirm {
-            return stack![body, self.confirm_card(pending)].into();
+            return stack![body, self.confirm_card(pending), self.resize_frame()].into();
         }
 
         // Same reasoning, one rank down: the bug report is modal too, and it
         // yields to the unsaved prompt because losing work outranks filing a
         // report about it.
         if let Some(draft) = &self.bug_report {
-            return stack![body, self.bug_report_card(draft)].into();
+            return stack![body, self.bug_report_card(draft), self.resize_frame()].into();
         }
 
         // And one rank below that. It only ever appears just after an import,
         // when neither of the two above can be up, but the ordering is stated
         // rather than assumed.
         if let Some(up) = self.orient_prompt {
-            return stack![body, self.orient_prompt_card(up)].into();
+            return stack![body, self.orient_prompt_card(up), self.resize_frame()].into();
         }
 
         match self.top_menu {
@@ -93,11 +93,81 @@ impl Brokkr {
             Some(which) => stack![
                 body,
                 container(self.top_menu_panel(which))
-                    .padding(Padding { top: 40.0, ..Padding::ZERO })
+                    .padding(Padding { top: 40.0, ..Padding::ZERO }),
+                self.resize_frame(),
             ]
             .into(),
-            None => body.into(),
+            None => stack![body, self.resize_frame()].into(),
         }
+    }
+
+    /// The window's resize frame: eight invisible strips around the edges.
+    ///
+    /// An undecorated window gets **no resize border from the compositor** --
+    /// Wayland has no concept of one for a client that has taken over its own
+    /// decoration -- so without this the window cannot be resized at all. That
+    /// was the state for exactly as long as it took to notice.
+    ///
+    /// Laid over the whole application as a `stack!` layer. That works because
+    /// iced 0.14's stack layers do NOT block what is underneath: only the
+    /// strips carry a `mouse_area`, and the large `space` in the middle
+    /// handles no events, so every press that is not on an edge falls straight
+    /// through to the application.
+    fn resize_frame(&self) -> Element<'_, Message> {
+        use iced::window::Direction;
+
+        // Thin enough not to steal presses from a maximised panel's edge,
+        // thick enough to hit on a 1.5x display, where this is nine physical
+        // pixels.
+        const EDGE: f32 = 6.0;
+        const CORNER: f32 = 14.0;
+
+        let grip = |width: Length, height: Length, direction: Direction| {
+            mouse_area(space().width(width).height(height))
+                .on_press(Message::ResizeStarted(direction))
+                .interaction(match direction {
+                    Direction::North | Direction::South => {
+                        iced::mouse::Interaction::ResizingVertically
+                    }
+                    Direction::East | Direction::West => {
+                        iced::mouse::Interaction::ResizingHorizontally
+                    }
+                    Direction::NorthWest | Direction::SouthEast => {
+                        iced::mouse::Interaction::ResizingDiagonallyDown
+                    }
+                    Direction::NorthEast | Direction::SouthWest => {
+                        iced::mouse::Interaction::ResizingDiagonallyUp
+                    }
+                })
+        };
+        let corner = |direction| grip(Length::Fixed(CORNER), Length::Fixed(CORNER), direction);
+
+        column![
+            row![
+                corner(Direction::NorthWest),
+                grip(Length::Fill, Length::Fixed(EDGE), Direction::North),
+                corner(Direction::NorthEast),
+            ],
+            row![
+                grip(Length::Fixed(EDGE), Length::Fill, Direction::West),
+                space().width(Length::Fill).height(Length::Fill),
+                grip(Length::Fixed(EDGE), Length::Fill, Direction::East),
+            ]
+            .height(Length::Fill),
+            // Aligned to the END, because the row is as tall as the corners
+            // and the strip is thinner: left at the default it sits at the TOP
+            // of that row and leaves the window's last eight pixels -- the
+            // ones anyone actually aims at -- uncovered. That is precisely how
+            // this shipped the first time, with every edge resizing except
+            // the bottom.
+            row![
+                corner(Direction::SouthWest),
+                grip(Length::Fill, Length::Fixed(EDGE), Direction::South),
+                corner(Direction::SouthEast),
+            ]
+            .align_y(Alignment::End),
+        ]
+        .into()
     }
 
     fn header(&self) -> Element<'_, Message> {
