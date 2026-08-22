@@ -32,7 +32,7 @@
 
   <!-- wordmark: convert to outlines before shipping so it renders identically everywhere -->
   <text x="176" y="112" font-family="'Segoe UI',system-ui,-apple-system,Helvetica,Arial,sans-serif" font-size="58" font-weight="700" letter-spacing="-1.5">
-    <tspan fill="#16283D">Brokkr</tspan><tspan fill="#FF5A2C">Sculpt</tspan>
+    <tspan fill="#16283D">Brokkr</tspan><tspan fill="#FF5A2C">SCULPT</tspan>
   </text>
   <text x="178" y="146" font-family="'Segoe UI',system-ui,-apple-system,Helvetica,Arial,sans-serif" font-size="18" fill="#5B6E82">Voxel sculpting, forged for the print.</text>
 </svg>

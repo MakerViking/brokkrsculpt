@@ -107,7 +107,7 @@ impl Brokkr {
             row![
                 crate::logo::mark(18.0),
                 text("Brokkr").size(theme::TEXT_SIZE).color(theme::TEXT),
-                text("Sculpt").size(theme::TEXT_SIZE).color(theme::ACCENT),
+                text("SCULPT").size(theme::TEXT_SIZE).color(theme::ACCENT),
             ]
             .align_y(Alignment::Center)
             .spacing(0)
