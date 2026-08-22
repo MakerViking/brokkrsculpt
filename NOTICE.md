@@ -134,12 +134,25 @@ where most of the dependency count went.
 
 ## Assets
 
-**The repository contains no binary assets at all** — every tracked file is
-source, documentation or configuration. There are no third-party fonts, icons,
-textures or sample models to attribute.
+**Nothing here is third-party.** Every image and mark in this repository was
+made for it, and there are no third-party fonts, icons, textures or sample
+models to attribute.
 
-That is deliberate rather than incidental. The clay matcap the model is shaded
-with is *generated in code* (`brokkr-gpu/src/matcap.rs`) precisely so that the
-repository does not carry an image whose licence would have to be tracked, and
-the interface draws its own geometry. Any screenshot added later will be the
-project's own.
+- `docs/images/*.jpg` — screenshots of the application, taken from it.
+- `docs/images/brokkr-dwarf.png` — the Brokkr character illustration,
+  commissioned for this project and generated with Google Gemini. Copyright
+  holder as for the rest of the repository.
+- `assets/brand/*.svg` — the BrokkrSculpt lockup and mark, hand-written SVG.
+  They deliberately share the molten gradient of SindriCAD's mark, which is the
+  same author's.
+
+**No font files are shipped.** The lockups name a font *stack* and fall back
+through the system's own faces, so nothing here embeds a typeface. Converting
+the wordmark to outlines before it goes anywhere it must render identically is
+noted in the files themselves.
+
+The clay matcap the model is shaded with is *generated in code*
+(`brokkr-gpu/src/matcap.rs`) rather than shipped, which keeps the largest asset
+the application needs out of the repository entirely — that was the reasoning
+before any of the above existed, and it still holds for anything the renderer
+consumes.

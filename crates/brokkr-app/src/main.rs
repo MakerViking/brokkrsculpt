@@ -6,6 +6,7 @@ mod app;
 mod breadcrumbs;
 mod camera;
 mod cursor;
+mod icon;
 #[cfg(target_os = "linux")]
 mod input_watch;
 mod message;
@@ -67,5 +68,8 @@ fn main() -> iced::Result {
         // `Message::CloseRequested` and is the only thing that closes the
         // window from here on, so the two must be changed together.
         .exit_on_close_request(false)
+        // Drawn at startup rather than shipped as a file: see `icon.rs`, and
+        // `brokkr-gpu`'s matcap for the same reasoning applied to the shading.
+        .window(iced::window::Settings { icon: icon::icon(), ..Default::default() })
         .run()
 }

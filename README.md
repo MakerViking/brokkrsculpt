@@ -1,6 +1,11 @@
 <!-- SPDX-License-Identifier: AGPL-3.0-only -->
 
-<h1 align="center">BrokkrSculpt</h1>
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/brand/brokkrsculpt-lockup-dark.svg">
+    <img src="assets/brand/brokkrsculpt-lockup.svg" alt="BrokkrSculpt" width="480">
+  </picture>
+</p>
 
 <p align="center">
   <strong>Voxel sculpting for 3D printing.</strong><br>
@@ -13,6 +18,12 @@
   <img alt="Licence: AGPL-3.0-only" src="https://img.shields.io/badge/licence-AGPL--3.0--only-blue">
   <img alt="Platform: Linux" src="https://img.shields.io/badge/platform-Linux-informational">
   <img alt="Built with Rust" src="https://img.shields.io/badge/built%20with-Rust-orange">
+</p>
+
+> Named for Brokkr, the dwarven smith of Norse myth.
+
+<p align="center">
+  <img alt="Brokkr the dwarven smith, carving a dragon's head from a block of stone" src="docs/images/brokkr-dwarf.png" width="330">
 </p>
 
 <p align="center">
@@ -37,8 +48,8 @@ of it has to be printed.
 It is free and open source, and it is **honestly not finished**. It is being
 built in the open by one person.
 
-Sibling to [SindriCAD](https://tinkeratlas.com/sindricad). Brokkr and Sindri
-forged Mjolnir together; SindriCAD does parametric CAD, BrokkrSculpt does clay.
+Sibling to [SindriCAD](https://tinkeratlas.com/sindricad) — Brokkr and Sindri
+forged Mjolnir together. SindriCAD does parametric CAD, BrokkrSculpt does clay.
 
 **On platforms.** Linux is where this is built and tested every day, so it is
 what works today and it is what the code is honest about. It is not where this

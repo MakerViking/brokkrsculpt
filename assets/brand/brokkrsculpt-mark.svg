@@ -1,0 +1,20 @@
+<svg width="256" height="256" viewBox="0 0 256 256" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="BrokkrSculpt">
+  <defs>
+    <linearGradient id="molten" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#33517A"/>
+      <stop offset="0.30" stop-color="#FF7C36"/>
+      <stop offset="1" stop-color="#DE3A16"/>
+    </linearGradient>
+  </defs>
+  <!-- The mark alone, square, for favicons and window icons. Same geometry as
+       the lockup, re-centred: one voxel with two chipped off it. -->
+  <g transform="translate(18,34) scale(1.02)">
+    <path d="M110 44 L166 76 L166 140 L110 172 L54 140 L54 76 Z" fill="url(#molten)"/>
+    <path d="M110 44 L166 76 L110 108 L54 76 Z" fill="#FFFFFF" opacity="0.14"/>
+    <path d="M166 76 L166 140 L110 172 L110 108 Z" fill="#000000" opacity="0.22"/>
+    <path d="M110 44 L166 76 L166 140 L110 172 L54 140 L54 76 Z M110 108 L54 76 M110 108 L166 76 M110 108 L110 172"
+          fill="none" stroke="#16283D" stroke-width="4" stroke-linejoin="round" stroke-linecap="round" opacity="0.55"/>
+    <rect x="171" y="44" width="16" height="16" rx="2.5" fill="#FFFFFF" stroke="#FF5A2C" stroke-width="3" transform="rotate(16 179 52)"/>
+    <rect x="193" y="20" width="12" height="12" rx="2" fill="#FFFFFF" stroke="#FF5A2C" stroke-width="2.5" opacity="0.8" transform="rotate(-20 199 26)"/>
+  </g>
+</svg>

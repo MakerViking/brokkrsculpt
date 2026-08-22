@@ -102,9 +102,14 @@ impl Brokkr {
 
     fn header(&self) -> Element<'_, Message> {
         let bar = TopMenu::ALL.into_iter().fold(
-            row![text("BROKKRSCULPT").size(theme::CAPTION_SIZE).color(theme::ACCENT),]
-                .spacing(theme::S4)
-                .align_y(Alignment::Center),
+            // Split on colour the way the lockup in `assets/brand` is, so the
+            // application and the logo read as the same thing.
+            row![
+                text("BROKKR").size(theme::CAPTION_SIZE).color(theme::TEXT),
+                text("SCULPT").size(theme::CAPTION_SIZE).color(theme::ACCENT),
+            ]
+            .spacing(theme::S4)
+            .align_y(Alignment::Center),
             |assembled, menu| {
                 assembled.push(
                     button(text(menu.label()).size(theme::TEXT_SIZE_SMALL))

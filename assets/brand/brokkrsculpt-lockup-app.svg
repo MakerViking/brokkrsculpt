@@ -1,0 +1,37 @@
+<svg width="640" height="124" viewBox="0 36 640 124" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="BrokkrSculpt">
+  <defs>
+    <!-- The same molten gradient SindriCAD's mark is drawn in: the two are
+         forged by the two brothers and should read as a pair. -->
+    <linearGradient id="molten" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#33517A"/>
+      <stop offset="0.30" stop-color="#FF7C36"/>
+      <stop offset="1" stop-color="#DE3A16"/>
+    </linearGradient>
+  </defs>
+
+  <!-- Mark: one voxel, with two chipped off it.
+
+       SindriCAD's mark is a spline with its control points showing, because
+       that is what its document IS. This one is a cube of material with
+       pieces carved away, for the same reason. Same gradient, same white
+       squares, different verb. -->
+  <g transform="translate(22,30) scale(0.64)">
+    <!-- the cube body -->
+    <path d="M110 44 L166 76 L166 140 L110 172 L54 140 L54 76 Z" fill="url(#molten)"/>
+    <!-- top face catches the light, right face falls away -->
+    <path d="M110 44 L166 76 L110 108 L54 76 Z" fill="#FFFFFF" opacity="0.14"/>
+    <path d="M166 76 L166 140 L110 172 L110 108 Z" fill="#000000" opacity="0.22"/>
+    <!-- the three edges that make it read as a solid -->
+    <path d="M110 44 L166 76 L166 140 L110 172 L54 140 L54 76 Z M110 108 L54 76 M110 108 L166 76 M110 108 L110 172"
+          fill="none" stroke="#16283D" stroke-width="4" stroke-linejoin="round" stroke-linecap="round" opacity="0.55"/>
+    <!-- two voxels carved off the top corner, drawn as SindriCAD draws a
+         control point so the family is unmistakable -->
+    <rect x="171" y="44" width="16" height="16" rx="2.5" fill="#FFFFFF" stroke="#FF5A2C" stroke-width="3" transform="rotate(16 179 52)"/>
+    <rect x="193" y="20" width="12" height="12" rx="2" fill="#FFFFFF" stroke="#FF5A2C" stroke-width="2.5" opacity="0.8" transform="rotate(-20 199 26)"/>
+  </g>
+
+  <!-- wordmark: convert to outlines before shipping so it renders identically everywhere -->
+  <text x="176" y="112" font-family="'Segoe UI',system-ui,-apple-system,Helvetica,Arial,sans-serif" font-size="58" font-weight="700" letter-spacing="-1.5">
+    <tspan fill="#E9EFF6">Brokkr</tspan><tspan fill="#FF5A2C">Sculpt</tspan>
+  </text>
+</svg>
