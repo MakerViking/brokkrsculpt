@@ -2933,6 +2933,25 @@ impl Brokkr {
             }
 
             // --- the unsaved-work prompt -------------------------------------
+            // The window is undecorated, so these four are the title bar the
+            // compositor is no longer drawing. Each needs the window's id and
+            // none of them has it, so each asks for it first.
+            Message::TitleBarDragged => {
+                return iced::window::latest().and_then(iced::window::drag);
+            }
+            Message::TitleBarDoubleClicked => {
+                return iced::window::latest().and_then(iced::window::toggle_maximize);
+            }
+            Message::WindowMinimise => {
+                return iced::window::latest().and_then(|id| iced::window::minimize(id, true));
+            }
+            // Routed through CloseRequested rather than closing directly, so
+            // the unsaved-work prompt is the same one the compositor's close
+            // button used to reach.
+            Message::WindowClose => {
+                return iced::window::latest()
+                    .and_then(|id| Task::done(Message::CloseRequested(id)));
+            }
             Message::CloseRequested(id) => return self.guard(PendingAction::Quit(id)),
             Message::ConfirmAnswered(choice) => return self.answer_confirm(choice),
             Message::SavedThenContinue(path) => {

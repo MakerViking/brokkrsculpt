@@ -68,5 +68,10 @@ fn main() -> iced::Result {
         // `Message::CloseRequested` and is the only thing that closes the
         // window from here on, so the two must be changed together.
         .exit_on_close_request(false)
+        // No compositor title bar: the application draws its own, the way
+        // SindriCAD does, so there is one bar instead of two. `panel.rs`'s
+        // `header` carries the move, maximise, minimise and close that the
+        // decoration would have provided.
+        .window(iced::window::Settings { decorations: false, ..Default::default() })
         .run()
 }

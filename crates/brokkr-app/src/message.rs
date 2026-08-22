@@ -352,6 +352,14 @@ pub enum Message {
     /// is that many millimetres. Free, and buys no detail -- see
     /// `Volume::rescale`.
     WorkingSizeCommitted,
+    /// The title bar was pressed: start moving the window. The bar IS the
+    /// title bar -- the window is undecorated -- so this is what replaces the
+    /// one the compositor would otherwise have drawn.
+    TitleBarDragged,
+    /// Double-click on the title bar, which everywhere means maximise.
+    TitleBarDoubleClicked,
+    WindowMinimise,
+    WindowClose,
     /// The window manager asked to close. Carries the window, because
     /// `exit_on_close_request(false)` means nothing closes it but us.
     CloseRequested(iced::window::Id),

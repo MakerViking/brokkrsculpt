@@ -14,8 +14,8 @@ use std::sync::Arc;
 
 use brokkr_core::{BrushKind, FalloffCurve, MirrorAxis, PatternKind};
 use iced::widget::{
-    button, checkbox, column, container, mouse_area, pick_list, row, scrollable, sensor, slider,
-    space, stack, text, text_editor, text_input,
+    button, checkbox, column, container, mouse_area, pick_list, rich_text, row, scrollable, sensor,
+    slider, space, span, stack, text, text_editor, text_input,
 };
 use iced::{Alignment, Element, Length, Padding};
 
@@ -101,18 +101,24 @@ impl Brokkr {
     }
 
     fn header(&self) -> Element<'_, Message> {
-        let bar = TopMenu::ALL.into_iter().fold(
-            // Split on colour the way the lockup in `assets/brand` is, so the
-            // application and the logo read as the same thing.
-            row![
-                crate::logo::mark(18.0),
-                text("Brokkr").size(theme::TEXT_SIZE).color(theme::TEXT),
-                text("SCULPT").size(theme::TEXT_SIZE).color(theme::ACCENT),
-            ]
-            .align_y(Alignment::Center)
-            .spacing(0)
-            .spacing(theme::S4)
-            .align_y(Alignment::Center),
+        // The wordmark, as ONE text run rather than two widgets side by side.
+        // Two `text`s in a row cannot sit flush: a row's spacing applies
+        // between them, and setting it to zero leaves the glyphs kerned as two
+        // separate runs anyway. `rich_text` colours spans inside a single run,
+        // which is what makes it read as BrokkrSCULPT and not Brokkr SCULPT.
+        let wordmark = row![
+            crate::logo::mark(24.0),
+            rich_text::<(), Message, _, _>([
+                span("Brokkr").color(theme::TEXT),
+                span("SCULPT").color(theme::ACCENT),
+            ])
+            .size(theme::TEXT_SIZE),
+        ]
+        .spacing(theme::S2)
+        .align_y(Alignment::Center);
+
+        let menus = TopMenu::ALL.into_iter().fold(
+            row![].spacing(theme::S2).align_y(Alignment::Center),
             |assembled, menu| {
                 assembled.push(
                     button(text(menu.label()).size(theme::TEXT_SIZE_SMALL))
@@ -136,22 +142,49 @@ impl Brokkr {
         // star matches the window title, which shares `document_name`.
         let title = format!("{}{}", self.document_name(), if self.unsaved { "*" } else { "" });
 
-        container(
-            row![
-                bar,
-                text(title).size(theme::CAPTION_SIZE).color(theme::TEXT_MUTE).width(Length::Fill),
-                text(self.status.clone()).size(theme::CAPTION_SIZE).color(
+        // The window controls. The window is undecorated, so if these are not
+        // here there is no way to minimise, maximise or close it at all.
+        let control = |glyph: &'static str, message: Message| {
+            button(text(glyph).size(theme::TEXT_SIZE).align_x(Alignment::Center))
+                .padding(Padding { top: 1.0, bottom: 1.0, left: theme::S3, right: theme::S3 })
+                .style(theme::section_heading)
+                .on_press(message)
+        };
+
+        let bar = row![
+            wordmark,
+            menus,
+            text(title).size(theme::CAPTION_SIZE).color(theme::TEXT_MUTE),
+            // Takes the slack, so the status and the controls sit right and
+            // everything else stays left.
+            text(self.status.clone())
+                .size(theme::CAPTION_SIZE)
+                .width(Length::Fill)
+                .align_x(Alignment::End)
+                .color(
                     if self.status.contains("not exported") || self.status.contains("could not") {
                         theme::ERROR
                     } else {
                         theme::TEXT_MUTE
                     }
                 ),
-            ]
-            .spacing(theme::S4)
-            .align_y(Alignment::Center),
+            control("\u{2013}", Message::WindowMinimise),
+            control("\u{25a1}", Message::TitleBarDoubleClicked),
+            control("\u{00d7}", Message::WindowClose),
+        ]
+        .spacing(theme::S4)
+        .align_y(Alignment::Center);
+
+        container(
+            // Dragging the bar moves the window, and a double click maximises
+            // it, because this IS the title bar now. `mouse_area` honours event
+            // capture, so a press that lands on one of the buttons above is
+            // taken by the button and never starts a drag.
+            mouse_area(bar)
+                .on_press(Message::TitleBarDragged)
+                .on_double_click(Message::TitleBarDoubleClicked),
         )
-        .padding(Padding { top: theme::S2, bottom: theme::S2, left: theme::S4, right: theme::S4 })
+        .padding(Padding { top: theme::S2, bottom: theme::S2, left: theme::S4, right: theme::S3 })
         .width(Length::Fill)
         .style(theme::panel)
         .into()
