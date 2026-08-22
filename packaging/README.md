@@ -6,17 +6,16 @@ Not a packaged build — see the README's "Get it", which says to build from
 source and means it. These are the two files a Linux desktop needs in order to
 show BrokkrSculpt as an application rather than as an unnamed window.
 
-## Why the desktop file is what puts the icon on the window
+## Why the icon lives here rather than in the application
 
-The application generates its own window icon at startup
-(`crates/brokkr-app/src/icon.rs`) and **that does nothing under Wayland**.
-There is no Wayland protocol for a client to hand the compositor an icon;
-`winit`'s Wayland backend implements `set_window_icon` as an empty function.
-The compositor instead matches the surface's `app_id` — already `brokkrsculpt`
-— against an installed `.desktop` file, and takes the icon from the icon theme.
+The application does **not** set a window icon, and could not usefully: there
+is no Wayland protocol for a client to hand its compositor one, and `winit`'s
+Wayland backend implements `set_window_icon` as an empty function. The
+compositor matches the surface's `app_id` — already `brokkrsculpt` — against an
+installed `.desktop` file and takes the icon from the icon theme.
 
-So on Wayland the icon comes from here, and on X11 and Windows it comes from
-`icon.rs`. Both are wanted.
+This is also what gives the application a menu entry with a name, which is the
+larger part of what it is for. SindriCAD ships the same pair from its bundler.
 
 ## Installing for the current user
 
