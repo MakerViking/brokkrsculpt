@@ -109,6 +109,20 @@ const SHELL_FACTOR: f64 = 2.5;
 /// Rough vertices per unit of surface area in voxel units, same purpose.
 const VERTEX_FACTOR: f64 = 2.0;
 
+/// How many lattice lines outward [`SignField::inside_by_neighbours`] may look
+/// for a line whose winding balanced.
+///
+/// One step is what this used to do, and it silently gave up wherever a hole
+/// was more than one line across -- which is every hole worth repairing. This
+/// is the width of the widest hole the sweep can vote its way across, in lines:
+/// at a 0.25 mm voxel, 64 lines is 16 mm of missing surface.
+///
+/// A cap rather than an unbounded walk because the premise weakens with
+/// distance. Lines beside a hole run through the same material; lines a
+/// centimetre away are a different part of the model, and past some width the
+/// honest answer is that the sweep cannot know.
+const MAX_LINE_SEARCH: usize = 64;
+
 /// The most solid Y and Z neighbours a saturated voxel may have and still be
 /// judged a filament rather than bulk. See [`erase_impossible_filaments`].
 ///
@@ -779,6 +793,13 @@ impl SignField {
         }
     }
 
+    /// Whether this line's winding did not balance, so its raw answer cannot be
+    /// trusted and [`Self::inside_by_neighbours`] has to stand in for it.
+    #[inline]
+    fn is_broken(&self, line: usize) -> bool {
+        !self.broken.is_empty() && self.broken[line]
+    }
+
     /// Winding number at a world x along one line, under the nonzero rule.
     #[inline]
     fn inside_at(&self, line: usize, world_x: f32) -> bool {
@@ -830,12 +851,37 @@ impl SignField {
         let mut inside = 0u32;
         let mut usable = 0u32;
         for (dy, dz) in [(1, 0), (-1, 0), (0, 1), (0, -1)] {
-            let Some(neighbour) = self.line_of(voxel.y + dy, voxel.z + dz) else {
+            // Walk outward until a line that balanced turns up, rather than
+            // giving up on the first neighbour that is also broken.
+            //
+            // **This is what makes the repair work on a real model.** A hole
+            // big enough to matter breaks a patch of lines, not one, and every
+            // line in the middle of that patch had four broken neighbours and
+            // no usable vote -- so the repair declined and the leak survived in
+            // full. Measured: a cube missing one triangle of one face leaked
+            // 3,572 voxels straight past itself, and a generated dwarf came in
+            // covered in needles running along X while its source, opened in a
+            // slicer, has none.
+            //
+            // The premise holds further out than one step: the lines beside a
+            // hole run through the same material, and the vote is still a
+            // majority of four directions with the line's own answer kept on a
+            // tie. What it cannot do is see past a hole wider than
+            // [`MAX_LINE_SEARCH`] lines, which is why that is a cap and not a
+            // promise.
+            let mut found = None;
+            for step in 1..=MAX_LINE_SEARCH as i32 {
+                let Some(candidate) = self.line_of(voxel.y + dy * step, voxel.z + dz * step) else {
+                    break;
+                };
+                if !self.broken[candidate] {
+                    found = Some(candidate);
+                    break;
+                }
+            }
+            let Some(neighbour) = found else {
                 continue;
             };
-            if self.broken[neighbour] {
-                continue;
-            }
             usable += 1;
             if self.inside_at(neighbour, world_x) {
                 inside += 1;
@@ -1178,10 +1224,25 @@ fn fill_brick(
             let voxel_y = origin.y + y as i32;
             let voxel_z = origin.z + z as i32;
             let line = sign.line_of(voxel_y, voxel_z);
+            // Hoisted per line, not per voxel: whether this line's winding can
+            // be trusted does not change along X.
+            //
+            // **The repair has to be consulted HERE.** This loop is what fills
+            // every voxel of every dense brick, and it used to call
+            // `inside_at` directly -- the raw winding -- so a broken line was
+            // counted, reported in `repaired_scan_lines`, and then signed as if
+            // nothing were wrong. `inside_by_neighbours` was only ever reached
+            // from the uniform-brick probes. The repair was real, tested at the
+            // unit level, and unreachable from the path that matters.
+            let broken = line.is_some_and(|line| sign.is_broken(line));
             for x in 0..BRICK_DIM {
                 let slot = brick_index(x, y, z);
-                let world_x = (origin.x + x as i32) as f32 * voxel_size;
+                let voxel_x = origin.x + x as i32;
+                let world_x = voxel_x as f32 * voxel_size;
                 let inside = match line {
+                    Some(line) if broken => {
+                        sign.inside_by_neighbours(IVec3::new(voxel_x, voxel_y, voxel_z), line)
+                    }
                     Some(line) => sign.inside_at(line, world_x),
                     None => false,
                 };
@@ -1570,6 +1631,85 @@ mod tests {
 
     fn build(mesh: &ExportMesh) -> (Volume, VoxeliseReport) {
         voxelise(mesh, &VoxeliseOptions::at(VOXEL)).expect("this fixture should voxelise")
+    }
+
+    /// The unit cube with one triangle of its +X face removed.
+    ///
+    /// A hole about ten millimetres on its longest side, which at this voxel
+    /// size is roughly twenty lattice lines across. That is the whole point:
+    /// the scan-line repair was built and measured against a dragon where
+    /// **three** lines of 442,368 broke, and a lone broken line has healthy
+    /// neighbours to borrow from. A real generated model does not break lines
+    /// one at a time.
+    fn cube_with_half_a_face_missing() -> ExportMesh {
+        let mut mesh = unit_cube();
+        let doomed = mesh
+            .triangles
+            .iter()
+            .position(|t| {
+                let c = (mesh.positions[t[0] as usize]
+                    + mesh.positions[t[1] as usize]
+                    + mesh.positions[t[2] as usize])
+                    / 3.0;
+                c.x > 4.9
+            })
+            .expect("the fixture cube should have a +X face");
+        mesh.triangles.remove(doomed);
+        mesh
+    }
+
+    /// Solid voxels beyond `x_mm`, which for a cube ending at 5 mm is material
+    /// no triangle in the mesh can account for.
+    fn solid_beyond_x(volume: &Volume, x_mm: f32) -> usize {
+        let mut leaked = 0usize;
+        for coord in volume.brick_coords().collect::<Vec<_>>() {
+            let origin = coord.origin();
+            for dz in 0..BRICK_DIM as i32 {
+                for dy in 0..BRICK_DIM as i32 {
+                    for dx in 0..BRICK_DIM as i32 {
+                        let voxel = origin + IVec3::new(dx, dy, dz);
+                        if voxel.x as f32 * VOXEL > x_mm && volume.sample_voxel(voxel) < 0.0 {
+                            leaked += 1;
+                        }
+                    }
+                }
+            }
+        }
+        leaked
+    }
+
+    /// The failure a user sees as streaks: long needles running along the sweep
+    /// axis, out of a source mesh that has none of them.
+    ///
+    /// A ray along X that enters the cube and never leaves -- because the
+    /// triangle it should have left through is missing -- stays wound and lays
+    /// material down all the way to the edge of the grid. Measured on a real
+    /// generated model, 4,237 of 4,301 surviving strand voxels ran along X
+    /// against 34 and 30 on the other two axes, which is not something real
+    /// geometry does.
+    ///
+    /// The filament eraser cannot save this. A leaked line running past the
+    /// model stays inside the narrow band of real triangles for most of its
+    /// length, so it is never saturated and that proof never applies: 4,277 of
+    /// those 4,301 were within the band.
+    #[test]
+    fn a_hole_many_lines_wide_does_not_leak_needles_along_the_sweep() {
+        let mesh = cube_with_half_a_face_missing();
+        assert!(mesh.validate().boundary_edges > 0, "the fixture is not actually open");
+
+        let (volume, report) = build(&mesh);
+
+        assert!(
+            report.repaired_scan_lines > 0,
+            "the fixture broke no scan lines, so it is not testing the repair"
+        );
+        let leaked = solid_beyond_x(&volume, 6.0);
+        assert_eq!(
+            leaked, 0,
+            "{leaked} voxels of material leaked past the cube along the sweep, \
+             from {} broken scan lines",
+            report.repaired_scan_lines
+        );
     }
 
     /// How solid the result is, as a fraction of the voxels inside the shape's

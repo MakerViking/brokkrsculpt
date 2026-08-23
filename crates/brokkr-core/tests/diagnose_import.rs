@@ -157,6 +157,20 @@ fn diagnose() {
         // Getting this backwards means tuning a repair pass that was never
         // going to help.
         if std::env::var("BROKKR_DIAGNOSE_STRANDS").is_ok() {
+            // Which AXIS does the surviving thin material run along?
+            //
+            // This is the question that identifies a sweep leak, and it is the
+            // one to ask first. `voxelise` signs voxels by a winding number
+            // swept along X, and its own header warns that one hole "inverts a
+            // whole scan line, or leaks". So thin material that runs
+            // overwhelmingly along X is material the SWEEP invented, however
+            // clean the source is -- and the saturation test will not see it,
+            // because a leaked line passing near the model stays inside the
+            // narrow band of real triangles for most of its length.
+            //
+            // Runs along Y or Z in similar numbers would mean the opposite:
+            // real thin geometry, which has no reason to prefer an axis.
+            let (mut along_x, mut along_y, mut along_z) = (0usize, 0usize, 0usize);
             let (mut saturated, mut near_surface) = (0usize, 0usize);
             for coord in volume.brick_coords().collect::<Vec<_>>() {
                 let origin = coord.origin();
@@ -168,39 +182,38 @@ fn diagnose() {
                             if d >= 0.0 {
                                 continue;
                             }
-                            let solid = [
-                                glam::IVec3::Y,
-                                glam::IVec3::NEG_Y,
-                                glam::IVec3::Z,
-                                glam::IVec3::NEG_Z,
-                                glam::IVec3::X,
-                                glam::IVec3::NEG_X,
-                            ]
-                            .into_iter()
-                            .filter(|s| volume.sample_voxel(v + *s) < 0.0)
-                            .count();
-                            // Two or fewer solid neighbours out of six is a
-                            // strand or a whisker, not a surface or bulk.
-                            if solid <= 2 {
-                                if d <= -3.0 {
-                                    saturated += 1;
-                                } else {
-                                    near_surface += 1;
-                                }
+                            let solid = |s: glam::IVec3| volume.sample_voxel(v + s) < 0.0;
+                            let x = solid(glam::IVec3::X) || solid(glam::IVec3::NEG_X);
+                            let y = solid(glam::IVec3::Y) || solid(glam::IVec3::NEG_Y);
+                            let z = solid(glam::IVec3::Z) || solid(glam::IVec3::NEG_Z);
+                            // A strand: continues along exactly one axis and
+                            // has nothing beside it on the other two.
+                            match (x, y, z) {
+                                (true, false, false) => along_x += 1,
+                                (false, true, false) => along_y += 1,
+                                (false, false, true) => along_z += 1,
+                                _ => continue,
+                            }
+                            if d <= -3.0 {
+                                saturated += 1;
+                            } else {
+                                near_surface += 1;
                             }
                         }
                     }
                 }
             }
-            println!("  STRANDS surviving: {saturated} saturated, {near_surface} near a surface");
-            println!(
-                "  -> {}",
-                if saturated > near_surface {
-                    "mostly invented here; the filament eraser is the lever"
-                } else {
-                    "mostly REAL geometry from the file; no field sweep will fix it"
-                }
-            );
+            let total = along_x + along_y + along_z;
+            println!("  STRAND VOXELS by the axis they run along:");
+            println!("    along X (the sweep axis): {along_x}");
+            println!("    along Y:                  {along_y}");
+            println!("    along Z:                  {along_z}");
+            println!("    of those: {saturated} saturated, {near_surface} within the band");
+            if total > 0 && along_x > 4 * (along_y + along_z).max(1) {
+                println!("  -> SWEEP LEAK. The sign sweep invented these; the source is innocent.");
+            } else if total > 0 {
+                println!("  -> no axis preference, so this is real thin geometry from the file.");
+            }
         }
     }
 }
