@@ -896,6 +896,15 @@ impl Brokkr {
                             text(kind.label()).size(theme::TEXT_SIZE_SMALL),
                             text(format!("{}", index + 1)).size(theme::CAPTION_SIZE),
                         ]
+                        // `align_x` alone is not centring. A column defaults to
+                        // `Shrink`, so it hugs its widest child and then sits at
+                        // the LEFT of the button -- and `align_x` only centres
+                        // the children within that shrunken box. The result is
+                        // three elements that agree with each other and with
+                        // nothing else, and it reads as centred only on
+                        // whichever button holds the longest word. `Fill` is
+                        // what makes the box the button.
+                        .width(Length::Fill)
                         .spacing(0)
                         .align_x(Alignment::Center),
                     )
@@ -915,14 +924,22 @@ impl Brokkr {
         let mirrors =
             MirrorAxis::ALL.into_iter().fold(column![].spacing(theme::S2), |assembled, axis| {
                 assembled.push(
-                    button(text(axis.label()).size(theme::TEXT_SIZE_SMALL))
-                        .width(Length::Fill)
-                        .style(if self.symmetry.axis(axis) {
-                            theme::tool_button_active
-                        } else {
-                            theme::tool_button
-                        })
-                        .on_press(Message::SymmetryAxisToggled(axis)),
+                    button(
+                        text(axis.label())
+                            .size(theme::TEXT_SIZE_SMALL)
+                            // Same trap as the brush buttons: a `text` is
+                            // `Shrink`, so a single letter in a `Fill` button
+                            // sits against its left edge.
+                            .width(Length::Fill)
+                            .align_x(Alignment::Center),
+                    )
+                    .width(Length::Fill)
+                    .style(if self.symmetry.axis(axis) {
+                        theme::tool_button_active
+                    } else {
+                        theme::tool_button
+                    })
+                    .on_press(Message::SymmetryAxisToggled(axis)),
                 )
             });
 
@@ -934,6 +951,12 @@ impl Brokkr {
                 brushes,
                 text(if smoothing { "shift: smoothing" } else { "hold shift: smooth" })
                     .size(theme::CAPTION_SIZE)
+                    // The container centres this text as a block, but the block
+                    // wraps to two lines and centring it does nothing for the
+                    // lines inside it -- they stay ragged against its left
+                    // edge, under a column of centred buttons.
+                    .width(Length::Fill)
+                    .align_x(Alignment::Center)
                     .color(if smoothing { theme::ACCENT } else { theme::TEXT_MUTE }),
                 text("MIRROR").size(theme::CAPTION_SIZE).color(theme::TEXT_MUTE),
                 mirrors,
@@ -950,6 +973,7 @@ impl Brokkr {
                         text(if self.cut_armed { "armed" } else { "plane" })
                             .size(theme::TEXT_SIZE_SMALL),
                     ]
+                    .width(Length::Fill)
                     .spacing(0)
                     .align_x(Alignment::Center)
                 )
