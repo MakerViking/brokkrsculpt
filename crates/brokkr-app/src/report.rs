@@ -341,7 +341,7 @@ mod tests {
     #[test]
     fn the_status_line_this_application_writes_is_redacted() {
         assert_eq!(
-            redact_user_paths("saved /home/thomash/Downloads/sculpt2.brokkr"),
+            redact_user_paths("saved /home/maker/Downloads/sculpt2.brokkr"),
             "saved /home/[REDACTED]/Downloads/sculpt2.brokkr"
         );
     }
@@ -454,8 +454,8 @@ mod tests {
     #[test]
     fn the_description_carries_the_diagnostics_and_both_are_redacted() {
         let report = Report::new(
-            "crashed after saving to /home/thomash/x.brokkr",
-            "last message: saved /home/thomash/x.brokkr",
+            "crashed after saving to /home/maker/x.brokkr",
+            "last message: saved /home/maker/x.brokkr",
             &[],
             None,
             "0.0.1",
