@@ -77,22 +77,6 @@ impl PatternKind {
         }
     }
 
-    /// A one glyph label, for rows too narrow for a word.
-    ///
-    /// Not the first letter: `None` and `Noise` both start with N, and two
-    /// buttons labelled the same is worse than no label at all. `None` gets a
-    /// dash, since it is the absence of a pattern rather than one of them.
-    pub fn short_label(self) -> &'static str {
-        match self {
-            PatternKind::None => "–",
-            PatternKind::Noise => "N",
-            PatternKind::Scales => "S",
-            PatternKind::Hair => "H",
-            PatternKind::Weave => "W",
-            PatternKind::Cracks => "C",
-        }
-    }
-
     /// Whether this pattern's orientation follows the stroke.
     ///
     /// Only hair does. Everything else is a pure function of world position,
@@ -437,20 +421,6 @@ mod tests {
     /// the weight as a lerp factor toward a target, so anything outside the
     /// unit range would extrapolate away from that target and compound across
     /// a stroke.
-    /// Two buttons labelled the same is worse than no label: `None` and `Noise`
-    /// both begin with N, which is exactly what the first version did.
-    #[test]
-    fn every_short_label_is_distinct() {
-        let mut seen: Vec<&str> = PatternKind::ALL.iter().map(|k| k.short_label()).collect();
-        assert_eq!(seen.len(), PatternKind::ALL.len());
-        seen.sort_unstable();
-        seen.dedup();
-        assert_eq!(seen.len(), PatternKind::ALL.len(), "two patterns share a short label");
-        for kind in PatternKind::ALL {
-            assert!(!kind.short_label().is_empty(), "{kind} has no short label");
-        }
-    }
-
     #[test]
     fn every_pattern_stays_inside_the_unit_range_and_is_finite() {
         for (kind, prepared) in every_kind_prepared(2.0, 1.0) {

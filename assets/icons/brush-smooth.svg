@@ -1,0 +1,8 @@
+<!-- Generated from crates/brokkr-app/src/icon.rs by the
+     write_the_svg_twins test. Edit the drawing there, not here. -->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none"
+     stroke="currentColor" stroke-width="1.6" stroke-linecap="round"
+     stroke-linejoin="round">
+  <path d="M3.5 9 L6 5.5 L8.5 9 L11 5.5 L13.5 9 L16 5.5 L18.5 9 L20.5 7"/>
+  <path d="M3.5 17 C8 13.5 16 20.5 20.5 16"/>
+</svg>

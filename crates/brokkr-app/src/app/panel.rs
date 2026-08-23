@@ -25,6 +25,7 @@ use super::{
 use glam::Vec2;
 
 use crate::app::SizingTarget;
+use crate::icon;
 use crate::message::{ConfirmChoice, ExportFormat, Message, PanelSection, TopMenu};
 use crate::spacemouse::{self, ButtonAction};
 use crate::tablet::Diagnosis;
@@ -214,10 +215,16 @@ impl Brokkr {
 
         // The window controls. The window is undecorated, so if these are not
         // here there is no way to minimise, maximise or close it at all.
-        let control = |glyph: &'static str, message: Message| {
-            button(text(glyph).size(theme::TEXT_SIZE).align_x(Alignment::Center))
-                .padding(Padding { top: 1.0, bottom: 1.0, left: theme::S3, right: theme::S3 })
-                .style(theme::section_heading)
+        //
+        // Icons rather than the en dash, white square and multiplication sign
+        // these used to be: a Unicode character is resolved through per-platform
+        // font fallback, so the same three controls draw differently on another
+        // machine. `window_control` carries the hover state in its background
+        // because an icon cannot take the button's text colour.
+        let control = |name: icon::IconName, style: theme::ButtonStyle, message: Message| {
+            button(icon::icon(name, theme::ICON_CHROME, theme::TEXT_DIM))
+                .padding(Padding { top: theme::S1, bottom: theme::S1, left: 7.0, right: 7.0 })
+                .style(style)
                 .on_press(message)
         };
 
@@ -238,9 +245,13 @@ impl Brokkr {
                         theme::TEXT_MUTE
                     }
                 ),
-            control("\u{2013}", Message::WindowMinimise),
-            control("\u{25a1}", Message::TitleBarDoubleClicked),
-            control("\u{00d7}", Message::WindowClose),
+            control(icon::IconName::Minimise, theme::window_control, Message::WindowMinimise),
+            control(
+                icon::IconName::Maximise,
+                theme::window_control,
+                Message::TitleBarDoubleClicked,
+            ),
+            control(icon::IconName::Close, theme::window_control_close, Message::WindowClose),
         ]
         .spacing(theme::S4)
         .align_y(Alignment::Center);
@@ -778,14 +789,11 @@ impl Brokkr {
 
         let patterns =
             PatternKind::ALL.into_iter().fold(row![].spacing(theme::S1), |assembled, kind| {
+                let (style, ink) = theme::tool_toggle(kind == self.brush.pattern.kind);
                 assembled.push(
-                    button(text(kind.short_label()).size(theme::CAPTION_SIZE))
+                    button(icon::icon(icon::IconName::for_pattern(kind), theme::ICON_CHROME, ink))
                         .width(Length::Fill)
-                        .style(if kind == self.brush.pattern.kind {
-                            theme::tool_button_active
-                        } else {
-                            theme::tool_button
-                        })
+                        .style(style)
                         .on_press(Message::PatternChanged(kind)),
                 )
             });
@@ -874,35 +882,68 @@ impl Brokkr {
                 // Smooth as live. The selection underneath is untouched.
                 let live =
                     if smoothing { kind == BrushKind::Smooth } else { kind == self.brush.kind };
+                let (style, ink) = theme::tool_toggle(live);
                 assembled.push(
                     button(
+                        // The word stays under the icon, and that is the whole
+                        // mitigation for seven tools that all push a surface
+                        // around. SindriCAD's icons carry their labels in the
+                        // ribbon for the same reason; an icon-only strip would
+                        // bet the tool picker on telling clay from draw at
+                        // eighteen pixels.
                         column![
+                            icon::icon(icon::IconName::for_brush(kind), theme::ICON_TOOL, ink),
                             text(kind.label()).size(theme::TEXT_SIZE_SMALL),
                             text(format!("{}", index + 1)).size(theme::CAPTION_SIZE),
                         ]
+                        // `align_x` alone is not centring. A column defaults to
+                        // `Shrink`, so it hugs its widest child and then sits at
+                        // the LEFT of the button -- and `align_x` only centres
+                        // the children within that shrunken box. The result is
+                        // three elements that agree with each other and with
+                        // nothing else, and it reads as centred only on
+                        // whichever button holds the longest word. `Fill` is
+                        // what makes the box the button.
+                        .width(Length::Fill)
                         .spacing(0)
                         .align_x(Alignment::Center),
                     )
                     .width(Length::Fill)
-                    .style(if live { theme::tool_button_active } else { theme::tool_button })
+                    .style(style)
                     .on_press(Message::BrushKindChanged(kind)),
                 )
             },
         );
 
+        // The mirror toggles keep their letters and get no icon. X, Y and Z are
+        // plain ASCII, so they carry none of the font-fallback risk that made
+        // the rest of this worth doing -- and an axis is a thing a letter names
+        // better than a picture can. A mirror-plane glyph turned per axis reads
+        // for X and Y and then has to say "depth" in two dimensions for Z,
+        // which is the point at which a set starts inventing puzzles.
         let mirrors =
             MirrorAxis::ALL.into_iter().fold(column![].spacing(theme::S2), |assembled, axis| {
                 assembled.push(
-                    button(text(axis.label()).size(theme::TEXT_SIZE_SMALL))
-                        .width(Length::Fill)
-                        .style(if self.symmetry.axis(axis) {
-                            theme::tool_button_active
-                        } else {
-                            theme::tool_button
-                        })
-                        .on_press(Message::SymmetryAxisToggled(axis)),
+                    button(
+                        text(axis.label())
+                            .size(theme::TEXT_SIZE_SMALL)
+                            // Same trap as the brush buttons: a `text` is
+                            // `Shrink`, so a single letter in a `Fill` button
+                            // sits against its left edge.
+                            .width(Length::Fill)
+                            .align_x(Alignment::Center),
+                    )
+                    .width(Length::Fill)
+                    .style(if self.symmetry.axis(axis) {
+                        theme::tool_button_active
+                    } else {
+                        theme::tool_button
+                    })
+                    .on_press(Message::SymmetryAxisToggled(axis)),
                 )
             });
+
+        let (cut_style, cut_ink) = theme::tool_toggle(self.cut_armed);
 
         container(
             column![
@@ -910,6 +951,12 @@ impl Brokkr {
                 brushes,
                 text(if smoothing { "shift: smoothing" } else { "hold shift: smooth" })
                     .size(theme::CAPTION_SIZE)
+                    // The container centres this text as a block, but the block
+                    // wraps to two lines and centring it does nothing for the
+                    // lines inside it -- they stay ragged against its left
+                    // edge, under a column of centred buttons.
+                    .width(Length::Fill)
+                    .align_x(Alignment::Center)
                     .color(if smoothing { theme::ACCENT } else { theme::TEXT_MUTE }),
                 text("MIRROR").size(theme::CAPTION_SIZE).color(theme::TEXT_MUTE),
                 mirrors,
@@ -917,12 +964,21 @@ impl Brokkr {
                 // Armed state is shown in the strip, not just in the status
                 // line, because this is the one mode that changes what a left
                 // drag does and a cut is not something to discover by accident.
+                // The word stays for exactly that reason: "armed" versus
+                // "plane" is a state, and an icon says which tool this is, not
+                // whether it is about to go off.
                 button(
-                    text(if self.cut_armed { "armed" } else { "plane" })
-                        .size(theme::TEXT_SIZE_SMALL)
+                    column![
+                        icon::icon(icon::IconName::CutPlane, theme::ICON_TOOL, cut_ink),
+                        text(if self.cut_armed { "armed" } else { "plane" })
+                            .size(theme::TEXT_SIZE_SMALL),
+                    ]
+                    .width(Length::Fill)
+                    .spacing(0)
+                    .align_x(Alignment::Center)
                 )
                 .width(Length::Fill)
-                .style(if self.cut_armed { theme::tool_button_active } else { theme::tool_button })
+                .style(cut_style)
                 .on_press(Message::CutToggled),
             ]
             .spacing(theme::S3)
@@ -998,12 +1054,14 @@ impl Brokkr {
             .on_exit(Message::TimelineLeft)
             .on_right_press(Message::TimelineRemoveKey);
 
-        let play = button(
-            text(if self.timeline.playing { "\u{25a0}" } else { "\u{25b6}" })
-                .size(theme::CAPTION_SIZE),
-        )
+        let (play_style, play_ink) = theme::tool_toggle(self.timeline.playing);
+        let play = button(icon::icon(
+            if self.timeline.playing { icon::IconName::Stop } else { icon::IconName::Play },
+            theme::ICON_CHROME,
+            play_ink,
+        ))
         .padding(Padding { top: 1.0, right: 6.0, bottom: 1.0, left: 6.0 })
-        .style(if self.timeline.playing { theme::tool_button_active } else { theme::tool_button })
+        .style(play_style)
         .on_press_maybe((self.timeline.keys.len() >= 2).then_some(Message::TimelinePlayToggled));
 
         let hint = match self.timeline.keys.len() {
@@ -1083,8 +1141,10 @@ impl Brokkr {
 
         let history = row![
             button(text("Undo").size(theme::TEXT_SIZE_SMALL))
+                .style(theme::tool_button)
                 .on_press_maybe(self.history.can_undo().then_some(Message::Undo)),
             button(text("Redo").size(theme::TEXT_SIZE_SMALL))
+                .style(theme::tool_button)
                 .on_press_maybe(self.history.can_redo().then_some(Message::Redo)),
         ]
         .spacing(theme::S2);
@@ -1106,6 +1166,7 @@ impl Brokkr {
                 self.section(PanelSection::Detail, || self.detail_panel()),
                 self.section(PanelSection::Export, || self.export_panel()),
                 button(text("Reset sphere").size(theme::TEXT_SIZE_SMALL))
+                    .style(theme::tool_button)
                     .on_press(Message::ResetSphere),
                 text(
                     "drag: sculpt\nctrl or alt drag: invert\nshift drag: smooth\nright drag: orbit\nshift right drag: pan\nwheel: zoom\n1-6: brush\nx y z: mirror\n[ ]: radius\nctrl z, ctrl shift z: undo, redo"
@@ -1263,9 +1324,11 @@ impl Brokkr {
             row![
                 button(text("Invert all").size(theme::CAPTION_SIZE))
                     .width(Length::Fill)
+                    .style(theme::tool_button)
                     .on_press(Message::SpaceMouse(SpaceMouseSetting::InvertAll)),
                 button(text("Reset").size(theme::CAPTION_SIZE))
                     .width(Length::Fill)
+                    .style(theme::tool_button)
                     .on_press(Message::SpaceMouse(SpaceMouseSetting::Reset)),
             ]
             .spacing(theme::S2),
@@ -1320,12 +1383,19 @@ impl Brokkr {
         let open = self.expanded[which as usize];
         let heading = button(
             row![
-                text(if open { "−" } else { "+" })
-                    .size(theme::CAPTION_SIZE)
-                    .color(theme::TEXT_MUTE)
-                    .width(Length::Fixed(10.0)),
+                // The caret keeps `TEXT_MUTE` through hover while the title
+                // beside it lifts to `TEXT`, because `section_heading` signals
+                // hover through `text_color` and an icon cannot follow that.
+                // Tolerable here, unlike on the window controls, precisely
+                // because there IS a word next to it still doing the job.
+                icon::icon(
+                    if open { icon::IconName::CaretDown } else { icon::IconName::CaretRight },
+                    theme::ICON_INLINE,
+                    theme::TEXT_MUTE,
+                ),
                 text(which.title()).size(theme::CAPTION_SIZE).color(theme::TEXT_MUTE),
             ]
+            .align_y(Alignment::Center)
             .spacing(theme::S2),
         )
         .width(Length::Fill)
@@ -1346,15 +1416,31 @@ impl Brokkr {
 
         let kinds =
             PatternKind::ALL.into_iter().fold(column![].spacing(theme::S1), |assembled, kind| {
+                let (style, ink) = theme::tool_toggle(kind == pattern.kind);
                 assembled.push(
-                    button(text(kind.label()).size(theme::CAPTION_SIZE))
+                    button(
+                        // A container, because a row lays its children out from
+                        // its left edge and a button does not centre `Shrink`
+                        // content -- so neither `row` nor `button` alone can put
+                        // this pair in the middle of a full-width row.
+                        container(
+                            row![
+                                icon::icon(
+                                    icon::IconName::for_pattern(kind),
+                                    theme::ICON_CHROME,
+                                    ink
+                                ),
+                                text(kind.label()).size(theme::CAPTION_SIZE),
+                            ]
+                            .spacing(theme::S2)
+                            .align_y(Alignment::Center),
+                        )
                         .width(Length::Fill)
-                        .style(if kind == pattern.kind {
-                            theme::tool_button_active
-                        } else {
-                            theme::tool_button
-                        })
-                        .on_press(Message::PatternChanged(kind)),
+                        .align_x(Alignment::Center),
+                    )
+                    .width(Length::Fill)
+                    .style(style)
+                    .on_press(Message::PatternChanged(kind)),
                 )
             });
 
@@ -1418,10 +1504,13 @@ impl Brokkr {
                 .color(theme::TEXT_DIM),
             row![
                 button(text("finer").size(theme::TEXT_SIZE_SMALL))
+                    .style(theme::tool_button)
                     .on_press_maybe((finer >= FINEST_VOXEL_MM).then_some(Message::Resample(finer))),
-                button(text("coarser").size(theme::TEXT_SIZE_SMALL)).on_press_maybe(
-                    (coarser <= COARSEST_VOXEL_MM).then_some(Message::Resample(coarser))
-                ),
+                button(text("coarser").size(theme::TEXT_SIZE_SMALL))
+                    .style(theme::tool_button)
+                    .on_press_maybe(
+                        (coarser <= COARSEST_VOXEL_MM).then_some(Message::Resample(coarser))
+                    ),
             ]
             .spacing(theme::S2),
             text("Print size").size(theme::TEXT_SIZE_SMALL).color(theme::TEXT_DIM),
@@ -1431,6 +1520,7 @@ impl Brokkr {
                     .on_submit(Message::WorkingSizeCommitted)
                     .size(theme::TEXT_SIZE_SMALL),
                 button(text("set").size(theme::TEXT_SIZE_SMALL))
+                    .style(theme::tool_button)
                     .on_press(Message::WorkingSizeCommitted),
             ]
             .spacing(theme::S2),
@@ -1449,6 +1539,7 @@ impl Brokkr {
             ExportFormat::ALL.into_iter().fold(row![].spacing(theme::S2), |assembled, format| {
                 assembled.push(
                     button(text(format.label()).size(theme::TEXT_SIZE_SMALL))
+                        .style(theme::tool_button)
                         .on_press(Message::Export(format)),
                 )
             });
@@ -1546,6 +1637,7 @@ impl Brokkr {
             row![
                 text(live).size(theme::CAPTION_SIZE).font(theme::MONO).color(theme::TEXT_DIM),
                 button(text("reset").size(theme::CAPTION_SIZE))
+                    .style(theme::tool_button)
                     .on_press(Message::ResetPressurePeak),
             ]
             .spacing(theme::S2)
