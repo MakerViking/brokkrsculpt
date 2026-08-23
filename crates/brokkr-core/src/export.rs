@@ -81,6 +81,21 @@ pub struct MeshReport {
     /// Reported, but deliberately NOT a reason to refuse an export -- see
     /// [`MeshReport::is_printable`].
     pub non_manifold_edges: usize,
+    /// Edges shared by exactly two triangles that both traverse them the SAME
+    /// way round, meaning the two disagree about which side is outside.
+    ///
+    /// **The third of the three defects a slicer calls "non-manifold", and the
+    /// one that is easiest to forget.** A mesh can score zero on holes and zero
+    /// on over-used edges and still be rejected outright for this: OrcaSlicer
+    /// reported exactly 956 on a mesh with none of the other two, counting such
+    /// an edge once per adjacent triangle.
+    ///
+    /// This code has no business producing one -- surface nets winds
+    /// consistently -- and measured on a real generated model it produces zero.
+    /// It is counted anyway, because "it cannot happen" was the previous
+    /// position and an unmeasured assumption is how the scan-line repair came
+    /// to be dead for months.
+    pub inconsistent_edges: usize,
     /// Triangles with three distinct corners but no area. Harmless to most
     /// slicers and not removed, because removing one would open a hole, but
     /// worth reporting as a quality signal.
@@ -108,19 +123,37 @@ impl MeshReport {
     /// A hole is different in kind. There is no fill rule that recovers inside
     /// from outside across a boundary edge, so that stays fatal.
     ///
-    /// The count is still gathered and still shown by [`MeshReport::summary`],
+    /// **An inconsistently wound edge is fatal too**, and for the same reason a
+    /// hole is: a slicer cannot tell which side of the surface is solid, so it
+    /// rejects the file rather than guessing. That this code has never produced
+    /// one is not a reason to let it out unchecked.
+    ///
+    /// The counts are still gathered and still shown by [`MeshReport::summary`],
     /// so a model that is genuinely coming apart is visible rather than silent.
     pub fn is_printable(&self) -> bool {
-        self.boundary_edges == 0 && self.triangles > 0
+        self.boundary_edges == 0 && self.inconsistent_edges == 0 && self.triangles > 0
     }
 
     /// A one line summary for an interface or a log.
     pub fn summary(&self) -> String {
-        if !self.is_printable() {
+        if self.boundary_edges > 0 {
             return format!(
                 "{} triangles, {} vertices, NOT watertight: {} holes",
                 self.triangles, self.vertices, self.boundary_edges
             );
+        }
+        // Closed, but the two sides disagree about which is out. Named
+        // separately because "NOT watertight: 0 holes" is the sort of message
+        // that sends the next person looking for a hole that is not there.
+        if self.inconsistent_edges > 0 {
+            return format!(
+                "{} triangles, {} vertices, closed but wound inconsistently: \
+                 {} edges where neighbouring triangles disagree which side is out",
+                self.triangles, self.vertices, self.inconsistent_edges
+            );
+        }
+        if self.triangles == 0 {
+            return "nothing to export".to_string();
         }
         if self.non_manifold_edges > 0 {
             // Worth saying out loud even though it does not stop an export, so
@@ -142,11 +175,19 @@ impl ExportMesh {
     /// Count what would stop this mesh printing.
     ///
     /// Edges are compared as unordered pairs, so a triangle wound the other way
-    /// still shares an edge with its neighbour. Winding is checked separately by
-    /// the tests, since surface nets is consistent about it and a wrong result
-    /// there would be a bug rather than something to repair here.
+    /// still shares an edge with its neighbour -- and the direction each
+    /// triangle traverses it in is counted alongside, which is what catches the
+    /// pair that agree on the edge and disagree on which side is out.
+    ///
+    /// All three of the defects a slicer flattens into "non-manifold" are
+    /// counted separately, because fixing one leaves the others reporting and
+    /// they have different causes: a hole, an over-used edge, and a winding
+    /// disagreement are not the same problem.
     pub fn validate(&self) -> MeshReport {
-        let mut uses: FxHashMap<(u32, u32), u32> = FxHashMap::default();
+        // Uses of each edge, and how many of those traversed it low-to-high.
+        // Two triangles sharing an edge should traverse it in OPPOSITE
+        // directions; both going the same way means one of them is flipped.
+        let mut uses: FxHashMap<(u32, u32), (u32, u32)> = FxHashMap::default();
         uses.reserve(self.triangles.len() * 3);
 
         let mut zero_area = 0;
@@ -159,8 +200,11 @@ impl ExportMesh {
                 zero_area += 1;
             }
             for (from, to) in [(a, b), (b, c), (c, a)] {
-                let key = if from <= to { (from, to) } else { (to, from) };
-                *uses.entry(key).or_insert(0) += 1;
+                let forward = from <= to;
+                let key = if forward { (from, to) } else { (to, from) };
+                let entry = uses.entry(key).or_insert((0, 0));
+                entry.0 += 1;
+                entry.1 += u32::from(forward);
             }
         }
 
@@ -168,8 +212,12 @@ impl ExportMesh {
             vertices: self.positions.len(),
             triangles: self.triangles.len(),
             collapsed_triangles: 0,
-            boundary_edges: uses.values().filter(|count| **count == 1).count(),
-            non_manifold_edges: uses.values().filter(|count| **count > 2).count(),
+            boundary_edges: uses.values().filter(|(count, _)| *count == 1).count(),
+            non_manifold_edges: uses.values().filter(|(count, _)| *count > 2).count(),
+            inconsistent_edges: uses
+                .values()
+                .filter(|(count, forward)| *count == 2 && (*forward == 2 || *forward == 0))
+                .count(),
             zero_area_triangles: zero_area,
         }
     }
@@ -410,6 +458,40 @@ mod tests {
         // Nothing to print is not printable, so a caller cannot write an empty
         // file believing it succeeded.
         assert!(!report.is_printable());
+    }
+
+    /// The control for the third defect, and the reason it is now counted.
+    ///
+    /// A slicer flattens holes, over-used edges and winding disagreements into
+    /// one phrase, and a mesh can be clean of the first two and still be
+    /// rejected for this. Nothing in this codebase should produce one -- surface
+    /// nets winds consistently, and a real generated model measured zero -- but
+    /// "cannot happen" was also the standing position on the scan-line repair,
+    /// which turned out to be unreachable from the path that mattered.
+    #[test]
+    fn the_validator_notices_a_triangle_wound_the_wrong_way() {
+        let volume = sphere(1.0, 24.0);
+        let (mut mesh, report) = volume.export_mesh();
+        assert!(report.is_printable());
+        assert_eq!(report.inconsistent_edges, 0, "our own meshing should wind consistently");
+
+        // Turn one triangle over. It still shares all three of its edges with
+        // the same neighbours, so this opens no hole and over-uses no edge:
+        // the ONLY signal is the direction each edge is traversed in.
+        let flipped = mesh.triangles[0];
+        mesh.triangles[0] = [flipped[0], flipped[2], flipped[1]];
+        let wrong = mesh.validate();
+
+        assert_eq!(wrong.boundary_edges, 0, "flipping a triangle should not open a hole");
+        assert_eq!(wrong.non_manifold_edges, 0, "flipping a triangle should not over-use an edge");
+        assert_eq!(
+            wrong.inconsistent_edges, 3,
+            "a flipped triangle disagrees with each of its three neighbours"
+        );
+        assert!(
+            !wrong.is_printable(),
+            "a mesh that disagrees about which side is out is not fit to print"
+        );
     }
 
     #[test]

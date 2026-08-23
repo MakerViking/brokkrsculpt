@@ -19,6 +19,35 @@
 use brokkr_core::export::ExportMesh;
 use brokkr_core::voxelise::{VoxeliseOptions, voxelise};
 
+/// The three separate defects a slicer lumps together as "non-manifold".
+///
+/// Counted here rather than taken from `MeshReport`, because that type does not
+/// carry the third one: it assumes surface nets winds consistently and says so.
+/// An assumption is worth measuring once on a real model.
+fn manifold_triple(mesh: &ExportMesh) -> (usize, usize, usize) {
+    use std::collections::HashMap;
+    // Unordered pair -> how many triangles use it, and how many traverse it
+    // low-to-high. A shared edge that two triangles both traverse the SAME way
+    // means they disagree about which side is out.
+    let mut uses: HashMap<(u32, u32), (u32, u32)> = HashMap::new();
+    for [a, b, c] in &mesh.triangles {
+        for (from, to) in [(*a, *b), (*b, *c), (*c, *a)] {
+            let key = if from <= to { (from, to) } else { (to, from) };
+            let entry = uses.entry(key).or_insert((0, 0));
+            entry.0 += 1;
+            if from <= to {
+                entry.1 += 1;
+            }
+        }
+    }
+    let one_sided = uses.values().filter(|(n, _)| *n == 1).count();
+    let over_used = uses.values().filter(|(n, _)| *n > 2).count();
+    // Exactly two triangles, both going the same way round it.
+    let same_direction =
+        uses.values().filter(|(n, fwd)| *n == 2 && (*fwd == 2 || *fwd == 0)).count();
+    (one_sided, over_used, same_direction)
+}
+
 fn read(path: &std::path::Path) -> ExportMesh {
     let bytes = std::fs::read(path).expect("reading the model");
     let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
@@ -132,6 +161,11 @@ fn diagnose() {
 
         let (out, out_report) = volume.export_mesh();
         println!("  back out: {}", out_report.summary());
+        let (one_sided, over_used, same_dir) = manifold_triple(&out);
+        println!(
+            "  the three \"non-manifold\" defects: {one_sided} one-sided, \
+             {over_used} used by 3+, {same_dir} wound against a neighbour"
+        );
         println!(
             "  -> {}",
             if out_report.boundary_edges == 0 {
