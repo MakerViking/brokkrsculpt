@@ -91,7 +91,13 @@ pub const RADIUS_LG: f32 = 10.0;
 /// Window controls and the timeline's transport.
 pub const ICON_CHROME: f32 = 14.0;
 /// The tool strip, above the tool's name.
-pub const ICON_TOOL: f32 = 20.0;
+///
+/// Eighteen rather than the twenty-four the grid is drawn on, because the strip
+/// has a vertical budget and seven brushes plus three mirror toggles plus the
+/// cut have to fit a 768-high window without scrolling. A properties panel
+/// taller than its window has already happened here once and put every
+/// SpaceMouse binding out of reach.
+pub const ICON_TOOL: f32 = 18.0;
 /// Inline with a line of text: a section's collapse marker.
 pub const ICON_INLINE: f32 = 11.0;
 

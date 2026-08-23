@@ -43,7 +43,7 @@
 //! same time and costs **thirty one** — resvg, usvg, rustybuzz and four raster
 //! decoders for bitmaps an icon never carries. Six is the price of the set.
 
-use brokkr_core::PatternKind;
+use brokkr_core::{BrushKind, PatternKind};
 use iced::widget::canvas;
 use iced::{Color, Element, Point, Renderer, Size, Theme};
 
@@ -92,6 +92,15 @@ enum Seg {
 enum Ink {
     /// The default, and nearly everything: a stroked outline.
     Stroke,
+    /// Stroked, but broken — a *reference* rather than a thing.
+    ///
+    /// Worth its own variant because in several icons the dash carries the
+    /// whole meaning. SindriCAD's draft angle is the clearest case: without the
+    /// dashed vertical saying "this is where it started", a lone trapezoid
+    /// reads as a generic taper. Here it is what makes `MOVE` a displacement
+    /// rather than a bulge, and what makes `CUT_PLANE` a cut rather than a
+    /// solid with a line on it.
+    Dashed,
     /// Solid. The house style reserves this for dots and for the one or two
     /// shapes whose whole meaning is that they are solid — a play triangle
     /// outlined reads as a direction, not as a button.
@@ -120,13 +129,15 @@ const CLOSE: Glyph = Glyph {
     ],
 };
 
-/// Minimise: a single rule along the bottom of the live area.
+/// Minimise: a single rule across the live area.
 ///
-/// Low rather than centred, because the gesture it stands for is "put it down
-/// there" — and because a centred rule is the same drawing as a "remove" or a
-/// collapsed section, which is a twin this set does not need.
+/// It sat four units lower than this at first, to keep it away from a centred
+/// rule that the collapse marker was going to be. The collapse marker became a
+/// caret instead, so that reason evaporated — and seen at 14 px beside the
+/// square and the X, the low rule simply read as misaligned. Centred now,
+/// sharing their axis.
 const MINIMISE: Glyph = Glyph {
-    subs: &[Sub { segs: &[Seg::Move(6.5, 16.5), Seg::Line(17.5, 16.5)], ink: Ink::Stroke }],
+    subs: &[Sub { segs: &[Seg::Move(6.5, 12.0), Seg::Line(17.5, 12.0)], ink: Ink::Stroke }],
 };
 
 /// Maximise: the window's outline.
@@ -294,6 +305,169 @@ const PATTERN_CRACKS: Glyph = Glyph {
     ],
 };
 
+// --- the brushes -------------------------------------------------------------
+//
+// Seven tools that all push a surface around, which is exactly the setup that
+// produces twins: SindriCAD rendered its 108 icons together and found four
+// pairs that were the same drawing, and a sculpting strip is worse, because
+// "draw", "clay", "inflate" and "pinch" are all a lump appearing on a curve.
+//
+// So none of these is a variation on a lump. Each one draws the SUBJECT of its
+// operation instead -- what the tool is *about* rather than what its result
+// vaguely looks like. Smooth is a rough line above a calm one; pinch is two
+// arrows squeezing a crease; move is where the surface was against where it is.
+// That is also SindriCAD's own answer to its twins, arrived at the same way.
+
+/// Draw: one dome deposited on a flat surface.
+///
+/// The plainest of the seven on purpose — it is the default brush, and the
+/// baseline the other six read as departures from.
+const BRUSH_DRAW: Glyph = Glyph {
+    subs: &[Sub {
+        segs: &[
+            Seg::Move(3.5, 17.0),
+            Seg::Line(8.5, 17.0),
+            Seg::Quad { cx: 12.0, cy: 8.0, x: 15.5, y: 17.0 },
+            Seg::Line(20.5, 17.0),
+        ],
+        ink: Ink::Stroke,
+    }],
+};
+
+/// Clay: material added in slabs.
+///
+/// Stacked rather than domed, which is the whole difference from `BRUSH_DRAW`:
+/// clay builds a surface up in layers toward a target, and two blocks sitting
+/// on the ground say that where a second smooth hump would only have said
+/// "draw again".
+const BRUSH_CLAY: Glyph = Glyph {
+    subs: &[
+        Sub { segs: &[Seg::Move(3.5, 18.5), Seg::Line(20.5, 18.5)], ink: Ink::Stroke },
+        Sub { segs: &[Seg::Rect { x: 6.0, y: 13.5, w: 12.0, h: 3.2, r: 0.8 }], ink: Ink::Stroke },
+        Sub { segs: &[Seg::Rect { x: 8.5, y: 8.8, w: 7.0, h: 3.2, r: 0.8 }], ink: Ink::Stroke },
+    ],
+};
+
+/// Smooth: a rough line, and the calm one it becomes.
+///
+/// Two lines rather than one transitioning, because a single line that starts
+/// jagged and ends smooth needs a transition zone, and at 18 px the transition
+/// is where all the pixels go and none of the meaning is.
+const BRUSH_SMOOTH: Glyph = Glyph {
+    subs: &[
+        Sub {
+            segs: &[
+                Seg::Move(3.5, 9.0),
+                Seg::Line(6.0, 5.5),
+                Seg::Line(8.5, 9.0),
+                Seg::Line(11.0, 5.5),
+                Seg::Line(13.5, 9.0),
+                Seg::Line(16.0, 5.5),
+                Seg::Line(18.5, 9.0),
+                Seg::Line(20.5, 7.0),
+            ],
+            ink: Ink::Stroke,
+        },
+        Sub {
+            segs: &[
+                Seg::Move(3.5, 17.0),
+                Seg::Cubic { c1x: 8.0, c1y: 13.5, c2x: 16.0, c2y: 20.5, x: 20.5, y: 16.0 },
+            ],
+            ink: Ink::Stroke,
+        },
+    ],
+};
+
+/// Inflate: a closed form swelling along its own normals.
+///
+/// A whole body rather than a patch of surface, because that is the actual
+/// difference from draw — inflate pushes everywhere at once, so the icon has
+/// to have an "everywhere" in it for the radiating ticks to mean anything.
+const BRUSH_INFLATE: Glyph = Glyph {
+    subs: &[
+        Sub { segs: &[Seg::Circle { cx: 12.0, cy: 12.0, r: 5.5 }], ink: Ink::Stroke },
+        Sub { segs: &[Seg::Move(15.9, 8.1), Seg::Line(18.6, 5.4)], ink: Ink::Stroke },
+        Sub { segs: &[Seg::Move(8.1, 8.1), Seg::Line(5.4, 5.4)], ink: Ink::Stroke },
+        Sub { segs: &[Seg::Move(15.9, 15.9), Seg::Line(18.6, 18.6)], ink: Ink::Stroke },
+        Sub { segs: &[Seg::Move(8.1, 15.9), Seg::Line(5.4, 18.6)], ink: Ink::Stroke },
+    ],
+};
+
+/// Pinch: two arrows squeezing material onto a crease.
+///
+/// Deliberately NOT "a sharp peak instead of a round dome". That was the first
+/// drawing, and beside `BRUSH_DRAW` at 18 px it was a twin — the eye reads
+/// "bump on a line" for both and the corner radius is a couple of pixels of
+/// difference. Arrows converging say what pinch does; a pointier lump does not.
+const BRUSH_PINCH: Glyph = Glyph {
+    subs: &[
+        Sub { segs: &[Seg::Move(12.0, 4.0), Seg::Line(12.0, 20.0)], ink: Ink::Stroke },
+        Sub { segs: &[Seg::Move(4.5, 12.0), Seg::Line(9.3, 12.0)], ink: Ink::Stroke },
+        Sub {
+            segs: &[Seg::Move(7.4, 10.1), Seg::Line(9.3, 12.0), Seg::Line(7.4, 13.9)],
+            ink: Ink::Stroke,
+        },
+        Sub { segs: &[Seg::Move(19.5, 12.0), Seg::Line(14.7, 12.0)], ink: Ink::Stroke },
+        Sub {
+            segs: &[Seg::Move(16.6, 10.1), Seg::Line(14.7, 12.0), Seg::Line(16.6, 13.9)],
+            ink: Ink::Stroke,
+        },
+    ],
+};
+
+/// Flatten: a bumpy surface meeting the plane it is levelled to.
+const BRUSH_FLATTEN: Glyph = Glyph {
+    subs: &[
+        Sub {
+            segs: &[
+                Seg::Move(3.5, 17.5),
+                Seg::Cubic { c1x: 6.0, c1y: 9.5, c2x: 9.5, c2y: 9.5, x: 12.0, y: 17.5 },
+                Seg::Cubic { c1x: 14.5, c1y: 9.5, c2x: 18.0, c2y: 9.5, x: 20.5, y: 17.5 },
+            ],
+            ink: Ink::Stroke,
+        },
+        Sub { segs: &[Seg::Move(3.0, 13.0), Seg::Line(21.0, 13.0)], ink: Ink::Stroke },
+    ],
+};
+
+/// Move: where the surface was, against where it is now.
+///
+/// The dashed original is the icon. Without it this is a curve, and a curve is
+/// every other brush's result too — displacement is only visible as a
+/// comparison, which is exactly why Move locks the field at stroke start and
+/// warps from that snapshot rather than integrating increments.
+const BRUSH_MOVE: Glyph = Glyph {
+    subs: &[
+        Sub { segs: &[Seg::Move(8.0, 4.5), Seg::Line(8.0, 19.5)], ink: Ink::Dashed },
+        Sub {
+            segs: &[
+                Seg::Move(8.0, 4.5),
+                Seg::Cubic { c1x: 17.0, c1y: 8.5, c2x: 17.0, c2y: 15.5, x: 8.0, y: 19.5 },
+            ],
+            ink: Ink::Stroke,
+        },
+    ],
+};
+
+/// The plane cut: a solid, and the plane going through it.
+const CUT_PLANE: Glyph = Glyph {
+    subs: &[
+        Sub {
+            segs: &[
+                Seg::Move(5.0, 9.0),
+                Seg::Line(12.0, 5.0),
+                Seg::Line(19.0, 9.0),
+                Seg::Line(19.0, 16.0),
+                Seg::Line(12.0, 20.0),
+                Seg::Line(5.0, 16.0),
+                Seg::Close,
+            ],
+            ink: Ink::Stroke,
+        },
+        Sub { segs: &[Seg::Move(3.5, 14.0), Seg::Line(20.5, 10.5)], ink: Ink::Dashed },
+    ],
+};
+
 /// Every icon in the set.
 ///
 /// An enum rather than a string lookup for the reason SindriCAD moved to
@@ -314,6 +488,14 @@ pub enum IconName {
     PatternHair,
     PatternWeave,
     PatternCracks,
+    BrushDraw,
+    BrushClay,
+    BrushSmooth,
+    BrushInflate,
+    BrushPinch,
+    BrushFlatten,
+    BrushMove,
+    CutPlane,
 }
 
 impl IconName {
@@ -325,7 +507,7 @@ impl IconName {
     /// set's index, and anything that needs the whole set rather than one icon
     /// starts here.
     #[allow(dead_code)]
-    pub const ALL: [IconName; 13] = [
+    pub const ALL: [IconName; 21] = [
         IconName::Close,
         IconName::Minimise,
         IconName::Maximise,
@@ -339,7 +521,31 @@ impl IconName {
         IconName::PatternHair,
         IconName::PatternWeave,
         IconName::PatternCracks,
+        IconName::BrushDraw,
+        IconName::BrushClay,
+        IconName::BrushSmooth,
+        IconName::BrushInflate,
+        IconName::BrushPinch,
+        IconName::BrushFlatten,
+        IconName::BrushMove,
+        IconName::CutPlane,
     ];
+
+    /// The icon standing for a sculpting brush.
+    ///
+    /// Exhaustive for the same reason [`Self::for_pattern`] is: an eighth brush
+    /// cannot be added without being drawn.
+    pub fn for_brush(kind: BrushKind) -> Self {
+        match kind {
+            BrushKind::Draw => IconName::BrushDraw,
+            BrushKind::Clay => IconName::BrushClay,
+            BrushKind::Smooth => IconName::BrushSmooth,
+            BrushKind::Inflate => IconName::BrushInflate,
+            BrushKind::Pinch => IconName::BrushPinch,
+            BrushKind::Flatten => IconName::BrushFlatten,
+            BrushKind::Move => IconName::BrushMove,
+        }
+    }
 
     /// The icon standing for a surface pattern.
     ///
@@ -373,6 +579,14 @@ impl IconName {
             IconName::PatternHair => &PATTERN_HAIR,
             IconName::PatternWeave => &PATTERN_WEAVE,
             IconName::PatternCracks => &PATTERN_CRACKS,
+            IconName::BrushDraw => &BRUSH_DRAW,
+            IconName::BrushClay => &BRUSH_CLAY,
+            IconName::BrushSmooth => &BRUSH_SMOOTH,
+            IconName::BrushInflate => &BRUSH_INFLATE,
+            IconName::BrushPinch => &BRUSH_PINCH,
+            IconName::BrushFlatten => &BRUSH_FLATTEN,
+            IconName::BrushMove => &BRUSH_MOVE,
+            IconName::CutPlane => &CUT_PLANE,
         }
     }
 }
@@ -414,21 +628,36 @@ impl<Message> canvas::Program<Message> for IconProgram {
         for sub in self.glyph.subs {
             let path = build(sub.segs);
             match sub.ink {
-                Ink::Stroke => frame.stroke(
-                    &path,
-                    canvas::Stroke {
-                        style: canvas::Style::Solid(self.colour),
-                        width: STROKE_WIDTH,
-                        line_cap: canvas::LineCap::Round,
-                        line_join: canvas::LineJoin::Round,
-                        ..canvas::Stroke::default()
-                    },
-                ),
+                Ink::Stroke => {
+                    frame.stroke(&path, stroke_of(self.colour, canvas::LineDash::default()));
+                }
+                // In grid units, so the dash scales with everything else. Round
+                // caps make each dash a touch longer than it is specified,
+                // which is why the gap is the larger of the two.
+                Ink::Dashed => {
+                    let dash = canvas::LineDash { segments: &[1.6, 2.2], offset: 0 };
+                    frame.stroke(&path, stroke_of(self.colour, dash));
+                }
                 Ink::Fill => frame.fill(&path, self.colour),
             }
         }
 
         vec![frame.into_geometry()]
+    }
+}
+
+/// The house style's stroke, in whichever dash pattern is wanted.
+///
+/// A function rather than a closure over `self.colour`: the returned `Stroke`
+/// borrows the dash segments, and a closure cannot express that its output
+/// lives exactly as long as its input, so the borrow checker refuses it.
+fn stroke_of(colour: Color, dash: canvas::LineDash<'_>) -> canvas::Stroke<'_> {
+    canvas::Stroke {
+        style: canvas::Style::Solid(colour),
+        width: STROKE_WIDTH,
+        line_cap: canvas::LineCap::Round,
+        line_join: canvas::LineJoin::Round,
+        line_dash: dash,
     }
 }
 

@@ -882,9 +882,17 @@ impl Brokkr {
                 // Smooth as live. The selection underneath is untouched.
                 let live =
                     if smoothing { kind == BrushKind::Smooth } else { kind == self.brush.kind };
+                let (style, ink) = theme::tool_toggle(live);
                 assembled.push(
                     button(
+                        // The word stays under the icon, and that is the whole
+                        // mitigation for seven tools that all push a surface
+                        // around. SindriCAD's icons carry their labels in the
+                        // ribbon for the same reason; an icon-only strip would
+                        // bet the tool picker on telling clay from draw at
+                        // eighteen pixels.
                         column![
+                            icon::icon(icon::IconName::for_brush(kind), theme::ICON_TOOL, ink),
                             text(kind.label()).size(theme::TEXT_SIZE_SMALL),
                             text(format!("{}", index + 1)).size(theme::CAPTION_SIZE),
                         ]
@@ -892,12 +900,18 @@ impl Brokkr {
                         .align_x(Alignment::Center),
                     )
                     .width(Length::Fill)
-                    .style(if live { theme::tool_button_active } else { theme::tool_button })
+                    .style(style)
                     .on_press(Message::BrushKindChanged(kind)),
                 )
             },
         );
 
+        // The mirror toggles keep their letters and get no icon. X, Y and Z are
+        // plain ASCII, so they carry none of the font-fallback risk that made
+        // the rest of this worth doing -- and an axis is a thing a letter names
+        // better than a picture can. A mirror-plane glyph turned per axis reads
+        // for X and Y and then has to say "depth" in two dimensions for Z,
+        // which is the point at which a set starts inventing puzzles.
         let mirrors =
             MirrorAxis::ALL.into_iter().fold(column![].spacing(theme::S2), |assembled, axis| {
                 assembled.push(
@@ -912,6 +926,8 @@ impl Brokkr {
                 )
             });
 
+        let (cut_style, cut_ink) = theme::tool_toggle(self.cut_armed);
+
         container(
             column![
                 text("TOOL").size(theme::CAPTION_SIZE).color(theme::TEXT_MUTE),
@@ -925,12 +941,20 @@ impl Brokkr {
                 // Armed state is shown in the strip, not just in the status
                 // line, because this is the one mode that changes what a left
                 // drag does and a cut is not something to discover by accident.
+                // The word stays for exactly that reason: "armed" versus
+                // "plane" is a state, and an icon says which tool this is, not
+                // whether it is about to go off.
                 button(
-                    text(if self.cut_armed { "armed" } else { "plane" })
-                        .size(theme::TEXT_SIZE_SMALL)
+                    column![
+                        icon::icon(icon::IconName::CutPlane, theme::ICON_TOOL, cut_ink),
+                        text(if self.cut_armed { "armed" } else { "plane" })
+                            .size(theme::TEXT_SIZE_SMALL),
+                    ]
+                    .spacing(0)
+                    .align_x(Alignment::Center)
                 )
                 .width(Length::Fill)
-                .style(if self.cut_armed { theme::tool_button_active } else { theme::tool_button })
+                .style(cut_style)
                 .on_press(Message::CutToggled),
             ]
             .spacing(theme::S3)
