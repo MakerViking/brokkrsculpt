@@ -94,7 +94,11 @@ const REFIT_LONGEST_MM: f32 = 200.0;
 /// Past this the pool logs an error and returns, leaving the model silently
 /// incomplete on screen, so an import that would exceed it is refused up front
 /// with a voxel size that would fit instead.
-const VERTEX_CAPACITY: f64 = 88_000_000.0;
+///
+/// `brokkr-gpu` owns the real number and pins this one to it in
+/// `the_import_ceiling_matches_the_pool_it_is_protecting`, because a comment
+/// asking two crates to agree is not a mechanism.
+pub const VERTEX_CAPACITY: f64 = 88_000_000.0;
 
 /// Rough dense bricks per unit of surface area, used only by the preflight.
 ///
@@ -104,6 +108,26 @@ const VERTEX_CAPACITY: f64 = 88_000_000.0;
 const SHELL_FACTOR: f64 = 2.5;
 /// Rough vertices per unit of surface area in voxel units, same purpose.
 const VERTEX_FACTOR: f64 = 2.0;
+
+/// The most solid Y and Z neighbours a saturated voxel may have and still be
+/// judged a filament rather than bulk. See [`erase_impossible_filaments`].
+///
+/// One, not zero and not three. Zero is a strand exactly one voxel thick and
+/// misses the two-thick strands that two adjacent broken scan lines produce,
+/// which is most of them. Three would take the bulk material lying alongside a
+/// scan line that broke the *other* way, widening that defect rather than
+/// removing it.
+const MAX_STRAND_NEIGHBOURS: usize = 1;
+
+/// How many peeling passes [`erase_impossible_filaments`] may make.
+///
+/// A strand `2n + 1` voxels thick needs `n + 1` rounds, since each pass can only
+/// take the layer whose sides are already gone. Four covers a strand seven
+/// voxels across, which is far past anything a broken scan line makes; a model
+/// that wanted more has something wrong with it that this sweep is not the
+/// right answer to. Each round is a full sweep of every dense brick, so this is
+/// a cost ceiling as much as a correctness one.
+const MAX_PEEL_ROUNDS: usize = 4;
 
 /// How much a single import may allocate for voxel data.
 ///
@@ -461,12 +485,11 @@ fn place(
 /// Delete solid voxels that no closed surface could have produced.
 ///
 /// A voxel saturated at [`INSIDE`] is, by the definition of the narrow band,
-/// more than [`NARROW_BAND`] voxels from the nearest surface. A voxel whose
-/// neighbours on BOTH Y and Z read outside is, by inspection, one voxel from a
-/// surface on four sides. **Those two statements cannot both be true**, so a
-/// voxel that satisfies them is not geometry -- it is what a scan line whose
-/// winding went wrong leaves behind, a filament of material that appears in no
-/// triangle of the source file.
+/// more than [`NARROW_BAND`] voxels from the nearest surface. A neighbour one
+/// step away that reads *outside* puts a surface one voxel from it. **Those two
+/// statements cannot both be true**, so material satisfying them is not
+/// geometry -- it is what a scan line whose winding went wrong leaves behind, a
+/// filament that appears in no triangle of the source file.
 ///
 /// This is a proof, not a tolerance, and that is what makes it safe on exactly
 /// the models most at risk. A real membrane wing one voxel thick is *near* a
@@ -475,39 +498,98 @@ fn place(
 /// material. The holes that caused it are the model's own defect and are
 /// neither repaired nor hidden -- see [`VoxeliseReport::repaired_scan_lines`].
 ///
+/// # Why it counts neighbours instead of requiring all four
+///
+/// It used to demand that **all four** of the Y and Z neighbours read outside,
+/// which is a strand exactly one voxel thick. Two broken scan lines side by
+/// side produce a strand two thick, every voxel of which has one solid
+/// neighbour, and the whole thing survived -- measured on a real generated
+/// model, the visible result is streaks of material standing off the surface
+/// that this sweep had already been asked to remove.
+///
+/// The proof never needed four. It needs the voxel to be a *strand* rather than
+/// bulk, and [`MAX_STRAND_NEIGHBOURS`] is where that line sits. One outside
+/// neighbour alone would not do: a scan line that broke the other way punches a
+/// line of outside **through** solid material, and the bulk beside it is
+/// saturated with an outside neighbour too. Erasing that would widen the defect
+/// instead of removing it, which is why the threshold is a count and not a
+/// boolean, and why `material_beside_a_broken_outside_line_is_not_eaten` exists.
+///
+/// Peeling is iterative because a strand three thick has a core with two solid
+/// neighbours that only becomes exposed once its sides are gone. Rounds are
+/// capped: each one is a full sweep, and a model needing many of them is one
+/// where something else is wrong.
+///
 /// The sweep runs after the sign is resolved and before the cavity fill, so the
 /// flood does not have to reason about filaments that are about to vanish.
 fn erase_impossible_filaments(volume: &mut Volume) -> usize {
-    let solid_elsewhere = |volume: &Volume, voxel: IVec3| volume.sample_voxel(voxel) < 0.0;
+    let mut erased = 0;
+    let mut doomed = sweep_for_strands(volume);
 
-    let mut doomed: Vec<IVec3> = Vec::new();
+    for _ in 0..MAX_PEEL_ROUNDS {
+        if doomed.is_empty() {
+            break;
+        }
+        for voxel in &doomed {
+            volume.edit_voxels(*voxel, *voxel, |_, _, _| OUTSIDE);
+        }
+        erased += doomed.len();
+
+        // Only a neighbour of something just erased can have newly become a
+        // strand, so later rounds look there instead of sweeping the model
+        // again. Measured on a real defective import: a second full sweep cost
+        // as much as the first and nearly doubled the whole voxelise, for a few
+        // hundred voxels.
+        doomed = restrand_around(volume, &doomed);
+    }
+    erased
+}
+
+/// Every strand in the volume. The first round has to look everywhere.
+fn sweep_for_strands(volume: &Volume) -> Vec<IVec3> {
+    let mut doomed = Vec::new();
     for coord in volume.brick_coords().collect::<Vec<_>>() {
         let origin = coord.origin();
         for dz in 0..BRICK_DIM as i32 {
             for dy in 0..BRICK_DIM as i32 {
                 for dx in 0..BRICK_DIM as i32 {
                     let voxel = origin + IVec3::new(dx, dy, dz);
-                    // Saturated inside: nothing within the band, so nothing
-                    // nearby can explain material here.
-                    if volume.sample_voxel(voxel) > INSIDE {
-                        continue;
-                    }
-                    let pinched = !solid_elsewhere(volume, voxel + IVec3::Y)
-                        && !solid_elsewhere(volume, voxel - IVec3::Y)
-                        && !solid_elsewhere(volume, voxel + IVec3::Z)
-                        && !solid_elsewhere(volume, voxel - IVec3::Z);
-                    if pinched {
+                    if is_strand(volume, voxel) {
                         doomed.push(voxel);
                     }
                 }
             }
         }
     }
+    doomed
+}
 
-    for voxel in &doomed {
-        volume.edit_voxels(*voxel, *voxel, |_, _, _| OUTSIDE);
+/// The strands exposed by erasing `just_erased`.
+fn restrand_around(volume: &Volume, just_erased: &[IVec3]) -> Vec<IVec3> {
+    let mut doomed: Vec<IVec3> = Vec::new();
+    for voxel in just_erased {
+        for step in [IVec3::Y, IVec3::NEG_Y, IVec3::Z, IVec3::NEG_Z, IVec3::X, IVec3::NEG_X] {
+            let neighbour = *voxel + step;
+            if is_strand(volume, neighbour) && !doomed.contains(&neighbour) {
+                doomed.push(neighbour);
+            }
+        }
     }
-    doomed.len()
+    doomed
+}
+
+/// Saturated material with too little beside it to be part of a surface.
+fn is_strand(volume: &Volume, voxel: IVec3) -> bool {
+    // Saturated inside: nothing within the band, so nothing nearby can explain
+    // material here.
+    if volume.sample_voxel(voxel) > INSIDE {
+        return false;
+    }
+    let solid = [IVec3::Y, IVec3::NEG_Y, IVec3::Z, IVec3::NEG_Z]
+        .into_iter()
+        .filter(|step| volume.sample_voxel(voxel + *step) < 0.0)
+        .count();
+    solid <= MAX_STRAND_NEIGHBOURS
 }
 
 /// Total surface area of the placed triangles, in mm squared.
@@ -1381,6 +1463,66 @@ mod tests {
 
         assert_eq!(erased, 0, "a feature one voxel from a surface is geometry, not an artifact");
         assert_eq!(solid(&volume), 20, "real thin material was deleted");
+    }
+
+    /// Lay a run of material along X, `thickness` voxels deep in Y.
+    fn filament_slab(length: i32, thickness: i32, depth: f32) -> Volume {
+        let mut volume = Volume::new(VOXEL);
+        volume.edit_voxels(
+            IVec3::new(0, 0, 0),
+            IVec3::new(length - 1, thickness - 1, 0),
+            |_, _, _| depth,
+        );
+        volume
+    }
+
+    /// Two broken scan lines side by side, which is the case a real defective
+    /// model produces constantly and a single one almost never does.
+    ///
+    /// The proof does not care how thick the strand is: a saturated voxel is
+    /// more than `NARROW_BAND` from any surface, and an outside voxel one step
+    /// away puts a surface one voxel from it. That contradiction holds for the
+    /// voxel at the edge of a two thick strand exactly as it does for a lone
+    /// one -- it simply has fewer outside neighbours.
+    #[test]
+    fn a_filament_two_voxels_thick_is_erased_too() {
+        let mut volume = filament_slab(20, 2, INSIDE);
+        let solid = |v: &Volume| {
+            (0..20)
+                .flat_map(|x| (0..2).map(move |y| IVec3::new(x, y, 0)))
+                .filter(|c| v.sample_voxel(*c) < 0.0)
+                .count()
+        };
+        assert_eq!(solid(&volume), 40, "the fixture did not lay down what the test needs");
+
+        let erased = erase_impossible_filaments(&mut volume);
+
+        assert_eq!(erased, 40, "a two thick strand is as impossible as a one thick one");
+        assert_eq!(solid(&volume), 0, "the filament survived the sweep");
+    }
+
+    /// The control for the loosened rule, and the reason it is a count rather
+    /// than "any outside neighbour at all".
+    ///
+    /// A scan line that broke the other way punches a line of OUTSIDE through
+    /// solid material. The material beside it is saturated and does have an
+    /// outside neighbour -- but it is bulk, not a strand, and erasing it would
+    /// widen the defect instead of removing it.
+    #[test]
+    fn material_beside_a_broken_outside_line_is_not_eaten() {
+        let mut volume = Volume::new(VOXEL);
+        // A solid block, saturated inside.
+        volume.edit_voxels(IVec3::new(0, 0, 0), IVec3::new(19, 6, 6), |_, _, _| INSIDE);
+        // ...with one line punched out through the middle of it.
+        volume.edit_voxels(IVec3::new(0, 3, 3), IVec3::new(19, 3, 3), |_, _, _| OUTSIDE);
+
+        let erased = erase_impossible_filaments(&mut volume);
+
+        assert_eq!(erased, 0, "bulk material next to a broken line is not a filament");
+        assert!(
+            volume.sample_voxel(IVec3::new(10, 2, 3)) < 0.0,
+            "the material beside the broken line was eaten"
+        );
     }
 
     /// An axis aligned cube as twelve triangles, wound counter-clockwise seen

@@ -677,4 +677,23 @@ mod tests {
         }
         assert_eq!(allocator.live(), 0);
     }
+
+    /// The import preflight refuses a model whose estimated vertices exceed
+    /// what the pool can hold, and it keeps its own copy of that number because
+    /// `brokkr-core` may not depend on this crate -- CI fails the build if it
+    /// ever does.
+    ///
+    /// A copy with nothing enforcing it is a constant waiting to drift. When it
+    /// drifts high the pool overflows and the model silently loses bricks off
+    /// the screen; when it drifts low, imports are refused that would have been
+    /// fine. Both have happened here in other guises, which is why this exists
+    /// rather than a comment asking the next person to remember.
+    #[test]
+    fn the_import_ceiling_matches_the_pool_it_is_protecting() {
+        assert_eq!(
+            brokkr_core::voxelise::VERTEX_CAPACITY,
+            TOTAL_VERTEX_CAPACITY as f64,
+            "brokkr-core's VERTEX_CAPACITY has drifted from the pool's real total"
+        );
+    }
 }
