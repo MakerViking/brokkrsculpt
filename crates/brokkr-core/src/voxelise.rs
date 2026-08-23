@@ -123,6 +123,24 @@ const VERTEX_FACTOR: f64 = 2.0;
 /// honest answer is that the sweep cannot know.
 const MAX_LINE_SEARCH: usize = 64;
 
+/// How much of a model's surface may fall between voxels before the import
+/// builds it again at half the voxel size.
+///
+/// Measured on two real generated models: a solid one loses 0.02% at a 0.25 mm
+/// voxel and looks right, a hollow-shelled one loses 2.42% and arrives visibly
+/// perforated. Anything between those is a judgement, and this sits an order of
+/// magnitude below the bad case rather than just under it, because the cost of
+/// being wrong in one direction is a slower import and in the other is a model
+/// with holes in it.
+const LOST_SURFACE_BUDGET: f64 = 0.005;
+
+/// How many times an import may halve the voxel to save thin surface.
+///
+/// Two, so a 0.25 mm request can reach 0.0625 mm. Each step is a full rebuild
+/// at four times the voxel count, so this is a time ceiling as much as a
+/// memory one -- and the preflight can stop it sooner by refusing to fit.
+const MAX_REFINE_STEPS: usize = 2;
+
 /// The most solid Y and Z neighbours a saturated voxel may have and still be
 /// judged a filament rather than bulk. See [`erase_impossible_filaments`].
 ///
@@ -202,6 +220,13 @@ pub struct VoxeliseOptions {
     /// Off in tests that assert the refusal, because the coarsened build of a
     /// genuinely too-fine import is by construction at capacity scale.
     pub coarsen_to_fit: bool,
+    /// When the requested voxel size loses too much thin surface, build again
+    /// at half of it and keep the better result.
+    ///
+    /// The mirror of [`Self::coarsen_to_fit`]. Off for callers that need the
+    /// size they asked for -- a test pinning field values at a known voxel, or
+    /// a measurement comparing like with like.
+    pub refine_to_resolve: bool,
 }
 
 impl VoxeliseOptions {
@@ -213,6 +238,7 @@ impl VoxeliseOptions {
             fill_sealed_cavities: true,
             repair_broken_scan_lines: true,
             coarsen_to_fit: true,
+            refine_to_resolve: true,
         }
     }
 }
@@ -258,6 +284,9 @@ pub struct VoxeliseReport {
     /// The size that was ASKED for, when the import had to coarsen to fit.
     /// Zero when it did not.
     pub coarsened_from_mm: f32,
+    /// The size that was ASKED for, when the import refined past it to keep
+    /// thin walls. Zero when it did not.
+    pub refined_from_mm: f32,
 }
 
 impl VoxeliseReport {
@@ -281,6 +310,12 @@ impl VoxeliseReport {
         if self.filled_voxels > 0 {
             out.push_str(&format!(", filled a sealed cavity of {} voxels", self.filled_voxels));
         }
+        if self.refined_from_mm > 0.0 {
+            out.push_str(&format!(
+                ", built at {:.3} mm instead of {:.3} to keep walls thinner than a voxel",
+                self.voxel_mm, self.refined_from_mm
+            ));
+        }
         if self.coarsened_from_mm > 0.0 {
             out.push_str(&format!(
                 ", voxel coarsened {:.3} -> {:.3} mm to fit",
@@ -296,7 +331,65 @@ impl VoxeliseReport {
 /// Returns a volume with every brick already marked dirty, exactly as
 /// `project::read` does, so a caller can never forget to and get an invisible
 /// model.
+/// Voxelise a mesh, refining the voxel size until the surface survives.
+///
+/// # Why this is a loop and not a calculation
+///
+/// The right voxel size is decided by the model's *thinnest wall*, and nothing
+/// in the file says what that is. It was worth trying: measured across two real
+/// generated models scaled to the same 200 mm, their triangles are the same
+/// size — median edge 0.303 mm against 0.270 mm — and yet one loses 0.02% of
+/// its surface at a 0.25 mm voxel and the other loses **2.42%** and comes in
+/// perforated. A thin wall is tessellated exactly like a thick one, so the
+/// source cannot predict this. Only building it and looking can.
+///
+/// So: build, measure [`VoxeliseReport::lost_triangles`], and if too much of
+/// the surface fell between voxels, halve and build again. A model that does
+/// not need it pays nothing, because the first attempt is the answer.
+///
+/// This is the mirror of `coarsen_to_fit`, which moves the size the other way
+/// when the ceilings cannot hold it — and the two must not fight. A finer
+/// attempt that does not fit comes back *coarsened*, and that is taken as
+/// "there is no more resolution to be had here" rather than a reason to try
+/// again.
+///
+/// Returns a volume with every brick already marked dirty, exactly as
+/// `project::read` does, so a caller can never forget to and get an invisible
+/// model.
 pub fn voxelise(
+    mesh: &ExportMesh,
+    options: &VoxeliseOptions,
+) -> Result<(Volume, VoxeliseReport), ImportError> {
+    let requested = options.voxel_size;
+    let mut attempt = *options;
+    let mut best: Option<(Volume, VoxeliseReport)> = None;
+
+    for step in 0..=MAX_REFINE_STEPS {
+        let (volume, mut report) = voxelise_once(mesh, &attempt)?;
+
+        // The ceilings pushed back. Whatever we already have is the best this
+        // machine can do, and re-refining would only ask the same question.
+        if step > 0 && report.coarsened_from_mm > 0.0 {
+            break;
+        }
+
+        let lost = report.lost_triangles as f64 / report.triangles.max(1) as f64;
+        if step > 0 {
+            report.refined_from_mm = requested;
+        }
+        let finer = report.voxel_mm * 0.5;
+        best = Some((volume, report));
+
+        if !options.refine_to_resolve || lost <= LOST_SURFACE_BUDGET {
+            break;
+        }
+        attempt.voxel_size = finer;
+    }
+
+    Ok(best.expect("the loop always runs at least once and keeps its result"))
+}
+
+fn voxelise_once(
     mesh: &ExportMesh,
     options: &VoxeliseOptions,
 ) -> Result<(Volume, VoxeliseReport), ImportError> {
@@ -1678,6 +1771,95 @@ mod tests {
         leaked
     }
 
+    /// A wedge: 1.2 mm thick at one end, tapering to almost nothing at the
+    /// other, at the size the importer refits to.
+    ///
+    /// Three attempts to get this fixture right, and each failure says
+    /// something about the thing being tested.
+    ///
+    /// A 10 mm plate 0.3 mm thick lost nothing: thinness is a RATIO, and the
+    /// refit scaled it twenty times into a 6 mm slab. A 200 mm plate 0.3 mm
+    /// thick lost nothing either, because a uniform plate is all-or-nothing --
+    /// a lattice plane either falls inside it everywhere or nowhere, and that
+    /// one was caught. A 0.04 mm plate lost exactly a third at every size,
+    /// because no halving this is allowed to make can resolve a wall a twelfth
+    /// of a voxel thick.
+    ///
+    /// A taper has every thickness at once, so the lost FRACTION moves with the
+    /// voxel size instead of flipping. That is what the real models look like
+    /// too: a car body is not one thickness, which is why it loses 2.42% rather
+    /// than everything or nothing.
+    fn thin_wedge() -> ExportMesh {
+        let mut mesh = cube(Vec3::new(-100.0, -100.0, -0.6), Vec3::new(100.0, 100.0, 0.6));
+        for p in &mut mesh.positions {
+            let along = (p.x + 100.0) / 200.0;
+            p.z *= 0.05 + 0.95 * along;
+        }
+        mesh
+    }
+
+    /// The import has to find the voxel size itself, because nothing in the
+    /// file says which one it needs.
+    ///
+    /// Measured across two real generated models scaled to the same size, the
+    /// triangles are the same size -- median edge 0.303 mm against 0.270 -- and
+    /// one loses 0.02% of its surface at 0.25 mm while the other loses 2.42%
+    /// and arrives visibly perforated. A thin wall is tessellated exactly like a
+    /// thick one. So the only way to know is to build it and look, which is
+    /// what this does.
+    #[test]
+    fn a_wall_thinner_than_a_voxel_makes_the_import_refine_itself() {
+        let mesh = thin_wedge();
+
+        // The control: told not to refine, it loses the plate's surface.
+        let asked = VoxeliseOptions { refine_to_resolve: false, ..VoxeliseOptions::at(VOXEL) };
+        let (_, coarse) = voxelise(&mesh, &asked).expect("the plate should voxelise");
+        let lost = coarse.lost_triangles as f64 / coarse.triangles.max(1) as f64;
+        assert!(
+            lost > LOST_SURFACE_BUDGET,
+            "the fixture is not thin enough to lose anything at {VOXEL} mm: lost {lost}"
+        );
+        assert_eq!(coarse.voxel_mm, VOXEL, "the control must not move the voxel size");
+        assert_eq!(coarse.refined_from_mm, 0.0);
+
+        // And left to itself, it goes finer until the surface survives.
+        let (_, refined) = voxelise(&mesh, &VoxeliseOptions::at(VOXEL)).expect("should voxelise");
+        assert!(
+            refined.voxel_mm < VOXEL,
+            "the import kept {} mm and lost the surface anyway",
+            refined.voxel_mm
+        );
+        assert_eq!(
+            refined.refined_from_mm, VOXEL,
+            "the report has to say what was asked for, or the status line cannot"
+        );
+        // What the loop promises is "refine while it helps, up to the bound" --
+        // NOT "always reach the budget". Nothing can save a wall a twelfth of a
+        // voxel thick, and pretending otherwise would mean refining until the
+        // machine gave out. So the contract is that it goes as far as it is
+        // allowed and the surface is measurably better for it.
+        assert_eq!(
+            refined.voxel_mm,
+            VOXEL / 4.0,
+            "two halvings are allowed and this fixture needs both of them"
+        );
+        let still_lost = refined.lost_triangles as f64 / refined.triangles.max(1) as f64;
+        assert!(
+            still_lost < lost,
+            "refining to {} mm did not save any surface: {lost} lost before, {still_lost} after",
+            refined.voxel_mm
+        );
+    }
+
+    /// A model that does not need refining must not pay for it -- neither in
+    /// time nor in a voxel size nobody asked for.
+    #[test]
+    fn a_solid_model_is_left_at_the_size_it_was_asked_for() {
+        let (_, report) = build(&unit_cube());
+        assert_eq!(report.voxel_mm, VOXEL, "a solid cube has no thin wall to chase");
+        assert_eq!(report.refined_from_mm, 0.0, "nothing was refined, so nothing should be said");
+    }
+
     /// The failure a user sees as streaks: long needles running along the sweep
     /// axis, out of a source mesh that has none of them.
     ///
@@ -1946,6 +2128,7 @@ mod tests {
                 fill_sealed_cavities: true,
                 repair_broken_scan_lines: true,
                 coarsen_to_fit: false,
+                refine_to_resolve: false,
             },
         )
         .expect("a sphere should voxelise");
@@ -2055,6 +2238,7 @@ mod tests {
                 fill_sealed_cavities: true,
                 repair_broken_scan_lines: true,
                 coarsen_to_fit: false,
+                refine_to_resolve: false,
             },
         );
         // `Volume` has no `Debug`, so the success case cannot be unwrapped into
@@ -2146,6 +2330,7 @@ mod preflight_calibration {
                     fill_sealed_cavities: true,
                     repair_broken_scan_lines: true,
                     coarsen_to_fit: false,
+                    refine_to_resolve: false,
                 },
             )
             .expect("the fixture should voxelise");

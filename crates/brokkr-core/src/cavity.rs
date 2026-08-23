@@ -630,6 +630,7 @@ mod tests {
             fill_sealed_cavities: fill,
             repair_broken_scan_lines: true,
             coarsen_to_fit: false,
+            refine_to_resolve: false,
         }
     }
 

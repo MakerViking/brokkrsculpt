@@ -112,6 +112,35 @@ fn diagnose() {
         size.z,
         size.max_element()
     );
+    // Does the SOURCE predict the voxel it needs?
+    //
+    // If it does, the importer can pick a size up front instead of voxelising
+    // once to find out. Edge length is the candidate: a generated mesh's
+    // feature size is roughly its cell size, and its triangles are cut from
+    // that same grid.
+    {
+        let scale = 200.0 / size.max_element().max(1.0e-9);
+        let mut edges: Vec<f32> = Vec::with_capacity(mesh.triangles.len() * 3);
+        for [a, b, c] in &mesh.triangles {
+            let (pa, pb, pc) = (
+                mesh.positions[*a as usize],
+                mesh.positions[*b as usize],
+                mesh.positions[*c as usize],
+            );
+            edges.push((pb - pa).length() * scale);
+            edges.push((pc - pb).length() * scale);
+            edges.push((pa - pc).length() * scale);
+        }
+        edges.sort_by(|x, y| x.partial_cmp(y).unwrap());
+        let at = |q: f64| edges[((edges.len() - 1) as f64 * q) as usize];
+        println!(
+            "  edge length once scaled to 200 mm: p10 {:.4}, median {:.4}, p90 {:.4} mm",
+            at(0.10),
+            at(0.50),
+            at(0.90)
+        );
+    }
+
     println!(
         "  -> the file is {}",
         if source.boundary_edges == 0 {
@@ -127,12 +156,18 @@ fn diagnose() {
     // centring included. A diagnostic that quietly used different options would
     // be answering a question nobody asked -- the first version of this did,
     // and reported a refusal the application never hits.
-    for (label, cavities, repair) in
-        [("as the application imports it", true, true), ("with both repairs OFF", false, false)]
-    {
+    for (label, cavities, repair, refine) in [
+        ("at this exact size", true, true, false),
+        ("with both repairs OFF", false, false, false),
+        ("AS THE APPLICATION IMPORTS IT (refining itself)", true, true, true),
+    ] {
+        // Refinement off: this tool exists to report what a NAMED voxel size
+        // does, and a run that quietly moved to a different one would be
+        // answering a different question.
         let options = VoxeliseOptions {
             fill_sealed_cavities: cavities,
             repair_broken_scan_lines: repair,
+            refine_to_resolve: refine,
             ..VoxeliseOptions::at(voxel)
         };
         let started = std::time::Instant::now();

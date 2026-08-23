@@ -773,6 +773,7 @@ fn an_imported_mesh_renders() {
             fill_sealed_cavities: true,
             repair_broken_scan_lines: true,
             coarsen_to_fit: false,
+            refine_to_resolve: false,
         },
     )
     .expect("the exported sphere should voxelise");
