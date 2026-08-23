@@ -25,6 +25,7 @@ use super::{
 use glam::Vec2;
 
 use crate::app::SizingTarget;
+use crate::icon;
 use crate::message::{ConfirmChoice, ExportFormat, Message, PanelSection, TopMenu};
 use crate::spacemouse::{self, ButtonAction};
 use crate::tablet::Diagnosis;
@@ -214,10 +215,16 @@ impl Brokkr {
 
         // The window controls. The window is undecorated, so if these are not
         // here there is no way to minimise, maximise or close it at all.
-        let control = |glyph: &'static str, message: Message| {
-            button(text(glyph).size(theme::TEXT_SIZE).align_x(Alignment::Center))
-                .padding(Padding { top: 1.0, bottom: 1.0, left: theme::S3, right: theme::S3 })
-                .style(theme::section_heading)
+        //
+        // Icons rather than the en dash, white square and multiplication sign
+        // these used to be: a Unicode character is resolved through per-platform
+        // font fallback, so the same three controls draw differently on another
+        // machine. `window_control` carries the hover state in its background
+        // because an icon cannot take the button's text colour.
+        let control = |name: icon::IconName, style: theme::ButtonStyle, message: Message| {
+            button(icon::icon(name, theme::ICON_CHROME, theme::TEXT_DIM))
+                .padding(Padding { top: theme::S1, bottom: theme::S1, left: 7.0, right: 7.0 })
+                .style(style)
                 .on_press(message)
         };
 
@@ -238,9 +245,13 @@ impl Brokkr {
                         theme::TEXT_MUTE
                     }
                 ),
-            control("\u{2013}", Message::WindowMinimise),
-            control("\u{25a1}", Message::TitleBarDoubleClicked),
-            control("\u{00d7}", Message::WindowClose),
+            control(icon::IconName::Minimise, theme::window_control, Message::WindowMinimise),
+            control(
+                icon::IconName::Maximise,
+                theme::window_control,
+                Message::TitleBarDoubleClicked,
+            ),
+            control(icon::IconName::Close, theme::window_control_close, Message::WindowClose),
         ]
         .spacing(theme::S4)
         .align_y(Alignment::Center);

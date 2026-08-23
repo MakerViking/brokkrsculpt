@@ -7,6 +7,7 @@ mod breadcrumbs;
 mod camera;
 mod cursor;
 #[cfg(target_os = "linux")]
+mod icon;
 mod input_watch;
 mod logo;
 mod message;

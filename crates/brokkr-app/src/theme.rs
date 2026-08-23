@@ -71,11 +71,29 @@ pub const OK: Color = rgb(0x4a, 0xd0, 0x7d);
 pub const WARN: Color = rgb(0xe0, 0xa0, 0x20);
 /// `--error`.
 pub const ERROR: Color = rgb(0xff, 0x5c, 0x5c);
+/// `--error-tint`, a red wash behind a destructive control being hovered.
+///
+/// A wash rather than a fill, because the icon on top of it is drawn at a fixed
+/// colour and cannot lighten to stay legible the way text does — see
+/// `icon.rs`'s header.
+pub const ERROR_TINT: Color = rgba(0xff, 0x5c, 0x5c, 0.22);
 
 // Radii, from `--r-sm` through `--r-lg`.
 pub const RADIUS_SM: f32 = 6.0;
 pub const RADIUS_MD: f32 = 8.0;
 pub const RADIUS_LG: f32 = 10.0;
+
+// Icon sizes. These live here rather than at the call sites for the reason
+// SindriCAD needed a whole CSS sizing table: an icon does not inherit a font
+// size, so every control that used to hold a character needs its box named
+// somewhere. Naming them together is also what keeps the set looking like a
+// set.
+/// Window controls and the timeline's transport.
+pub const ICON_CHROME: f32 = 14.0;
+/// The tool strip, above the tool's name.
+pub const ICON_TOOL: f32 = 20.0;
+/// Inline with a line of text: a section's collapse marker.
+pub const ICON_INLINE: f32 = 11.0;
 
 // Spacing scale, `--s-1` through `--s-6`.
 pub const S1: f32 = 4.0;
@@ -254,6 +272,64 @@ pub fn section_heading(
             Status::Hovered | Status::Pressed => TEXT,
             Status::Active | Status::Disabled => TEXT_MUTE,
         },
+        ..Default::default()
+    }
+}
+
+/// The shape of every button style in this module.
+///
+/// Worth a name because a style passed as a *value* rather than called needs
+/// one: each `fn` here has its own distinct type, so a closure that takes one
+/// infers that exact function and then refuses the next, which reads as a
+/// baffling "expected fn item, found a different fn item".
+pub type ButtonStyle =
+    fn(&iced::Theme, iced::widget::button::Status) -> iced::widget::button::Style;
+
+/// A window control: minimise, maximise, close.
+///
+/// **Its hover feedback is the background, not the text colour, and that is
+/// forced rather than chosen.** [`section_heading`] — which these three used
+/// while they were Unicode characters — signals hover *only* by lifting its
+/// text from `TEXT_MUTE` to `TEXT`. An icon is a canvas drawn at a colour fixed
+/// when the widget is built, so it cannot follow that, and keeping
+/// `section_heading` would have left the window controls with no hover response
+/// at all. Moving the affordance to the background is also what every title bar
+/// does. See `icon.rs`'s header for why the colour cannot cascade.
+pub fn window_control(
+    _theme: &iced::Theme,
+    status: iced::widget::button::Status,
+) -> iced::widget::button::Style {
+    use iced::widget::button::Status;
+    iced::widget::button::Style {
+        background: match status {
+            Status::Hovered => Some(RAISED.into()),
+            Status::Pressed => Some(RAISED_2.into()),
+            Status::Active | Status::Disabled => None,
+        },
+        text_color: TEXT_DIM,
+        border: iced::Border { radius: RADIUS_SM.into(), ..Default::default() },
+        ..Default::default()
+    }
+}
+
+/// Close, which is [`window_control`] that goes red.
+///
+/// A tint rather than a filled red: the icon on top is a fixed colour and would
+/// be unreadable on a saturated fill, where text would simply have been given
+/// `ON_ACCENT`. The tint still reads as "this one is different".
+pub fn window_control_close(
+    _theme: &iced::Theme,
+    status: iced::widget::button::Status,
+) -> iced::widget::button::Style {
+    use iced::widget::button::Status;
+    iced::widget::button::Style {
+        background: match status {
+            Status::Hovered => Some(ERROR_TINT.into()),
+            Status::Pressed => Some(ERROR.into()),
+            Status::Active | Status::Disabled => None,
+        },
+        text_color: TEXT_DIM,
+        border: iced::Border { radius: RADIUS_SM.into(), ..Default::default() },
         ..Default::default()
     }
 }

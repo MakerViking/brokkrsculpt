@@ -19,7 +19,16 @@ brokkr-gpu.workspace = true
 bytemuck.workspace = true
 env_logger.workspace = true
 glam.workspace = true
-iced = { workspace = true, features = ["advanced", "wgpu", "debug"] }
+# `canvas` is the icon set, and it is the one feature of iced this project pays
+# for. Measured against this lockfile: canvas adds SIX crates -- the `lyon`
+# tessellator and `float_next_after` -- where `svg` adds THIRTY ONE (resvg,
+# usvg, rustybuzz, and four raster decoders for bitmaps an icon never carries)
+# and `image` adds seventy one. `logo.rs` predicted this trade in its own header
+# and drew the mark out of `fill_quad` rectangles rather than take it early;
+# fill_quad is axis-aligned rectangles only, which a 24px stroke icon with
+# circles and diagonals cannot be made of. A whole icon set is what earns the
+# six. See `icon.rs`.
+iced = { workspace = true, features = ["advanced", "wgpu", "debug", "canvas"] }
 log.workspace = true
 rfd.workspace = true
 serde_json = "1.0.151"
