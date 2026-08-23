@@ -3,9 +3,14 @@
 //! The icon set: minimal stroke icons on a 24 by 24 grid.
 //!
 //! The same house style as SindriCAD's `src/ui/icons.ts`, and deliberately so —
-//! the two applications are siblings and should look it. Each icon also exists
-//! as a hand-written file under `assets/icons/`, carrying the same numbers, the
-//! way `logo.rs` and `assets/brand/brokkrsculpt-mark.svg` already do.
+//! the two applications are siblings and should look it.
+//!
+//! Every icon also exists as a file under `assets/icons/`, **generated from
+//! this data** by the `write_the_svg_twins` test rather than maintained beside
+//! it. `logo.rs` and `assets/brand/brokkrsculpt-mark.svg` are hand-kept twins
+//! and rely on nobody editing one without the other; at twenty-one icons that
+//! bet is not worth taking, and generating them means the contact sheet cannot
+//! flatter a drawing the application does not actually have.
 //!
 //! # House style, hold to it when adding entries
 //!
@@ -210,31 +215,38 @@ const PATTERN_NONE: Glyph = Glyph {
 ///
 /// The grid is what `WEAVE` is, so an evenly spaced field of dots would have
 /// been a twin of it. Irregularity *is* the subject here.
+///
+/// Five fat dots rather than seven small ones. At `ICON_INLINE` a radius of
+/// 1.3 grid units is **0.6 of a pixel**, and seven of those is not a texture,
+/// it is a smudge — which is exactly how it looked in the pattern list before
+/// anyone measured it.
 const PATTERN_NOISE: Glyph = Glyph {
     subs: &[
-        Sub { segs: &[Seg::Circle { cx: 7.0, cy: 8.5, r: 1.3 }], ink: Ink::Fill },
-        Sub { segs: &[Seg::Circle { cx: 12.5, cy: 5.8, r: 1.3 }], ink: Ink::Fill },
-        Sub { segs: &[Seg::Circle { cx: 17.2, cy: 9.6, r: 1.3 }], ink: Ink::Fill },
-        Sub { segs: &[Seg::Circle { cx: 11.4, cy: 11.8, r: 1.3 }], ink: Ink::Fill },
-        Sub { segs: &[Seg::Circle { cx: 6.4, cy: 15.2, r: 1.3 }], ink: Ink::Fill },
-        Sub { segs: &[Seg::Circle { cx: 16.2, cy: 16.4, r: 1.3 }], ink: Ink::Fill },
-        Sub { segs: &[Seg::Circle { cx: 11.0, cy: 18.4, r: 1.3 }], ink: Ink::Fill },
+        Sub { segs: &[Seg::Circle { cx: 7.0, cy: 8.0, r: 1.9 }], ink: Ink::Fill },
+        Sub { segs: &[Seg::Circle { cx: 13.2, cy: 5.8, r: 1.9 }], ink: Ink::Fill },
+        Sub { segs: &[Seg::Circle { cx: 17.6, cy: 10.8, r: 1.9 }], ink: Ink::Fill },
+        Sub { segs: &[Seg::Circle { cx: 8.8, cy: 15.4, r: 1.9 }], ink: Ink::Fill },
+        Sub { segs: &[Seg::Circle { cx: 16.0, cy: 17.2, r: 1.9 }], ink: Ink::Fill },
     ],
 };
 
 /// Scales: overlapping arcs, offset row to row the way real scales lie.
+///
+/// Two big scallops and one below rather than three small ones. Three arcs on
+/// a 24 grid are about four pixels each in the pattern list, and four-pixel
+/// arcs abutting each other do not read as scales, they read as a squiggle.
 const PATTERN_SCALES: Glyph = Glyph {
     subs: &[
         Sub {
-            segs: &[Seg::Move(3.5, 11.0), Seg::Quad { cx: 8.0, cy: 4.5, x: 12.5, y: 11.0 }],
+            segs: &[Seg::Move(2.5, 12.0), Seg::Quad { cx: 7.25, cy: 3.5, x: 12.0, y: 12.0 }],
             ink: Ink::Stroke,
         },
         Sub {
-            segs: &[Seg::Move(12.5, 11.0), Seg::Quad { cx: 17.0, cy: 4.5, x: 21.0, y: 11.0 }],
+            segs: &[Seg::Move(12.0, 12.0), Seg::Quad { cx: 16.75, cy: 3.5, x: 21.5, y: 12.0 }],
             ink: Ink::Stroke,
         },
         Sub {
-            segs: &[Seg::Move(7.5, 19.5), Seg::Quad { cx: 12.0, cy: 13.0, x: 16.5, y: 19.5 }],
+            segs: &[Seg::Move(7.25, 21.0), Seg::Quad { cx: 12.0, cy: 12.5, x: 16.75, y: 21.0 }],
             ink: Ink::Stroke,
         },
     ],
@@ -289,19 +301,23 @@ const PATTERN_WEAVE: Glyph = Glyph {
 };
 
 /// Cracks: one split that forks, because a crack that never forks is a line.
+///
+/// **One** branch, not two. Two branches leave three strokes meeting near the
+/// middle, and at small sizes three strokes radiating from a point is a
+/// sparkle — which is what this drew in the pattern list, and a sparkle is
+/// SindriCAD's `cleanUp`, the opposite of carving damage in.
 const PATTERN_CRACKS: Glyph = Glyph {
     subs: &[
         Sub {
             segs: &[
-                Seg::Move(12.5, 3.5),
-                Seg::Line(10.5, 10.0),
-                Seg::Line(13.5, 15.0),
-                Seg::Line(11.5, 20.5),
+                Seg::Move(13.2, 2.6),
+                Seg::Line(10.0, 10.5),
+                Seg::Line(13.2, 15.5),
+                Seg::Line(10.6, 21.4),
             ],
             ink: Ink::Stroke,
         },
-        Sub { segs: &[Seg::Move(10.5, 10.0), Seg::Line(4.5, 12.5)], ink: Ink::Stroke },
-        Sub { segs: &[Seg::Move(13.5, 15.0), Seg::Line(19.5, 12.0)], ink: Ink::Stroke },
+        Sub { segs: &[Seg::Move(10.0, 10.5), Seg::Line(3.6, 13.4)], ink: Ink::Stroke },
     ],
 };
 
@@ -415,18 +431,29 @@ const BRUSH_PINCH: Glyph = Glyph {
     ],
 };
 
-/// Flatten: a bumpy surface meeting the plane it is levelled to.
+/// Flatten: a bump with its top taken off, level with a plane.
+///
+/// Two passes to get here, both driven by the contact sheet. It began as humps
+/// with a plane line through them, which was two curves plus a straight — and
+/// `BRUSH_SMOOTH` is two curves, so at 14 px both were "a squiggle" and
+/// `BRUSH_DRAW` was a third. Flattening the top fixed that pair and left a new
+/// one: round-topped bump against square-topped bump is a couple of pixels of
+/// difference. The dashed level is what separates them, and it is the honest
+/// drawing anyway — flatten blends toward a plane, and this is the plane.
 const BRUSH_FLATTEN: Glyph = Glyph {
     subs: &[
         Sub {
             segs: &[
-                Seg::Move(3.5, 17.5),
-                Seg::Cubic { c1x: 6.0, c1y: 9.5, c2x: 9.5, c2y: 9.5, x: 12.0, y: 17.5 },
-                Seg::Cubic { c1x: 14.5, c1y: 9.5, c2x: 18.0, c2y: 9.5, x: 20.5, y: 17.5 },
+                Seg::Move(3.5, 18.0),
+                Seg::Line(7.5, 18.0),
+                Seg::Line(9.5, 11.5),
+                Seg::Line(14.5, 11.5),
+                Seg::Line(16.5, 18.0),
+                Seg::Line(20.5, 18.0),
             ],
             ink: Ink::Stroke,
         },
-        Sub { segs: &[Seg::Move(3.0, 13.0), Seg::Line(21.0, 13.0)], ink: Ink::Stroke },
+        Sub { segs: &[Seg::Move(2.8, 11.5), Seg::Line(21.2, 11.5)], ink: Ink::Dashed },
     ],
 };
 
@@ -438,11 +465,11 @@ const BRUSH_FLATTEN: Glyph = Glyph {
 /// warps from that snapshot rather than integrating increments.
 const BRUSH_MOVE: Glyph = Glyph {
     subs: &[
-        Sub { segs: &[Seg::Move(8.0, 4.5), Seg::Line(8.0, 19.5)], ink: Ink::Dashed },
+        Sub { segs: &[Seg::Move(6.0, 4.5), Seg::Line(6.0, 19.5)], ink: Ink::Dashed },
         Sub {
             segs: &[
-                Seg::Move(8.0, 4.5),
-                Seg::Cubic { c1x: 17.0, c1y: 8.5, c2x: 17.0, c2y: 15.5, x: 8.0, y: 19.5 },
+                Seg::Move(6.0, 4.5),
+                Seg::Cubic { c1x: 19.5, c1y: 8.5, c2x: 19.5, c2y: 15.5, x: 6.0, y: 19.5 },
             ],
             ink: Ink::Stroke,
         },
@@ -631,11 +658,15 @@ impl<Message> canvas::Program<Message> for IconProgram {
                 Ink::Stroke => {
                     frame.stroke(&path, stroke_of(self.colour, canvas::LineDash::default()));
                 }
-                // In grid units, so the dash scales with everything else. Round
-                // caps make each dash a touch longer than it is specified,
-                // which is why the gap is the larger of the two.
+                // In grid units, so the dash scales with everything else. It
+                // started at 1.6 on / 2.2 off, which is 1.2 px on at the tool
+                // strip's 18 px -- under the stroke width, so it greyed out
+                // into a faint solid line and `BRUSH_MOVE` read as a plain "D"
+                // with no reference to be displaced from. Sized so the ON
+                // segment stays wider than the stroke at the smallest size the
+                // set is drawn at.
                 Ink::Dashed => {
-                    let dash = canvas::LineDash { segments: &[1.6, 2.2], offset: 0 };
+                    let dash = canvas::LineDash { segments: &DASH, offset: 0 };
                     frame.stroke(&path, stroke_of(self.colour, dash));
                 }
                 Ink::Fill => frame.fill(&path, self.colour),
@@ -690,6 +721,13 @@ fn build(segs: &[Seg]) -> canvas::Path {
     })
 }
 
+/// The dash pattern, in grid units.
+///
+/// A constant because the SVG twins have to emit the identical
+/// `stroke-dasharray`, and two places writing "2.6 2.2" independently is the
+/// drift this module goes out of its way to avoid.
+const DASH: [f32; 2] = [2.6, 2.2];
+
 /// An icon, `size` pixels square, in `colour`.
 ///
 /// The colour is not optional and has no default on purpose — see the module
@@ -697,6 +735,143 @@ fn build(segs: &[Seg]) -> canvas::Path {
 /// a selected state.
 pub fn icon<'a, Message: 'a>(name: IconName, size: f32, colour: Color) -> Element<'a, Message> {
     canvas(IconProgram { glyph: name.glyph(), colour }).width(size).height(size).into()
+}
+
+/// The kebab-case name an icon's SVG twin is filed under.
+#[cfg(test)]
+fn file_stem(name: IconName) -> String {
+    let raw = format!("{name:?}");
+    let mut out = String::new();
+    for (i, ch) in raw.char_indices() {
+        if ch.is_uppercase() && i > 0 {
+            out.push('-');
+        }
+        out.extend(ch.to_lowercase());
+    }
+    out
+}
+
+/// One icon as a standalone SVG document.
+///
+/// **Generated from the same `&'static` data the application draws**, rather
+/// than hand-written beside it. `logo.rs` and `brokkrsculpt-mark.svg` are twins
+/// maintained by hand and rely on nobody editing one without the other; with
+/// twenty-one icons that bet is not worth taking, and generating them means the
+/// contact sheet cannot flatter a drawing the application does not have.
+///
+/// `currentColor` throughout, so the files drop into a web page or a README and
+/// take their colour from it — which is how SindriCAD's set works, and the one
+/// part of its design iced could not give us at run time.
+///
+/// Test-only: the application draws from [`Glyph`] directly and never reads
+/// these files, so this exists purely to write them and to be checked.
+#[cfg(test)]
+fn to_svg(name: IconName) -> String {
+    fn n(v: f32) -> String {
+        let s = format!("{v:.2}");
+        s.trim_end_matches('0').trim_end_matches('.').to_string()
+    }
+
+    let mut body = String::new();
+    for sub in name.glyph().subs {
+        let extra = match sub.ink {
+            Ink::Stroke => String::new(),
+            Ink::Dashed => format!(r#" stroke-dasharray="{} {}""#, n(DASH[0]), n(DASH[1])),
+            Ink::Fill => r#" fill="currentColor" stroke="none""#.to_string(),
+        };
+
+        // A sub-path is either one whole shape or a run of path commands. Both
+        // exist because a circle written as four arcs is unreadable in a file
+        // somebody may want to open in an editor.
+        match sub.segs {
+            [Seg::Circle { cx, cy, r }] => body.push_str(&format!(
+                "\n  <circle cx=\"{}\" cy=\"{}\" r=\"{}\"{extra}/>",
+                n(*cx),
+                n(*cy),
+                n(*r)
+            )),
+            [Seg::Rect { x, y, w, h, r }] => body.push_str(&format!(
+                "\n  <rect x=\"{}\" y=\"{}\" width=\"{}\" height=\"{}\" rx=\"{}\"{extra}/>",
+                n(*x),
+                n(*y),
+                n(*w),
+                n(*h),
+                n(*r)
+            )),
+            segs => {
+                let mut d = String::new();
+                for seg in segs {
+                    if !d.is_empty() {
+                        d.push(' ');
+                    }
+                    match *seg {
+                        Seg::Move(x, y) => d.push_str(&format!("M{} {}", n(x), n(y))),
+                        Seg::Line(x, y) => d.push_str(&format!("L{} {}", n(x), n(y))),
+                        Seg::Quad { cx, cy, x, y } => {
+                            d.push_str(&format!("Q{} {} {} {}", n(cx), n(cy), n(x), n(y)));
+                        }
+                        Seg::Cubic { c1x, c1y, c2x, c2y, x, y } => d.push_str(&format!(
+                            "C{} {} {} {} {} {}",
+                            n(c1x),
+                            n(c1y),
+                            n(c2x),
+                            n(c2y),
+                            n(x),
+                            n(y)
+                        )),
+                        Seg::Circle { cx, cy, r } => {
+                            // Only reachable if a circle is ever mixed into a
+                            // run; approximated so the file still draws.
+                            d.push_str(&format!(
+                                "M{} {} a{} {} 0 1 0 {} 0 a{} {} 0 1 0 -{} 0",
+                                n(cx - r),
+                                n(cy),
+                                n(r),
+                                n(r),
+                                n(r * 2.0),
+                                n(r),
+                                n(r),
+                                n(r * 2.0)
+                            ));
+                        }
+                        Seg::Rect { x, y, w, h, .. } => d.push_str(&format!(
+                            "M{} {} L{} {} L{} {} L{} {} Z",
+                            n(x),
+                            n(y),
+                            n(x + w),
+                            n(y),
+                            n(x + w),
+                            n(y + h),
+                            n(x),
+                            n(y + h)
+                        )),
+                        Seg::Close => d.push('Z'),
+                    }
+                }
+                body.push_str(&format!("\n  <path d=\"{d}\"{extra}/>"));
+            }
+        }
+    }
+
+    format!(
+        concat!(
+            // No double hyphen anywhere in here. XML forbids `--` inside a
+            // comment, and the first version of this line named the cargo
+            // command that generates the file -- which contains `-- --ignored`
+            // -- so all twenty-one files were unparseable XML. They rendered
+            // in nothing, and the only reason it surfaced is that something
+            // tried to rasterise one.
+            "<!-- Generated from crates/brokkr-app/src/icon.rs by the\n",
+            "     write_the_svg_twins test. Edit the drawing there, not here. -->\n",
+            "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 {} {}\" fill=\"none\"\n",
+            "     stroke=\"currentColor\" stroke-width=\"{}\" stroke-linecap=\"round\"\n",
+            "     stroke-linejoin=\"round\">{}\n</svg>\n"
+        ),
+        n(VIEWBOX),
+        n(VIEWBOX),
+        n(STROKE_WIDTH),
+        body
+    )
 }
 
 #[cfg(test)]
@@ -824,5 +999,105 @@ mod tests {
                 "{name:?} appears twice in IconName::ALL, so something else is missing from it"
             );
         }
+    }
+
+    #[test]
+    fn every_svg_twin_carries_the_house_style_and_no_colour() {
+        for name in IconName::ALL {
+            let svg = to_svg(name);
+            assert!(svg.contains(r#"viewBox="0 0 24 24""#), "{name:?} lost its viewBox");
+            assert!(svg.contains(r#"stroke-width="1.6""#), "{name:?} lost the house stroke");
+            assert!(svg.contains(r#"stroke="currentColor""#), "{name:?} lost currentColor");
+            // The one rule the whole set rests on. A colour baked into a twin
+            // would look right on a dark contact sheet and then refuse to
+            // follow a selected button, which is the failure this module goes
+            // out of its way to design against.
+            assert!(
+                !svg.contains('#') && !svg.to_lowercase().contains("rgb("),
+                "{name:?} has a colour baked into it"
+            );
+            assert!(
+                svg.contains("<path") || svg.contains("<circle") || svg.contains("<rect"),
+                "{name:?} emitted no shapes"
+            );
+
+            // XML forbids `--` inside a comment, and the header comment here
+            // once named the cargo command that writes these files -- which
+            // contains one. Every file was unparseable and rendered as nothing
+            // at all, which no amount of looking at the application would have
+            // shown, because the application does not read them.
+            let comment = svg.split("-->").next().unwrap_or_default();
+            let opened = comment.strip_prefix("<!--").unwrap_or(comment);
+            assert!(
+                !opened.contains("--"),
+                "{name:?} has a double hyphen in its comment, so the file is not valid XML"
+            );
+        }
+    }
+
+    /// Write the SVG twins and a contact sheet, then go and look at them.
+    ///
+    /// `#[ignore]`d because it writes into the repository — the same reason the
+    /// bug reporter's live test is ignored for filing a real report. Run it
+    /// with `cargo test -p brokkr-app -- --ignored write_the_svg_twins
+    /// --nocapture` after changing any drawing.
+    ///
+    /// The sheet renders every icon at the three sizes the application actually
+    /// uses, because that is the only way this catches anything. SindriCAD
+    /// found four twins and two illegible drawings only once the whole set was
+    /// rendered together **at shipping size**, and judging enlarged had hidden
+    /// all six. This project has now repeated that twice: a pinch that was a
+    /// twin of draw at 18 px, and a noise whose dots came out 0.6 px across.
+    #[test]
+    #[ignore]
+    fn write_the_svg_twins() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let dir = root.join("assets/icons");
+        std::fs::create_dir_all(&dir).expect("creating assets/icons");
+
+        let mut cells = String::new();
+        for name in IconName::ALL {
+            let stem = file_stem(name);
+            let svg = to_svg(name);
+            std::fs::write(dir.join(format!("{stem}.svg")), &svg).expect("writing an icon");
+            cells.push_str(&format!(
+                "<figure><div class=\"row\">\
+                 <span class=\"s24\">{svg}</span>\
+                 <span class=\"s18\">{svg}</span>\
+                 <span class=\"s14\">{svg}</span></div>\
+                 <figcaption>{stem}</figcaption></figure>\n"
+            ));
+        }
+
+        let sheet = format!(
+            "<!doctype html><meta charset=utf-8>\n\
+             <title>BrokkrSculpt icons</title>\n\
+             <style>\n\
+             body{{background:#0e0f12;color:#9aa3af;\
+             font:13px/1.4 Inter,system-ui,sans-serif;margin:0;padding:28px}}\n\
+             h1{{color:#e6e8ec;font-size:15px;font-weight:600;margin:0 0 4px}}\n\
+             p{{color:#6b7280;font-size:11px;margin:0 0 24px}}\n\
+             .grid{{display:grid;\
+             grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:18px}}\n\
+             figure{{margin:0;background:#16181d;border:1px solid #262a31;\
+             border-radius:6px;padding:14px 10px}}\n\
+             .row{{display:flex;align-items:center;justify-content:center;\
+             gap:12px;min-height:34px}}\n\
+             .s24 svg{{width:24px;height:24px;display:block}}\n\
+             .s18 svg{{width:18px;height:18px;display:block}}\n\
+             .s14 svg{{width:14px;height:14px;display:block}}\n\
+             figcaption{{color:#6b7280;font-size:10px;text-align:center;\
+             margin-top:10px}}\n\
+             </style>\n\
+             <h1>BrokkrSculpt icons</h1>\n\
+             <p>Every icon at 24, 18 and 14 pixels &mdash; the three sizes the \
+             application draws. Judge them here, at these sizes, never enlarged.</p>\n\
+             <div class=\"grid\">\n{cells}</div>\n"
+        );
+        let sheet_path = root.join("docs/icons.html");
+        std::fs::write(&sheet_path, sheet).expect("writing the contact sheet");
+
+        println!("wrote {} icons to {}", IconName::ALL.len(), dir.display());
+        println!("contact sheet: {}", sheet_path.display());
     }
 }

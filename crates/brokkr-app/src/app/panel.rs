@@ -1141,8 +1141,10 @@ impl Brokkr {
 
         let history = row![
             button(text("Undo").size(theme::TEXT_SIZE_SMALL))
+                .style(theme::tool_button)
                 .on_press_maybe(self.history.can_undo().then_some(Message::Undo)),
             button(text("Redo").size(theme::TEXT_SIZE_SMALL))
+                .style(theme::tool_button)
                 .on_press_maybe(self.history.can_redo().then_some(Message::Redo)),
         ]
         .spacing(theme::S2);
@@ -1164,6 +1166,7 @@ impl Brokkr {
                 self.section(PanelSection::Detail, || self.detail_panel()),
                 self.section(PanelSection::Export, || self.export_panel()),
                 button(text("Reset sphere").size(theme::TEXT_SIZE_SMALL))
+                    .style(theme::tool_button)
                     .on_press(Message::ResetSphere),
                 text(
                     "drag: sculpt\nctrl or alt drag: invert\nshift drag: smooth\nright drag: orbit\nshift right drag: pan\nwheel: zoom\n1-6: brush\nx y z: mirror\n[ ]: radius\nctrl z, ctrl shift z: undo, redo"
@@ -1321,9 +1324,11 @@ impl Brokkr {
             row![
                 button(text("Invert all").size(theme::CAPTION_SIZE))
                     .width(Length::Fill)
+                    .style(theme::tool_button)
                     .on_press(Message::SpaceMouse(SpaceMouseSetting::InvertAll)),
                 button(text("Reset").size(theme::CAPTION_SIZE))
                     .width(Length::Fill)
+                    .style(theme::tool_button)
                     .on_press(Message::SpaceMouse(SpaceMouseSetting::Reset)),
             ]
             .spacing(theme::S2),
@@ -1411,15 +1416,31 @@ impl Brokkr {
 
         let kinds =
             PatternKind::ALL.into_iter().fold(column![].spacing(theme::S1), |assembled, kind| {
+                let (style, ink) = theme::tool_toggle(kind == pattern.kind);
                 assembled.push(
-                    button(text(kind.label()).size(theme::CAPTION_SIZE))
+                    button(
+                        // A container, because a row lays its children out from
+                        // its left edge and a button does not centre `Shrink`
+                        // content -- so neither `row` nor `button` alone can put
+                        // this pair in the middle of a full-width row.
+                        container(
+                            row![
+                                icon::icon(
+                                    icon::IconName::for_pattern(kind),
+                                    theme::ICON_CHROME,
+                                    ink
+                                ),
+                                text(kind.label()).size(theme::CAPTION_SIZE),
+                            ]
+                            .spacing(theme::S2)
+                            .align_y(Alignment::Center),
+                        )
                         .width(Length::Fill)
-                        .style(if kind == pattern.kind {
-                            theme::tool_button_active
-                        } else {
-                            theme::tool_button
-                        })
-                        .on_press(Message::PatternChanged(kind)),
+                        .align_x(Alignment::Center),
+                    )
+                    .width(Length::Fill)
+                    .style(style)
+                    .on_press(Message::PatternChanged(kind)),
                 )
             });
 
@@ -1483,10 +1504,13 @@ impl Brokkr {
                 .color(theme::TEXT_DIM),
             row![
                 button(text("finer").size(theme::TEXT_SIZE_SMALL))
+                    .style(theme::tool_button)
                     .on_press_maybe((finer >= FINEST_VOXEL_MM).then_some(Message::Resample(finer))),
-                button(text("coarser").size(theme::TEXT_SIZE_SMALL)).on_press_maybe(
-                    (coarser <= COARSEST_VOXEL_MM).then_some(Message::Resample(coarser))
-                ),
+                button(text("coarser").size(theme::TEXT_SIZE_SMALL))
+                    .style(theme::tool_button)
+                    .on_press_maybe(
+                        (coarser <= COARSEST_VOXEL_MM).then_some(Message::Resample(coarser))
+                    ),
             ]
             .spacing(theme::S2),
             text("Print size").size(theme::TEXT_SIZE_SMALL).color(theme::TEXT_DIM),
@@ -1496,6 +1520,7 @@ impl Brokkr {
                     .on_submit(Message::WorkingSizeCommitted)
                     .size(theme::TEXT_SIZE_SMALL),
                 button(text("set").size(theme::TEXT_SIZE_SMALL))
+                    .style(theme::tool_button)
                     .on_press(Message::WorkingSizeCommitted),
             ]
             .spacing(theme::S2),
@@ -1514,6 +1539,7 @@ impl Brokkr {
             ExportFormat::ALL.into_iter().fold(row![].spacing(theme::S2), |assembled, format| {
                 assembled.push(
                     button(text(format.label()).size(theme::TEXT_SIZE_SMALL))
+                        .style(theme::tool_button)
                         .on_press(Message::Export(format)),
                 )
             });
@@ -1611,6 +1637,7 @@ impl Brokkr {
             row![
                 text(live).size(theme::CAPTION_SIZE).font(theme::MONO).color(theme::TEXT_DIM),
                 button(text("reset").size(theme::CAPTION_SIZE))
+                    .style(theme::tool_button)
                     .on_press(Message::ResetPressurePeak),
             ]
             .spacing(theme::S2)

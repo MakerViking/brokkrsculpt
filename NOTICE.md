@@ -145,6 +145,12 @@ models to attribute.
 - `assets/brand/*.svg` — the BrokkrSculpt lockup and mark, hand-written SVG.
   They deliberately share the molten gradient of SindriCAD's mark, which is the
   same author's.
+- `assets/icons/*.svg` — the user-interface icon set, **generated** from
+  `crates/brokkr-app/src/icon.rs`, which is where the drawings live. Original
+  work, drawn for this project. They follow the same house style as SindriCAD's
+  icons — a 24 by 24 grid, 1.6 stroke, round caps, `currentColor` throughout —
+  because that is the same author's set too; no third-party icon library is
+  used, vendored or traced.
 
 **No font files are shipped.** The lockups name a font *stack* and fall back
 through the system's own faces, so nothing here embeds a typeface. Converting
