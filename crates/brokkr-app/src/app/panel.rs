@@ -789,14 +789,11 @@ impl Brokkr {
 
         let patterns =
             PatternKind::ALL.into_iter().fold(row![].spacing(theme::S1), |assembled, kind| {
+                let (style, ink) = theme::tool_toggle(kind == self.brush.pattern.kind);
                 assembled.push(
-                    button(text(kind.short_label()).size(theme::CAPTION_SIZE))
+                    button(icon::icon(icon::IconName::for_pattern(kind), theme::ICON_CHROME, ink))
                         .width(Length::Fill)
-                        .style(if kind == self.brush.pattern.kind {
-                            theme::tool_button_active
-                        } else {
-                            theme::tool_button
-                        })
+                        .style(style)
                         .on_press(Message::PatternChanged(kind)),
                 )
             });
@@ -1009,12 +1006,14 @@ impl Brokkr {
             .on_exit(Message::TimelineLeft)
             .on_right_press(Message::TimelineRemoveKey);
 
-        let play = button(
-            text(if self.timeline.playing { "\u{25a0}" } else { "\u{25b6}" })
-                .size(theme::CAPTION_SIZE),
-        )
+        let (play_style, play_ink) = theme::tool_toggle(self.timeline.playing);
+        let play = button(icon::icon(
+            if self.timeline.playing { icon::IconName::Stop } else { icon::IconName::Play },
+            theme::ICON_CHROME,
+            play_ink,
+        ))
         .padding(Padding { top: 1.0, right: 6.0, bottom: 1.0, left: 6.0 })
-        .style(if self.timeline.playing { theme::tool_button_active } else { theme::tool_button })
+        .style(play_style)
         .on_press_maybe((self.timeline.keys.len() >= 2).then_some(Message::TimelinePlayToggled));
 
         let hint = match self.timeline.keys.len() {
@@ -1331,12 +1330,19 @@ impl Brokkr {
         let open = self.expanded[which as usize];
         let heading = button(
             row![
-                text(if open { "−" } else { "+" })
-                    .size(theme::CAPTION_SIZE)
-                    .color(theme::TEXT_MUTE)
-                    .width(Length::Fixed(10.0)),
+                // The caret keeps `TEXT_MUTE` through hover while the title
+                // beside it lifts to `TEXT`, because `section_heading` signals
+                // hover through `text_color` and an icon cannot follow that.
+                // Tolerable here, unlike on the window controls, precisely
+                // because there IS a word next to it still doing the job.
+                icon::icon(
+                    if open { icon::IconName::CaretDown } else { icon::IconName::CaretRight },
+                    theme::ICON_INLINE,
+                    theme::TEXT_MUTE,
+                ),
                 text(which.title()).size(theme::CAPTION_SIZE).color(theme::TEXT_MUTE),
             ]
+            .align_y(Alignment::Center)
             .spacing(theme::S2),
         )
         .width(Length::Fill)

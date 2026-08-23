@@ -285,6 +285,21 @@ pub fn section_heading(
 pub type ButtonStyle =
     fn(&iced::Theme, iced::widget::button::Status) -> iced::widget::button::Style;
 
+/// The style *and* the icon colour for a control that can be selected.
+///
+/// **Always take both from here; never pick one beside the other.** Nothing in
+/// the type system ties an icon's colour to the button it sits in, and the two
+/// disagree badly if they drift: [`tool_button_active`] fills with `ACCENT` and
+/// drops its foreground to a near-black `ON_ACCENT`, where [`tool_button`]
+/// leaves it `TEXT_DIM` on a dark panel. Text follows that automatically
+/// because the button sets `text_color`. An icon cannot — it is a canvas drawn
+/// at a colour fixed when the widget is built — so a call site that chose the
+/// style here and the colour by hand would eventually put a near-black icon on
+/// a near-black panel, and nothing would fail. See `icon.rs`'s header.
+pub fn tool_toggle(selected: bool) -> (ButtonStyle, Color) {
+    if selected { (tool_button_active, ON_ACCENT) } else { (tool_button, TEXT_DIM) }
+}
+
 /// A window control: minimise, maximise, close.
 ///
 /// **Its hover feedback is the background, not the text colour, and that is

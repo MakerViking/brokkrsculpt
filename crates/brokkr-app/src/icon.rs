@@ -43,6 +43,7 @@
 //! same time and costs **thirty one** — resvg, usvg, rustybuzz and four raster
 //! decoders for bitmaps an icon never carries. Six is the price of the set.
 
+use brokkr_core::PatternKind;
 use iced::widget::canvas;
 use iced::{Color, Element, Point, Renderer, Size, Theme};
 
@@ -65,14 +66,25 @@ const STROKE_WIDTH: f32 = 1.6;
 /// A small vocabulary on purpose. It is `&'static` data rather than a closure
 /// so the tests can walk every icon and check its bounds — which is how
 /// SindriCAD found paths that were empty or outside the viewBox.
+///
+/// Named fields on everything past two numbers: `Rect(6.5, 6.5, 11.0, 11.0,
+/// 1.0)` reads as five anonymous floats at the call site, and a cubic has six.
 #[derive(Clone, Copy, PartialEq)]
 enum Seg {
     /// Start a new sub-path.
     Move(f32, f32),
     /// Straight line from the current point.
     Line(f32, f32),
-    /// An axis-aligned rectangle with a corner radius: `(x, y, w, h, r)`.
-    Rect(f32, f32, f32, f32, f32),
+    /// Quadratic Bézier from the current point, through one control point.
+    Quad { cx: f32, cy: f32, x: f32, y: f32 },
+    /// Cubic Bézier from the current point, through two control points.
+    Cubic { c1x: f32, c1y: f32, c2x: f32, c2y: f32, x: f32, y: f32 },
+    /// A whole circle. Stroked it is an outline, filled it is a dot.
+    Circle { cx: f32, cy: f32, r: f32 },
+    /// An axis-aligned rectangle with a corner radius.
+    Rect { x: f32, y: f32, w: f32, h: f32, r: f32 },
+    /// Join the last point back to where this sub-path started.
+    Close,
 }
 
 /// How a sub-path is inked.
@@ -80,6 +92,10 @@ enum Seg {
 enum Ink {
     /// The default, and nearly everything: a stroked outline.
     Stroke,
+    /// Solid. The house style reserves this for dots and for the one or two
+    /// shapes whose whole meaning is that they are solid — a play triangle
+    /// outlined reads as a direction, not as a button.
+    Fill,
 }
 
 /// One sub-path of an icon, and how it is drawn.
@@ -114,8 +130,169 @@ const MINIMISE: Glyph = Glyph {
 };
 
 /// Maximise: the window's outline.
-const MAXIMISE: Glyph =
-    Glyph { subs: &[Sub { segs: &[Seg::Rect(6.5, 6.5, 11.0, 11.0, 1.0)], ink: Ink::Stroke }] };
+const MAXIMISE: Glyph = Glyph {
+    subs: &[Sub {
+        segs: &[Seg::Rect { x: 6.5, y: 6.5, w: 11.0, h: 11.0, r: 1.0 }],
+        ink: Ink::Stroke,
+    }],
+};
+
+// --- the timeline's transport ------------------------------------------------
+
+/// Play: a solid triangle.
+///
+/// Filled rather than outlined because an outlined triangle reads as "this way"
+/// — a direction — where a solid one reads as a button. SindriCAD's transport
+/// quartet is solid for the same reason.
+const PLAY: Glyph = Glyph {
+    subs: &[Sub {
+        segs: &[Seg::Move(8.5, 5.5), Seg::Line(18.0, 12.0), Seg::Line(8.5, 18.5), Seg::Close],
+        ink: Ink::Fill,
+    }],
+};
+
+/// Stop: a solid square.
+const STOP: Glyph = Glyph {
+    subs: &[Sub {
+        segs: &[Seg::Rect { x: 7.0, y: 7.0, w: 10.0, h: 10.0, r: 1.0 }],
+        ink: Ink::Fill,
+    }],
+};
+
+// --- section headings --------------------------------------------------------
+
+/// An open section: a caret pointing down at the contents it is showing.
+///
+/// A caret rather than the minus sign this replaced. A centred horizontal rule
+/// would have been the same drawing as [`MINIMISE`], and while the two are far
+/// apart on screen, "the same drawing means the same thing" is a promise worth
+/// keeping across a set. It is also what SindriCAD's tree uses.
+const CARET_DOWN: Glyph = Glyph {
+    subs: &[Sub {
+        segs: &[Seg::Move(6.5, 9.5), Seg::Line(12.0, 15.0), Seg::Line(17.5, 9.5)],
+        ink: Ink::Stroke,
+    }],
+};
+
+/// A closed section: the same caret, turned to point at its heading.
+const CARET_RIGHT: Glyph = Glyph {
+    subs: &[Sub {
+        segs: &[Seg::Move(9.5, 6.5), Seg::Line(15.0, 12.0), Seg::Line(9.5, 17.5)],
+        ink: Ink::Stroke,
+    }],
+};
+
+// --- the pattern modifier ----------------------------------------------------
+
+/// No pattern: the universal "none".
+///
+/// A ring with a bar through it rather than a bare dash, because this sits in a
+/// row of six and has to read as *off* rather than as one more texture.
+const PATTERN_NONE: Glyph = Glyph {
+    subs: &[
+        Sub { segs: &[Seg::Circle { cx: 12.0, cy: 12.0, r: 6.5 }], ink: Ink::Stroke },
+        Sub { segs: &[Seg::Move(7.4, 16.6), Seg::Line(16.6, 7.4)], ink: Ink::Stroke },
+    ],
+};
+
+/// Noise: scattered dots, deliberately at no spacing you could call a grid.
+///
+/// The grid is what `WEAVE` is, so an evenly spaced field of dots would have
+/// been a twin of it. Irregularity *is* the subject here.
+const PATTERN_NOISE: Glyph = Glyph {
+    subs: &[
+        Sub { segs: &[Seg::Circle { cx: 7.0, cy: 8.5, r: 1.3 }], ink: Ink::Fill },
+        Sub { segs: &[Seg::Circle { cx: 12.5, cy: 5.8, r: 1.3 }], ink: Ink::Fill },
+        Sub { segs: &[Seg::Circle { cx: 17.2, cy: 9.6, r: 1.3 }], ink: Ink::Fill },
+        Sub { segs: &[Seg::Circle { cx: 11.4, cy: 11.8, r: 1.3 }], ink: Ink::Fill },
+        Sub { segs: &[Seg::Circle { cx: 6.4, cy: 15.2, r: 1.3 }], ink: Ink::Fill },
+        Sub { segs: &[Seg::Circle { cx: 16.2, cy: 16.4, r: 1.3 }], ink: Ink::Fill },
+        Sub { segs: &[Seg::Circle { cx: 11.0, cy: 18.4, r: 1.3 }], ink: Ink::Fill },
+    ],
+};
+
+/// Scales: overlapping arcs, offset row to row the way real scales lie.
+const PATTERN_SCALES: Glyph = Glyph {
+    subs: &[
+        Sub {
+            segs: &[Seg::Move(3.5, 11.0), Seg::Quad { cx: 8.0, cy: 4.5, x: 12.5, y: 11.0 }],
+            ink: Ink::Stroke,
+        },
+        Sub {
+            segs: &[Seg::Move(12.5, 11.0), Seg::Quad { cx: 17.0, cy: 4.5, x: 21.0, y: 11.0 }],
+            ink: Ink::Stroke,
+        },
+        Sub {
+            segs: &[Seg::Move(7.5, 19.5), Seg::Quad { cx: 12.0, cy: 13.0, x: 16.5, y: 19.5 }],
+            ink: Ink::Stroke,
+        },
+    ],
+};
+
+/// Hair: strokes that all comb the same way.
+///
+/// Hair is the one pattern evaluated along the stroke rather than in world
+/// space — it combs along the drag — so every line leaning together is the
+/// honest drawing of it.
+const PATTERN_HAIR: Glyph = Glyph {
+    subs: &[
+        Sub {
+            segs: &[
+                Seg::Move(4.5, 19.5),
+                Seg::Cubic { c1x: 5.5, c1y: 13.0, c2x: 7.0, c2y: 8.0, x: 9.5, y: 4.5 },
+            ],
+            ink: Ink::Stroke,
+        },
+        Sub {
+            segs: &[
+                Seg::Move(9.5, 19.5),
+                Seg::Cubic { c1x: 10.5, c1y: 13.0, c2x: 12.0, c2y: 8.0, x: 14.5, y: 4.5 },
+            ],
+            ink: Ink::Stroke,
+        },
+        Sub {
+            segs: &[
+                Seg::Move(14.5, 19.5),
+                Seg::Cubic { c1x: 15.5, c1y: 13.0, c2x: 17.0, c2y: 8.0, x: 19.5, y: 4.5 },
+            ],
+            ink: Ink::Stroke,
+        },
+    ],
+};
+
+/// Weave: threads crossing, with the verticals broken where they pass under.
+///
+/// The breaks are the whole icon. An unbroken grid is a grid — SindriCAD's
+/// `texture` — and says nothing about interlacing.
+const PATTERN_WEAVE: Glyph = Glyph {
+    subs: &[
+        Sub { segs: &[Seg::Move(4.0, 9.0), Seg::Line(20.0, 9.0)], ink: Ink::Stroke },
+        Sub { segs: &[Seg::Move(4.0, 15.0), Seg::Line(20.0, 15.0)], ink: Ink::Stroke },
+        // Broken at y=9, so it passes under the upper thread and over the lower.
+        Sub { segs: &[Seg::Move(9.0, 4.0), Seg::Line(9.0, 7.6)], ink: Ink::Stroke },
+        Sub { segs: &[Seg::Move(9.0, 10.4), Seg::Line(9.0, 20.0)], ink: Ink::Stroke },
+        // And the mirror of it, so the over-under alternates like real weave.
+        Sub { segs: &[Seg::Move(15.0, 4.0), Seg::Line(15.0, 13.6)], ink: Ink::Stroke },
+        Sub { segs: &[Seg::Move(15.0, 16.4), Seg::Line(15.0, 20.0)], ink: Ink::Stroke },
+    ],
+};
+
+/// Cracks: one split that forks, because a crack that never forks is a line.
+const PATTERN_CRACKS: Glyph = Glyph {
+    subs: &[
+        Sub {
+            segs: &[
+                Seg::Move(12.5, 3.5),
+                Seg::Line(10.5, 10.0),
+                Seg::Line(13.5, 15.0),
+                Seg::Line(11.5, 20.5),
+            ],
+            ink: Ink::Stroke,
+        },
+        Sub { segs: &[Seg::Move(10.5, 10.0), Seg::Line(4.5, 12.5)], ink: Ink::Stroke },
+        Sub { segs: &[Seg::Move(13.5, 15.0), Seg::Line(19.5, 12.0)], ink: Ink::Stroke },
+    ],
+};
 
 /// Every icon in the set.
 ///
@@ -127,6 +304,16 @@ pub enum IconName {
     Close,
     Minimise,
     Maximise,
+    Play,
+    Stop,
+    CaretDown,
+    CaretRight,
+    PatternNone,
+    PatternNoise,
+    PatternScales,
+    PatternHair,
+    PatternWeave,
+    PatternCracks,
 }
 
 impl IconName {
@@ -138,13 +325,54 @@ impl IconName {
     /// set's index, and anything that needs the whole set rather than one icon
     /// starts here.
     #[allow(dead_code)]
-    pub const ALL: [IconName; 3] = [IconName::Close, IconName::Minimise, IconName::Maximise];
+    pub const ALL: [IconName; 13] = [
+        IconName::Close,
+        IconName::Minimise,
+        IconName::Maximise,
+        IconName::Play,
+        IconName::Stop,
+        IconName::CaretDown,
+        IconName::CaretRight,
+        IconName::PatternNone,
+        IconName::PatternNoise,
+        IconName::PatternScales,
+        IconName::PatternHair,
+        IconName::PatternWeave,
+        IconName::PatternCracks,
+    ];
+
+    /// The icon standing for a surface pattern.
+    ///
+    /// A match rather than a lookup table, so a new `PatternKind` cannot be
+    /// added without being given a drawing — the same guarantee SindriCAD gets
+    /// from typing `FEATURE_META` against `IconName`, where a feature type with
+    /// no icon is a compile error rather than a blank square at run time.
+    pub fn for_pattern(kind: PatternKind) -> Self {
+        match kind {
+            PatternKind::None => IconName::PatternNone,
+            PatternKind::Noise => IconName::PatternNoise,
+            PatternKind::Scales => IconName::PatternScales,
+            PatternKind::Hair => IconName::PatternHair,
+            PatternKind::Weave => IconName::PatternWeave,
+            PatternKind::Cracks => IconName::PatternCracks,
+        }
+    }
 
     fn glyph(self) -> &'static Glyph {
         match self {
             IconName::Close => &CLOSE,
             IconName::Minimise => &MINIMISE,
             IconName::Maximise => &MAXIMISE,
+            IconName::Play => &PLAY,
+            IconName::Stop => &STOP,
+            IconName::CaretDown => &CARET_DOWN,
+            IconName::CaretRight => &CARET_RIGHT,
+            IconName::PatternNone => &PATTERN_NONE,
+            IconName::PatternNoise => &PATTERN_NOISE,
+            IconName::PatternScales => &PATTERN_SCALES,
+            IconName::PatternHair => &PATTERN_HAIR,
+            IconName::PatternWeave => &PATTERN_WEAVE,
+            IconName::PatternCracks => &PATTERN_CRACKS,
         }
     }
 }
@@ -196,6 +424,7 @@ impl<Message> canvas::Program<Message> for IconProgram {
                         ..canvas::Stroke::default()
                     },
                 ),
+                Ink::Fill => frame.fill(&path, self.colour),
             }
         }
 
@@ -210,11 +439,23 @@ fn build(segs: &[Seg]) -> canvas::Path {
             match *seg {
                 Seg::Move(x, y) => builder.move_to(Point::new(x, y)),
                 Seg::Line(x, y) => builder.line_to(Point::new(x, y)),
-                Seg::Rect(x, y, w, h, r) => builder.rounded_rectangle(
+                Seg::Quad { cx, cy, x, y } => {
+                    builder.quadratic_curve_to(Point::new(cx, cy), Point::new(x, y));
+                }
+                Seg::Cubic { c1x, c1y, c2x, c2y, x, y } => {
+                    builder.bezier_curve_to(
+                        Point::new(c1x, c1y),
+                        Point::new(c2x, c2y),
+                        Point::new(x, y),
+                    );
+                }
+                Seg::Circle { cx, cy, r } => builder.circle(Point::new(cx, cy), r),
+                Seg::Rect { x, y, w, h, r } => builder.rounded_rectangle(
                     Point::new(x, y),
                     Size::new(w, h),
                     iced::border::Radius::new(r),
                 ),
+                Seg::Close => builder.close(),
             }
         }
     })
@@ -235,18 +476,38 @@ mod tests {
 
     /// Walk every point an icon names, so a glyph can be measured without
     /// caring which segment produced a coordinate.
+    ///
+    /// A curve's control points are included even though the curve itself
+    /// stays inside its hull. That makes the bounds check **conservative**: a
+    /// design could in principle be refused for a control point that never
+    /// draws anywhere near the edge. That is the safe direction to be wrong in,
+    /// and no icon in the set has needed the slack.
     fn points(glyph: &Glyph) -> Vec<(f32, f32)> {
         let mut out = Vec::new();
         for sub in glyph.subs {
             for seg in sub.segs {
                 match *seg {
                     Seg::Move(x, y) | Seg::Line(x, y) => out.push((x, y)),
+                    Seg::Quad { cx, cy, x, y } => {
+                        out.push((cx, cy));
+                        out.push((x, y));
+                    }
+                    Seg::Cubic { c1x, c1y, c2x, c2y, x, y } => {
+                        out.push((c1x, c1y));
+                        out.push((c2x, c2y));
+                        out.push((x, y));
+                    }
+                    Seg::Circle { cx, cy, r } => {
+                        out.push((cx - r, cy - r));
+                        out.push((cx + r, cy + r));
+                    }
                     // Both corners, so a rectangle cannot hang out of the grid
                     // at the far end while its origin sits comfortably inside.
-                    Seg::Rect(x, y, w, h, _) => {
+                    Seg::Rect { x, y, w, h, .. } => {
                         out.push((x, y));
                         out.push((x + w, y + h));
                     }
+                    Seg::Close => {}
                 }
             }
         }
@@ -280,7 +541,16 @@ mod tests {
         // pen put down and never moved. Counting segments instead called the
         // maximise icon empty, which is how this wording was arrived at.
         fn draws_something(sub: &Sub) -> bool {
-            sub.segs.iter().any(|seg| matches!(seg, Seg::Line(..) | Seg::Rect(..)))
+            sub.segs.iter().any(|seg| {
+                matches!(
+                    seg,
+                    Seg::Line(..)
+                        | Seg::Quad { .. }
+                        | Seg::Cubic { .. }
+                        | Seg::Circle { .. }
+                        | Seg::Rect { .. }
+                )
+            })
         }
 
         for name in IconName::ALL {

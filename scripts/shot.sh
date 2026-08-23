@@ -45,30 +45,42 @@ qdbus6 org.kde.KWin /Scripting org.kde.kwin.Scripting.unloadScript "$NAME" >/dev
 # The compositor needs a moment to raise and refocus before the grab.
 sleep 1.5
 
-# Then CHECK it worked, because activation is a request and not a guarantee.
+# Ask the compositor a question and read the answer back out of the journal.
+#
+# A KWin script has no return channel -- `print` goes to the journal -- so each
+# question carries a unique marker and finds its own answer by it. Reusing one
+# marker would read a previous run's reply, which is the same class of mistake
+# as reading a stale window position out of `journalctl`.
+kwin_ask() {
+    local body="$1" marker script name id
+    marker="brokkr-ask-$$-$RANDOM"
+    script=$(mktemp /tmp/kwin-ask-XXXXXX.js)
+    printf 'const MARKER = "%s";\n%s\n' "$marker" "$body" >"$script"
+    name="brokkr-ask-$$-$RANDOM"
+    id=$(qdbus6 org.kde.KWin /Scripting org.kde.kwin.Scripting.loadScript "$script" "$name")
+    qdbus6 org.kde.KWin "/Scripting/Script${id}" org.kde.kwin.Script.run
+    qdbus6 org.kde.KWin /Scripting org.kde.kwin.Scripting.unloadScript "$name" >/dev/null
+    rm -f "$script"
+    journalctl --user -b --since "-20s" 2>/dev/null |
+        grep -o "${marker} .*" | tail -1 | cut -d' ' -f2- | tr -d '\r'
+}
+
+active_class() {
+    kwin_ask 'const a = workspace.activeWindow;
+              print(MARKER + " " + (a ? a.resourceClass : "none"));'
+}
+
+# CHECK the activation worked, because activation is a request and not a
+# guarantee.
 #
 # `spectacle -a` captures whatever is active at the moment it runs, so if the
 # activation above lost a race -- a busy desktop, a video player taking focus
 # back, a window that was still mapping -- the capture silently becomes a
 # picture of somebody else's window. That is not a wasted screenshot: on
-# 2026-08-19 it captured a media player mid-playback and put it in an agent's
-# context. Whatever is on this desktop is nobody's business but its owner's, so
-# this asks the compositor what is actually focused and refuses rather than
-# guessing.
-MARKER="brokkr-active-$$-$RANDOM"
-PROBE=$(mktemp /tmp/kwin-probe-XXXXXX.js)
-cat >"$PROBE" <<EOF
-const active = workspace.activeWindow;
-print("${MARKER} " + (active ? active.resourceClass : "none"));
-EOF
-PROBE_NAME="brokkr-probe-$$-$RANDOM"
-PROBE_ID=$(qdbus6 org.kde.KWin /Scripting org.kde.kwin.Scripting.loadScript "$PROBE" "$PROBE_NAME")
-qdbus6 org.kde.KWin "/Scripting/Script${PROBE_ID}" org.kde.kwin.Script.run
-qdbus6 org.kde.KWin /Scripting org.kde.kwin.Scripting.unloadScript "$PROBE_NAME" >/dev/null
-rm -f "$PROBE"
-
-ACTIVE=$(journalctl --user -b --since "-20s" 2>/dev/null |
-    grep -o "${MARKER} .*" | tail -1 | cut -d' ' -f2- | tr -d '\r')
+# 2026-08-19 it captured a media player mid-playback, and on 2026-08-23 a
+# browser showing a private session, both straight into an agent's context.
+# Whatever is on this desktop is nobody's business but its owner's.
+ACTIVE=$(active_class)
 
 if [[ -z "$ACTIVE" ]]; then
     echo "could not ask the compositor what is focused, so not taking a screenshot" >&2
@@ -80,6 +92,19 @@ if [[ "${ACTIVE,,}" != *"${CLASS,,}"* ]]; then
     exit 1
 fi
 
+# What shape the window we are aiming at actually is, asked before the grab so
+# the image can be checked against it afterwards.
+GEOM=$(kwin_ask 'const wanted = "'"${CLASS}"'";
+                 for (const w of workspace.windowList()) {
+                     const k = (w.resourceClass || "").toString().toLowerCase();
+                     const n = (w.resourceName || "").toString().toLowerCase();
+                     if (k.includes(wanted) || n.includes(wanted)) {
+                         print(MARKER + " " + Math.round(w.frameGeometry.width)
+                               + "x" + Math.round(w.frameGeometry.height));
+                         break;
+                     }
+                 }')
+
 # -b background, -n no notification, -a active window. NOT -f: full screen
 # captures the whole desktop, including whatever else is on the other monitor.
 spectacle -b -n -a -o "$OUT" >/dev/null 2>&1
@@ -90,8 +115,48 @@ if [[ ! -s "$OUT" ]]; then
     exit 1
 fi
 
-# Gate on the size. A capture of the terminal instead of the application is the
-# failure this whole script exists to prevent, and it is invisible unless
-# something checks -- so report the geometry and let the caller judge.
-identify -format "%wx%h" "$OUT" 2>/dev/null || true
-echo
+# --- and now check what was ACTUALLY captured --------------------------------
+#
+# Everything above happens BEFORE the grab, which is precisely the hole: focus
+# can move in the moment between the check passing and spectacle running, and
+# then a guard that "passed" hands back a picture of another window. That is
+# not theoretical -- it is how the private-session capture above happened, on a
+# run whose focus check had just succeeded.
+#
+# So the file is now guilty until proven innocent, and a capture that cannot be
+# shown to be the right window is DELETED rather than left on disk for the next
+# thing to read.
+refuse() {
+    rm -f "$OUT"
+    echo "refusing the capture and deleting it: $1" >&2
+    exit 1
+}
+
+AFTER=$(active_class)
+if [[ "${AFTER,,}" != *"${CLASS,,}"* ]]; then
+    refuse "focus moved to '${AFTER}' during the grab"
+fi
+
+SIZE=$(identify -format "%wx%h" "$OUT" 2>/dev/null || true)
+if [[ -z "$SIZE" ]]; then
+    refuse "could not measure $OUT"
+fi
+
+# Compare SHAPE, not size. The image is the window scaled by the output's
+# scale factor and padded by the compositor's drop shadow, so its pixel size
+# is not the window's -- but its aspect ratio survives both. A window that is
+# 4:3 and an image that is 2.47:1 are not the same window, which is exactly
+# the case that got through.
+if [[ -n "$GEOM" ]]; then
+    if ! awk -v g="$GEOM" -v s="$SIZE" '
+        BEGIN {
+            split(g, a, "x"); split(s, b, "x");
+            if (a[1] <= 0 || a[2] <= 0 || b[1] <= 0 || b[2] <= 0) exit 1;
+            want = a[1] / a[2]; got = b[1] / b[2];
+            exit (got > want * 1.15 || got < want * 0.85) ? 1 : 0;
+        }'; then
+        refuse "the image is ${SIZE}, the wrong shape for a ${GEOM} window"
+    fi
+fi
+
+echo "$SIZE"
