@@ -304,6 +304,12 @@ pub struct Brokkr {
     /// Which blocks of the properties panel are open, in `PanelSection::ALL`
     /// order.
     expanded: [bool; PanelSection::ALL.len()],
+    /// Whether the stats readout over the viewport is showing.
+    ///
+    /// Closed to begin with: it is seven lines of monospace across the corner
+    /// of the model, and the answers it holds are wanted occasionally rather
+    /// than continuously. The icon that opens it stays put either way.
+    stats_open: bool,
     /// The brush ring and mirror planes, handed to the renderer through
     /// `SharedFrame`. Held here and swapped rather than rebuilt into a fresh
     /// allocation each time.
@@ -690,6 +696,7 @@ impl Brokkr {
             voxel_size: VOXEL_SIZE_MM,
             status: String::new(),
             expanded: PanelSection::ALL.map(PanelSection::open_by_default),
+            stats_open: false,
             overlay: brokkr_gpu::OverlayBatch::default(),
             hover: None,
             sizing: None,
@@ -2926,6 +2933,7 @@ impl Brokkr {
                 let open = &mut self.expanded[section as usize];
                 *open = !*open;
             }
+            Message::StatsToggled => self.stats_open = !self.stats_open,
             // Both the panel button and File > New come here, so the two
             // cannot drift apart. Both discard the document, so both ask.
             Message::ResetSphere | Message::NewSculpt => {
@@ -3150,6 +3158,24 @@ mod tests {
             app.volume.sample_world(front) < before,
             "adding clay should have pushed the field negative at the surface"
         );
+    }
+
+    /// The stats readout starts collapsed, and the icon is what brings it back.
+    ///
+    /// Pinned because "it is not covering the model" is the whole point of the
+    /// control: a default flipped by an unrelated edit to the constructor would
+    /// put seven lines of monospace back across the corner of the sculpt with
+    /// nothing failing anywhere.
+    #[test]
+    fn the_stats_readout_starts_collapsed_and_the_icon_toggles_it() {
+        let mut app = app();
+        assert!(!app.stats_open, "the readout should not be over the model on launch");
+
+        update(&mut app, Message::StatsToggled);
+        assert!(app.stats_open, "pressing the info icon should show the numbers");
+
+        update(&mut app, Message::StatsToggled);
+        assert!(!app.stats_open, "pressing it again should put them away");
     }
 
     #[test]

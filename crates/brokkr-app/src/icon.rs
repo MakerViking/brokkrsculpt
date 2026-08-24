@@ -153,6 +153,23 @@ const MAXIMISE: Glyph = Glyph {
     }],
 };
 
+// --- the viewport's own chrome -----------------------------------------------
+
+/// Info: the circled "i" that opens the stats readout.
+///
+/// The dot is fatter than a period would be for the reason `PATTERN_NOISE`
+/// records: at [`crate::theme::ICON_CHROME`] a grid unit is 0.58 of a pixel, so
+/// a radius under about one unit draws thinner than the stroke beside it and
+/// reads as a smudge rather than as a dot. At 1.2 it is half again the stroke's
+/// width, which is what a tittle looks like.
+const INFO: Glyph = Glyph {
+    subs: &[
+        Sub { segs: &[Seg::Circle { cx: 12.0, cy: 12.0, r: 8.5 }], ink: Ink::Stroke },
+        Sub { segs: &[Seg::Circle { cx: 12.0, cy: 7.8, r: 1.2 }], ink: Ink::Fill },
+        Sub { segs: &[Seg::Move(12.0, 11.3), Seg::Line(12.0, 16.6)], ink: Ink::Stroke },
+    ],
+};
+
 // --- the timeline's transport ------------------------------------------------
 
 /// Play: a solid triangle.
@@ -505,6 +522,7 @@ pub enum IconName {
     Close,
     Minimise,
     Maximise,
+    Info,
     Play,
     Stop,
     CaretDown,
@@ -534,10 +552,11 @@ impl IconName {
     /// set's index, and anything that needs the whole set rather than one icon
     /// starts here.
     #[allow(dead_code)]
-    pub const ALL: [IconName; 21] = [
+    pub const ALL: [IconName; 22] = [
         IconName::Close,
         IconName::Minimise,
         IconName::Maximise,
+        IconName::Info,
         IconName::Play,
         IconName::Stop,
         IconName::CaretDown,
@@ -596,6 +615,7 @@ impl IconName {
             IconName::Close => &CLOSE,
             IconName::Minimise => &MINIMISE,
             IconName::Maximise => &MAXIMISE,
+            IconName::Info => &INFO,
             IconName::Play => &PLAY,
             IconName::Stop => &STOP,
             IconName::CaretDown => &CARET_DOWN,

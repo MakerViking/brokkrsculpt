@@ -375,6 +375,9 @@ pub enum Message {
     SpaceMouse(SpaceMouseSetting),
     /// Open or close one block of the properties panel.
     SectionToggled(PanelSection),
+    /// Show or hide the stats readout over the viewport. Collapsed it is one
+    /// icon in the corner; open it is seven lines of numbers.
+    StatsToggled,
     /// Arm or disarm the plane cut. The next left drag becomes the cut line.
     CutToggled,
 }

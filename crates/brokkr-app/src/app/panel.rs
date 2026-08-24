@@ -551,10 +551,60 @@ impl Brokkr {
         .into()
     }
 
-    /// The debug overlay: frame rate, frame time, triangles, bricks, resident
-    /// memory and what history is holding.
+    /// The stats readout over the viewport, and the button that opens it.
+    ///
+    /// Collapsed to a single icon by default. Seven lines of monospace sat
+    /// permanently across the top-left of the model, which is the corner a
+    /// sculpt is as likely to occupy as any other, and none of it is wanted
+    /// while actually sculpting.
+    ///
+    /// **The mesh-pool warning is deliberately outside the collapse and shows
+    /// in both states.** It does not report a statistic, it reports that part
+    /// of the model is not on the screen — and this project has already shipped
+    /// that failure twice as something the user had to go looking for. It is
+    /// also not a flicker: `overflowed` only clears on a whole-model rebuild,
+    /// so once it is up it stays up until the condition is actually gone.
     fn overlay(&self) -> Element<'_, Message> {
         let pool = self.shared.stats();
+
+        // `tool_toggle` rather than a style and a colour picked side by side:
+        // the icon is a canvas drawn at a fixed colour and cannot follow the
+        // button's foreground the way text does. See `icon.rs`'s header.
+        let (style, ink) = theme::tool_toggle(self.stats_open);
+        let toggle = button(icon::icon(icon::IconName::Info, theme::ICON_CHROME, ink))
+            .padding(theme::S2)
+            .style(style)
+            .on_press(Message::StatsToggled);
+
+        let mut stacked = column![toggle].spacing(theme::S2);
+
+        if self.stats_open {
+            stacked = stacked.push(
+                container(self.stats_readout(pool)).padding(theme::S3).style(theme::overlay_card),
+            );
+        }
+
+        if pool.overflowed > 0 {
+            let warning =
+                format!("MESH POOL FULL: {} bricks missing from the view", pool.overflowed);
+            stacked = stacked.push(
+                container(
+                    text(warning)
+                        .size(theme::TEXT_SIZE_SMALL)
+                        .font(theme::MONO)
+                        .color(theme::ERROR),
+                )
+                .padding(theme::S3)
+                .style(theme::overlay_card),
+            );
+        }
+
+        container(stacked).padding(theme::S4).into()
+    }
+
+    /// What the stats readout says: frame rate, frame time, triangles, bricks,
+    /// resident memory and what history is holding.
+    fn stats_readout(&self, pool: brokkr_gpu::PoolStats) -> Element<'_, Message> {
         let frame_ms = self.perf.average_frame_ms();
         let fps = if frame_ms > 0.0 { 1000.0 / frame_ms } else { 0.0 };
 
@@ -563,7 +613,7 @@ impl Brokkr {
             (pool.vertices as f64 * 24.0 + pool.triangles as f64 * 12.0) / (1024.0 * 1024.0);
         let history_mb = self.history_stats.bytes as f64 / (1024.0 * 1024.0);
 
-        let mut lines = vec![
+        let lines = vec![
             format!(
                 "{fps:6.1} fps    {frame_ms:5.2} ms avg   {:5.2} ms worst",
                 self.perf.worst_frame_ms()
@@ -610,16 +660,12 @@ impl Brokkr {
                 }
             ),
         ];
-        if pool.overflowed > 0 {
-            lines.push(format!("MESH POOL FULL: {} bricks missing from the view", pool.overflowed));
-        }
 
-        let readout = lines.into_iter().fold(column![].spacing(2), |stacked, line| {
-            stacked.push(text(line).size(theme::TEXT_SIZE_SMALL).font(theme::MONO))
-        });
-
-        container(container(readout).padding(theme::S3).style(theme::overlay_card))
-            .padding(theme::S4)
+        lines
+            .into_iter()
+            .fold(column![].spacing(2), |stacked, line| {
+                stacked.push(text(line).size(theme::TEXT_SIZE_SMALL).font(theme::MONO))
+            })
             .into()
     }
 
