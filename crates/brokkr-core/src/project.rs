@@ -87,7 +87,7 @@ use std::io::{Read, Write};
 
 use glam::{IVec3, Vec3};
 
-use crate::body::{Document, MAX_BODIES, MAX_NODES, Node, NodeId, NodeMeta};
+use crate::body::{Document, MAX_BODIES, MAX_DEPTH, MAX_NODES, Node, NodeId, NodeMeta};
 use crate::brick::{BRICK_DIM, BRICK_VOXELS, Brick, BrickCoord, INSIDE, NARROW_BAND, OUTSIDE};
 use crate::volume::Volume;
 
@@ -247,10 +247,18 @@ const NODE_RECORD_BYTES: usize = 40;
 /// terminator and must still round-trip -- the rename field in the interface
 /// enforces exactly this length, so the application actively encourages
 /// producing the one name a "must be NUL terminated" rule would destroy.
-const NAME_BYTES: usize = 32;
+///
+/// Public because the rename field is what has to enforce it. A field that let
+/// the user type a thirty-third byte and then quietly dropped it at save time
+/// would be the same silent loss the char-boundary rule below exists to
+/// prevent, one layer up: what is on screen has to be what reaches the file.
+pub const MAX_NAME_BYTES: usize = 32;
 
 /// `kind` for a row that holds a field.
 const KIND_BODY: u8 = 0;
+
+/// `kind` for a folder row, which carries no brick stream at all.
+const KIND_FOLDER: u8 = 1;
 
 /// This row's own eye.
 const FLAG_VISIBLE: u16 = 1 << 0;
@@ -272,7 +280,7 @@ const RESERVED_FLAGS: u16 = !(FLAG_VISIBLE | FLAG_COLLAPSED);
 /// Widening the name without widening the record would move every brick stream
 /// in the file while leaving the tests that *measure* the header perfectly
 /// happy, because they measure the same wrong thing.
-const _: () = assert!(NODE_RECORD_BYTES == 4 + 2 + 1 + 1 + NAME_BYTES);
+const _: () = assert!(NODE_RECORD_BYTES == 4 + 2 + 1 + 1 + MAX_NAME_BYTES);
 
 /// Read one distance and hold it to what every writer here guarantees.
 fn read_distance(input: &mut impl Read) -> Result<f32> {
@@ -319,6 +327,19 @@ const TAG_DENSE: u8 = 1;
 /// Its own type because two things restore it: reopening a file, and jumping to
 /// a timeline key. Keeping them one type is what stops a key from quietly
 /// restoring less than a reopen does when a field is added here.
+///
+/// # Solo does not belong here, and this is where a careful reader will put it
+///
+/// Solo looks like a view setting, and it is a view MODE -- which is not the
+/// same thing. Both of the two things that restore this type would then restore
+/// it: reopening a file would bring back a mode the user left an hour ago, and
+/// jumping to a timeline key would change *which bodies exist on screen*, so
+/// playback would flicker them in and out against the pinned rule that playback
+/// moves the camera and nothing else. Solo lives on `Brokkr` and reaches
+/// [`crate::resolve_visibility`] as a parameter; [`write`] takes a `&Document`
+/// and a `&ProjectState` and solo is a field of neither, so there is no
+/// expression that can hand it to the writer. That is not discipline -- the
+/// call does not typecheck.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct View {
     pub camera_target: Vec3,
@@ -413,12 +434,16 @@ pub struct Progress {
     /// Values the reader repaired rather than refused.
     ///
     /// The node table's repairs, and only those: a name that was not UTF-8 or
-    /// was empty, a `collapsed` bit set on a body row, an `active_index` that
-    /// named nothing or named a folder. The camera and key repairs in
-    /// [`read_view`] are deliberately *not* counted here — they happen on every
-    /// ordinary file that was saved with a NaN camera, so folding them in would
-    /// give the field a second meaning that the first caller to use it would
-    /// have to subtract back out.
+    /// was empty, a `collapsed` bit set on a body row, a `depth` the tree fold
+    /// clamped, and an `active_index` that named nothing or named a folder. The
+    /// camera and key repairs in [`read_view`] are deliberately *not* counted
+    /// here — they happen on every ordinary file that was saved with a NaN
+    /// camera, so folding them in would give the field a second meaning that
+    /// the first caller to use it would have to subtract back out.
+    ///
+    /// One per repaired ROW and never one per clamp term: a depth clamped by
+    /// two of the three terms at once is still one row the file did not
+    /// describe correctly.
     pub repairs: u32,
 }
 
@@ -479,17 +504,15 @@ pub enum ProjectError {
     ReservedFlags {
         found: u16,
     },
-    /// A node `kind` outside the legal set. It decides whether a brick stream
-    /// follows, so it sits on the geometry side of the refuse/repair line for
-    /// the same reason [`ProjectError::UnknownBrickTag`] does: repairing it
-    /// would misalign every stream after it.
+    /// A node `kind` outside the legal set, which is `{0, 1}`. It decides
+    /// whether a brick stream follows, so it sits on the geometry side of the
+    /// refuse/repair line for the same reason [`ProjectError::UnknownBrickTag`]
+    /// does: repairing it would misalign every stream after it.
+    ///
+    /// **`depth` deliberately has no variant beside it.** It is repaired by a
+    /// clamp that is closed over the tree invariant, so the whole folder
+    /// feature adds exactly this one refusal in front of the brick stream.
     UnknownNodeKind(u8),
-    /// A node at a non-zero `depth`, which container version 3 reserves. The
-    /// increment that makes folders representable replaces this refusal with a
-    /// clamp, because a clamped depth is still a valid forest.
-    ReservedDepth {
-        found: u8,
-    },
     /// A node table holding no body rows at all. Nothing would then answer
     /// "which body is active", and the first thing to touch the active body
     /// would panic on a file that had otherwise loaded cleanly.
@@ -556,9 +579,6 @@ impl std::fmt::Display for ProjectError {
                 write!(f, "the file sets a reserved flag bit: {found:#018b}")
             }
             ProjectError::UnknownNodeKind(kind) => write!(f, "unknown row kind {kind}"),
-            ProjectError::ReservedDepth { found } => {
-                write!(f, "the file nests a row {found} deep, and this build has no folders")
-            }
             ProjectError::NoBodies => write!(f, "the file holds no bodies at all"),
             ProjectError::UnknownBrickTag(tag) => write!(f, "unknown brick kind {tag}"),
             ProjectError::TooManyKeys { keys, limit } => {
@@ -833,35 +853,48 @@ fn write_node_record(out: &mut impl Write, node: &Node) -> Result<()> {
     }
     write_u16(out, flags)?;
 
-    // `kind` and `depth`, RESERVED AT ZERO until folders exist. They are
-    // written as literal zeroes rather than derived from the node, because this
-    // build's reader refuses a non-zero value in either -- deriving them would
-    // let a document that should never exist produce a file this build cannot
-    // read. The increment that makes folders representable changes both ends
-    // together.
-    debug_assert!(node.is_body(), "there are no folder rows to write yet");
-    debug_assert_eq!(node.depth(), 0, "there is no nesting to write yet");
-    out.write_all(&[KIND_BODY, 0])?;
+    // `kind` decides whether a brick stream follows this record, and `depth` is
+    // this row's place in the tree. Both are written from the node rather than
+    // as literals now that a folder row can exist -- and the reader's legal set
+    // for `kind` is exactly {0, 1}, so the two ends move together.
+    let kind = if node.is_body() { KIND_BODY } else { KIND_FOLDER };
+    out.write_all(&[kind, node.depth()])?;
 
     out.write_all(&name_bytes(&node.name))?;
     Ok(())
 }
 
-/// A name in its fixed field: at most [`NAME_BYTES`] of UTF-8, NUL padded.
+/// A name in its fixed field: at most [`MAX_NAME_BYTES`] of UTF-8, NUL padded.
 ///
-/// **Truncated on a CHAR BOUNDARY.** Slicing at byte 32 through the middle of a
+/// The cut itself is [`name_that_fits`], which is the same rule the rename
+/// field applies as the user types. One function and not two: a field that
+/// clamped at a different point from the writer would show a name the file
+/// cannot hold, and the disagreement would only surface on the next open.
+fn name_bytes(name: &str) -> [u8; MAX_NAME_BYTES] {
+    let fits = name_that_fits(name);
+    let mut out = [0u8; MAX_NAME_BYTES];
+    out[..fits.len()].copy_from_slice(fits.as_bytes());
+    out
+}
+
+/// The longest prefix of `name` the fixed field can hold.
+///
+/// **Cut on a CHAR BOUNDARY.** Slicing at byte 32 through the middle of a
 /// multi-byte sequence writes bytes that are not UTF-8; the reader then
 /// correctly repairs the name to `Body {n}`, and the user silently loses a name
-/// this build wrote itself. `is_char_boundary(0)` is true, so the walk back
-/// always terminates.
-fn name_bytes(name: &str) -> [u8; NAME_BYTES] {
-    let mut end = name.len().min(NAME_BYTES);
+/// this build wrote itself -- a name of eleven three-byte characters would come
+/// back as "Body 1" rather than as ten of them. `is_char_boundary(0)` is true,
+/// so the walk back always terminates.
+///
+/// Borrowing rather than returning a `String`, because the common case by far
+/// is a name that already fits and allocating for it would be a copy per
+/// keystroke of a field that is edited one keystroke at a time.
+pub fn name_that_fits(name: &str) -> &str {
+    let mut end = name.len().min(MAX_NAME_BYTES);
     while !name.is_char_boundary(end) {
         end -= 1;
     }
-    let mut out = [0u8; NAME_BYTES];
-    out[..end].copy_from_slice(&name.as_bytes()[..end]);
-    out
+    &name[..end]
 }
 
 /// One body's brick stream: a count, then that many brick records.
@@ -1050,12 +1083,15 @@ fn read_table_or_synthesize(
 /// the mutation fuzz below meaningful without a recursive parser for it to
 /// overflow.
 ///
-/// Validating the tree is therefore a fold over one `u8` -- and at version 3 it
-/// is the degenerate case of that fold, since `depth` is reserved at zero and
-/// refused otherwise. The increment that makes folders representable replaces
-/// the refusal with the clamp
-/// `depth[i] = min(depth[i], depth[i - 1] + 1, MAX_DEPTH - 1)`, which is closed
-/// over the invariant and so needs no error variant of its own.
+/// Validating the tree is therefore a fold over one `u8`. The whole of it is
+/// the clamp
+/// `depth[i] = min(depth[i], depth[i - 1] + 1, depth[i - 1] if i-1 is a body,
+/// MAX_DEPTH - 1)`, which is **closed over the invariant** -- a clamped depth
+/// column is still a valid forest -- so the tree needs no error variant at all
+/// and the whole folder feature adds exactly ONE refusal (`kind`) in front of
+/// the brick stream. `[0, 1, 7, 8, 9]` over folder, folder, body, body, body
+/// repairs to `[0, 1, 2, 2, 2]`; the all-folder version of the same file
+/// repairs to `[0, 1, 2, 3, 4]`.
 ///
 /// A crafted file's only levers are `node_count`, bounded before the allocation
 /// it decides; `kind`, a set membership test; and `depth`, above.
@@ -1089,21 +1125,32 @@ fn read_node_table(input: &mut impl Read, progress: &mut Progress) -> Result<(Ve
         }
 
         let kind = read_exact::<1>(input)?[0];
-        if kind != KIND_BODY {
+        if kind != KIND_BODY && kind != KIND_FOLDER {
             return Err(ProjectError::UnknownNodeKind(kind));
         }
-        let depth = read_exact::<1>(input)?[0];
-        if depth != 0 {
-            return Err(ProjectError::ReservedDepth { found: depth });
+        let is_body = kind == KIND_BODY;
+
+        // The fold. Repaired rather than refused, because a clamped depth is
+        // still a valid forest and a row drawn at the wrong indent is not a
+        // reason to lose the sculpt beside it.
+        let found = read_exact::<1>(input)?[0];
+        let ceiling = match rows.last() {
+            None => 0,
+            // A body is never a parent, so a row below one can be its sibling
+            // at most.
+            Some(above) if above.is_body => above.meta.depth,
+            Some(above) => (above.meta.depth + 1).min(MAX_DEPTH - 1),
+        };
+        let depth = found.min(ceiling);
+        if depth != found {
+            progress.repairs += 1;
         }
 
         let name = read_name(input, index, progress)?;
 
-        // Every row is a body while `kind` must be zero. The count is kept
-        // rather than derived so that the two checks that need it -- the body
-        // cap and the "no bodies at all" refusal -- read the same way from the
-        // increment that makes a folder row representable.
-        let is_body = kind == KIND_BODY;
+        // The count is kept rather than derived, so that the two checks that
+        // need it -- the body cap and the "no bodies at all" refusal -- read
+        // the same way.
         if is_body {
             bodies += 1;
             if bodies > MAX_BODIES {
@@ -1137,8 +1184,6 @@ fn read_node_table(input: &mut impl Read, progress: &mut Progress) -> Result<(Ve
     // `active` to name -- so the first thing that touches the active body
     // panics on a file that loaded without complaint. The mutation fuzz cannot
     // catch it either: its band assertion loops over zero bodies and passes.
-    // Unreachable while `kind` must be zero, and one line ahead of the
-    // increment that makes it reachable.
     if bodies == 0 {
         return Err(ProjectError::NoBodies);
     }
@@ -1161,10 +1206,10 @@ fn read_node_table(input: &mut impl Read, progress: &mut Progress) -> Result<(Ve
 /// and whose name field is rubbish should open and show the sculpt under a
 /// default name -- exactly as a NaN camera does.
 fn read_name(input: &mut impl Read, index: usize, progress: &mut Progress) -> Result<String> {
-    let field: [u8; NAME_BYTES] = read_exact(input)?;
+    let field: [u8; MAX_NAME_BYTES] = read_exact(input)?;
     // Up to the first NUL, or the whole field when there is none. A full
     // thirty-two byte name has no terminator and has to round-trip.
-    let end = field.iter().position(|byte| *byte == 0).unwrap_or(NAME_BYTES);
+    let end = field.iter().position(|byte| *byte == 0).unwrap_or(MAX_NAME_BYTES);
     match std::str::from_utf8(&field[..end]) {
         Ok(name) if !name.is_empty() => Ok(name.to_string()),
         _ => {
@@ -1188,11 +1233,17 @@ pub(crate) fn read_reporting(
 
     let (rows, active) = read_table_or_synthesize(input, header.container, progress)?;
 
-    // The brick streams, one per body, consecutive and in table order.
+    // The brick streams, one per BODY row, consecutive and in table order. A
+    // folder declares no stream at all, which is what `kind` is for and why it
+    // is refused rather than repaired: a wrong `kind` would misalign every
+    // stream after it.
     let mut total = 0u64;
-    let mut loaded: Vec<(NodeMeta, Volume)> = Vec::with_capacity(rows.len());
+    let mut loaded: Vec<(NodeMeta, Option<Volume>)> = Vec::with_capacity(rows.len());
     for row in rows {
-        debug_assert!(row.is_body, "a version 3 file's rows are all bodies");
+        if !row.is_body {
+            loaded.push((row.meta, None));
+            continue;
+        }
         let count = read_u64(input)?;
         // The running DOCUMENT total, checked before this body's bricks are
         // touched. A per-body check would let sixty-four bodies ask for
@@ -1208,7 +1259,7 @@ pub(crate) fn read_reporting(
         if total > MAX_BRICKS {
             return Err(ProjectError::TooLarge { bricks: total, limit: MAX_BRICKS });
         }
-        loaded.push((row.meta, read_bricks(input, count, header.voxel_size, progress)?));
+        loaded.push((row.meta, Some(read_bricks(input, count, header.voxel_size, progress)?)));
     }
 
     // The key trailer, which only version 2 and later carry. A version 1 file
@@ -1631,32 +1682,48 @@ mod tests {
         assert_eq!(loaded.active_volume().brick_coords().count(), 0);
     }
 
-    #[test]
-    fn a_corrupted_project_is_answered_rather_than_survived() {
-        // The targeted corruptions above each aim at one field. This aims at
-        // nothing in particular, which is what an interrupted autosave, a
-        // half synced file or a failing disk actually produce.
-        //
-        // The property is that every input gets an answer. A panic here is
-        // worse than in the mesh readers: this runs on File > Open and on
-        // File > Recover, so the file most likely to be corrupt is the crash
-        // net a user is reaching for precisely because something already went
-        // wrong. Whatever loads has to be a volume the rest of the
-        // application can use -- finite everywhere, and inside the narrow
-        // band, because a value outside it means a brick that meshes into
-        // nothing or into a surface where there is none.
-        let mut valid = Vec::new();
-        write(&mut valid, &sculpted_doc(), &ProjectState::default()).expect("write failed");
+    /// What one fuzz run reached, counted rather than inferred from which error
+    /// came back.
+    ///
+    /// **Counted is the whole point.** The control used to match four error
+    /// variants said to be raisable "only from inside the brick loop", and one
+    /// of them was not: `NonFiniteValue` is also how a corrupt `voxel_size` at
+    /// byte 20 is refused, forty-three bytes before the brick count, so mutants
+    /// stopped at the header were counted as having reached the geometry.
+    #[derive(Debug, Default)]
+    struct FuzzReach {
+        tried: usize,
+        /// Mutants that got at least one node record out of the table.
+        table: usize,
+        /// Mutants that started at least one brick.
+        bricks: usize,
+        /// Mutants that loaded whole.
+        loaded: usize,
+    }
 
-        let mut loaded = 0usize;
-        let mut reached_the_bricks = 0usize;
-        let mut tried = 0usize;
+    /// Mutate one corpus 1800 ways and demand an answer for every one of them.
+    ///
+    /// Three strategies, 600 runs each, seeded from the strategy and the run so
+    /// that a failure names a reproducible file. The property is that every
+    /// input gets an answer and that whatever loads is a volume the rest of the
+    /// application can use -- finite everywhere and inside the narrow band,
+    /// because a value outside it means a brick that meshes into nothing or
+    /// into a surface where there is none.
+    ///
+    /// **This is shared between two corpora and the sharing is the point.** The
+    /// four-megabyte sculpt cannot reach the node table in any meaningful
+    /// fraction of its mutants -- the table is 4.8e-5 of it -- so "the fuzz
+    /// still passes" would say nothing at all about the folder reader. The
+    /// small tree corpus is the one that aims there. Same strategies, same
+    /// `Noise`, same assertions; only the file differs.
+    fn fuzz_the_reader(valid: &[u8]) -> FuzzReach {
+        let mut reach = FuzzReach::default();
 
         for strategy in 0..3 {
             for run in 0..600u64 {
                 let seed = (strategy as u64) << 32 | run | 1;
                 let mut noise = Noise::seeded(seed);
-                let mut bytes = valid.clone();
+                let mut bytes = valid.to_vec();
 
                 match strategy {
                     // Flipped bits anywhere, header included.
@@ -1684,39 +1751,145 @@ mod tests {
                     }
                 }
 
-                tried += 1;
+                reach.tried += 1;
                 let mut progress = Progress::default();
                 let outcome = read_reporting(&mut bytes.as_slice(), &mut progress);
-                // Counted rather than inferred from which error came back.
-                // This used to match four variants said to be raisable "only
-                // from inside the brick loop", and one of them was not:
-                // `NonFiniteValue` is also how a corrupt `voxel_size` at byte
-                // 20 is refused, forty-three bytes before the brick count. So
-                // mutants stopped at the header were counted as having reached
-                // the geometry, and the control was measuring less than it
-                // claimed.
+                if progress.nodes > 0 {
+                    reach.table += 1;
+                }
                 if progress.bricks > 0 {
-                    reached_the_bricks += 1;
+                    reach.bricks += 1;
                 }
                 let Ok((doc, _)) = outcome else {
                     continue;
                 };
-                loaded += 1;
-                let volume = doc.active_volume();
+                reach.loaded += 1;
 
-                assert!(volume.voxel_size() > 0.0, "seed {seed}: a non positive voxel size loaded");
-                for coord in volume.brick_coords().collect::<Vec<_>>() {
-                    let origin = coord.origin();
-                    for offset in [IVec3::ZERO, IVec3::splat(BRICK_DIM as i32 - 1)] {
-                        let value = volume.sample_voxel(origin + offset);
-                        assert!(
-                            value.is_finite() && (INSIDE..=OUTSIDE).contains(&value),
-                            "seed {seed}: brick {coord:?} loaded {value}, which is outside the band"
-                        );
+                // Every body, not only the active one: a folder-bearing corpus
+                // has bodies the active row is not, and a corrupt brick in one
+                // of those is exactly what this is looking for.
+                for (id, volume) in doc.bodies() {
+                    assert!(
+                        volume.voxel_size() > 0.0,
+                        "seed {seed}: a non positive voxel size loaded"
+                    );
+                    for coord in volume.brick_coords().collect::<Vec<_>>() {
+                        let origin = coord.origin();
+                        for offset in [IVec3::ZERO, IVec3::splat(BRICK_DIM as i32 - 1)] {
+                            let value = volume.sample_voxel(origin + offset);
+                            assert!(
+                                value.is_finite() && (INSIDE..=OUTSIDE).contains(&value),
+                                "seed {seed}: {id:?} brick {coord:?} loaded {value}, which is \
+                                 outside the band"
+                            );
+                        }
                     }
                 }
             }
         }
+        reach
+    }
+
+    /// Three bodies of four uniform bricks each inside two nested folders.
+    ///
+    /// **The corpus that can actually reach the node table.** Measured at 503
+    /// bytes, of which the table is 208 -- 41% of the file, against 4.8e-5 for
+    /// the sculpt below. The bodies are `Uniform(INSIDE)` bricks rather than a
+    /// sphere because the point is the table, and seventeen bytes a brick is
+    /// what keeps the table's share of the file high enough for the mutants to
+    /// land in it.
+    fn a_small_tree() -> Document {
+        let mut doc = Document::from_volume(uniform_bricks(0));
+        let first = doc.active();
+        let second = doc.add_body("Body 2", uniform_bricks(8));
+        let third = doc.add_body("Body 3", uniform_bricks(16));
+
+        let (inner, _) = doc.group(first, "Inner").expect("the inner group");
+        doc.move_to_folder(second, Some(inner)).expect("the second body in");
+        let (outer, _) = doc.group(inner, "Outer").expect("the outer group");
+        doc.move_to_folder(third, Some(outer)).expect("the third body in");
+        doc.set_collapsed(inner, true).expect("the collapse");
+        doc
+    }
+
+    /// Four solid bricks in a row, starting at `from` along X.
+    fn uniform_bricks(from: i32) -> Volume {
+        let mut volume = Volume::new(0.5);
+        for step in 0..4 {
+            volume.insert_brick(BrickCoord::new(from + step, 0, 0), Brick::Uniform(INSIDE));
+        }
+        volume
+    }
+
+    /// **The corpus that aims at the node table**, which the four-megabyte
+    /// sculpt below structurally cannot.
+    ///
+    /// Measured on this build, from the counters and not from the error
+    /// variants: of 1800 mutants, **1444** get at least one record out of the
+    /// table, **944** reach the brick loop and **158** load whole. The 356 that
+    /// never reach a record are the header refusals -- the header is 63 of 503
+    /// bytes here, an eighth of the file, where in the sculpt corpus it is
+    /// 1.5e-5 of it. The 500 that read a record and never reach a brick are the
+    /// folder reader doing its job: a `kind` outside `{0, 1}`, a reserved flag
+    /// bit, a duplicate id or a truncation inside the table, on a file where
+    /// the table is 41% of the bytes.
+    ///
+    /// Both floors are the same ones the sculpt corpus is held to, deliberately
+    /// unnudged: over a quarter reaching the geometry, and at least one loading.
+    #[test]
+    fn a_corrupted_folder_tree_is_answered_rather_than_survived() {
+        let mut valid = Vec::new();
+        write(&mut valid, &a_small_tree(), &ProjectState::default()).expect("write failed");
+        // Pinned, because the whole argument for this corpus is its SIZE: the
+        // day it grows to four megabytes it stops aiming at the table and
+        // nothing else would say so.
+        assert!(
+            (400..600).contains(&valid.len()),
+            "the small corpus is {} bytes, which is no longer small",
+            valid.len()
+        );
+
+        let reach = fuzz_the_reader(&valid);
+        eprintln!(
+            "small tree, {} bytes: {} of {} mutants read a node record, {} reached the brick \
+             loop, {} loaded whole",
+            valid.len(),
+            reach.table,
+            reach.tried,
+            reach.bricks,
+            reach.loaded
+        );
+        assert!(
+            reach.table > reach.tried / 4,
+            "only {} of {} mutants got a record out of the table, so this is measuring the \
+             header check and not the folder reader",
+            reach.table,
+            reach.tried
+        );
+        assert!(
+            reach.bricks > reach.tried / 4,
+            "only {} of {} corrupted trees got as far as the brick loop",
+            reach.bricks,
+            reach.tried
+        );
+        assert!(reach.loaded > 0, "not one corrupted tree loaded, so nothing was checked on load");
+    }
+
+    #[test]
+    fn a_corrupted_project_is_answered_rather_than_survived() {
+        // The targeted corruptions above each aim at one field. This aims at
+        // nothing in particular, which is what an interrupted autosave, a
+        // half synced file or a failing disk actually produce.
+        //
+        // The property is that every input gets an answer. A panic here is
+        // worse than in the mesh readers: this runs on File > Open and on
+        // File > Recover, so the file most likely to be corrupt is the crash
+        // net a user is reaching for precisely because something already went
+        // wrong.
+        let mut valid = Vec::new();
+        write(&mut valid, &sculpted_doc(), &ProjectState::default()).expect("write failed");
+
+        let reach = fuzz_the_reader(&valid);
 
         // The control: without it a reader that refused everything at the
         // magic bytes would pass this file having parsed nothing.
@@ -1727,16 +1900,22 @@ mod tests {
         // -- so counting only what loads measures how strict the validation
         // is rather than how far the reader got.
         //
-        // Measured, from the counter rather than from the error variants:
-        // **1800 of 1800** mutants reach the brick loop, of which **22** load
-        // whole. All 1800 is not a surprise once counted -- the header is 119
-        // of 4,194,843 bytes, so a handful of flipped bits, a cut at a random
-        // offset or a 256-byte overwrite lands in the geometry essentially
-        // every time.
+        // Measured on this build, from the counters rather than from the error
+        // variants: **1800 of 1800** mutants reach the brick loop, of which
+        // **22** load whole. All 1800 is not a surprise once counted -- the
+        // header and table together are 111 of 4,194,843 bytes, so a handful of
+        // flipped bits, a cut at a random offset or a 256-byte overwrite lands
+        // in the geometry essentially every time.
         //
-        // **Both numbers are unchanged by the node table**, re-measured when it
-        // landed: the table added 48 bytes to a four megabyte corpus, which is
-        // one mutant in eighty-seven thousand.
+        // **That is also exactly why this corpus says nothing about the node
+        // table**, and why `a_corrupted_folder_tree_is_answered_rather_than_survived`
+        // exists beside it. The table counter here is **1800 of 1800** as well,
+        // and it is worthless: every mutant gets the first record out before it
+        // dies somewhere in four megabytes of bricks, because this document's
+        // whole table is 48 of 4,194,843 bytes -- 1.1e-5 of the file -- and
+        // almost nothing ever lands IN it. The small corpus reads 1444 and 944
+        // on the same two counters, and the 500 between them is the folder
+        // reader actually refusing something.
         //
         // The previously recorded "1200 of 1800" was wrong in both directions
         // and must not be treated as a floor: it over-counted header refusals
@@ -1744,16 +1923,25 @@ mod tests {
         // died inside the loop with a variant the match did not list, chiefly
         // `Truncated`, which is the whole of strategy 1.
         eprintln!(
-            "{reached_the_bricks} of {tried} corrupted projects reached the brick loop, \
-             {loaded} loaded whole, from a {} byte corpus",
-            valid.len()
+            "sculpt, {} bytes: {} of {} corrupted projects read a node record, {} reached the \
+             brick loop, {} loaded whole",
+            valid.len(),
+            reach.table,
+            reach.tried,
+            reach.bricks,
+            reach.loaded
         );
         assert!(
-            reached_the_bricks > tried / 4,
-            "only {reached_the_bricks} of {tried} corrupted projects got as far as the brick \
-             loop, so this is measuring the header check and not the reader"
+            reach.bricks > reach.tried / 4,
+            "only {} of {} corrupted projects got as far as the brick loop, so this is \
+             measuring the header check and not the reader",
+            reach.bricks,
+            reach.tried
         );
-        assert!(loaded > 0, "not one corrupted project loaded, so nothing was checked on load");
+        assert!(
+            reach.loaded > 0,
+            "not one corrupted project loaded, so nothing was checked on load"
+        );
     }
 
     /// The overflow the fuzz above found, pinned as its own case so that a
@@ -2277,17 +2465,10 @@ mod tests {
 
         // `kind` decides whether a brick stream follows, so it is refused
         // rather than repaired: repairing it would misalign every stream after
-        // it, exactly as an unknown brick tag would.
-        let bytes = crafted(0, &[Record { kind: 1, ..Record::body(1, "Folder") }]);
-        assert!(matches!(read(&mut bytes.as_slice()), Err(ProjectError::UnknownNodeKind(1))));
-
-        // `depth` is reserved at zero until folders exist. The increment that
-        // makes them representable replaces this refusal with a clamp.
-        let bytes = crafted(0, &[Record { depth: 1, ..Record::body(1, "Body 1") }]);
-        assert!(matches!(
-            read(&mut bytes.as_slice()),
-            Err(ProjectError::ReservedDepth { found: 1 })
-        ));
+        // it, exactly as an unknown brick tag would. The legal set is {0, 1}
+        // now that a folder row exists, so 2 is the first illegal value.
+        let bytes = crafted(0, &[Record { kind: 2, ..Record::body(1, "Body 1") }]);
+        assert!(matches!(read(&mut bytes.as_slice()), Err(ProjectError::UnknownNodeKind(2))));
     }
 
     /// A count read out of a file decides an allocation, so it is bounded
@@ -2333,25 +2514,264 @@ mod tests {
     }
 
     /// The hole every source design left open, and where it is actually
-    /// plugged today.
+    /// plugged.
     ///
     /// A table whose rows are all folders parses perfectly, declares no brick
     /// stream and consumes exactly the right number of bytes -- and leaves a
     /// document with no body for `active` to name, so the first thing to touch
     /// the active body panics on a file that loaded without complaint. The
     /// mutation fuzz cannot catch it either: its band assertion loops over zero
-    /// bodies and passes. At container version 3 that file cannot be built,
-    /// because `kind` must be zero and the row is refused one check earlier.
-    /// [`ProjectError::NoBodies`] is the same hole guarded one layer later; it
-    /// becomes reachable in the increment that makes a folder row legal, and
-    /// this test is what records that the two guards are for one thing.
+    /// bodies and passes.
+    ///
+    /// **This became reachable the moment `kind = 1` became legal.** Until then
+    /// the row was refused one check earlier, at the kind; now
+    /// [`ProjectError::NoBodies`] is the only thing standing between a
+    /// 115-byte file and a panic on open.
     #[test]
-    fn a_table_whose_only_row_is_a_folder_is_refused_at_the_kind() {
-        let bytes = crafted(0, &[Record { kind: 1, ..Record::body(1, "Folder") }]);
+    fn a_table_whose_only_row_is_a_folder_is_refused_for_holding_no_bodies() {
+        let bytes = crafted(0, &[Record { kind: KIND_FOLDER, ..Record::body(1, "Folder") }]);
         // 63 of header, 8 of counts, 40 of record, 4 of empty trailer: no brick
         // stream at all, and every length in the file agrees with every other.
         assert_eq!(bytes.len(), NODE_TABLE_AT + 8 + NODE_RECORD_BYTES + 4);
-        assert!(matches!(read(&mut bytes.as_slice()), Err(ProjectError::UnknownNodeKind(1))));
+        assert!(matches!(read(&mut bytes.as_slice()), Err(ProjectError::NoBodies)));
+    }
+
+    /// A folder row's `collapsed` bit is its own, and a body's is repaired
+    /// away.
+    ///
+    /// Both halves matter. The bit surviving on a folder is what makes a
+    /// collapsed tree still collapsed on the next open; the bit being cleared
+    /// on a body is what keeps write -> read -> write from differing by one
+    /// bit, which is the property the atomic save's own verification rests on.
+    #[test]
+    fn collapse_is_kept_on_a_folder_and_repaired_away_on_a_body() {
+        let bytes = crafted(
+            1,
+            &[
+                Record {
+                    kind: KIND_FOLDER,
+                    flags: FLAG_VISIBLE | FLAG_COLLAPSED,
+                    ..Record::body(1, "Folder")
+                },
+                Record {
+                    depth: 1,
+                    flags: FLAG_VISIBLE | FLAG_COLLAPSED,
+                    ..Record::body(2, "Body 1")
+                },
+            ],
+        );
+        let mut progress = Progress::default();
+        let (doc, _) =
+            read_reporting(&mut bytes.as_slice(), &mut progress).expect("a folder was refused");
+        assert!(doc.nodes()[0].collapsed, "the folder's own collapse was thrown away");
+        assert!(!doc.nodes()[1].collapsed, "a body row kept a bit it cannot mean");
+        assert_eq!(progress.repairs, 1, "the body's collapse repair was not counted");
+    }
+
+    // ---------------------------------------------------------------------
+    // Folders.
+    // ---------------------------------------------------------------------
+
+    /// The deepest tree a legal file can carry: seven folders wrapping one
+    /// body, which puts that body at depth 7, plus a sibling outside them all.
+    ///
+    /// `MAX_DEPTH` is 8 and legal depths are `0 ..= 7`, so this is the case
+    /// that would fall off the end of `resolve_visibility`'s fixed ancestor
+    /// array if either clamp were missing.
+    fn nested_seven_deep() -> Document {
+        let mut doc = Document::from_volume(one_brick(BrickCoord::new(0, 0, 0), INSIDE));
+        let body = doc.active();
+        for level in (0..MAX_DEPTH - 1).rev() {
+            doc.group(body, format!("Group {level}")).expect("a legal group");
+        }
+        assert_eq!(doc.node(body).expect("the body").depth(), MAX_DEPTH - 1);
+        // A row outside the chain, so the file is a forest and not one line,
+        // and a collapsed folder, so the bit has something to survive on.
+        doc.add_body("Outside", one_brick(BrickCoord::new(9, 0, 0), -0.25));
+        let innermost = doc.parent_of(body).expect("the innermost folder");
+        doc.set_collapsed(innermost, true).expect("the collapse");
+        doc
+    }
+
+    /// A depth-seven tree round-trips byte-identically twice, and survives
+    /// write -> read -> write.
+    ///
+    /// **Byte-identity is the assertion and not "the same sculpt"**, because
+    /// the save path verifies its own output and the autosave runs unwatched
+    /// every two minutes: a writer that emitted a different file each time
+    /// would make that verification meaningless and every diff of a project
+    /// file noise.
+    #[test]
+    fn a_depth_seven_tree_round_trips_byte_identically_twice() {
+        let doc = nested_seven_deep();
+        let state = ProjectState::default();
+
+        let mut once = Vec::new();
+        write(&mut once, &doc, &state).expect("the deepest legal tree was refused by the writer");
+        let mut twice = Vec::new();
+        write(&mut twice, &doc, &state).expect("write failed");
+        assert_eq!(once, twice, "the same document wrote two different files");
+
+        let mut progress = Progress::default();
+        let (loaded, _) = read_reporting(&mut once.as_slice(), &mut progress)
+            .expect("this build refused a file it had just written itself");
+        assert_eq!(progress.repairs, 0, "the reader repaired a tree this build wrote");
+        assert_eq!(progress.nodes, doc.node_count() as u32);
+        assert_same_document(&doc, &loaded);
+
+        let mut again = Vec::new();
+        write(&mut again, &loaded, &state).expect("write failed");
+        assert_eq!(once, again, "write -> read -> write is not the identity for a folder tree");
+    }
+
+    /// **The depth column is repaired by a clamp and never refused**, because a
+    /// clamped column is still a valid forest -- which is why the whole folder
+    /// feature adds exactly one refusal (`kind`) in front of the brick stream.
+    ///
+    /// Both clamps, and the numbers are the plan's own worked examples. Over
+    /// folder, folder, body, body, body the third one fires because **a body
+    /// cannot be a parent**; over a chain of folders the +1 one fires instead,
+    /// which is a different line.
+    #[test]
+    fn a_depth_column_past_the_tree_is_clamped_and_every_clamp_is_counted() {
+        let folder = |id: u32, name: &'static str, depth: u8| Record {
+            kind: KIND_FOLDER,
+            depth,
+            ..Record::body(id, name)
+        };
+        let body =
+            |id: u32, name: &'static str, depth: u8| Record { depth, ..Record::body(id, name) };
+
+        // Two folders and three bodies at [0, 1, 7, 8, 9]. Rows 2 and 3 are
+        // clamped to their parent's depth plus one; row 4 is clamped to row 3's
+        // OWN depth, because row 3 is a body and a body is never a parent.
+        let bytes = crafted(
+            2,
+            &[
+                folder(1, "A", 0),
+                folder(2, "B", 1),
+                body(3, "One", 7),
+                body(4, "Two", 8),
+                body(5, "Three", 9),
+            ],
+        );
+        let mut progress = Progress::default();
+        let (doc, _) =
+            read_reporting(&mut bytes.as_slice(), &mut progress).expect("a clamped tree refused");
+        assert_eq!(
+            doc.nodes().iter().map(Node::depth).collect::<Vec<_>>(),
+            vec![0, 1, 2, 2, 2],
+            "the clamp did not produce the forest the plan works through"
+        );
+        assert_eq!(progress.repairs, 3, "one clamp per repaired row, and no more");
+
+        // The same depths over folders, where every row CAN be a parent, so
+        // the other clamp is the only one that fires and the column steps down
+        // one level at a time instead.
+        let bytes = crafted(
+            4,
+            &[
+                folder(1, "A", 0),
+                folder(2, "B", 1),
+                folder(3, "C", 7),
+                folder(4, "D", 8),
+                body(5, "Inside", 9),
+            ],
+        );
+        let mut progress = Progress::default();
+        let (doc, _) =
+            read_reporting(&mut bytes.as_slice(), &mut progress).expect("a clamped tree refused");
+        assert_eq!(
+            doc.nodes().iter().map(Node::depth).collect::<Vec<_>>(),
+            vec![0, 1, 2, 3, 4],
+            "the other clamp did not step the column down one level at a time"
+        );
+        assert_eq!(progress.repairs, 3);
+    }
+
+    /// The panel's cap is the third term of the clamp, and it is the one that
+    /// keeps `resolve_visibility`'s fixed ancestor array in bounds.
+    ///
+    /// A well-formed chain of nine folders steps 0, 1, ... 7 legally and then
+    /// asks for 8, which is past the end of a `[bool; MAX_DEPTH]`. Clamped,
+    /// not refused, and the result is still a forest.
+    #[test]
+    fn a_chain_deeper_than_the_panel_allows_is_clamped_to_the_deepest_legal_level() {
+        let records: Vec<Record> = (0..=u32::from(MAX_DEPTH))
+            .map(|level| Record {
+                kind: if level == u32::from(MAX_DEPTH) { KIND_BODY } else { KIND_FOLDER },
+                depth: level as u8,
+                ..Record::body(level + 1, "Row")
+            })
+            .collect();
+
+        let mut progress = Progress::default();
+        // The last row, which is the only body: naming a folder would spend a
+        // repair on the active index and muddy the count this test is making.
+        let active = records.len() as u32 - 1;
+        let (doc, _) = read_reporting(&mut crafted(active, &records).as_slice(), &mut progress)
+            .expect("a chain past the cap was refused instead of clamped");
+        let depths: Vec<u8> = doc.nodes().iter().map(Node::depth).collect();
+        assert_eq!(depths, vec![0, 1, 2, 3, 4, 5, 6, 7, 7], "the cap did not hold the last row");
+        assert_eq!(progress.repairs, 1, "only the row past the cap should have been repaired");
+
+        // And the thing the cap exists for: the resolver walks it without
+        // indexing past the end of its ancestor array.
+        let mut shown = Vec::new();
+        doc.saved_visibility(&mut shown);
+        assert_eq!(shown.len(), depths.len());
+    }
+
+    /// **A folder's eye hides its children on screen and writes nothing into
+    /// their own bits**, which is the composition rule Maxon and Photoshop
+    /// state in the same words -- and the file is where it is proved, because
+    /// the file is the only place a descendant's own bit is visible after the
+    /// fact.
+    #[test]
+    fn a_hidden_folder_leaves_its_childrens_own_eyes_untouched_in_the_file() {
+        let mut doc = Document::from_volume(one_brick(BrickCoord::new(0, 0, 0), INSIDE));
+        let body = doc.active();
+        let (folder, _) = doc.group(body, "Group 1").expect("the group");
+        doc.add_body("Outside", one_brick(BrickCoord::new(9, 0, 0), -0.25));
+
+        let meta = doc.meta(folder).expect("the folder");
+        doc.set_meta(&NodeMeta { visible: false, ..meta });
+
+        let mut shown = Vec::new();
+        doc.saved_visibility(&mut shown);
+        assert_eq!(shown, vec![false, false, true], "the folder's eye did not reach its child");
+
+        let (loaded, _) = round_trip(&doc, &ProjectState::default());
+        assert!(!loaded.node(folder).expect("the folder").visible, "the folder's eye was lost");
+        assert!(
+            loaded.node(body).expect("the body").visible,
+            "the ancestor's eye was written into the child's own bit"
+        );
+    }
+
+    /// A version 3 file whose `kind` and `depth` bytes are the reserved zeroes
+    /// -- which is every file this build wrote before folders existed -- opens
+    /// under the folder reader as a flat list of bodies, unchanged.
+    #[test]
+    fn a_reserved_bytes_version_3_file_still_opens_as_a_flat_list() {
+        let doc = three_bodies();
+        let mut bytes = Vec::new();
+        write(&mut bytes, &doc, &ProjectState::default()).expect("write failed");
+        // Every record's `kind` and `depth`, as a pre-folder build wrote them.
+        for index in 0..doc.node_count() {
+            assert_eq!(
+                (bytes[record_at(index) + 6], bytes[record_at(index) + 7]),
+                (KIND_BODY, 0),
+                "the fixture is not a reserved-bytes file"
+            );
+        }
+
+        let mut progress = Progress::default();
+        let (loaded, _) = read_reporting(&mut bytes.as_slice(), &mut progress)
+            .expect("the folder reader refused a reserved-bytes file");
+        assert_eq!(progress.repairs, 0, "a flat list was repaired");
+        assert!(loaded.nodes().iter().all(|node| node.depth() == 0 && node.is_body()));
+        assert_same_document(&doc, &loaded);
     }
 
     /// A name decides only what a row is called, so it is repaired rather than
@@ -2363,10 +2783,10 @@ mod tests {
         // The second row's name field, filled with a byte no UTF-8 sequence
         // may start with.
         let at = record_at(1) + 8;
-        bytes[at..at + NAME_BYTES].fill(0xff);
+        bytes[at..at + MAX_NAME_BYTES].fill(0xff);
         // And the first row's, emptied.
         let at = record_at(0) + 8;
-        bytes[at..at + NAME_BYTES].fill(0);
+        bytes[at..at + MAX_NAME_BYTES].fill(0);
 
         let mut progress = Progress::default();
         let (doc, _) = read_reporting(&mut bytes.as_slice(), &mut progress)
@@ -2383,7 +2803,7 @@ mod tests {
     #[test]
     fn a_full_thirty_two_byte_name_round_trips_unchanged() {
         let name = "0123456789abcdef0123456789abcdef";
-        assert_eq!(name.len(), NAME_BYTES);
+        assert_eq!(name.len(), MAX_NAME_BYTES);
         let doc = named(name);
 
         let mut bytes = Vec::new();
@@ -2931,6 +3351,11 @@ mod tests {
         assert_eq!(found.body_count(), expected.body_count(), "the number of bodies changed");
         assert_eq!(found.node_count(), expected.node_count(), "the number of rows changed");
         assert_eq!(found.active(), expected.active(), "the selection moved");
+        assert_eq!(
+            found.outline(),
+            expected.outline(),
+            "the node table came back with a different shape: name, eye, collapse or DEPTH"
+        );
         for (before, after) in expected.nodes().iter().zip(found.nodes()) {
             assert_eq!(after.id, before.id, "the ids came back in a different order");
             assert_eq!(after.name, before.name, "{:?} came back renamed", before.id);

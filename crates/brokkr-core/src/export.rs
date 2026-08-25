@@ -1015,6 +1015,41 @@ mod tests {
         assert!(refusal.contains("every body is hidden"), "{refusal}");
     }
 
+    /// A folder row is not a body, so it is neither exported nor counted as
+    /// omitted -- and a folder whose eye is off takes its children out of the
+    /// print, which is the one place the composition rule has real consequences.
+    ///
+    /// **The omitted count is the line the whole defence rests on**, and a
+    /// folder is the way to get it wrong: `node_count() - result.len()` would
+    /// report a phantom omission for every folder in the document, and a user
+    /// told "1 body omitted" who hid nothing has been taught to ignore the
+    /// line.
+    #[test]
+    fn a_hidden_folder_takes_its_children_out_of_the_export_and_counts_only_them() {
+        let mut doc = document_of(3);
+        let second = doc.nodes()[1].id;
+        let (folder, _) = doc.group(second, "Group 1").expect("the group");
+
+        // Everything shown: the folder itself contributes no mesh and no
+        // omission.
+        let mut visible = Vec::new();
+        doc.saved_visibility(&mut visible);
+        let bodies = doc.export_bodies(&visible);
+        assert_eq!(bodies.len(), 3, "a folder row was counted as a body");
+        assert_eq!(doc.body_count() - bodies.len(), 0, "a folder was reported as omitted");
+
+        // The folder's eye off, with the child's own eye untouched.
+        let meta = doc.meta(folder).expect("the folder");
+        doc.set_meta(&crate::body::NodeMeta { visible: false, ..meta });
+        assert!(doc.node(second).expect("the child").visible, "the child's own bit was written");
+
+        doc.saved_visibility(&mut visible);
+        let bodies = doc.export_bodies(&visible);
+        assert_eq!(bodies.len(), 2, "the folder's eye did not reach its child");
+        assert!(bodies.iter().all(|(meta, _, _)| meta.id != second));
+        assert_eq!(doc.body_count() - bodies.len(), 1, "the omitted count is not the child alone");
+    }
+
     #[test]
     fn the_summed_report_adds_every_field() {
         let one = MeshReport {

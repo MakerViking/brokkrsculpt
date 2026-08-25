@@ -36,6 +36,38 @@ pub struct VolumeStats {
     pub resident_bytes: usize,
 }
 
+thread_local! {
+    /// How many times [`Volume::duplicated`] has run on THIS thread.
+    ///
+    /// Read it through [`copies_made_on_this_thread`].
+    ///
+    /// This exists so that a caller which promises to refuse a copy *before*
+    /// allocating it can be held to that promise. The promise is worth a
+    /// counter: the 765 MB dragon is 1.53 GiB of memory traffic, and a guard
+    /// that has been hoisted below the allocation still refuses, still reports
+    /// the right numbers, and still leaves the document untouched -- so every
+    /// assertion a test can make about the DOCUMENT passes either way. Nothing
+    /// but a count of the copies distinguishes the two.
+    ///
+    /// **Not `#[cfg(test)]`**, because the caller that has to be pinned lives
+    /// in another crate and links this one built without `cfg(test)`. The cost
+    /// is one non-atomic increment per duplicate, against a copy that is
+    /// already measured in gibibytes.
+    ///
+    /// **Thread-local rather than a global**, because the test harness runs
+    /// tests in parallel threads: a shared counter would make the assertion
+    /// race against every other test that duplicates anything.
+    static COPIES_MADE: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// The value of that counter, for a test that needs to see a copy NOT happen.
+///
+/// Take it before and after and compare the difference; the absolute value is
+/// whatever the rest of the thread has done.
+pub fn copies_made_on_this_thread() -> usize {
+    COPIES_MADE.with(std::cell::Cell::get)
+}
+
 /// What is known about one brick before an edit decides whether to touch it.
 ///
 /// The useful part is [`BrickPreview::uniform`]. Most of a large brush's box is
@@ -318,6 +350,61 @@ impl Volume {
     pub fn rescale(&mut self, factor: f32) {
         assert!(factor.is_finite() && factor > 0.0, "a scale factor must be finite and positive");
         self.voxel_size *= factor;
+    }
+
+    /// A deep copy of this field, with every brick moved by `offset_bricks`.
+    ///
+    /// **Named, and deliberately not `impl Clone`.** A `Volume` is the heaviest
+    /// thing this application holds, and `.clone()` is one syllable that would
+    /// hide all of it: the 765 MB dragon is 6,120 dense bricks, so a copy of it
+    /// is 6,120 allocations and 1.53 GiB of memory traffic. Nothing else in the
+    /// engine copies a field at all -- a delete MOVES the volume into the undo
+    /// entry, and resample, rotate and clip each build a new one while dropping
+    /// the old -- so duplicate is the first operation whose whole cost IS the
+    /// copy, and the call site is where that has to be visible. Deriving
+    /// `Clone` would also make it available to every `#[derive]` above every
+    /// type that ever comes to hold a `Volume`, which is how a gigabyte gets
+    /// copied by a struct update nobody read.
+    ///
+    /// # Why this is not `rotated(identity)`
+    ///
+    /// [`Volume::rotated`] walks 32,768 scalars per dense brick, because a
+    /// quarter turn genuinely moves every voxel to a different index inside its
+    /// brick. A translation by WHOLE BRICKS moves no voxel within its brick, so
+    /// each one is copied by `Brick::clone` -- a single 128 KB memcpy for a
+    /// dense brick, and nothing at all for a tile. The offset is in bricks
+    /// rather than in voxels for exactly that reason: a sub-brick offset would
+    /// have to rebuild every brick from two neighbours, which is the resample
+    /// this whole lattice exists to avoid, and it would cost the surface a
+    /// little detail on the way through.
+    ///
+    /// Serial where [`Volume::rotated`] is parallel, and that is a choice
+    /// rather than an omission: this is a memcpy of the brick map and so is
+    /// bound by memory bandwidth, not by arithmetic, and there is no per-voxel
+    /// work for the other cores to take. The 1.53 GiB is the cost, and no
+    /// scheduling makes it smaller.
+    ///
+    /// The copy comes back with **every** brick marked dirty, because nothing
+    /// else will mark them -- the same rule and the same reason as
+    /// [`crate::primitive::build`]. A body whose bricks were never meshed sits
+    /// in the document, exports correctly, and is invisible on screen for the
+    /// rest of the session. This project has shipped that twice.
+    pub fn duplicated(&self, offset_bricks: IVec3) -> Volume {
+        COPIES_MADE.with(|made| made.set(made.get() + 1));
+        let mut copy = Volume::new(self.voxel_size);
+        copy.bricks.reserve(self.bricks.len());
+        for (coord, brick) in &self.bricks {
+            copy.bricks.insert(BrickCoord(coord.0 + offset_bricks), brick.clone());
+        }
+        // A stroke in progress is NOT carried over. `recorder` holds the prior
+        // contents of the bricks this volume's own gesture touched, and those
+        // name an undo entry that belongs to the body being copied; a copy that
+        // arrived mid-recording would end that stroke by restoring the
+        // original's bricks into the wrong body. `Volume::new` leaves it
+        // `None`, which is "no stroke here", which is the truth about a field
+        // that has never been edited.
+        copy.mark_everything_dirty();
+        copy
     }
 
     // ---------------------------------------------------------------- sampling
@@ -1829,5 +1916,129 @@ mod tests {
     #[test]
     fn an_empty_volume_has_no_content_radius() {
         assert_eq!(Volume::new(0.25).content_radius(), None);
+    }
+
+    /// **The whole promise of duplicate**: the copy is the same field, and
+    /// writing to one does not touch the other.
+    ///
+    /// Bit-identical rather than approximately equal, and per BRICK rather than
+    /// by sampling a handful of points. Sampling would pass on a copy that had
+    /// been rebuilt by trilinear resampling, which is exactly the implementation
+    /// this one is written to avoid -- and a resample loses a little of the
+    /// surface every time it runs, so a duplicate that quietly went through one
+    /// would degrade a model a user duplicated a few times with nothing on
+    /// screen saying so. Uniform tiles are compared as tiles for the same
+    /// reason: a copy that promoted an interior tile to a dense brick would
+    /// hold the same values and cost 128 KB apiece.
+    #[test]
+    fn a_copy_holds_the_same_field_brick_for_brick() {
+        // The same fixture as `seeding_a_sphere_allocates_only_the_shell`,
+        // because it is the one sized to produce both kinds of brick: the
+        // interior spans whole bricks, so there are tiles as well as a shell.
+        let mut source = Volume::new(1.0);
+        source.seed_sphere(Vec3::ZERO, 60.0);
+        let copy = source.duplicated(IVec3::ZERO);
+
+        assert_eq!(copy.voxel_size(), source.voxel_size());
+        assert_eq!(copy.brick_count(), source.brick_count(), "the copy holds a different map");
+        assert_eq!(copy.stats().dense_bricks, source.stats().dense_bricks);
+        assert_eq!(copy.stats().uniform_bricks, source.stats().uniform_bricks);
+        assert!(source.stats().uniform_bricks > 0, "the fixture must exercise tiles as well");
+
+        for coord in source.brick_coords() {
+            match (source.brick(coord), copy.brick(coord)) {
+                (Some(Brick::Uniform(here)), Some(Brick::Uniform(there))) => {
+                    assert_eq!(here, there, "the tile at {coord:?} differs");
+                }
+                (Some(Brick::Dense(here)), Some(Brick::Dense(there))) => {
+                    assert_eq!(here, there, "the brick at {coord:?} differs");
+                }
+                (here, there) => {
+                    panic!("the brick at {coord:?} changed kind: {here:?} became {there:?}");
+                }
+            }
+        }
+    }
+
+    /// Two bodies, not one body in two rows. The copy owns its own storage, so
+    /// a stroke on either leaves the other exactly as it was.
+    #[test]
+    fn writing_to_a_copy_leaves_the_original_alone() {
+        let mut source = Volume::new(0.5);
+        source.seed_sphere(Vec3::ZERO, 20.0);
+        let before = source.sample_voxel(IVec3::ZERO);
+
+        let mut copy = source.duplicated(IVec3::ZERO);
+        copy.edit_box(Vec3::splat(-30.0), Vec3::splat(30.0), |_, _| OUTSIDE);
+
+        assert_eq!(copy.sample_voxel(IVec3::ZERO), OUTSIDE, "the copy was not written to");
+        assert_eq!(
+            source.sample_voxel(IVec3::ZERO),
+            before,
+            "writing to the copy reached the original, so the two share storage"
+        );
+    }
+
+    /// A whole-brick offset moves bricks and changes not one voxel, which is
+    /// the property that lets the copy be a memcpy instead of a resample.
+    #[test]
+    fn an_offset_copy_moves_whole_bricks_and_rewrites_no_voxel() {
+        let mut source = Volume::new(0.5);
+        source.seed_sphere(Vec3::ZERO, 20.0);
+        let offset = IVec3::new(3, -2, 7);
+        let copy = source.duplicated(offset);
+
+        assert_eq!(copy.brick_count(), source.brick_count());
+        for coord in source.brick_coords() {
+            let moved = BrickCoord(coord.0 + offset);
+            let here = source.brick(coord).expect("the coordinate came from the source");
+            let there = copy.brick(moved).expect("every brick moved by the offset");
+            match (here, there) {
+                (Brick::Uniform(a), Brick::Uniform(b)) => assert_eq!(a, b),
+                (Brick::Dense(a), Brick::Dense(b)) => assert_eq!(a, b),
+                _ => panic!("the brick at {coord:?} changed kind on the way to {moved:?}"),
+            }
+        }
+    }
+
+    /// **A copy that never reaches the GPU is the failure this project has
+    /// shipped twice**: the row is in the document, the export is right, and
+    /// the viewport is empty for the rest of the session.
+    ///
+    /// The dirty set covers each stored brick's neighbours as well, because a
+    /// brick with no voxels of its own still owns the quads on its low faces —
+    /// so the count is at least the brick count and not equal to it.
+    #[test]
+    fn a_copy_arrives_with_every_brick_dirty() {
+        let mut source = Volume::new(0.5);
+        source.seed_sphere(Vec3::ZERO, 20.0);
+        // Drained, so the source is in the state a body is in after its first
+        // remesh -- which is the state every body a user can duplicate is in.
+        source.take_dirty(&mut Vec::new());
+        assert_eq!(source.dirty_count(), 0, "the fixture must start clean");
+
+        let copy = source.duplicated(IVec3::ZERO);
+        assert!(
+            copy.dirty_count() >= copy.brick_count(),
+            "a copy of {} bricks arrived with {} dirty",
+            copy.brick_count(),
+            copy.dirty_count()
+        );
+    }
+
+    /// Copying a volume mid-stroke must not carry the recording with it. The
+    /// prior contents in there name bricks of the body being copied, and
+    /// restoring them into the copy would undo the wrong body.
+    #[test]
+    fn a_copy_taken_mid_stroke_is_not_recording() {
+        let mut source = Volume::new(0.5);
+        source.seed_sphere(Vec3::ZERO, 20.0);
+        source.begin_stroke();
+        source.edit_box(Vec3::splat(-5.0), Vec3::splat(5.0), |_, _| INSIDE);
+        assert!(source.is_recording(), "the fixture must actually be mid-stroke");
+
+        let mut copy = source.duplicated(IVec3::ZERO);
+        assert!(!copy.is_recording(), "the copy inherited the original's recording");
+        assert!(copy.end_stroke().is_none(), "the copy handed back an edit it never made");
     }
 }

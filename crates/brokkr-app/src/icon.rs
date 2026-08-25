@@ -600,6 +600,70 @@ const TRASH: Glyph = Glyph {
     ],
 };
 
+/// Duplicate: one sheet in front of another.
+///
+/// **The sheet behind is an L and not a second rectangle**, and that is the
+/// whole difference between a copy icon and a smudge at 11 px. Drawn whole, its
+/// right and bottom edges run *underneath* the front sheet, so at shipping size
+/// the two overlap into a grid of five or six lines and read as a table. The L
+/// keeps every stroke of the back sheet clear of the front one -- the upright
+/// sits left of `x = 8.5` and the bar sits above `y = 8.5` -- so nothing
+/// crosses anything and the offset is what the eye picks up.
+const COPY: Glyph = Glyph {
+    subs: &[
+        Sub {
+            segs: &[Seg::Move(5.0, 15.0), Seg::Line(5.0, 5.0), Seg::Line(15.0, 5.0)],
+            ink: Ink::Stroke,
+        },
+        Sub { segs: &[Seg::Rect { x: 8.5, y: 8.5, w: 11.0, h: 11.0, r: 1.5 }], ink: Ink::Stroke },
+    ],
+};
+
+/// Solo: a ring around a single dot — "this one, and nothing else".
+///
+/// **A bullseye and not a bare ring.** A lone stroked circle at
+/// [`crate::theme::ICON_INLINE`] is a 6 px `o` that reads as a letter, and it
+/// would sit one column away from [`EYE`] in the same row where the two have to
+/// be told apart at a glance. The centre dot is what makes it a target: the
+/// outer ring is the document and the dot is the one row inside it that is
+/// left, which is exactly what the mode does.
+///
+/// The dot is [`EYE`]'s pupil at the same radius on purpose — 2.4 is the size
+/// this set has already settled on for a filled centre, and copying it is what
+/// keeps the two icons looking like they came from one hand. The ring is what
+/// carries the difference, and the two are never the same drawing because
+/// [`EYE`]'s outer sub-path is an almond of two quadratics.
+const SOLO: Glyph = Glyph {
+    subs: &[
+        Sub { segs: &[Seg::Circle { cx: 12.0, cy: 12.0, r: 7.0 }], ink: Ink::Stroke },
+        Sub { segs: &[Seg::Circle { cx: 12.0, cy: 12.0, r: 2.4 }], ink: Ink::Fill },
+    ],
+};
+
+/// Merge down: an arrow dropping onto the row beneath it.
+///
+/// **A bar and not a second sheet**, which is what keeps this clear of [`COPY`]
+/// two columns along in the same verb row. Copy's meaning is two objects, so
+/// anything here built out of two rectangles would read as a copy with a
+/// decoration. The bar is the row below and the arrow is what lands in it: one
+/// object, one direction, and nothing that resembles a page.
+///
+/// It is also not [`CARET_DOWN`] with a line under it. The caret is the section
+/// heading's disclosure and appears on folder rows in this very panel, so the
+/// arrow carries a shaft the caret does not have — at
+/// [`crate::theme::ICON_INLINE`] the shaft is the whole of the difference, and
+/// the two are never seen at the same size in the same column.
+const MERGE_DOWN: Glyph = Glyph {
+    subs: &[
+        Sub { segs: &[Seg::Move(12.0, 4.0), Seg::Line(12.0, 12.8)], ink: Ink::Stroke },
+        Sub {
+            segs: &[Seg::Move(8.0, 8.8), Seg::Line(12.0, 12.8), Seg::Line(16.0, 8.8)],
+            ink: Ink::Stroke,
+        },
+        Sub { segs: &[Seg::Move(5.0, 17.5), Seg::Line(19.0, 17.5)], ink: Ink::Stroke },
+    ],
+};
+
 /// Every icon in the set.
 ///
 /// An enum rather than a string lookup for the reason SindriCAD moved to
@@ -633,6 +697,9 @@ pub enum IconName {
     EyeOff,
     Plus,
     Trash,
+    Copy,
+    Solo,
+    MergeDown,
 }
 
 impl IconName {
@@ -644,7 +711,7 @@ impl IconName {
     /// set's index, and anything that needs the whole set rather than one icon
     /// starts here.
     #[allow(dead_code)]
-    pub const ALL: [IconName; 26] = [
+    pub const ALL: [IconName; 29] = [
         IconName::Close,
         IconName::Minimise,
         IconName::Maximise,
@@ -671,6 +738,9 @@ impl IconName {
         IconName::EyeOff,
         IconName::Plus,
         IconName::Trash,
+        IconName::Copy,
+        IconName::Solo,
+        IconName::MergeDown,
     ];
 
     /// The icon standing for a sculpting brush.
@@ -734,6 +804,9 @@ impl IconName {
             IconName::EyeOff => &EYE_OFF,
             IconName::Plus => &PLUS,
             IconName::Trash => &TRASH,
+            IconName::Copy => &COPY,
+            IconName::Solo => &SOLO,
+            IconName::MergeDown => &MERGE_DOWN,
         }
     }
 }

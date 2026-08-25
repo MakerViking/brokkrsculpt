@@ -429,6 +429,23 @@ pub fn body_row_active(_theme: &iced::Theme) -> iced::widget::container::Style {
     }
 }
 
+/// A row solo is not showing.
+///
+/// **The dim is the second signal, and it is not decoration.** While solo is on,
+/// an out-of-scope row's own eye is still on, so its glyph is still an open eye
+/// — ten rows claiming "visible" over a viewport drawing one. `ICON_INLINE` is
+/// 11 px and the muted ink alone is a subtle difference at that size, so the
+/// row itself recedes: [`BG_DEEP`] is the inset-well colour, darker than the
+/// panel behind it, which reads as "this is switched off" rather than as "this
+/// is selected".
+pub fn body_row_out_of_scope(_theme: &iced::Theme) -> iced::widget::container::Style {
+    iced::widget::container::Style {
+        background: Some(BG_DEEP.into()),
+        border: iced::Border { radius: RADIUS_SM.into(), ..Default::default() },
+        ..Default::default()
+    }
+}
+
 /// The two-pixel bar down the inside edge of the active row.
 ///
 /// The tint alone is 0.14 alpha over a dark panel, which survives a screenshot

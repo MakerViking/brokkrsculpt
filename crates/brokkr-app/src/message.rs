@@ -313,6 +313,30 @@ pub enum Message {
         key: iced::keyboard::Key,
         modifiers: iced::keyboard::Modifiers,
     },
+    /// A left press that no widget in the tree wanted. **Nothing acts on it;
+    /// it exists so that something arrives.**
+    ///
+    /// This is the application's only blur signal, and it is needed because
+    /// `text_input` blurs itself without saying so: any left press that is not
+    /// over its own bounds sets `state.is_focused = None`
+    /// (`text_input.rs:723-735`) and does not capture, and no ancestor stops
+    /// it -- `Row::update` forwards every event to every child regardless of
+    /// capture (`row.rs:261-271`). The bodies list is a FIXED six or eight
+    /// rows tall, so with a handful of bodies there is empty scrollable below
+    /// the last row that belongs to no widget at all. A press there used to
+    /// produce no message whatsoever, which left `Brokkr::renaming` set and
+    /// the rename field DRAWN BUT DEAD: the user's next keystroke reached
+    /// `key_event` as Ignored and fired a tool shortcut -- `s` starting a
+    /// brush-radius drag, `x`/`y`/`z` flipping the mirror planes -- which is
+    /// verbatim the class of bug `viewport::route_pointer`'s header records as
+    /// fixed.
+    ///
+    /// Left button only, and that is not an oversight: `text_input` blurs on a
+    /// LEFT press, so a right press leaves the field focused and must leave
+    /// the rename alone. Presses that a widget did want never get here at all
+    /// -- `key_event` drops captured events, and the field, a row's
+    /// `mouse_area` and the viewport shader all capture their own.
+    PressedNothing,
     /// Close the right-click menu.
     MenuClosed,
     /// Turn the model so the face the cube menu was opened on becomes this
@@ -435,6 +459,81 @@ pub enum Message {
     /// Go ahead with a delete the prompt asked about.
     BodyDeleteConfirmed,
     BodyDeleteCancelled,
+    /// Start renaming a row: a DOUBLE click on it, which is Photoshop's
+    /// gesture and not the plan's single click.
+    ///
+    /// Single click had to go: the name cell is `Length::Fill` and therefore
+    /// the largest target in the row, so a single click there is how a body
+    /// gets selected. Giving the name its own `mouse_area` does not rescue it
+    /// either -- `MouseArea::update` captures a left press whenever
+    /// `on_double_click` is set, double or not (`mouse_area.rs:394-398`), so an
+    /// inner area would eat the press the row's own selection depends on.
+    BodyRenameBegan(brokkr_core::NodeId),
+    /// A keystroke in the rename field, already clamped to what the file
+    /// format's fixed name field can hold.
+    BodyRenameEdited(String),
+    /// Enter in the rename field. See `Brokkr::commit_rename` for where the
+    /// commit actually happens, which is NOT this arm.
+    BodyRenameSubmitted,
+    /// Copy the active body, in place, as a new row directly below it.
+    ///
+    /// No payload: the active row is the subject, exactly as `BodyDeleted`'s is.
+    /// A `NodeId` here would be a second answer to "which body" beside
+    /// `Document::active`, and the two would disagree the first time a verb
+    /// button was pressed while a stale id sat in a queued message.
+    BodyDuplicated,
+    /// Merge the active body down into the body directly below it.
+    ///
+    /// No payload, for the reason `BodyDuplicated` gives. May raise a prompt
+    /// first; see `Brokkr::pending_merge`.
+    BodyMergedDown,
+    /// Go ahead with a merge the prompt asked about.
+    BodyMergeConfirmed,
+    BodyMergeCancelled,
+    /// `ctrl+G`: wrap the active row in a new folder, in place, no dialog.
+    BodyGrouped,
+    /// `ctrl+shift+G`: dissolve the folder the active row sits in.
+    ///
+    /// The PARENT and not the row, because the active row is always a body and
+    /// a body has nothing to dissolve. That is also what makes the pair
+    /// symmetric: ctrl+G then ctrl+shift+G leaves the document as it was.
+    BodyUngrouped,
+    /// Re-parent the active row into a folder, or `None` for the top level.
+    ///
+    /// **Increment 17 deletes this the day a drag lands.** Two routes to one
+    /// operation is two sets of drop rules to keep consistent in a 214 px
+    /// panel, and neither ever gets removed once shipped.
+    BodyMovedToFolder(Option<brokkr_core::NodeId>),
+    /// Fold a folder's children away in the panel, or show them again.
+    ///
+    /// Names the folder rather than acting on the active row: the chevron is
+    /// drawn on the folder it belongs to, and a folder is never the active row.
+    FolderCollapseToggled(brokkr_core::NodeId),
+    /// Delete a folder and everything in it.
+    ///
+    /// **Deliberately not `BodyDeleted` with a folder in it.** The verb row's
+    /// Delete names `Document::active`, which always holds a field, and this
+    /// names a folder -- so no state of the panel, collapsed least of all, can
+    /// make one of them do the other's job. In ZBrush it can, and a user
+    /// reported losing an unrecoverable hour to it.
+    FolderDeleted(brokkr_core::NodeId),
+    /// Show only this row's subtree, and leave every eye alone.
+    ///
+    /// A view MODE and never a document change: it is `Option<NodeId>` on
+    /// `Brokkr`, it is passed to `resolve_visibility` as a parameter, and it is
+    /// written nowhere. Entering it on a row that is hidden is the one exception
+    /// — that turns the row's own eye and its ancestors' back on, because
+    /// "show me only this" with nothing on screen is not a mode anyone asked
+    /// for — and *that* part is an ordinary undoable edit.
+    SoloEntered(brokkr_core::NodeId),
+    /// Leave solo. Escape, `ctrl+alt+comma`, and the header indicator's own
+    /// exit all send this.
+    ///
+    /// It restores nothing, because it changed nothing: every hand-set eye is
+    /// exactly where the user left it. That is the whole reason solo is a mode
+    /// rather than a saved-visibility vector — every shipped version of the
+    /// vector design loses the hand-set set on the way out.
+    SoloExited,
     /// Show or hide the thumbnail column. Session state, so it must NOT dirty
     /// the document: nothing about it is written to the file.
     ThumbnailsToggled,

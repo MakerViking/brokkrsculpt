@@ -16,26 +16,45 @@
 //! at the bottom of this file, which is the measurement everything else rests
 //! on.
 //!
-//! # Why a tree type when there is one body
-//!
-//! [`Node`] carries `depth`, `collapsed` and an optional body from its first
-//! commit, and the application pins all of it: one node, `depth` 0, `body`
-//! always `Some`. That is deliberate rather than speculative. Folder rows are a
-//! decided requirement, and the alternative is converting a `Vec<Body>` into a
-//! `Vec<Node>` across six later changes plus every test that names a body by
-//! index. The invariants that hold *today* are asserted in
-//! [`Document::assert_invariants`], in one place, so relaxing them later is an
-//! edit to that function rather than an archaeology exercise.
+//! # The tree: a flat preorder array with a depth column
 //!
 //! Position in the tree is `(preorder index, depth)` and nothing else. There is
-//! no parent pointer, which is what makes a cycle unrepresentable rather than
-//! merely detectable.
+//! no parent pointer, which is what makes a cycle **unrepresentable** rather
+//! than merely detectable: there is nothing in this encoding to point at an
+//! ancestor with, so no arrangement of bytes -- and no sequence of edits --
+//! can produce one. Validating the whole tree is therefore a fold over one
+//! integer, [`Document::assert_invariants`], and neither the reader nor the
+//! visibility resolver recurses at all.
+//!
+//! Do not "improve" this into parent indices with a cycle check. That admits
+//! the bad state and then hunts for it, it needs an invented canonical sibling
+//! order before the file can be byte-identical twice, and it reintroduces the
+//! recursive parser a hostile file could overflow.
+//!
+//! The one tree primitive anybody needs is [`subtree`]: group, ungroup,
+//! move-to-folder and delete-folder are all range moves over it, and every
+//! legality question is a range comparison. "You cannot drop a folder into
+//! itself" is `!range.contains(&target)`, not a graph search.
+//!
+//! Two rules taken from the references because both REMOVE state:
+//!
+//! - **A folder can never be empty.** Removing its last child dissolves it, in
+//!   the same undo entry. It is not asserted as an invariant, and that is
+//!   deliberate -- undo restores a deleted subtree one row at a time, and the
+//!   folder necessarily stands alone for the instant between its own row going
+//!   back and its children's. See [`Document::assert_invariants`].
+//! - **A collapsed folder NEVER changes what a command does.** In ZBrush,
+//!   deleting a subtool inside a closed folder deletes the whole folder; a user
+//!   reported losing an unrecoverable hour to it. Collapse changes only what is
+//!   drawn.
 //!
 //! `nodes` is a `Vec` and never a hash map. `project::write` has to produce
 //! identical bytes twice -- `writing_the_same_volume_twice_gives_identical_bytes`
 //! pins it -- and a hash order breaks that nondeterministically, which is the
 //! shape of failure that passes locally and fails on CI. List order is also
 //! user-visible state that has to round-trip.
+
+use std::ops::Range;
 
 use glam::Vec3;
 use rayon::prelude::*;
@@ -44,6 +63,7 @@ use crate::brick::{BRICK_VOXELS, Brick, BrickCoord, NARROW_BAND};
 use crate::mesh::{BrickMesh, MeshScratch};
 use crate::project::MAX_VOLUME_BYTES;
 use crate::raycast::{Hit, raycast};
+use crate::undo::Change;
 use crate::volume::{PARALLEL_MESH_THRESHOLD, Volume, VolumeStats};
 
 /// Which node, for as long as the document lives.
@@ -211,8 +231,11 @@ pub struct Node {
     pub id: NodeId,
     /// `0 ..= MAX_DEPTH - 1`. Position in the tree IS (preorder index, depth).
     ///
-    /// Private because every node is at depth 0 in this build and the
-    /// invariant check is what says so; the setter arrives with folders.
+    /// Private because [`Document::assert_invariants`] is the one place that
+    /// decides what a legal depth is, and because every write to it has to go
+    /// through a clamp: [`resolve_visibility`] indexes a fixed
+    /// `[bool; MAX_DEPTH]` ancestor chain, so an over-deep row is a panic in a
+    /// function every frame calls.
     depth: u8,
     /// At most 32 bytes of UTF-8, which is the file format's fixed field.
     pub name: String,
@@ -236,11 +259,25 @@ pub struct Node {
 }
 
 impl Node {
-    /// A body row at depth 0.
-    fn body(id: NodeId, name: String, volume: Volume) -> Self {
+    /// A body row at a chosen depth.
+    ///
+    /// **The depth is a parameter and not a zero, and the increment that made
+    /// folders reachable is the increment that had to stop it being a zero.** A
+    /// row's position in the tree IS (preorder index, depth), so a constructor
+    /// that hard-codes one of the two can only ever build a top-level row --
+    /// and the one caller that inserts mid-list, duplicate, then drops a
+    /// depth-0 row into the middle of a folder's preorder run, which ends that
+    /// folder early and silently evicts everything after the copy.
+    ///
+    /// Clamped for the same reason [`Node::from_meta`] and [`Node::set_meta`]
+    /// clamp: every write to `depth` goes through one, because
+    /// [`resolve_visibility`] indexes a fixed `[bool; MAX_DEPTH]` array with
+    /// it. Whether the depth is legal *at a position* is a question about the
+    /// document rather than the row, and [`Document::insert_body`] answers it.
+    fn body(id: NodeId, depth: u8, name: String, volume: Volume) -> Self {
         Self {
             id,
-            depth: 0,
+            depth: depth.min(MAX_DEPTH - 1),
             name,
             visible: true,
             collapsed: false,
@@ -249,24 +286,41 @@ impl Node {
     }
 
     /// A body row rebuilt from a snapshot, which is what a node table read out
-    /// of a file amounts to.
+    /// of a file amounts to. `None` for the volume IS the folder.
     ///
     /// **The depth is clamped here rather than trusted, and this is the
     /// clamping constructor [`MAX_DEPTH`] refers to.** `resolve_visibility`
     /// walks a fixed `[bool; MAX_DEPTH]` ancestor chain, and a depth past the
     /// end of it is an index out of bounds -- a panic in the one function every
-    /// frame calls. The reader refuses a non-zero depth outright at container
-    /// version 3, so nothing reaches this clamp today; it is here because the
-    /// reader is not the only thing that builds a document, and the split, the
-    /// group and every test helper come through this constructor instead.
-    pub(crate) fn from_meta(meta: NodeMeta, volume: Volume) -> Self {
+    /// frame calls. The reader has its own clamp, which is the one that keeps
+    /// the *forest* valid; this one only keeps the array in bounds, and it is
+    /// here because the reader is not the only thing that builds a document --
+    /// the split, the group and every test helper come through this
+    /// constructor instead.
+    pub(crate) fn from_meta(meta: NodeMeta, volume: Option<Volume>) -> Self {
         Self {
             id: meta.id,
             depth: meta.depth.min(MAX_DEPTH - 1),
             name: meta.name,
             visible: meta.visible,
-            collapsed: meta.collapsed,
-            body: Some(Box::new(BodyData::new(volume))),
+            // A body row has nothing to collapse, and the reader repairs the
+            // bit away rather than refusing it. Doing it here as well is what
+            // stops a test helper from building a document whose write ->
+            // read -> write differs by one bit.
+            collapsed: meta.collapsed && volume.is_none(),
+            body: volume.map(|volume| Box::new(BodyData::new(volume))),
+        }
+    }
+
+    /// A folder row: a name, a depth, and no field at all.
+    fn folder(id: NodeId, name: String, depth: u8) -> Self {
+        Self {
+            id,
+            depth: depth.min(MAX_DEPTH - 1),
+            name,
+            visible: true,
+            collapsed: false,
+            body: None,
         }
     }
 
@@ -324,10 +378,26 @@ impl Node {
     pub(crate) fn set_meta(&mut self, meta: &NodeMeta) {
         debug_assert_eq!(self.id, meta.id, "a node's snapshot belongs to another node");
         let NodeMeta { id: _, depth, ref name, visible, collapsed } = *meta;
-        self.depth = depth;
+        // Clamped for the same reason `from_meta` clamps: this is the other
+        // write to `depth`, and a snapshot is only as good as whatever built
+        // it. A legal depth passes through untouched, so undo stays exact.
+        self.depth = depth.min(MAX_DEPTH - 1);
         self.name.clone_from(name);
         self.visible = visible;
-        self.collapsed = collapsed;
+        self.collapsed = collapsed && !self.is_body();
+    }
+
+    /// Move this row one level in or out, clamped to the panel's cap.
+    ///
+    /// `by` is signed because a group deepens and an ungroup shallows, and
+    /// writing the two out separately is two places for the clamp to be
+    /// forgotten in.
+    fn shift_depth(&mut self, by: i16) {
+        self.depth = i16::from(self.depth)
+            .saturating_add(by)
+            .clamp(0, i16::from(MAX_DEPTH) - 1)
+            .try_into()
+            .expect("clamped into 0 ..= MAX_DEPTH - 1");
     }
 }
 
@@ -371,7 +441,7 @@ impl Document {
         let id = NodeId(1);
         let doc = Self {
             voxel_size: volume.voxel_size(),
-            nodes: vec![Node::body(id, Self::FIRST_BODY_NAME.to_string(), volume)],
+            nodes: vec![Node::body(id, 0, Self::FIRST_BODY_NAME.to_string(), volume)],
             active: id,
             next_id: 2,
         };
@@ -396,20 +466,20 @@ impl Document {
     /// very next save would write a file the reader refuses for duplicate ids.
     /// **The build would have written a file it will not read.**
     ///
-    /// Every row is a body, because container version 3 refuses a `kind` byte
-    /// that is not zero. Folders widen this to `Vec<(NodeMeta, Option<Volume>)>`
-    /// in the increment that makes a folder row representable at all.
+    /// Every row that carries a `Some` volume is a body; a `None` IS a folder.
+    /// The reader has already clamped the depth column into a valid forest, so
+    /// this does not re-derive it -- it only asserts it, through
+    /// [`Document::assert_invariants`].
     pub(crate) fn from_table(
         voxel_size: f32,
-        rows: Vec<(NodeMeta, Volume)>,
+        rows: Vec<(NodeMeta, Option<Volume>)>,
         active: usize,
     ) -> Self {
         let nodes: Vec<Node> = rows
             .into_iter()
             .map(|(meta, volume)| {
-                debug_assert_eq!(
-                    volume.voxel_size(),
-                    voxel_size,
+                debug_assert!(
+                    volume.as_ref().is_none_or(|volume| volume.voxel_size() == voxel_size),
                     "every body shares the document's lattice"
                 );
                 Node::from_meta(meta, volume)
@@ -420,6 +490,20 @@ impl Document {
              caller builds its own",
         );
         let active = nodes[active.min(nodes.len() - 1)].id;
+        // Belt and braces over the reader's own repair: a folder cannot be the
+        // active row, and the invariant that says so is a `debug_assert`, which
+        // a release build would sail straight past into the first `expect` that
+        // asks for the active body's field.
+        let active = match nodes.iter().find(|node| node.id == active) {
+            Some(node) if node.is_body() => active,
+            _ => {
+                nodes
+                    .iter()
+                    .find(|node| node.is_body())
+                    .expect("the reader refuses a table with no body rows before it gets here")
+                    .id
+            }
+        };
         // `highest + 1` cannot overflow: the reader refuses an id of
         // `u32::MAX` for exactly this reason, so the highest id that can reach
         // here is `u32::MAX - 1`.
@@ -539,12 +623,61 @@ impl Document {
 
     /// Add a body at the end of the list and return its id.
     ///
-    /// Nothing in the interface calls this yet -- the application holds exactly
-    /// one body until primitives land. It exists because every test from here
-    /// on that has anything to say about two bodies needs to build two, and
-    /// because the id policy (monotonic, never reused, never zero) is worth
-    /// having one implementation of.
+    /// The add-a-primitive path and every test that needs a second body. It is
+    /// [`Document::insert_body`] at the end of the list, and it stays as its own
+    /// name because "put it last" is what almost every caller means and
+    /// `nodes().len()` at each of them is a position that can be computed
+    /// wrongly.
     pub fn add_body(&mut self, name: impl Into<String>, volume: Volume) -> NodeId {
+        self.insert_body(self.nodes.len(), 0, name, volume)
+    }
+
+    /// Add a body at a POSITION and a DEPTH in display order and return its id.
+    ///
+    /// Duplicate is what needs it: the copy goes directly below the row it came
+    /// from, where the user is looking, rather than at the bottom of a list of
+    /// sixty-four.
+    ///
+    /// **The depth is a parameter rather than a zero, and a caller that means
+    /// "beside this row" passes that row's depth.** A position alone does not
+    /// say where in the TREE a row lands -- a row's place is (preorder index,
+    /// depth) and nothing less -- so a mid-list insert that assumed depth 0
+    /// dropped the copy of a body inside a folder at the top level, ended the
+    /// folder's preorder run at the copy, and silently evicted every sibling
+    /// after it. That was invisible to the panel's own smoke test because the
+    /// active row there happened to be at depth 0.
+    ///
+    /// The depth is clamped to what is legal AT `at` rather than trusted, which
+    /// is the same bargain the reader strikes with a file: no argument can
+    /// leave the document a non-forest. A row may be at most one level below
+    /// the row above it and only a folder may be a parent at all, which sets
+    /// the ceiling; and the row that will now FOLLOW this body may not be
+    /// deeper than it, which sets the floor. The floor never exceeds the
+    /// ceiling, because the following row already satisfied both against the
+    /// row this one is displacing.
+    ///
+    /// **This mints a new id and [`Document::insert`] does not, and the two must
+    /// not be confused.** `insert` puts a node the document has already handed
+    /// an id to back where it was, which is what undo does; this one is the
+    /// document growing by a row that never existed. The id policy -- monotonic,
+    /// never reused, never zero -- has exactly one implementation and it is
+    /// here.
+    ///
+    /// **The volume's dirty set is the caller's business**, as it is for
+    /// `add_body`: this does not mark anything, because the two things that
+    /// build a field for it -- [`crate::primitive::build`] and
+    /// [`Volume::duplicated`] -- both hand back a volume already marked, and a
+    /// second full marking here would walk the brick map again for nothing.
+    /// `Document::insert` marks precisely because the node it takes has been
+    /// sitting in an undo entry with a drained dirty set.
+    pub fn insert_body(
+        &mut self,
+        at: usize,
+        depth: u8,
+        name: impl Into<String>,
+        volume: Volume,
+    ) -> NodeId {
+        debug_assert!(at <= self.nodes.len(), "position {at} is past the end of the document");
         debug_assert_eq!(
             volume.voxel_size(),
             self.voxel_size,
@@ -552,9 +685,27 @@ impl Document {
         );
         let id = NodeId(self.next_id);
         self.next_id += 1;
-        self.nodes.push(Node::body(id, name.into(), volume));
+        let depth = self.legal_body_depth_at(at, depth);
+        self.nodes.insert(at, Node::body(id, depth, name.into(), volume));
         self.assert_invariants();
         id
+    }
+
+    /// The depth nearest to `wanted` that a BODY inserted at `at` may hold.
+    ///
+    /// The whole of what [`Document::insert_body`]'s doc comment describes as
+    /// the ceiling and the floor, written once because getting it wrong is a
+    /// document that is no longer a forest -- and a forest is what every fold
+    /// over the depth column, the visibility resolver first among them, is
+    /// entitled to assume.
+    fn legal_body_depth_at(&self, at: usize, wanted: u8) -> u8 {
+        let ceiling = match at.checked_sub(1).map(|above| &self.nodes[above]) {
+            None => 0,
+            Some(above) if above.is_body() => above.depth(),
+            Some(above) => above.depth() + 1,
+        };
+        let floor = self.nodes.get(at).map_or(0, Node::depth);
+        wanted.min(ceiling).min(MAX_DEPTH - 1).max(floor)
     }
 
     /// Where a node sits in display order, or `None` when it is not here.
@@ -666,6 +817,340 @@ impl Document {
         let below = self.nodes[from.min(self.nodes.len())..].iter();
         let above = self.nodes[..from.min(self.nodes.len())].iter().rev();
         below.chain(above).find(|node| node.is_body()).map(|node| node.id)
+    }
+
+    // --- the tree ----------------------------------------------------------
+
+    /// Everything about every row, in display order.
+    ///
+    /// The payload of [`Change::Outline`], and the reason that variant can
+    /// cover rename, the eye, collapse, reorder, group and ungroup at once: a
+    /// whole-outline snapshot is a permutation *plus* field edits over a fixed
+    /// id set, and its inverse is the pair swapped.
+    ///
+    /// A hundred and twenty-eight rows at some eighty bytes each is about
+    /// 10 KB, against a 256 MB history budget. That is the whole cost argument,
+    /// and it is why there is no narrower variant for "just the eye".
+    pub fn outline(&self) -> Vec<NodeMeta> {
+        self.nodes.iter().map(Node::meta).collect()
+    }
+
+    /// Put a whole outline back: the order, and every row's fields.
+    ///
+    /// **The id multiset must be exactly the document's own**, which is what
+    /// makes this a permutation rather than a structural edit. A group records
+    /// its new folder as a separate [`Change::NodeAdded`] precisely so that this
+    /// stays true; see the module doc's account of the ordering rule.
+    ///
+    /// `O(n^2)` in the lookup, with `n` at most [`MAX_NODES`]. This runs at a
+    /// user action and at an undo press, never per frame.
+    pub(crate) fn set_outline(&mut self, outline: &[NodeMeta]) {
+        debug_assert_eq!(
+            outline.len(),
+            self.nodes.len(),
+            "an outline snapshot covers every row or none of them"
+        );
+        let mut taken: Vec<Option<Node>> = self.nodes.drain(..).map(Some).collect();
+        for meta in outline {
+            let found =
+                taken.iter().position(|node| node.as_ref().is_some_and(|node| node.id == meta.id));
+            let Some(index) = found else {
+                debug_assert!(false, "an outline snapshot names {:?}, which is not here", meta.id);
+                continue;
+            };
+            let mut node = taken[index].take().expect("found just above");
+            node.set_meta(meta);
+            self.nodes.push(node);
+        }
+        debug_assert!(
+            taken.iter().all(Option::is_none),
+            "an outline snapshot left rows out of the document"
+        );
+        self.assert_invariants();
+    }
+
+    /// The rows one node's subtree occupies, or `None` when it is not here.
+    ///
+    /// See [`subtree`]. A body's subtree is always exactly itself.
+    pub fn subtree_of(&self, id: NodeId) -> Option<Range<usize>> {
+        self.index_of(id).map(|at| subtree(&self.nodes, at))
+    }
+
+    /// How many rows in one node's subtree hold a field.
+    ///
+    /// What a delete has to know before it runs: whether it would take the last
+    /// body, and how many slots the renderer has to be told to forget.
+    pub fn subtree_body_count(&self, id: NodeId) -> usize {
+        self.subtree_of(id)
+            .map_or(0, |range| self.nodes[range].iter().filter(|node| node.is_body()).count())
+    }
+
+    /// The folder one row sits directly inside, or `None` at the top level.
+    ///
+    /// A backward scan for the first row shallower than this one, which by the
+    /// preorder invariant IS the parent. No pointer, no search.
+    pub fn parent_of(&self, id: NodeId) -> Option<NodeId> {
+        let at = self.index_of(id)?;
+        let depth = self.nodes[at].depth();
+        if depth == 0 {
+            return None;
+        }
+        self.nodes[..at].iter().rev().find(|node| node.depth() < depth).map(|node| node.id)
+    }
+
+    /// Every folder row, in display order.
+    pub fn folders(&self) -> impl Iterator<Item = &Node> {
+        self.nodes.iter().filter(|node| !node.is_body())
+    }
+
+    /// How many bodies each row's subtree holds, written into `out` by node
+    /// position. Zero for a body row, which counts nothing but itself.
+    ///
+    /// **One backward pass and a fixed-size accumulator, because the panel asks
+    /// for this and the panel is rebuilt at display rate.** Done per row it
+    /// would be a subtree walk per row, which is the `O(n^2)` per frame the
+    /// panel's own header forbids. Allocates nothing beyond `out`'s growth.
+    pub fn subtree_body_counts(&self, out: &mut Vec<usize>) {
+        out.clear();
+        out.resize(self.nodes.len(), 0);
+        // `pending[d]` is the number of bodies in the subtrees at depth `d`
+        // seen since the last row shallower than `d`. Preorder read backwards
+        // means a row's children are all counted before the row itself.
+        let mut pending = [0usize; MAX_DEPTH as usize + 1];
+        for (index, node) in self.nodes.iter().enumerate().rev() {
+            let depth = usize::from(node.depth()).min(MAX_DEPTH as usize - 1);
+            let bodies = if node.is_body() { 1 } else { pending[depth + 1] };
+            out[index] = if node.is_body() { 0 } else { bodies };
+            // Consumed by this row; nothing deeper can be outstanding, because
+            // the fold forbids a jump of more than one level.
+            pending[depth + 1] = 0;
+            pending[depth] += bodies;
+        }
+    }
+
+    /// Wrap one row's subtree in a new folder, in place.
+    ///
+    /// Returns the folder's id and the changes one undo press has to reverse,
+    /// or `None` when the document has no room for another row or the subtree
+    /// is already as deep as the panel goes.
+    ///
+    /// # The order of the two changes is load-bearing
+    ///
+    /// `[NodeAdded, Outline]`, and never the other way round. An entry is
+    /// applied in reverse, so undo runs the `Outline` first -- putting the
+    /// depths back while the folder is still in the list, which is what keeps
+    /// the outline's id multiset equal to the document's -- and only then
+    /// removes the folder. Recording the `Outline` first would hand
+    /// [`Document::set_outline`] a snapshot one row short of the document.
+    pub fn group(&mut self, id: NodeId, name: impl Into<String>) -> Option<(NodeId, Vec<Change>)> {
+        let at = self.index_of(id)?;
+        if self.nodes.len() >= MAX_NODES {
+            return None;
+        }
+        let range = subtree(&self.nodes, at);
+        let deepest = self.nodes[range.clone()].iter().map(Node::depth).max()?;
+        if deepest + 1 >= MAX_DEPTH {
+            return None;
+        }
+
+        let depth = self.nodes[at].depth();
+        let folder = NodeId(self.next_id);
+        self.next_id += 1;
+        self.nodes.insert(at, Node::folder(folder, name.into(), depth));
+
+        // Snapshotted with the folder already in the list and the subtree still
+        // beside it rather than inside it. That intermediate arrangement is a
+        // valid forest -- an empty folder followed by its future children --
+        // which is exactly why an empty folder is not an invariant.
+        let before = self.outline();
+        for node in &mut self.nodes[at + 1..=range.end] {
+            node.shift_depth(1);
+        }
+        let after = self.outline();
+
+        self.assert_invariants();
+        Some((
+            folder,
+            vec![Change::NodeAdded { at, id: folder }, Change::Outline { before, after }],
+        ))
+    }
+
+    /// Dissolve a folder: its children rise out of it and keep their order.
+    ///
+    /// `None` when the id names a body or is not here. The mirror of
+    /// [`Document::group`], including the ordering rule: `[Outline,
+    /// NodeRemoved]`, so undo puts the folder back first and only then
+    /// re-deepens the children into it.
+    pub fn ungroup(&mut self, folder: NodeId) -> Option<Vec<Change>> {
+        let at = self.index_of(folder)?;
+        if self.nodes[at].is_body() {
+            return None;
+        }
+        let range = subtree(&self.nodes, at);
+
+        let before = self.outline();
+        for node in &mut self.nodes[at + 1..range.end] {
+            node.shift_depth(-1);
+        }
+        let after = self.outline();
+
+        let node = self.nodes.remove(at);
+        debug_assert_ne!(self.active, node.id, "a folder was never the active row");
+        self.assert_invariants();
+        Some(vec![
+            Change::Outline { before, after },
+            Change::NodeRemoved { at, node: Box::new(node) },
+        ])
+    }
+
+    /// Move one row's subtree into a folder, or out to the top level.
+    ///
+    /// The whole of the legality question is a range comparison: **you cannot
+    /// drop a folder into its own subtree**, which is `range.contains(&target)`
+    /// and not a graph search. That is the property the depth encoding buys --
+    /// a cycle is not rejected here, it is unrepresentable.
+    ///
+    /// `None` when the move is illegal, when the target is a body, or when the
+    /// subtree would end up deeper than the panel goes. A move that changes
+    /// nothing also returns `None`, so a no-op never costs an undo press.
+    ///
+    /// A folder the departure leaves empty is dissolved in the same list of
+    /// changes, after the reorder, so one ctrl+Z puts both back.
+    pub fn move_to_folder(&mut self, id: NodeId, into: Option<NodeId>) -> Option<Vec<Change>> {
+        let at = self.index_of(id)?;
+        let range = subtree(&self.nodes, at);
+
+        let (insert_at, depth) = match into {
+            Some(folder) => {
+                let folder_at = self.index_of(folder)?;
+                if self.nodes[folder_at].is_body() || range.contains(&folder_at) {
+                    return None;
+                }
+                (subtree(&self.nodes, folder_at).end, self.nodes[folder_at].depth() + 1)
+            }
+            // Out to the end of the top level, which is where a row with no
+            // parent belongs and the only unambiguous place to put it.
+            None => (self.nodes.len(), 0),
+        };
+
+        let by = i16::from(depth) - i16::from(self.nodes[at].depth());
+        let deepest = self.nodes[range.clone()].iter().map(Node::depth).max()?;
+        if i16::from(deepest) + by >= i16::from(MAX_DEPTH) {
+            return None;
+        }
+        // Already exactly where it is being sent: the rows would come out in
+        // the same order at the same depths.
+        if by == 0 && (insert_at == range.start || insert_at == range.end) {
+            return None;
+        }
+
+        let before = self.outline();
+        let moved: Vec<Node> = self.nodes.drain(range.clone()).collect();
+        // The drain shifted everything after the subtree down by its length.
+        let target = if insert_at > range.start { insert_at - moved.len() } else { insert_at };
+        self.nodes.splice(target..target, moved);
+        for node in &mut self.nodes[target..target + range.len()] {
+            node.shift_depth(by);
+        }
+        let after = self.outline();
+
+        // **Where the subtree LEFT FROM, in the list as it now stands**, which
+        // is not `range.start` whenever the block landed in front of it: the
+        // splice shifted the vacated slot up by the block's own length. Getting
+        // this wrong dissolves nothing and leaves an empty folder behind --
+        // caught by the property test rather than by reasoning, on a move of a
+        // folder's only child into a folder ABOVE it.
+        let vacated = if target < range.start { range.start + range.len() } else { range.start };
+        let mut changes = vec![Change::Outline { before, after }];
+        changes.extend(self.dissolve_empty_folders_above(vacated));
+        self.assert_invariants();
+        Some(changes)
+    }
+
+    /// Show or hide a folder's children in the panel.
+    ///
+    /// Recorded like any other field of the outline, because `collapsed` is
+    /// written to the file: a change nobody could undo would still be a change
+    /// the next save keeps. `None` for a body row, which has nothing to fold
+    /// away, and for a folder already in that state.
+    pub fn set_collapsed(&mut self, folder: NodeId, collapsed: bool) -> Option<Vec<Change>> {
+        let at = self.index_of(folder)?;
+        if self.nodes[at].is_body() || self.nodes[at].collapsed == collapsed {
+            return None;
+        }
+        let before = self.outline();
+        self.nodes[at].collapsed = collapsed;
+        let after = self.outline();
+        self.assert_invariants();
+        Some(vec![Change::Outline { before, after }])
+    }
+
+    /// Take a row and everything under it out of the document.
+    ///
+    /// `None` when it would take the last body, which a document may not be
+    /// without. Otherwise a `Change::NodeRemoved` per row, **in removal order:
+    /// deepest and last first, the subtree's own root last.** An entry is
+    /// applied in reverse, so that is precisely what makes undo put the FOLDER
+    /// back before the bodies that live in it -- every insertion then lands at
+    /// an index that is already correct, and no intermediate state has a body
+    /// standing where a folder should be.
+    ///
+    /// The volumes MOVE into the changes; [`Volume`] has no `Clone` at all, so
+    /// a folder delete of three bodies allocates nothing and peak memory does
+    /// not rise, it merely does not fall.
+    ///
+    /// A folder the delete leaves empty is dissolved into the same list.
+    pub fn delete_subtree(&mut self, id: NodeId) -> Option<Vec<Change>> {
+        let at = self.index_of(id)?;
+        let range = subtree(&self.nodes, at);
+        let going = self.nodes[range.clone()].iter().filter(|node| node.is_body()).count();
+        if going >= self.body_count() {
+            return None;
+        }
+
+        let mut changes = Vec::with_capacity(range.len());
+        for index in range.clone().rev() {
+            let node = self.nodes.remove(index);
+            changes.push(Change::NodeRemoved { at: index, node: Box::new(node) });
+        }
+        changes.extend(self.dissolve_empty_folders_above(range.start));
+
+        if !self.nodes.iter().any(|node| node.id == self.active) {
+            self.active = self
+                .nearest_body(range.start)
+                .expect("a document always holds at least one body to fall back to");
+        }
+        self.assert_invariants();
+        Some(changes)
+    }
+
+    /// Remove every folder immediately above `at` that has just been left with
+    /// no children, innermost first.
+    ///
+    /// **A folder can never be empty**, which is ZBrush's rule and which
+    /// removes the empty-folder state from the panel and the resolver rather
+    /// than adding a case to each. Recorded innermost-first so that undo, which
+    /// runs backwards, puts the outermost one back first and every insertion
+    /// index is already right.
+    fn dissolve_empty_folders_above(&mut self, at: usize) -> Vec<Change> {
+        let mut changes = Vec::new();
+        let mut at = at.min(self.nodes.len());
+        while at > 0 {
+            let index = at - 1;
+            let node = &self.nodes[index];
+            if node.is_body() {
+                break;
+            }
+            let has_a_child =
+                self.nodes.get(index + 1).is_some_and(|next| next.depth() > node.depth());
+            if has_a_child {
+                break;
+            }
+            let removed = self.nodes.remove(index);
+            changes.push(Change::NodeRemoved { at: index, node: Box::new(removed) });
+            at = index;
+        }
+        changes
     }
 
     /// Every body, in display order, with its id.
@@ -1085,14 +1570,21 @@ impl Document {
         self.bodies().all(|(_, volume)| volume.voxel_size() == self.voxel_size)
     }
 
-    /// Everything that is true of a document in this build, in one place.
+    /// Everything that is true of a document, in one place.
     ///
-    /// Three of these are permanent -- ids unique and nonzero, at least one
-    /// body, the active node holds a volume. Two are temporary and say what the
-    /// application is pinned to rather than what the type can express: every
-    /// node is at depth 0, and every node holds a body. **The document type
-    /// holds N nodes from its first commit; it is the application that holds
-    /// one**, which is why relaxing those two is an edit here and nowhere else.
+    /// Ids unique and nonzero, at least one body, the active node holds a
+    /// volume -- and **the tree, which is a fold over one integer**: the first
+    /// row is at depth 0, no row is more than one level deeper than the row
+    /// above it, and a body is never a parent. That is the whole acyclicity
+    /// check, and it is a fold rather than a traversal because the encoding
+    /// cannot express a cycle in the first place.
+    ///
+    /// **An empty folder is deliberately NOT here.** Every operation dissolves
+    /// one, in the same undo entry, but undo restores a deleted subtree row by
+    /// row and the folder necessarily stands alone for the instant between its
+    /// own row going back and its first child's. Asserting it would fail on a
+    /// correct undo; the rule lives in the operations, where it can be true
+    /// between gestures rather than between statements.
     ///
     /// Debug only, because it is O(nodes squared) in the uniqueness check and
     /// it runs after every mutation.
@@ -1126,11 +1618,43 @@ impl Document {
                 node.id
             );
             debug_assert!(node.depth < MAX_DEPTH, "depth {} is past the panel's cap", node.depth);
-            // Pinned rather than permanent: folders relax both of these.
-            debug_assert_eq!(node.depth, 0, "every node is at depth 0 in this build");
-            debug_assert!(node.is_body(), "every node holds a body in this build");
+            debug_assert!(!node.is_body() || !node.collapsed, "a body row has nothing to collapse");
+            match index.checked_sub(1).map(|above| &self.nodes[above]) {
+                None => debug_assert_eq!(node.depth, 0, "the first row is at the top level"),
+                Some(above) if above.is_body() => debug_assert!(
+                    node.depth <= above.depth,
+                    "a body is not a parent, so depth {} cannot follow a body at {}",
+                    node.depth,
+                    above.depth
+                ),
+                Some(above) => debug_assert!(
+                    node.depth <= above.depth + 1,
+                    "depth {} skips a level below {}",
+                    node.depth,
+                    above.depth
+                ),
+            }
         }
     }
+}
+
+/// The half-open preorder range this node's subtree occupies: `[at, j)` where
+/// `j` is the first index after `at` whose depth is at most `depth[at]`.
+///
+/// **The only tree primitive there is.** Group, ungroup, move-to-folder and
+/// delete-folder are range moves over this, and every legality question is a
+/// range comparison rather than a graph search. A body's subtree is always
+/// exactly itself, because a body is never a parent.
+///
+/// Panics on an index past the end, exactly as slicing would: a caller that
+/// does not know whether the row is there asks [`Document::subtree_of`].
+pub fn subtree(nodes: &[Node], at: usize) -> Range<usize> {
+    let depth = nodes[at].depth();
+    let end = nodes[at + 1..]
+        .iter()
+        .position(|node| node.depth() <= depth)
+        .map_or(nodes.len(), |offset| at + 1 + offset);
+    at..end
 }
 
 /// Where a ray enters a world space box, or `None` when it never does inside
@@ -1341,6 +1865,33 @@ impl GrowthGuard {
     /// parameter every caller has to estimate would buy a ceiling nothing
     /// reaches first.
     pub fn no_room_for(&self, bytes: f64, vertices: f64) -> Option<(String, f32)> {
+        let (why, fit) = self.shortfall(bytes, vertices)?;
+        let workable = (fit.sqrt() * Self::MARGIN) as f32;
+        Some((format!("{why} -- {:.0}% of that size would fit", workable * 100.0), workable))
+    }
+
+    /// [`GrowthGuard::no_room_for`] for an add that has **no size lever**.
+    ///
+    /// Duplicate is the case, and merge will be the second: a copy is the size
+    /// of what it copies, and there is no control anywhere in the interface
+    /// that makes one smaller. Telling that user "45% of that size would fit"
+    /// names a size they cannot ask for, which is worse than saying nothing --
+    /// the established pattern is that a refusal names the size that WOULD
+    /// work, and the honest reading of it here is that no size would.
+    ///
+    /// Both ceilings, both numbers and the same arithmetic; only the suggestion
+    /// is dropped. Sharing [`GrowthGuard::shortfall`] rather than being written
+    /// out again is what keeps the two refusals from drifting into quoting
+    /// different headroom for the same document.
+    pub fn no_room_for_a_copy(&self, bytes: f64, vertices: f64) -> Option<String> {
+        self.shortfall(bytes, vertices).map(|(why, _)| why)
+    }
+
+    /// Why a body of this cost does not fit, and the fraction of it that would.
+    ///
+    /// The fraction is of the COST, not of the linear size; squaring it back
+    /// into a size belongs to the caller that has a size to offer.
+    fn shortfall(&self, bytes: f64, vertices: f64) -> Option<(String, f64)> {
         let byte_headroom = (MAX_VOLUME_BYTES - self.resident_bytes).max(0.0);
         let byte_fit = if bytes > 0.0 { byte_headroom / bytes } else { f64::INFINITY };
         let vertex_fit = if vertices > 0.0 { self.pool_headroom / vertices } else { f64::INFINITY };
@@ -1367,8 +1918,7 @@ impl GrowthGuard {
                 self.pool_headroom / 1.0e6,
             )
         };
-        let workable = (fit.sqrt() * Self::MARGIN) as f32;
-        Some((format!("{why} -- {:.0}% of that size would fit", workable * 100.0), workable))
+        Some((why, fit))
     }
 }
 
@@ -1644,16 +2194,447 @@ mod tests {
         assert_eq!(doc.body_count(), 2);
     }
 
+    // --- the tree ----------------------------------------------------------
+
+    /// The depth column of a document, which is the whole of its shape.
+    fn depths(doc: &Document) -> Vec<u8> {
+        doc.nodes().iter().map(Node::depth).collect()
+    }
+
+    /// Three bodies at the top level, named for what they are.
+    fn three() -> (Document, NodeId, NodeId, NodeId) {
+        let mut doc = Document::new(0.5);
+        let first = doc.active();
+        let second = doc.add_body("Body 2", Volume::new(0.5));
+        let third = doc.add_body("Body 3", Volume::new(0.5));
+        (doc, first, second, third)
+    }
+
+    /// The one tree primitive, on the case that decides every range move: a
+    /// folder's subtree ends where the depth column comes back up, and a
+    /// body's is exactly itself.
+    #[test]
+    fn a_subtree_is_the_preorder_run_of_everything_deeper_than_its_root() {
+        let (mut doc, first, second, third) = three();
+        // folder > [folder > first] , second, third
+        let (inner, _) = doc.group(first, "Inner").expect("the inner group");
+        let (outer, _) = doc.group(inner, "Outer").expect("the outer group");
+
+        assert_eq!(depths(&doc), vec![0, 1, 2, 0, 0]);
+        assert_eq!(doc.subtree_of(outer), Some(0..3), "the outer folder lost its descendants");
+        assert_eq!(doc.subtree_of(inner), Some(1..3));
+        assert_eq!(doc.subtree_of(first), Some(2..3), "a body's subtree is exactly itself");
+        assert_eq!(doc.subtree_of(second), Some(3..4));
+        assert_eq!(doc.subtree_of(third), Some(4..5), "the last row's subtree ran off the end");
+        assert_eq!(doc.subtree_body_count(outer), 1);
+        assert_eq!(doc.parent_of(first), Some(inner));
+        assert_eq!(doc.parent_of(outer), None);
+    }
+
+    /// ctrl+G then ctrl+shift+G is the identity, outline for outline, which is
+    /// what makes the pair safe to press without thinking.
+    #[test]
+    fn grouping_and_ungrouping_leaves_the_outline_exactly_as_it_was() {
+        let (mut doc, _, second, _) = three();
+        let was = doc.outline();
+
+        let (folder, _) = doc.group(second, "Group 1").expect("the group");
+        assert_eq!(depths(&doc), vec![0, 0, 1, 0], "the grouped row did not move inside");
+        assert_eq!(doc.node_count(), 4);
+
+        doc.ungroup(folder).expect("the ungroup");
+        assert_eq!(doc.outline(), was, "the pair is not each other's inverse");
+    }
+
+    /// The whole gesture, undone and redone, with the folder and the depths
+    /// moving together.
+    ///
+    /// It is two changes in one entry and the ORDER between them is the thing
+    /// under test: undo runs them backwards, so the depths go back while the
+    /// folder is still in the list and only then does the folder go. Recorded
+    /// the other way round, `set_outline` would be handed a snapshot one row
+    /// short of the document.
+    #[test]
+    fn one_undo_takes_a_whole_group_apart_and_one_redo_rebuilds_it() {
+        let (mut doc, _, second, _) = three();
+        let was = doc.outline();
+
+        let (_, changes) = doc.group(second, "Group 1").expect("the group");
+        let grouped = doc.outline();
+        let mut history = crate::undo::History::new(1 << 20);
+        history.push(crate::undo::Entry::new(changes));
+
+        let shown = all_shown(&doc);
+        history.undo(&mut doc, &shown);
+        assert_eq!(doc.outline(), was, "one undo did not take the group apart");
+
+        let shown = all_shown(&doc);
+        history.redo(&mut doc, &shown);
+        assert_eq!(doc.outline(), grouped, "one redo did not put the group back");
+    }
+
+    /// Eight levels is the cap, so the deepest legal row is at depth 7 and the
+    /// press that would make an eighth is refused rather than clamped.
+    ///
+    /// Clamping would be worse than refusing: the row would appear to move and
+    /// then not have, with a folder minted around it either way.
+    #[test]
+    fn grouping_stops_at_the_eighth_level_rather_than_clamping_into_it() {
+        let mut doc = Document::new(0.5);
+        let body = doc.active();
+        // Seven folders wrap the body, which puts it at depth 7 -- the deepest
+        // legal row, since MAX_DEPTH is 8 and legal depths are 0..=7.
+        for level in 0..MAX_DEPTH - 1 {
+            doc.group(body, format!("Group {level}")).expect("a legal group");
+        }
+        assert_eq!(doc.node(body).expect("the body").depth(), MAX_DEPTH - 1);
+        assert_eq!(doc.node_count(), usize::from(MAX_DEPTH));
+
+        let rows = doc.node_count();
+        assert!(doc.group(body, "One too many").is_none(), "an eighth level was allowed");
+        assert_eq!(doc.node_count(), rows, "the refused group left a folder behind");
+    }
+
+    /// **A cycle is unrepresentable, and this is the check that stands in for
+    /// the acyclicity validator the encoding deletes.**
+    ///
+    /// There is no way to express "this folder's parent is its own child" in a
+    /// preorder array plus a depth column, so the only thing a move CAN get
+    /// wrong is being asked to send a subtree inside itself -- and that is one
+    /// range comparison, not a graph search.
+    #[test]
+    fn a_folder_cannot_be_moved_into_its_own_subtree() {
+        let (mut doc, first, _, _) = three();
+        let (inner, _) = doc.group(first, "Inner").expect("the inner group");
+        let (outer, _) = doc.group(inner, "Outer").expect("the outer group");
+        let was = doc.outline();
+
+        assert!(doc.move_to_folder(outer, Some(inner)).is_none(), "a folder went inside itself");
+        assert!(doc.move_to_folder(outer, Some(outer)).is_none(), "a folder went inside itself");
+        assert_eq!(doc.outline(), was, "a refused move changed the document");
+    }
+
+    /// A row moves into a folder, and back out to the top level, carrying its
+    /// depth with it.
+    #[test]
+    fn a_body_moves_into_a_folder_and_back_out_again() {
+        let (mut doc, first, second, third) = three();
+        let (folder, _) = doc.group(first, "Group 1").expect("the group");
+
+        doc.move_to_folder(second, Some(folder)).expect("the move in");
+        assert_eq!(
+            doc.nodes().iter().map(|node| node.id).collect::<Vec<_>>(),
+            vec![folder, first, second, third],
+            "the row did not land inside the folder"
+        );
+        assert_eq!(depths(&doc), vec![0, 1, 1, 0]);
+
+        doc.move_to_folder(second, None).expect("the move out");
+        assert_eq!(
+            doc.nodes().iter().map(|node| node.id).collect::<Vec<_>>(),
+            vec![folder, first, third, second],
+            "the row did not come back out to the end of the top level"
+        );
+        assert_eq!(depths(&doc), vec![0, 1, 0, 0]);
+    }
+
+    /// **A folder can never be empty**, so taking its last child out takes the
+    /// folder with it -- and in the SAME list of changes, so one ctrl+Z puts
+    /// both back.
+    #[test]
+    fn moving_a_folders_last_child_out_dissolves_the_folder_in_one_entry() {
+        let (mut doc, first, _, _) = three();
+        let (folder, _) = doc.group(first, "Group 1").expect("the group");
+        let was = doc.outline();
+
+        let changes = doc.move_to_folder(first, None).expect("the move out");
+        assert!(
+            doc.node(folder).is_none(),
+            "the folder its last child left is still in the document"
+        );
+        assert_eq!(depths(&doc), vec![0, 0, 0]);
+
+        let mut history = crate::undo::History::new(1 << 20);
+        history.push(crate::undo::Entry::new(changes));
+        assert_eq!(history.stats().undo_entries, 1, "the move and the dissolve are two gestures");
+        let shown = all_shown(&doc);
+        history.undo(&mut doc, &shown);
+        assert_eq!(doc.outline(), was, "one undo did not restore the folder and the row together");
+    }
+
+    /// A folder delete is N removals in ONE entry, and undo puts the FOLDER
+    /// back before the bodies that live in it.
+    ///
+    /// The order is the thing under test and getting it wrong is not silent --
+    /// a body restored into a list with no folder above it is a body at a depth
+    /// the fold refuses -- but it would only fail inside a `debug_assert`, so
+    /// the row order is checked here where the failure has a name.
+    #[test]
+    fn a_folder_delete_is_one_entry_that_restores_the_folder_before_its_bodies() {
+        let (mut doc, first, second, third) = three();
+        let keeper = doc.add_body("Keeper", Volume::new(0.5));
+        let (folder, _) = doc.group(first, "Group 1").expect("the group");
+        doc.move_to_folder(second, Some(folder)).expect("the second in");
+        doc.move_to_folder(third, Some(folder)).expect("the third in");
+        doc.set_active(keeper);
+        let was = doc.outline();
+        assert_eq!(doc.subtree_body_count(folder), 3);
+
+        let changes = doc.delete_subtree(folder).expect("the folder delete");
+        assert_eq!(changes.len(), 4, "a folder of three bodies is four removals");
+        assert_eq!(doc.node_count(), 1, "the delete left rows behind");
+
+        let entry = crate::undo::Entry::new(changes);
+        let mut history = crate::undo::History::new(1 << 20);
+        history.push(entry);
+        assert_eq!(history.stats().undo_entries, 1, "four removals became four gestures");
+
+        let shown = all_shown(&doc);
+        history.undo(&mut doc, &shown);
+        assert_eq!(doc.outline(), was, "one undo did not put the whole folder back");
+    }
+
+    /// The reclaim allowance is what predicts the 512 MB prompt, so a folder
+    /// delete has to charge it the SUM of what it is holding rather than one
+    /// body's worth.
+    #[test]
+    fn a_folder_delete_charges_the_reclaim_allowance_the_sum_of_its_bodies() {
+        let mut doc = Document::new(1.0);
+        let keeper = doc.active();
+        let mut resident = 0usize;
+        let mut inside = Vec::new();
+        for n in 0..3 {
+            let mut volume = Volume::new(1.0);
+            volume.seed_sphere(Vec3::new(n as f32 * 80.0, 0.0, 0.0), 16.0);
+            resident += volume.stats().resident_bytes;
+            inside.push(doc.add_body(format!("Body {n}"), volume));
+        }
+        let (folder, _) = doc.group(inside[0], "Group 1").expect("the group");
+        doc.move_to_folder(inside[1], Some(folder)).expect("the second in");
+        doc.move_to_folder(inside[2], Some(folder)).expect("the third in");
+        doc.set_active(keeper);
+
+        let entry = crate::undo::Entry::new(doc.delete_subtree(folder).expect("the folder delete"));
+        assert!(
+            entry.reclaim_bytes() >= resident,
+            "three bodies of {resident} bytes were charged only {}",
+            entry.reclaim_bytes()
+        );
+    }
+
+    /// **Deleting a body inside a collapsed folder deletes the body, never the
+    /// folder.** Collapse changes only what is drawn.
+    ///
+    /// In ZBrush it does the other thing, a user reported losing an
+    /// unrecoverable hour to it, the bundled Delete macro had the same hole,
+    /// and a third-party plugin exists solely to intercept it.
+    #[test]
+    fn deleting_a_body_inside_a_collapsed_folder_never_takes_the_folder() {
+        let (mut doc, first, second, _) = three();
+        let (folder, _) = doc.group(first, "Group 1").expect("the group");
+        doc.move_to_folder(second, Some(folder)).expect("the second in");
+        doc.set_collapsed(folder, true).expect("the collapse");
+
+        doc.delete_subtree(first).expect("the body delete");
+        assert!(doc.node(folder).is_some(), "a collapsed folder swallowed a body delete");
+        assert!(doc.node(second).is_some(), "the folder's other body went with it");
+        assert!(doc.node(first).is_none(), "the body the user asked about is still here");
+        assert!(doc.node(folder).expect("the folder").collapsed, "the collapse was thrown away");
+    }
+
+    /// Deleting the LAST body in a folder does take the folder, because a
+    /// folder can never be empty -- and that is the other half of the rule
+    /// above rather than a contradiction of it.
+    #[test]
+    fn deleting_a_folders_last_body_dissolves_the_folder_with_it() {
+        let (mut doc, first, _, _) = three();
+        let (folder, _) = doc.group(first, "Group 1").expect("the group");
+
+        let changes = doc.delete_subtree(first).expect("the body delete");
+        assert_eq!(changes.len(), 2, "the body and its emptied folder are one entry of two");
+        assert!(doc.node(folder).is_none(), "an empty folder was left behind");
+    }
+
+    /// The last body cannot go, however it is asked for.
+    #[test]
+    fn a_delete_that_would_take_every_body_is_refused() {
+        let mut doc = Document::new(0.5);
+        let only = doc.active();
+        let (folder, _) = doc.group(only, "Group 1").expect("the group");
+
+        assert!(doc.delete_subtree(only).is_none(), "the last body was deleted");
+        assert!(doc.delete_subtree(folder).is_none(), "the folder holding the last body went");
+        assert_eq!(doc.body_count(), 1);
+    }
+
+    /// **The property test the flat encoding exists to make possible.**
+    ///
+    /// A thousand random operations over a document that starts with six
+    /// bodies: group, ungroup, move, collapse, delete and duplicate, each aimed
+    /// at a row chosen by the same seeded noise. Every one of them runs
+    /// `Document::assert_invariants`, so the tree fold, the id uniqueness and
+    /// the active-holds-a-volume rule are checked after every single step; this
+    /// asserts the things that fold cannot see, and that the sequence never
+    /// panics.
+    ///
+    /// A recursive validator is exactly what is NOT needed here, and that is
+    /// the point: no sequence of these operations can produce a cycle, because
+    /// there is nothing in the encoding to express one with.
+    ///
+    /// **The counted control matters as much as the property.** A version of
+    /// this that refused every operation would pass it perfectly, so the run
+    /// asserts that each of the seven actually landed and that the tree really
+    /// got deep. Deletes are the arm that needs the last one: with nothing
+    /// adding bodies back, a six-body document runs out of them in five presses
+    /// and the delete arm goes quiet.
+    #[test]
+    fn a_thousand_random_tree_operations_keep_the_tree_a_tree() {
+        let mut noise = crate::testing::Noise::seeded(0x5eed_1234);
+        let mut doc = Document::new(0.5);
+        for n in 1..6 {
+            doc.add_body(format!("Body {n}"), Volume::new(0.5));
+        }
+
+        let mut landed = [0usize; 7];
+        let mut deepest = 0u8;
+        for step in 0..1000 {
+            let ids: Vec<NodeId> = doc.nodes().iter().map(|node| node.id).collect();
+            let chosen = ids[noise.below(ids.len())];
+            let operation = noise.below(7);
+            let done = match operation {
+                0 => {
+                    doc.node_count() < MAX_NODES
+                        && doc.group(chosen, format!("Group {step}")).is_some()
+                }
+                1 => doc.ungroup(chosen).is_some(),
+                2 => {
+                    let into = (noise.below(2) == 0).then(|| ids[noise.below(ids.len())]);
+                    doc.move_to_folder(chosen, into).is_some()
+                }
+                3 => doc.set_collapsed(chosen, noise.below(2) == 0).is_some(),
+                4 => doc.delete_subtree(chosen).is_some(),
+                // The duplicate button: a body copied BESIDE its source, which
+                // is the one insert in the application that lands in the middle
+                // of the list rather than at the end. It is here because the
+                // first five operations never exercised a mid-list insert, and
+                // the one that shipped assumed depth 0 -- so a copy made inside
+                // a folder ended that folder's run and evicted its siblings,
+                // with the whole suite green.
+                5 => {
+                    let at = doc.index_of(chosen).expect("a chosen id is in the document");
+                    let room = doc.body_count() < MAX_BODIES && doc.node_count() < MAX_NODES;
+                    let body = doc.nodes()[at].is_body();
+                    if room && body {
+                        let depth = doc.nodes()[at].depth();
+                        doc.insert_body(at + 1, depth, format!("Copy {step}"), Volume::new(0.5));
+                    }
+                    room && body
+                }
+                // Bodies come back, or the run runs out of them in five
+                // presses and the delete arm stops proving anything.
+                _ => {
+                    let room = doc.body_count() < MAX_BODIES && doc.node_count() < MAX_NODES;
+                    if room {
+                        doc.add_body(format!("Body {step}"), Volume::new(0.5));
+                    }
+                    room
+                }
+            };
+            landed[operation] += usize::from(done);
+            deepest = deepest.max(depths(&doc).into_iter().max().unwrap_or(0));
+
+            // What the fold cannot see, checked here rather than left to a
+            // release build's silence.
+            assert!(doc.body_count() >= 1, "step {step} deleted every body");
+            assert!(
+                doc.volume(doc.active()).is_some(),
+                "step {step} left the active row without a field"
+            );
+            // **A folder can never be empty**, which is the one rule that is
+            // NOT a document invariant -- undo restores a subtree row by row,
+            // so it cannot hold between statements. It has to hold between
+            // gestures, and this is where that is checked.
+            for (index, node) in doc.nodes().iter().enumerate() {
+                assert!(
+                    node.is_body()
+                        || doc
+                            .nodes()
+                            .get(index + 1)
+                            .is_some_and(|next| next.depth() > node.depth()),
+                    "step {step} left {} empty at row {index}: {:?}",
+                    node.name,
+                    depths(&doc)
+                );
+            }
+            let mut resolved = Vec::new();
+            doc.display_visibility(None, &mut resolved);
+            assert_eq!(resolved.len(), doc.node_count(), "step {step}: the resolver lost a row");
+        }
+
+        assert!(
+            landed.iter().all(|count| *count > 10),
+            "some operation never landed, so the run proves less than it looks: {landed:?}"
+        );
+        assert_eq!(deepest, MAX_DEPTH - 1, "the run never reached the deepest legal level");
+    }
+
+    /// The bug the property test above found, pinned as its own case so that a
+    /// regression fails with a name rather than at step 355 of a random run.
+    ///
+    /// Moving a folder's only child into a folder that sits ABOVE it inserts
+    /// the block in FRONT of the slot it left, which shifts that slot up by the
+    /// block's own length. Dissolving at the old index then looks at the wrong
+    /// row, finds a body, stops -- and the emptied folder stays in the list
+    /// with no children, which is a state nothing else in the design expects.
+    #[test]
+    fn moving_a_child_into_a_folder_above_it_still_dissolves_the_one_it_left() {
+        let (mut doc, first, second, _) = three();
+        let (target, _) = doc.group(first, "Target").expect("the folder above");
+        let (source, _) = doc.group(second, "Source").expect("the folder below");
+        assert_eq!(depths(&doc), vec![0, 1, 0, 1, 0], "the fixture is not the shape under test");
+        assert!(
+            doc.index_of(target) < doc.index_of(source),
+            "the target folder has to sit above the source one"
+        );
+
+        doc.move_to_folder(second, Some(target)).expect("the move up");
+        assert!(doc.node(source).is_none(), "the folder its only child left is still here");
+        assert!(doc.node(target).is_some());
+        assert_eq!(depths(&doc), vec![0, 1, 1, 0]);
+    }
+
+    /// The outline is a permutation plus field edits, so putting one back has
+    /// to restore the ORDER as well as the fields.
+    #[test]
+    fn an_outline_snapshot_restores_the_order_and_not_only_the_fields() {
+        let (mut doc, first, second, third) = three();
+        let was = doc.outline();
+
+        let (folder, _) = doc.group(third, "Group 1").expect("the group");
+        doc.move_to_folder(first, Some(folder)).expect("the move");
+        assert_ne!(
+            doc.nodes().iter().map(|node| node.id).collect::<Vec<_>>(),
+            vec![first, second, third],
+            "nothing moved, so this proves nothing"
+        );
+
+        // The folder has to go before the snapshot can: a snapshot names the
+        // rows it covers, and `was` predates the folder entirely.
+        doc.move_to_folder(third, None).expect("the folder's other child out");
+        doc.move_to_folder(first, None).expect("the last child out, which dissolves the folder");
+        assert!(doc.node(folder).is_none());
+        doc.set_outline(&was);
+        assert_eq!(doc.outline(), was, "the outline did not come back");
+    }
+
     // --- the visibility resolver ------------------------------------------
 
-    /// A row at a chosen depth with a chosen eye, built straight rather than
-    /// through a [`Document`].
+    /// A body row at a chosen depth with a chosen eye, built straight rather
+    /// than through a [`Document`].
     ///
-    /// The document pins every node to depth 0 in this build and asserts it
-    /// after every mutation, so a tree deep enough to exercise the ancestor
-    /// walk cannot be built through one. [`resolve_visibility`] is a free
-    /// function over `&[Node]` precisely so it can be tested ahead of the
-    /// feature that produces such a list.
+    /// [`resolve_visibility`] is a free function over `&[Node]` precisely so
+    /// that a tree can be handed to it row by row, without the group operation
+    /// that would otherwise have to exist to build one.
     fn row(id: u32, depth: u8, visible: bool) -> Node {
         Node::from_meta(
             NodeMeta {
@@ -1663,7 +2644,7 @@ mod tests {
                 visible,
                 collapsed: false,
             },
-            Volume::new(0.5),
+            Some(Volume::new(0.5)),
         )
     }
 
@@ -1996,6 +2977,141 @@ mod tests {
         let (_, workable) = guard.no_room_for(1024.0, 1024.0).expect("there is no room at all");
         assert!(workable.is_finite(), "the refusal named {workable} as a size");
         assert_eq!(workable, 0.0, "nothing fits, so no fraction of it fits either");
+    }
+
+    /// **The duplicate refusal, which is the 4 GB case.** A second copy of a
+    /// 4 GB body against a 6 GB ceiling does not fit, and the message has to
+    /// carry BOTH numbers -- what it needs and what is left -- because a user
+    /// who is told only one of them cannot tell whether to delete a body,
+    /// resample coarser, or give up.
+    ///
+    /// It must NOT name a fraction. Duplicate has no size lever anywhere in the
+    /// interface: a copy is the size of what it copies, so "62% of that size
+    /// would fit" points at a control that does not exist.
+    #[test]
+    fn a_copy_that_does_not_fit_is_refused_with_both_numbers_and_no_size_to_try() {
+        let gigabyte = 1024.0 * 1024.0 * 1024.0;
+        let guard = GrowthGuard { resident_bytes: 4.0 * gigabyte, pool_headroom: 80_000_000.0 };
+
+        let why = guard
+            .no_room_for_a_copy(4.0 * gigabyte, 1_000_000.0)
+            .expect("a second 4 GB body does not fit under a 6 GB ceiling");
+        assert!(why.contains("4.0 GB of memory"), "what it needs is not in the message: {why}");
+        assert!(why.contains("2.0 GB left"), "what is left is not in the message: {why}");
+        assert!(why.contains("6 GB ceiling"), "the ceiling itself is not in the message: {why}");
+        assert!(!why.contains('%'), "a copy has no size lever, so no size may be offered: {why}");
+    }
+
+    /// The same arithmetic as [`GrowthGuard::no_room_for`] and only the
+    /// suggestion dropped, checked at the boundary in both directions so that
+    /// the two cannot drift into disagreeing about whether a body fits.
+    #[test]
+    fn the_two_refusals_admit_and_refuse_exactly_the_same_bodies() {
+        let guard = GrowthGuard { resident_bytes: MAX_VOLUME_BYTES / 2.0, pool_headroom: 4_000.0 };
+        for bytes in [0.0, 1.0, MAX_VOLUME_BYTES / 2.0 - 1.0, MAX_VOLUME_BYTES] {
+            for vertices in [0.0, 1.0, 4_000.0, 4_001.0] {
+                assert_eq!(
+                    guard.no_room_for(bytes, vertices).is_none(),
+                    guard.no_room_for_a_copy(bytes, vertices).is_none(),
+                    "the two disagreed about {bytes} bytes and {vertices} vertices"
+                );
+            }
+        }
+    }
+
+    /// A copy goes directly below the row it came from, not at the bottom of a
+    /// list of sixty-four, and it gets an id of its own.
+    #[test]
+    fn a_body_inserted_at_a_position_lands_there_with_a_fresh_id() {
+        let mut doc = Document::new(0.5);
+        let first = doc.active();
+        let last = doc.add_body("Last", Volume::new(0.5));
+
+        let between = doc.insert_body(1, 0, "Between", Volume::new(0.5));
+        assert_eq!(
+            doc.nodes().iter().map(|node| node.id).collect::<Vec<_>>(),
+            vec![first, between, last],
+            "the row did not land between the two it was asked for"
+        );
+        assert_ne!(between, first);
+        assert_ne!(between, last);
+        assert_eq!(doc.index_of(between), Some(1));
+        // Which body edits land on is the caller's business: inserting a row
+        // must not move the selection out from under a gesture.
+        assert_eq!(doc.active(), first, "inserting a row changed the active body");
+    }
+
+    /// Duplicating a folder's ONLY child, which is the case that shows nothing
+    /// and reports success: no assertion can fire, because a body at depth 0
+    /// after a body at depth 1 is a perfectly good forest -- it is simply a
+    /// different one, with the copy at the top level and the folder it was
+    /// copied inside left holding one row.
+    #[test]
+    fn a_copy_of_a_folders_only_child_stays_inside_that_folder() {
+        let (mut doc, first, _, _) = three();
+        let (folder, _) = doc.group(first, "Group 1").expect("the folder");
+        let at = doc.index_of(first).expect("the child");
+
+        let copy = doc.insert_body(
+            at + 1,
+            doc.node(first).expect("the child").depth(),
+            "Copy",
+            Volume::new(0.5),
+        );
+
+        assert_eq!(doc.parent_of(copy), Some(folder), "the copy left the folder it was made in");
+        let range = doc.subtree_of(folder).expect("the folder is still here");
+        assert_eq!(range.len(), 3, "the folder no longer holds both the body and its copy");
+    }
+
+    /// Duplicating a child that has a SIBLING below it, which is the case that
+    /// does fire: a depth-0 copy in the middle of the run leaves the sibling at
+    /// depth 1 following a body at depth 0, so the fold every other operation
+    /// rests on no longer holds -- and in a release build, with the assertion
+    /// gone, the sibling silently leaves the folder instead.
+    #[test]
+    fn a_copy_made_beside_a_sibling_leaves_that_sibling_where_it_was() {
+        let (mut doc, first, second, _) = three();
+        let (folder, _) = doc.group(first, "Group 1").expect("the folder");
+        doc.move_to_folder(second, Some(folder)).expect("the sibling in");
+        assert_eq!(depths(&doc), vec![0, 1, 1, 0], "the fixture is not the shape under test");
+        let at = doc.index_of(first).expect("the child");
+
+        let copy = doc.insert_body(
+            at + 1,
+            doc.node(first).expect("the child").depth(),
+            "Copy",
+            Volume::new(0.5),
+        );
+
+        assert_eq!(depths(&doc), vec![0, 1, 1, 1, 0]);
+        assert_eq!(doc.parent_of(copy), Some(folder), "the copy left the folder");
+        assert_eq!(doc.parent_of(second), Some(folder), "the sibling fell out of the folder");
+        doc.assert_invariants();
+    }
+
+    /// A depth no position could hold is clamped rather than trusted, exactly
+    /// as the reader clamps a file's depth column: a caller asking for depth 3
+    /// directly under a top-level BODY gets depth 0, because a body is not a
+    /// parent, and one asking for depth 0 directly above a row at depth 1 gets
+    /// depth 1, because that row would otherwise follow a body two levels up.
+    #[test]
+    fn an_insert_depth_no_position_could_hold_is_clamped_to_one_that_can() {
+        let (mut doc, first, second, _) = three();
+        let deep = doc.insert_body(1, 3, "Too deep", Volume::new(0.5));
+        assert_eq!(doc.node(deep).expect("the row").depth(), 0, "a body is not a parent");
+
+        let (folder, _) = doc.group(second, "Group 1").expect("the folder");
+        let at = doc.index_of(folder).expect("the folder") + 1;
+        let shallow = doc.insert_body(at, 0, "Too shallow", Volume::new(0.5));
+        assert_eq!(
+            doc.node(shallow).expect("the row").depth(),
+            1,
+            "the row it was inserted above is at depth 1, so it cannot be shallower"
+        );
+        assert_eq!(doc.parent_of(shallow), Some(folder));
+        assert!(doc.node(first).is_some());
+        doc.assert_invariants();
     }
 
     // ------------------------------------------------------------- the pick

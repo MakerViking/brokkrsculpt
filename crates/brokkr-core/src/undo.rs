@@ -113,13 +113,7 @@ impl StrokeEdit {
     }
 
     pub(crate) fn from_bricks(bricks: Vec<(BrickCoord, Option<Brick>)>) -> Self {
-        let bytes = bricks
-            .iter()
-            .map(|(_, brick)| {
-                size_of::<(BrickCoord, Option<Brick>)>()
-                    + brick.as_ref().map_or(0, Brick::heap_bytes)
-            })
-            .sum();
+        let bytes = bricks.iter().map(|(_, brick)| prior_bytes(brick.as_ref())).sum();
         Self { bricks, bytes }
     }
 
@@ -145,6 +139,34 @@ impl StrokeEdit {
     }
 }
 
+/// What one brick's prior contents cost the stroke budget.
+///
+/// `None` is a brick that did not exist, which costs the map entry and nothing
+/// else -- and that is the whole reason a disjoint merge is nearly free where an
+/// overlapping one is measured in gigabytes.
+///
+/// A free function rather than arithmetic written out at each site, because
+/// [`crate::body::Document::merge_plan`] predicts a stroke's size from bricks it
+/// has not recorded yet and the prediction is only worth having while it is
+/// exact. Two copies of this formula would drift and nothing would say so.
+#[inline]
+pub(crate) fn prior_bytes(prior: Option<&Brick>) -> usize {
+    size_of::<(BrickCoord, Option<Brick>)>() + prior.map_or(0, Brick::heap_bytes)
+}
+
+/// What removing one node costs the reclaim allowance.
+///
+/// [`crate::Volume::stats`] and not `Brick::heap_bytes`: a brick knows nothing
+/// about whole volumes, and summing it over an entry that holds one counts a
+/// gigabyte as roughly zero -- which is the failure that lets a deleted dragon
+/// sit in history reporting nothing. Shared with `merge_plan` for the reason
+/// [`prior_bytes`] gives.
+pub(crate) fn removed_node_bytes(node: &Node) -> usize {
+    size_of::<Node>()
+        + node.name.capacity()
+        + node.volume().map_or(0, |volume| volume.stats().resident_bytes)
+}
+
 /// One thing an entry puts back.
 ///
 /// Read every variant as the event it undoes, because that is what applying it
@@ -163,7 +185,19 @@ pub enum Change {
     /// memory does not rise -- it merely does not fall.
     NodeRemoved { at: usize, node: Box<Node> },
     /// A row's name, eye, collapse or depth changed. Applying writes `before`.
-    NodeMeta { id: NodeId, before: NodeMeta, after: NodeMeta },
+    ///
+    /// **The whole outline, both sides, over a FIXED id set.** That is what
+    /// lets one variant cover rename, the eye, collapse, reorder, group and
+    /// ungroup: a reparent is a permutation *plus* a depth edit, and neither
+    /// half is expressible without the other. Its inverse is the pair swapped,
+    /// which is why there is no second variant for "just the eye".
+    ///
+    /// A hundred and twenty-eight rows at some eighty bytes each is about
+    /// 10 KB against a 256 MB budget. A group or an ungroup records this
+    /// ALONGSIDE the `NodeAdded` or `NodeRemoved` that mints or retires the
+    /// folder, never instead of it, and the order between them is worked
+    /// through in [`crate::body::Document::group`].
+    Outline { before: Vec<NodeMeta>, after: Vec<NodeMeta> },
 }
 
 impl Change {
@@ -191,21 +225,35 @@ impl Change {
                 doc.insert(at, *node);
                 Change::NodeAdded { at, id }
             }
-            Change::NodeMeta { id, before, after } => {
-                doc.set_meta(&before);
+            Change::Outline { before, after } => {
+                debug_assert!(
+                    same_ids(&before, &after),
+                    "an outline change is a permutation over a fixed id set"
+                );
+                doc.set_outline(&before);
                 // The inverse is the pair swapped, which applies `after`.
-                Change::NodeMeta { id, before: after, after: before }
+                Change::Outline { before: after, after: before }
             }
         }
     }
 
     /// The node this change is about.
+    ///
+    /// For an outline change that is the first row it actually moved or
+    /// edited, and not simply the first row in the document: what the caller
+    /// does with this is name it in a status line, and "renamed Body 1" for a
+    /// rename of Body 7 is worse than saying nothing.
     fn node(&self) -> NodeId {
         match self {
             Change::Bricks { body, .. } => *body,
             Change::NodeAdded { id, .. } => *id,
             Change::NodeRemoved { node, .. } => node.id,
-            Change::NodeMeta { id, .. } => *id,
+            Change::Outline { before, after } => {
+                before.iter().zip(after).find(|(was, now)| was != now).map_or_else(
+                    || before.first().map_or(NodeId(0), |meta| meta.id),
+                    |(was, _)| was.id,
+                )
+            }
         }
     }
 
@@ -215,26 +263,38 @@ impl Change {
             Change::Bricks { edit, .. } => edit.bytes(),
             Change::NodeRemoved { .. } => 0,
             Change::NodeAdded { .. } => size_of::<Self>(),
-            Change::NodeMeta { before, after, .. } => before.bytes() + after.bytes(),
+            Change::Outline { before, after } => {
+                before.iter().chain(after).map(NodeMeta::bytes).sum()
+            }
         }
     }
 
     /// What this change costs the reclaim allowance.
     ///
-    /// [`crate::Volume::stats`] and not `Brick::heap_bytes`: a brick knows
-    /// nothing about whole volumes, and summing it over an entry that holds one
-    /// counts a gigabyte as roughly zero -- which is the failure that lets a
-    /// deleted dragon sit in history reporting nothing.
+    /// See [`removed_node_bytes`], which is shared with the walk that predicts
+    /// a merge's size before the merge happens.
     fn reclaim_bytes(&self) -> usize {
         match self {
-            Change::NodeRemoved { node, .. } => {
-                size_of::<Node>()
-                    + node.name.capacity()
-                    + node.volume().map_or(0, |volume| volume.stats().resident_bytes)
-            }
+            Change::NodeRemoved { node, .. } => removed_node_bytes(node),
             _ => 0,
         }
     }
+}
+
+/// Whether two outline snapshots name the same rows, in any order.
+///
+/// A `debug_assert` and not a refusal: an outline change that added or dropped
+/// an id would be a structural edit wearing a permutation's clothes, and the
+/// two sides of it could then never be each other's inverse. Sorted rather than
+/// hashed because [`crate::body::MAX_NODES`] is 128 and this runs at an undo
+/// press.
+fn same_ids(before: &[NodeMeta], after: &[NodeMeta]) -> bool {
+    let ids = |metas: &[NodeMeta]| {
+        let mut ids: Vec<NodeId> = metas.iter().map(|meta| meta.id).collect();
+        ids.sort_unstable();
+        ids
+    };
+    ids(before) == ids(after)
 }
 
 /// One gesture: everything it changed, across every body it touched.
@@ -302,17 +362,17 @@ impl Entry {
     /// is not in the tree to click, so the entry can never be applied and it
     /// blocks every older entry behind it for the rest of the session.
     ///
-    /// `NodeMeta` is how the eye itself is undone. Gating it means that undoing
-    /// a hide is refused *because of the hide*, and the user is told to reveal
-    /// the body by hand -- which is the very thing they pressed ctrl+Z to do.
-    /// It is also visible in the panel whatever the eye says, so nothing is
-    /// happening off screen.
+    /// `Change::Outline` is how the eye itself is undone. Gating it means that
+    /// undoing a hide is refused *because of the hide*, and the user is told to
+    /// reveal the body by hand -- which is the very thing they pressed ctrl+Z
+    /// to do. It is also visible in the panel whatever the eye says, so nothing
+    /// is happening off screen.
     fn blocked_by(&self, doc: &Document, visible: &[bool]) -> Option<NodeId> {
         self.changes.iter().find_map(|change| {
             let id = match change {
                 Change::Bricks { body, .. } => *body,
                 Change::NodeAdded { id, .. } => *id,
-                Change::NodeRemoved { .. } | Change::NodeMeta { .. } => return None,
+                Change::NodeRemoved { .. } | Change::Outline { .. } => return None,
             };
             // A node that is not in the document, or a mask too short to cover
             // it, counts as visible: refusing on a missing answer would be the
@@ -1161,11 +1221,14 @@ mod tests {
         let other = doc.add_body("Body 2", heavy(1.0));
 
         let before = doc.meta(other).expect("the second body");
-        let after = NodeMeta { visible: false, ..before.clone() };
-        doc.set_meta(&after);
+        let outline_before = doc.outline();
+        doc.set_meta(&NodeMeta { visible: false, ..before.clone() });
 
         let mut history = History::default();
-        history.push(Entry::new(vec![Change::NodeMeta { id: other, before, after }]));
+        history.push(Entry::new(vec![Change::Outline {
+            before: outline_before,
+            after: doc.outline(),
+        }]));
 
         let mut shown = all_shown(&doc);
         shown[doc.index_of(other).expect("the second body")] = false;

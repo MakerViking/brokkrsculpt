@@ -28,6 +28,7 @@ pub mod cavity;
 pub mod clip;
 pub mod export;
 pub mod import;
+pub mod merge;
 pub mod mesh;
 pub mod orientation;
 pub mod pattern;
@@ -47,7 +48,7 @@ pub mod voxelise;
 pub use apron::ApronBuffer;
 pub use body::{
     Document, GrowthGuard, MAX_BODIES, MAX_DEPTH, MAX_NODES, Node, NodeId, NodeMeta,
-    resolve_visibility,
+    resolve_visibility, subtree,
 };
 pub use brick::{
     APRON_DIM, APRON_VOXELS, BRICK_DIM, BRICK_VOXELS, Brick, BrickCoord, INSIDE, NARROW_BAND,
@@ -60,11 +61,15 @@ pub use brush::{
 pub use clip::{ClipPlane, CutOutcome};
 pub use export::{ExportMesh, ExportedBody, MeshReport, document_verdict};
 pub use import::{ImportError, MESH_EXTENSIONS};
+pub use merge::{MergeOutcome, MergePlan, MergeTarget};
 pub use mesh::{BrickMesh, MeshScratch, Vertex};
 pub use orientation::{AxisRotation, Facing, from_print_space, resting_up, to_print_space};
 pub use pattern::{MAX_SCALE_MM, MIN_SCALE_VOXELS, Pattern, PatternKind};
 pub use primitive::PrimitiveKind;
-pub use project::{Keyframe, MAX_VOLUME_BYTES, Outline, ProjectError, ProjectState, View};
+pub use project::{
+    Keyframe, MAX_NAME_BYTES, MAX_VOLUME_BYTES, Outline, ProjectError, ProjectState, View,
+    name_that_fits,
+};
 pub use raycast::{Hit, raycast};
 pub use region::FieldRegion;
 pub use stroke::{MAX_STAMPS_PER_EVENT, Stroke};

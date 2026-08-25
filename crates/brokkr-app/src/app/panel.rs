@@ -32,6 +32,77 @@ use crate::tablet::Diagnosis;
 use crate::theme;
 use crate::viewport::Viewport;
 
+/// One entry in the "Move to ▸" list: a folder, or the top level.
+///
+/// **It BORROWS the folder's name.** The list is rebuilt whenever the panel is
+/// laid out, which is at display rate, so an owned `String` per folder would be
+/// up to sixty-four allocations a frame for a control the user opens once a
+/// session. `pick_list` asks only for `Clone + PartialEq + ToString`, and a
+/// borrow satisfies all three -- the lifetime is the borrow of `Brokkr` the
+/// whole widget tree already holds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FolderChoice<'a> {
+    /// `None` is the top level, which is a real destination and not an absent
+    /// one: it is how a row gets back out of a folder.
+    id: Option<brokkr_core::NodeId>,
+    label: &'a str,
+}
+
+impl std::fmt::Display for FolderChoice<'_> {
+    /// The name and nothing else. `pick_list` calls `to_string` on every option
+    /// it draws, so anything computed here -- an indent, a count, a prefix --
+    /// would be computed per option per frame.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.label)
+    }
+}
+
+/// A folder's body count, as a string that was never formatted.
+///
+/// **A table and not `format!`, because this is read in a panel row.** `view()`
+/// runs at display rate, so formatting a number here is one allocation per
+/// folder per frame -- the mistake `detail_advice` is cached to avoid,
+/// multiplied by the number of folders. A folder can hold at most
+/// [`brokkr_core::MAX_BODIES`] bodies, so the whole range fits a literal table
+/// and the lookup is free.
+fn count_label(count: usize) -> &'static str {
+    const LABELS: [&str; brokkr_core::MAX_BODIES + 1] = [
+        "0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12", "13", "14", "15", "16",
+        "17", "18", "19", "20", "21", "22", "23", "24", "25", "26", "27", "28", "29", "30", "31",
+        "32", "33", "34", "35", "36", "37", "38", "39", "40", "41", "42", "43", "44", "45", "46",
+        "47", "48", "49", "50", "51", "52", "53", "54", "55", "56", "57", "58", "59", "60", "61",
+        "62", "63", "64",
+    ];
+    LABELS.get(count).copied().unwrap_or("many")
+}
+
+/// Everything one body row draws that is not a field of its own `Node`.
+///
+/// **A struct, because every one of these is worked out ONCE for the whole
+/// list.** Each is a subtree question -- how many bodies are under this row,
+/// whether the active body is, whether solo is showing it -- and asked per row
+/// each would be a walk per row: `O(n^2)` at display rate, which is the mistake
+/// this panel's header exists to forbid. Bundled rather than passed as five
+/// positional `bool`s, because five bare booleans at a call site is exactly the
+/// shape that gets two of them swapped.
+#[derive(Debug, Clone, Copy)]
+struct RowFacts {
+    /// Bodies in this row's subtree. Zero for a body, which counts nothing but
+    /// itself.
+    count: usize,
+    /// Draw the accent bar: this row is active, or it is a COLLAPSED folder
+    /// holding the active body, whose own row is therefore not on screen.
+    marked: bool,
+    /// Offer the solo circle: this row is active, or it is a folder holding the
+    /// active body, collapsed or not.
+    soloable: bool,
+    /// This row is the one solo is showing, so its circle is the way out.
+    soloed: bool,
+    /// Solo is off, or this row is inside the soloed subtree. `false` is the
+    /// fourth eye state: the row's own eye is on and it is still not drawn.
+    in_scope: bool,
+}
+
 impl Brokkr {
     pub fn view(&self) -> Element<'_, Message> {
         let viewport = iced::widget::shader(Viewport::new(Arc::clone(&self.shared)))
@@ -81,6 +152,14 @@ impl Brokkr {
         // of the two below, but the ordering is stated rather than assumed.
         if let Some(pending) = &self.pending_delete {
             return stack![body, self.delete_card(pending), self.resize_frame()].into();
+        }
+
+        // And the merge prompt, which asks the same question about the same
+        // kind of size. It cannot be up at the same time as the delete one --
+        // both are raised from a verb press and either returns before the
+        // other could be -- but the ordering is stated rather than assumed.
+        if let Some(pending) = &self.pending_merge {
+            return stack![body, self.merge_card(pending), self.resize_frame()].into();
         }
 
         // Same reasoning, one rank down: the bug report is modal too, and it
@@ -1439,6 +1518,11 @@ impl Brokkr {
     ///
     /// The body is a closure rather than an `Element` so a closed section
     /// costs nothing to lay out — `view` runs every frame.
+    ///
+    /// The solo badge rides here rather than inside `bodies_panel` for one
+    /// reason: it has to survive the section being collapsed. Soloing a body,
+    /// folding the Bodies section away and forgetting is the same predicament as
+    /// soloing and scrolling away, which is what the indicator exists for.
     fn section<'a>(
         &'a self,
         which: PanelSection,
@@ -1467,7 +1551,52 @@ impl Brokkr {
         .style(theme::section_heading)
         .on_press(Message::SectionToggled(which));
 
-        if open { column![heading, body()].spacing(theme::S2).into() } else { heading.into() }
+        let heading: Element<'a, Message> = match self.solo_badge(which) {
+            // Beside the heading and not inside it. Nesting would work — a
+            // `Button` forwards to its content and returns early on
+            // `is_event_captured`, the same mechanism the row's eye rides — but
+            // it would also make a press on the word "SOLO" fold the section
+            // away, which is not what a status indicator should do.
+            Some(badge) => {
+                row![heading, badge].align_y(Alignment::Center).spacing(theme::S2).into()
+            }
+            None => heading.into(),
+        };
+
+        if open { column![heading, body()].spacing(theme::S2).into() } else { heading }
+    }
+
+    /// `SOLO: <name>  [exit]`, drawn beside the Bodies heading while the mode is
+    /// on.
+    ///
+    /// **Persistent, and outside the scrollable.** Without it, soloing a body
+    /// deep in a twenty-node tree and scrolling away leaves one body on screen,
+    /// nineteen missing, and no indicator anywhere: every eye in view still
+    /// reads "visible", because solo is a mask over those bits and never a write
+    /// to them. The MESH POOL FULL banner is the existing pattern for a mode the
+    /// viewport cannot explain by itself, and this doubles as the exit.
+    ///
+    /// Nothing here is computed or formatted: the name is borrowed straight out
+    /// of the document, and the whole badge is skipped by an `Option` when solo
+    /// is off.
+    fn solo_badge(&self, which: PanelSection) -> Option<Element<'_, Message>> {
+        if which != PanelSection::Bodies {
+            return None;
+        }
+        let node = self.doc.node(self.solo?)?;
+        Some(
+            row![
+                text("SOLO").size(theme::CAPTION_SIZE).color(theme::ACCENT),
+                text(node.name.as_str()).size(theme::CAPTION_SIZE).color(theme::TEXT_DIM),
+                button(icon::icon(icon::IconName::Close, theme::ICON_INLINE, theme::TEXT_MUTE))
+                    .padding(Padding { top: 1.0, bottom: 1.0, left: theme::S1, right: theme::S1 })
+                    .style(theme::section_heading)
+                    .on_press(Message::SoloExited),
+            ]
+            .align_y(Alignment::Center)
+            .spacing(theme::S1)
+            .into(),
+        )
     }
 
     // --- the body list -------------------------------------------------------
@@ -1497,11 +1626,18 @@ impl Brokkr {
     /// (`keyed/column.rs:228-244`), so state does not follow a row moved by a
     /// same-length reorder.
     ///
-    /// # Walked tree-shaped from the first commit
+    /// # Walked tree-shaped, and every per-row number worked out ONCE
     ///
-    /// Every row is at depth 0 today, so `indent` is always zero and
-    /// `skip_below` never fires. Three lines, and the walk does not have to be
-    /// rewritten when folders arrive.
+    /// The two things a folder row has to show that a body row does not -- how
+    /// many bodies are inside it, and whether the active body is one of them --
+    /// are both subtree questions, and asked per row they would each be a walk
+    /// per row: `O(n^2)` at display rate. Both are answered here in one pass
+    /// apiece, before a single row is built. Nothing in a row computes
+    /// anything.
+    ///
+    /// The counts need one `Vec` a frame, which is the deliberate trade: one
+    /// small allocation for the whole list beats one per row, and this function
+    /// is already building an `Element` per visible row.
     fn bodies_panel(&self) -> Element<'_, Message> {
         /// One row, with a thumbnail and without.
         const ROW_H: f32 = 32.0;
@@ -1510,6 +1646,21 @@ impl Brokkr {
         /// either way, so turning the pictures off buys rows rather than space.
         const VISIBLE_ROWS: f32 = 6.0;
         const VISIBLE_ROWS_BARE: f32 = 8.0;
+
+        // Bodies per folder subtree, by node position. One backward pass with a
+        // fixed accumulator; see `Document::subtree_body_counts`.
+        let mut counts = Vec::new();
+        self.doc.subtree_body_counts(&mut counts);
+        // Which folders have the active body somewhere beneath them. A forward
+        // pass over the ancestor chain, which is the same shape
+        // `resolve_visibility` uses and for the same reason: preorder means the
+        // chain is a fixed-size array and never a search.
+        let holds_active = self.folders_holding_the_active_body();
+        // The rows solo is showing, as ONE range. A subtree is a contiguous
+        // preorder run, so the scope test per row is an integer comparison --
+        // the same property that makes the resolver's own solo test one
+        // comparison, and the reason no row has to ask the document anything.
+        let scope = self.solo.and_then(|id| self.doc.subtree_of(id));
 
         let mut rows = column![].spacing(1);
         // The depth below which rows belong to a collapsed subtree and are not
@@ -1527,7 +1678,20 @@ impl Brokkr {
             if node.collapsed {
                 skip_below = Some(node.depth());
             }
-            rows = rows.push(self.body_row(index, node));
+            let holds = holds_active.get(index).copied().unwrap_or(false);
+            let facts = RowFacts {
+                count: counts.get(index).copied().unwrap_or(0),
+                marked: node.id == self.doc.active() || (node.collapsed && holds),
+                // The active row, or any folder holding it -- collapsed or not,
+                // which is where this parts company with `marked`. Solo is
+                // enterable from nowhere else, and that is what keeps "the
+                // active body is displayed-visible" true on the way IN with no
+                // extra machinery: a click on another row selects it first.
+                soloable: node.id == self.doc.active() || holds,
+                soloed: self.solo == Some(node.id),
+                in_scope: scope.as_ref().is_none_or(|range| range.contains(&index)),
+            };
+            rows = rows.push(self.body_row(index, node, facts));
         }
 
         let (row_h, visible_rows) =
@@ -1545,8 +1709,67 @@ impl Brokkr {
                 // and a button that looks pressable and is not teaches the user
                 // that the application ignores them.
                 .on_press_maybe((self.doc.body_count() > 1).then_some(Message::BodyDeleted)),
+            // Always pressable, and REFUSING on press with the count in the
+            // status line -- never greyed. Three reasons, in order of weight:
+            //
+            // * it is what the plan asks for by name, and what `+` beside it
+            //   already does. All four of duplicate's refusals then read the
+            //   same way, where greying could only ever cover two of them: the
+            //   memory and mesh-pool ceilings CANNOT be greyed for, because
+            //   reading them costs a walk of a brick map and a lock on the pool
+            //   stats and this row is built every frame;
+            // * greying here would be INVISIBLE. `theme::tool_button` returns
+            //   `PANEL_2` for `Status::Disabled` exactly as it does for
+            //   `Status::Active`, and the icon's colour is passed in at this
+            //   call site independently of button status, so iced would draw a
+            //   dead button identical to a live one. A button that looks
+            //   pressable and does nothing AND says nothing is the worst of the
+            //   three options, not the safe one;
+            // * a greyed button says only "no". The refusal says which ceiling
+            //   and how far over it, which is the only form in which any of
+            //   this is useful to someone with sixty-four bodies open.
+            button(icon::icon(icon::IconName::Copy, theme::ICON_INLINE, theme::TEXT_DIM))
+                .padding(Padding { top: 2.0, bottom: 2.0, left: theme::S3, right: theme::S3 })
+                .style(theme::tool_button)
+                .on_press(Message::BodyDuplicated),
+            // Always pressable and refusing on press, for the three reasons
+            // above -- and here the first of them is sharper still. Whether a
+            // merge is legal is "is the next row a body at this depth", which
+            // is cheap; whether it needs asking first is a walk of the source's
+            // brick map, which is not, and this row is built every frame. Two
+            // of merge's outcomes could be greyed for and the third could not,
+            // so all three refuse the same way and each says which it is.
+            button(icon::icon(icon::IconName::MergeDown, theme::ICON_INLINE, theme::TEXT_DIM))
+                .padding(Padding { top: 2.0, bottom: 2.0, left: theme::S3, right: theme::S3 })
+                .style(theme::tool_button)
+                .on_press(Message::BodyMergedDown),
         ]
         .spacing(theme::S2);
+
+        // **Below the scrollable and not on every row**, which is a deliberate
+        // departure from the plan's "a pick_list on the row". A `pick_list`
+        // needs an options collection built for it, so one per row is one
+        // allocation per row per frame to show six -- the exact multiplication
+        // this panel's header forbids. One instance acting on the active row
+        // costs one small `Vec` of BORROWED names, and the verb row beside it
+        // already means "the verbs that act on the active row".
+        //
+        // Increment 17 deletes this the day a drag lands.
+        //
+        // The row's CURRENT container is left out rather than offered and then
+        // refused: a destination that does nothing is a press that reports a
+        // failure, which teaches the user that the control is unreliable.
+        let parent = self.doc.parent_of(self.doc.active());
+        let mut targets = Vec::new();
+        if parent.is_some() {
+            targets.push(FolderChoice { id: None, label: "Top level" });
+        }
+        targets.extend(
+            self.doc
+                .folders()
+                .filter(|folder| parent != Some(folder.id))
+                .map(|folder| FolderChoice { id: Some(folder.id), label: folder.name.as_str() }),
+        );
 
         let mut stacked = column![
             // The pictures are session state and must not dirty the document.
@@ -1559,6 +1782,15 @@ impl Brokkr {
                 .text_size(theme::CAPTION_SIZE),
             scrollable(rows).height(Length::Fixed(row_h * visible_rows)),
             verbs,
+            // No selection ever shows: this is a verb wearing a list's clothes,
+            // and a sticky answer would read as "this body lives there" rather
+            // than as "send it there".
+            pick_list(targets, None::<FolderChoice<'_>>, |choice| Message::BodyMovedToFolder(
+                choice.id
+            ))
+            .placeholder("Move to \u{25b8}")
+            .text_size(theme::CAPTION_SIZE)
+            .width(Length::Fill),
         ]
         .spacing(theme::S2);
 
@@ -1583,9 +1815,15 @@ impl Brokkr {
         stacked.into()
     }
 
-    /// One row of the body list.
+    /// One row of the body list, body or folder.
     ///
-    /// `[marker][indent][disclosure][thumbnail][name, Fill][eye]`.
+    /// A body: `[marker][indent][disclosure spacer][thumbnail][name, Fill][eye]`.
+    /// A folder: `[marker][indent][chevron][name, Fill][count][trash][eye]`.
+    ///
+    /// `count` and `marked` are worked out ONCE for the whole list by
+    /// [`Brokkr::bodies_panel`], never here: both are subtree questions, and a
+    /// subtree walk per row is `O(n^2)` at display rate. So is every other field
+    /// of [`RowFacts`], for the same reason.
     ///
     /// # Clicking the eye must never change the active body, and it costs no
     /// code at all
@@ -1598,7 +1836,8 @@ impl Brokkr {
     /// into a row of buttons or an `on_press` on the eye's parent** -- this is
     /// Photoshop's quiet load-bearing property, the one that lets you audit
     /// visibility across twelve bodies without losing the body you were
-    /// sculpting.
+    /// sculpting. The chevron and the folder's trash ride on the same
+    /// mechanism, which is why neither needs to know the row exists.
     ///
     /// The thumbnail is INERT for the same mechanism read the other way: it is a
     /// styled `container`, which captures nothing, so the row press passes
@@ -1612,10 +1851,36 @@ impl Brokkr {
     /// everything, and a click a few pixels lower hides just that one. That is
     /// documented behaviour and exactly the presentation this brief exists to
     /// escape.
-    fn body_row<'a>(&'a self, index: usize, node: &'a brokkr_core::Node) -> Element<'a, Message> {
+    ///
+    /// # Four eye states, two signals each
+    ///
+    /// `ICON_INLINE` is 11 px, where an eye with a hairline through it is a
+    /// dot, so the glyph never carries a state on its own:
+    ///
+    /// | state | glyph | name |
+    /// |---|---|---|
+    /// | shown | `Eye` in `TEXT` | `TEXT` |
+    /// | hidden by itself | `EyeOff` in `TEXT_MUTE` | `TEXT_MUTE` |
+    /// | hidden by an ancestor folder | `Eye` in `TEXT_MUTE` | `TEXT_MUTE` |
+    /// | out of the solo scope | `Eye` in `TEXT_MUTE`, row background dimmed | `TEXT_MUTE` |
+    ///
+    /// The last two fall out of the first two rather than being written: the
+    /// glyph reads this row's OWN eye and the colour reads the RESOLVED answer,
+    /// so a row whose own eye is on inside a hidden folder — or outside the solo
+    /// scope — shows a bright-shaped eye in a muted colour. That is Photoshop's
+    /// grey eye, and it is what says "your bit is still on; something above you
+    /// is not". The fourth adds the recessed background, because it is the one
+    /// state where the eye is also REFUSED, and a control that will not do what
+    /// it looks like needs more than a shade of grey to say so.
+    fn body_row<'a>(
+        &'a self,
+        index: usize,
+        node: &'a brokkr_core::Node,
+        facts: RowFacts,
+    ) -> Element<'a, Message> {
         const THUMBNAIL: f32 = 28.0;
-        /// Where a folder's caret will go. Reserved now so a body row and a
-        /// folder row line up the day there are both.
+        /// The folder chevron's column. A body row spends it on empty space so
+        /// that the two line up.
         const DISCLOSURE: f32 = 11.0;
         const INDENT_PER_DEPTH: f32 = 12.0;
         const MARKER: f32 = 2.0;
@@ -1627,54 +1892,194 @@ impl Brokkr {
         let drawn = self.shown.get(index).copied().unwrap_or(true);
         let ink = if drawn { theme::TEXT } else { theme::TEXT_MUTE };
 
-        // Two signals, because `ICON_INLINE` is 11 px and an eye with a hairline
-        // through it is a dot at that size: the glyph AND the name's colour.
         let eye = if node.visible { icon::IconName::Eye } else { icon::IconName::EyeOff };
         let eye_ink = if drawn { theme::TEXT } else { theme::TEXT_MUTE };
 
         let mut line = row![
-            container(space()).width(Length::Fixed(MARKER)).height(Length::Fill).style(if active {
-                theme::body_row_marker
-            } else {
-                theme::body_row
-            }),
+            // **The marker is `marked` and not `active`**, and the difference
+            // is the whole point of it on a folder: a collapsed folder holding
+            // the active body draws the bar, because the row that would
+            // otherwise carry it is not on screen. Without that, selecting a
+            // body inside a folder and closing it leaves nothing anywhere
+            // saying where the brush will land.
+            container(space())
+                .width(Length::Fixed(MARKER))
+                .height(Length::Fill)
+                .style(if facts.marked { theme::body_row_marker } else { theme::body_row },),
             space().width(Length::Fixed(f32::from(node.depth()) * INDENT_PER_DEPTH)),
-            space().width(Length::Fixed(DISCLOSURE)),
         ]
         .spacing(theme::S2)
         .align_y(Alignment::Center);
 
-        if self.thumbnails {
+        if node.is_body() {
+            line = line.push(space().width(Length::Fixed(DISCLOSURE)));
+            if self.thumbnails {
+                line = line.push(
+                    container(space())
+                        .width(Length::Fixed(THUMBNAIL))
+                        .height(Length::Fixed(THUMBNAIL))
+                        .style(theme::body_thumbnail),
+                );
+            }
+        } else {
+            let chevron =
+                if node.collapsed { icon::IconName::CaretRight } else { icon::IconName::CaretDown };
             line = line.push(
-                container(space())
-                    .width(Length::Fixed(THUMBNAIL))
-                    .height(Length::Fixed(THUMBNAIL))
-                    .style(theme::body_thumbnail),
+                button(icon::icon(chevron, theme::ICON_INLINE, theme::TEXT_MUTE))
+                    .padding(0)
+                    .style(theme::section_heading)
+                    .on_press(Message::FolderCollapseToggled(node.id)),
             );
         }
 
-        let line = line
-            .push(
+        // At most one row is being renamed, so this is one `NodeId` compare and
+        // no allocation -- the field's text is already owned by the
+        // application and is handed to the widget by reference.
+        let typed = match &self.renaming {
+            Some((id, typed)) if *id == node.id => Some(typed),
+            _ => None,
+        };
+        let mut line = match typed {
+            Some(typed) => line.push(
+                text_input("name", typed)
+                    .id(super::RENAME_FIELD)
+                    .on_input(Message::BodyRenameEdited)
+                    .on_submit(Message::BodyRenameSubmitted)
+                    .padding(Padding { top: 1.0, bottom: 1.0, left: theme::S1, right: theme::S1 })
+                    .size(theme::TEXT_SIZE_SMALL)
+                    .width(Length::Fill),
+            ),
+            None => line.push(
                 text(node.name.as_str())
                     .size(theme::TEXT_SIZE_SMALL)
                     .color(ink)
                     .width(Length::Fill),
-            )
-            .push(
-                button(icon::icon(eye, theme::ICON_INLINE, eye_ink))
+            ),
+        };
+
+        if !node.is_body() {
+            line = line
+                .push(
+                    text(count_label(facts.count))
+                        .size(theme::CAPTION_SIZE)
+                        .color(theme::TEXT_MUTE),
+                )
+                // A folder's own delete, and NOT a mode of the verb row's. The
+                // verb row names the active body, which is always a body, so a
+                // collapsed folder can never swallow a body delete -- that is
+                // the ZBrush hour-losing failure made unrepresentable rather
+                // than remembered.
+                .push(
+                    button(icon::icon(icon::IconName::Trash, theme::ICON_INLINE, theme::TEXT_MUTE))
+                        .padding(Padding {
+                            top: 2.0,
+                            bottom: 2.0,
+                            left: theme::S1,
+                            right: theme::S1,
+                        })
+                        .style(theme::section_heading)
+                        .on_press(Message::FolderDeleted(node.id)),
+                );
+        }
+
+        // The solo circle, on the active row and on the folders holding it and
+        // nowhere else. Sixty-four rows each offering to solo is sixty-four
+        // targets for one mode; one target beside the row that already means
+        // "this is what I am working on" is the same idea the verb row is built
+        // on. It rides the eye's capture mechanism, so pressing it does not
+        // also select or rename the row.
+        if facts.soloable {
+            let ring = if facts.soloed { theme::ACCENT } else { theme::TEXT_MUTE };
+            line = line.push(
+                button(icon::icon(icon::IconName::Solo, theme::ICON_INLINE, ring))
                     .padding(Padding { top: 2.0, bottom: 2.0, left: theme::S1, right: theme::S1 })
                     .style(theme::section_heading)
-                    .on_press(Message::BodyVisibilityToggled(node.id)),
+                    // A toggle, so the way in is also a way out and the button
+                    // never lies about what it will do. Escape and the header
+                    // indicator are the other two.
+                    .on_press(if facts.soloed {
+                        Message::SoloExited
+                    } else {
+                        Message::SoloEntered(node.id)
+                    }),
             );
+        }
+
+        let line = line.push(
+            button(icon::icon(eye, theme::ICON_INLINE, eye_ink))
+                .padding(Padding { top: 2.0, bottom: 2.0, left: theme::S1, right: theme::S1 })
+                .style(theme::section_heading)
+                .on_press(Message::BodyVisibilityToggled(node.id)),
+        );
+
+        // Active outranks out-of-scope, and it has to: selecting a row solo is
+        // not showing is allowed -- a view mode never vetoes a structural
+        // operation -- and losing the selection marker in that state would leave
+        // nothing anywhere saying where the brush will land.
+        let background = match (active, facts.in_scope) {
+            (true, _) => theme::body_row_active,
+            (false, false) => theme::body_row_out_of_scope,
+            (false, true) => theme::body_row,
+        };
 
         mouse_area(
             container(line)
                 .padding(Padding { top: 0.0, bottom: 0.0, left: 0.0, right: theme::S1 })
                 .width(Length::Fill)
-                .style(if active { theme::body_row_active } else { theme::body_row }),
+                .style(background),
         )
         .on_press(Message::BodySelected(node.id))
+        // A DOUBLE click renames, and it is on the ROW rather than on the name.
+        // `MouseArea::update` publishes `on_press` first and then the double
+        // click (`mouse_area.rs:376-392`), so this selects the row AND starts
+        // the rename, which is what Photoshop does. A single click cannot be
+        // the gesture: the name is `Length::Fill` and therefore the row's main
+        // target, so renaming on a single click there is renaming on every
+        // attempt to select.
+        //
+        // The two rows-within-the-row that capture the press keep their
+        // meaning for free: the eye's `button` captures it, so a double click
+        // on the eye toggles twice and does not rename, and once a rename is in
+        // flight the `text_input` captures it, so clicking inside the field
+        // does not re-select the row underneath.
+        //
+        // *Deliberate shortcut:* this makes a double click on the THUMBNAIL
+        // rename too, where Photoshop opens layer styles. Revisit when the
+        // thumbnail gains an action of its own -- increment 15 draws it, and
+        // does not give it one.
+        .on_double_click(Message::BodyRenameBegan(node.id))
         .into()
+    }
+
+    /// Which rows have the active body somewhere beneath them, by node
+    /// position.
+    ///
+    /// One forward pass over the ancestor chain, which preorder makes a
+    /// fixed-size array rather than a search -- the same shape
+    /// `resolve_visibility` uses, and it allocates nothing: the array is
+    /// [`brokkr_core::MAX_NODES`] bools on the stack.
+    ///
+    /// Only a COLLAPSED folder draws the marker off this, but the answer is
+    /// computed for every row because knowing it per row is the expensive
+    /// version: a subtree walk per row is `O(n^2)` at display rate.
+    fn folders_holding_the_active_body(&self) -> [bool; brokkr_core::MAX_NODES] {
+        let mut holds = [false; brokkr_core::MAX_NODES];
+        let Some(active_at) = self.doc.index_of(self.doc.active()) else {
+            return holds;
+        };
+        let mut chain = [0usize; brokkr_core::MAX_DEPTH as usize];
+        for (index, node) in self.doc.nodes().iter().enumerate().take(active_at + 1) {
+            let depth = usize::from(node.depth()).min(chain.len() - 1);
+            chain[depth] = index;
+            if index == active_at {
+                for ancestor in chain.iter().take(depth) {
+                    if let Some(slot) = holds.get_mut(*ancestor) {
+                        *slot = true;
+                    }
+                }
+            }
+        }
+        holds
     }
 
     /// "This body is large enough that undo may not be able to hold it."
@@ -1701,8 +2106,13 @@ impl Brokkr {
             column![
                 text(format!("Delete {}?", pending.name)).size(theme::TEXT_SIZE).color(theme::TEXT),
                 text(format!(
-                    "It holds {:.0} MB. Undo keeps a deleted body only while it fits a {} MB \
-                     allowance, so this one may not be recoverable.",
+                    "It holds {} and {:.0} MB. Undo keeps a deleted body only while it fits a \
+                     {} MB allowance, so this may not be recoverable.",
+                    if pending.bodies == 1 {
+                        "one body".to_string()
+                    } else {
+                        format!("{} bodies", pending.bodies)
+                    },
                     pending.bytes as f64 / (1024.0 * 1024.0),
                     brokkr_core::DEFAULT_RECLAIM_BUDGET / (1024 * 1024),
                 ))
@@ -1711,6 +2121,61 @@ impl Brokkr {
                 row![
                     answer("Delete", Message::BodyDeleteConfirmed, theme::danger_button),
                     answer("Cancel", Message::BodyDeleteCancelled, theme::tool_button),
+                ]
+                .spacing(theme::S3),
+            ]
+            .spacing(theme::S4)
+            .width(Length::Fixed(420.0)),
+        )
+        .padding(theme::S5)
+        .style(theme::menu_card);
+
+        modal_layer(card)
+    }
+
+    /// "This merge records more than undo can be relied on to keep."
+    ///
+    /// Both halves of the size are in the question, because they are two
+    /// different things a user can reason about: the bricks the merge changes
+    /// are the overlap between the two bodies, and the consumed body is the
+    /// whole of the one being merged down. A merge of two bodies that barely
+    /// touch is nearly all the second number; one that fully overlaps is both,
+    /// which is how it reaches six times the stroke budget.
+    fn merge_card<'a>(&'a self, pending: &'a super::PendingMerge) -> Element<'a, Message> {
+        type ButtonStyle = fn(&iced::Theme, button::Status) -> button::Style;
+        let answer = |label: &'static str, message: Message, style: ButtonStyle| {
+            button(text(label).size(theme::TEXT_SIZE))
+                .padding(Padding {
+                    top: theme::S2,
+                    bottom: theme::S2,
+                    left: theme::S5,
+                    right: theme::S5,
+                })
+                .style(style)
+                .on_press(message)
+        };
+        let mb = |bytes: usize| bytes as f64 / (1024.0 * 1024.0);
+
+        let card = container(
+            column![
+                text(format!("Merge {} into {}?", pending.source_name, pending.target_name))
+                    .size(theme::TEXT_SIZE)
+                    .color(theme::TEXT),
+                text(format!(
+                    "Undoing it means keeping {:.0} MB: {:.0} MB of the bricks it changes and \
+                     {:.0} MB for {}, which the merge consumes. History keeps one gesture only \
+                     while it fits a {} MB budget, so this may not be recoverable.",
+                    mb(pending.bytes),
+                    mb(pending.stroke_bytes),
+                    mb(pending.reclaim_bytes),
+                    pending.source_name,
+                    brokkr_core::DEFAULT_RECLAIM_BUDGET / (1024 * 1024),
+                ))
+                .size(theme::CAPTION_SIZE)
+                .color(theme::TEXT_MUTE),
+                row![
+                    answer("Merge", Message::BodyMergeConfirmed, theme::danger_button),
+                    answer("Cancel", Message::BodyMergeCancelled, theme::tool_button),
                 ]
                 .spacing(theme::S3),
             ]

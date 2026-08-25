@@ -418,6 +418,17 @@ pub(crate) fn shortcut(character: &str, command: bool, shift: bool, alt: bool) -
                 Message::ActiveBodyVisibilityToggled
             });
         }
+        if command && !alt && character.eq_ignore_ascii_case("g") {
+            // Photoshop's pair, unchanged. Shift dissolves the folder the
+            // active row is in, so the two are each other's inverse: press
+            // ctrl+G then ctrl+shift+G and the document is as it was.
+            //
+            // `eq_ignore_ascii_case` and not `== "g"`, because a shifted key
+            // arrives as "G" -- matching the lowercase form alone would make
+            // ctrl+shift+G spell nothing at all, which is the bug this reads
+            // as a typo.
+            return Some(if shift { Message::BodyUngrouped } else { Message::BodyGrouped });
+        }
         let undo_chord = command && !alt && character.eq_ignore_ascii_case("z");
         return undo_chord.then_some(if shift { Message::Redo } else { Message::Undo });
     }
@@ -1178,5 +1189,23 @@ mod shortcut_tests {
         // function that always returns None.
         assert!(press("x").is_some());
         assert!(control("z").is_some());
+    }
+
+    /// `ctrl+G` and `ctrl+shift+G`, and the capital is the whole point.
+    ///
+    /// A shifted key arrives as `"G"`, so matching the lowercase form alone
+    /// would make ctrl+shift+G spell nothing at all -- the ungroup half of the
+    /// pair would simply never fire, with no error anywhere.
+    #[test]
+    fn ctrl_g_groups_and_ctrl_shift_g_ungroups_whatever_case_arrives() {
+        assert!(matches!(control("g"), Some(Message::BodyGrouped)));
+        assert!(matches!(control("G"), Some(Message::BodyGrouped)));
+        assert!(matches!(shortcut("G", true, true, false), Some(Message::BodyUngrouped)));
+        assert!(matches!(shortcut("g", true, true, false), Some(Message::BodyUngrouped)));
+
+        // Bare `g` is unclaimed and must stay so, and ctrl+alt+G is not a
+        // second spelling of either.
+        assert!(press("g").is_none(), "bare g was claimed");
+        assert!(shortcut("g", true, false, true).is_none(), "ctrl alt g is not group");
     }
 }
