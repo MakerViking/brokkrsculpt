@@ -15,6 +15,16 @@ use crate::mesh::{BrickMesh, MeshScratch, mesh_apron};
 use crate::region::FieldRegion;
 use crate::undo::StrokeEdit;
 
+/// Below this many bricks in ONE call, the thread hand off costs more than the
+/// meshing saves.
+///
+/// "In one call" is the load-bearing half of that sentence and is why this is a
+/// module constant rather than a local of [`Volume::mesh_bricks`]:
+/// [`crate::body::Document::mesh_dirty`] batches dirty bricks from every body
+/// so that the comparison is made once, against the real total, instead of once
+/// per body against a fraction of it.
+pub(crate) const PARALLEL_MESH_THRESHOLD: usize = 4;
+
 /// Counters for the debug overlay and the memory budget.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct VolumeStats {
@@ -450,10 +460,7 @@ impl Volume {
     pub fn mesh_bricks(&self, coords: &[BrickCoord], out: &mut [BrickMesh]) {
         assert_eq!(coords.len(), out.len(), "one output mesh per brick");
 
-        // Below this the thread hand off costs more than the meshing saves.
-        const PARALLEL_THRESHOLD: usize = 4;
-
-        if coords.len() < PARALLEL_THRESHOLD {
+        if coords.len() < PARALLEL_MESH_THRESHOLD {
             let mut scratch = MeshScratch::new();
             for (coord, mesh) in coords.iter().zip(out.iter_mut()) {
                 self.mesh_brick(*coord, &mut scratch, mesh);
@@ -518,7 +525,23 @@ impl Volume {
     /// Move the dirty set into `out`, keeping both allocations.
     pub fn take_dirty(&mut self, out: &mut Vec<BrickCoord>) {
         out.clear();
-        out.extend(self.dirty.drain());
+        self.drain_dirty(|coord| out.push(coord));
+    }
+
+    /// Move the dirty set out one coordinate at a time, keeping the set's
+    /// allocation.
+    ///
+    /// A callback rather than a returned iterator so that a caller collecting
+    /// several volumes' dirty sets into ONE list -- which is what
+    /// [`crate::body::Document::take_dirty`] does, so that the remesh can tag
+    /// each coordinate with the body it came from -- needs no scratch vector
+    /// per volume. A per-body scratch would be an allocation on the stroke
+    /// path, which is the one path in this engine that must never touch the
+    /// allocator.
+    pub fn drain_dirty(&mut self, mut visit: impl FnMut(BrickCoord)) {
+        for coord in self.dirty.drain() {
+            visit(coord);
+        }
     }
 
     // ------------------------------------------------------------------ editing
@@ -1140,32 +1163,39 @@ impl Volume {
         self.bricks.len()
     }
 
-    /// Iterate the coordinates of every stored brick. Used by tests and by the
-    /// initial full mesh after seeding.
-    /// A world space bounding radius for whatever the volume holds, measured
-    /// from the origin.
+    /// How big the CONTENT is, wherever in the world it sits: half the diagonal
+    /// of [`Volume::world_bounds`].
     ///
     /// Derived from the brick extents rather than from the surface, so it costs
     /// a walk of the map's keys instead of a mesh: it is used to size interface
     /// affordances -- how far a mirror plane should reach, what a brush radius
-    /// means as a fraction of the model -- and those need "about how big" rather
-    /// than a tight bound.
+    /// means as a fraction of the model, how far back to put the camera -- and
+    /// those need "about how big" rather than a tight bound.
+    ///
+    /// **This replaced `bounding_radius`, which measured from the world
+    /// origin** as `furthest.max(low.abs().max(high.abs()).length())`. That was
+    /// indistinguishable from this one while there was a single body seeded at
+    /// the origin, and wrong the moment a body sits anywhere else: a 5 mm cube
+    /// 100 mm out reported over 100 mm, so the camera framed empty space and a
+    /// Dynamic brush came out twenty times too big. It was deleted rather than
+    /// kept beside this, because the two differ only in a case that did not
+    /// exist yet and the wrong one was the one with the obvious name.
+    ///
+    /// **`surface_bounds` was refused for this**, though it would be tighter.
+    /// It scans every dense brick and its own documentation says it is a
+    /// user-action operation that must not run per frame -- and this figure is
+    /// refreshed on every remesh, which is to say on every pointer event of
+    /// every stroke.
     ///
     /// `None` when the volume is empty, which is the caller's cue to fall back
     /// rather than divide by zero.
-    pub fn bounding_radius(&self) -> Option<f32> {
-        let mut furthest: f32 = 0.0;
-        let mut any = false;
-        for coord in self.bricks.keys() {
-            any = true;
-            // The corner of the brick that is furthest from the origin.
-            let low = coord.origin().as_vec3() * self.voxel_size;
-            let high = coord.max_voxel().as_vec3() * self.voxel_size;
-            furthest = furthest.max(low.abs().max(high.abs()).length());
-        }
-        any.then_some(furthest)
+    pub fn content_radius(&self) -> Option<f32> {
+        let (low, high) = self.world_bounds()?;
+        Some((high - low).length() * 0.5)
     }
 
+    /// Iterate the coordinates of every stored brick. Used by tests and by the
+    /// initial full mesh after seeding.
     pub fn brick_coords(&self) -> impl Iterator<Item = BrickCoord> + '_ {
         self.bricks.keys().copied()
     }
@@ -1750,5 +1780,39 @@ mod tests {
         volume.edit_box(Vec3::splat(1.0), Vec3::splat(40.0), |_, d| d);
         assert_eq!(volume.stats().dense_bricks, 0);
         assert_eq!(volume.brick_count(), 0);
+    }
+
+    /// The failure this replaced `bounding_radius` to avoid: the same shape,
+    /// moved away from the origin, used to report its DISTANCE instead of its
+    /// size, and everything sized off it -- the camera, the mirror plane, the
+    /// Dynamic brush -- came out proportionally wrong.
+    ///
+    /// The tolerance is one brick diagonal because the bound rounds out to
+    /// whole 32-voxel bricks, so where the sphere happens to fall against the
+    /// lattice can add a brick to a side. It is nowhere near the 100 mm the old
+    /// measure would have reported, which is what the second assertion pins.
+    #[test]
+    fn the_content_radius_measures_the_content_and_not_its_distance_from_the_origin() {
+        let mut here = Volume::new(0.5);
+        here.seed_sphere(Vec3::ZERO, 5.0);
+        let mut far = Volume::new(0.5);
+        far.seed_sphere(Vec3::new(100.0, 0.0, 0.0), 5.0);
+
+        let centred = here.content_radius().expect("a seeded sphere has content");
+        let displaced = far.content_radius().expect("a seeded sphere has content");
+        let brick_diagonal = BRICK_DIM as f32 * 0.5 * 3.0f32.sqrt();
+        assert!(
+            (centred - displaced).abs() <= brick_diagonal,
+            "the same 5 mm ball measured {centred} at the origin and {displaced} at 100 mm"
+        );
+        assert!(displaced < 50.0, "a 5 mm ball 100 mm out reported a radius of {displaced}");
+
+        let (low, _) = far.world_bounds().expect("a seeded sphere has bounds");
+        assert!(low.x > 50.0, "the fixture is not actually off origin");
+    }
+
+    #[test]
+    fn an_empty_volume_has_no_content_radius() {
+        assert_eq!(Volume::new(0.25).content_radius(), None);
     }
 }

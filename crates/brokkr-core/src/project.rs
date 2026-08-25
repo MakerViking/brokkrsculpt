@@ -44,6 +44,7 @@ use std::io::{Read, Write};
 
 use glam::{IVec3, Vec3};
 
+use crate::body::Document;
 use crate::brick::{BRICK_DIM, BRICK_VOXELS, Brick, BrickCoord, INSIDE, NARROW_BAND, OUTSIDE};
 use crate::volume::Volume;
 
@@ -547,7 +548,7 @@ pub fn write(out: &mut impl Write, volume: &Volume, state: &ProjectState) -> Res
 /// deliberate: the shell opens a file and either gets a model or gets an error
 /// it can show, and threading an out-parameter through `File > Open` to be
 /// dropped at the other end would be ceremony.
-pub fn read(input: &mut impl Read) -> Result<(Volume, ProjectState)> {
+pub fn read(input: &mut impl Read) -> Result<(Document, ProjectState)> {
     read_reporting(input, &mut Progress::default())
 }
 
@@ -559,7 +560,7 @@ pub fn read(input: &mut impl Read) -> Result<(Volume, ProjectState)> {
 pub(crate) fn read_reporting(
     input: &mut impl Read,
     progress: &mut Progress,
-) -> Result<(Volume, ProjectState)> {
+) -> Result<(Document, ProjectState)> {
     let magic: [u8; 8] = read_exact(input)?;
     if &magic != MAGIC {
         return Err(ProjectError::NotABrokkrFile);
@@ -677,12 +678,17 @@ pub(crate) fn read_reporting(
     // model left. Marking everything dirty is what makes the load visible.
     volume.mark_everything_dirty();
 
-    Ok((volume, state))
+    // A version 1 or 2 file carries no node table, so what it holds is one
+    // implicit body -- which is exactly what `Document::from_volume` builds,
+    // named [`Document::FIRST_BODY_NAME`]. `Progress::nodes` stays 0 for the
+    // same reason: nothing was read from a table that is not there.
+    Ok((Document::from_volume(volume), state))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::body::NodeId;
     use crate::brush::{Brush, BrushDirection, BrushKind, BrushScratch, Stamp};
     use crate::testing::Noise;
 
@@ -721,7 +727,10 @@ mod tests {
         empty.len() - EMPTY_TRAILER_BYTES
     }
 
-    fn round_trip(volume: &Volume, state: &ProjectState) -> (Volume, ProjectState) {
+    /// Returns a whole [`Document`], because that is what the reader answers
+    /// with: a version 1 or 2 file is one implicit body, and the tests that
+    /// care about the field reach through `active_volume`.
+    fn round_trip(volume: &Volume, state: &ProjectState) -> (Document, ProjectState) {
         let mut bytes = Vec::new();
         write(&mut bytes, volume, state).expect("write failed");
         read(&mut bytes.as_slice()).expect("read failed")
@@ -736,6 +745,7 @@ mod tests {
 
         assert_eq!(loaded.voxel_size(), volume.voxel_size());
 
+        let loaded = loaded.active_volume();
         let mut original: Vec<BrickCoord> = volume.brick_coords().collect();
         let mut returned: Vec<BrickCoord> = loaded.brick_coords().collect();
         original.sort_unstable();
@@ -793,7 +803,7 @@ mod tests {
     #[test]
     fn everything_is_marked_dirty_so_the_load_is_visible() {
         let (mut loaded, _) = round_trip(&sculpted(), &ProjectState::default());
-        let mut dirty = Vec::new();
+        let mut dirty: Vec<(NodeId, BrickCoord)> = Vec::new();
         loaded.take_dirty(&mut dirty);
         assert!(!dirty.is_empty(), "a freshly loaded model had nothing to mesh");
     }
@@ -973,7 +983,7 @@ mod tests {
         let volume = Volume::new(0.25);
         let (loaded, _) = round_trip(&volume, &ProjectState::default());
         assert_eq!(loaded.voxel_size(), 0.25);
-        assert_eq!(loaded.brick_coords().count(), 0);
+        assert_eq!(loaded.active_volume().brick_coords().count(), 0);
     }
 
     #[test]
@@ -1043,10 +1053,11 @@ mod tests {
                 if progress.bricks > 0 {
                     reached_the_bricks += 1;
                 }
-                let Ok((volume, _)) = outcome else {
+                let Ok((doc, _)) = outcome else {
                     continue;
                 };
                 loaded += 1;
+                let volume = doc.active_volume();
 
                 assert!(volume.voxel_size() > 0.0, "seed {seed}: a non positive voxel size loaded");
                 for coord in volume.brick_coords().collect::<Vec<_>>() {
@@ -1127,8 +1138,9 @@ mod tests {
         // And the bound is not so tight that it refuses the edge it allows.
         let mut fine = bytes.clone();
         fine[coord_at..coord_at + 4].copy_from_slice(&MAX_BRICK_COORD.to_le_bytes());
-        let (volume, _) = read(&mut fine.as_slice()).expect("the largest legal brick was refused");
-        let coord = volume
+        let (doc, _) = read(&mut fine.as_slice()).expect("the largest legal brick was refused");
+        let coord = doc
+            .active_volume()
             .brick_coords()
             .find(|coord| coord.0.x == MAX_BRICK_COORD)
             .expect("the brick did not survive the load");
@@ -1225,7 +1237,7 @@ mod tests {
         assert_eq!(loaded_state.view, state.view, "the old file's settings came back wrong");
         assert!(loaded_state.keys.is_empty(), "a file with no trailer gained keys");
         assert_eq!(
-            loaded.brick_coords().count(),
+            loaded.active_volume().brick_coords().count(),
             volume.brick_coords().count(),
             "the geometry did not survive"
         );
@@ -1589,13 +1601,16 @@ mod tests {
         );
 
         let mut progress = Progress::default();
-        let (volume, state) = read_reporting(&mut bytes.as_slice(), &mut progress)
+        let (doc, state) = read_reporting(&mut bytes.as_slice(), &mut progress)
             .expect("the committed version 1 fixture was refused");
 
         assert_eq!(state.view, fixture_state(Vec::new()).view);
         assert!(state.keys.is_empty(), "a file with no trailer gained keys");
         assert_eq!(progress.bricks, 5);
-        assert_same_bricks(&fixture_volume(), &volume);
+        assert_eq!(doc.body_count(), 1, "a file with no node table is one implicit body");
+        assert_eq!(doc.nodes()[0].name, Document::FIRST_BODY_NAME);
+        assert_eq!(progress.nodes, 0, "there was no node table to read nodes from");
+        assert_same_bricks(&fixture_volume(), doc.active_volume());
     }
 
     /// And a version 2 file, whose trailer has to come back sorted.
@@ -1605,7 +1620,7 @@ mod tests {
         assert_eq!(u16::from_le_bytes([bytes[8], bytes[9]]), 2);
 
         let mut progress = Progress::default();
-        let (volume, state) = read_reporting(&mut bytes.as_slice(), &mut progress)
+        let (doc, state) = read_reporting(&mut bytes.as_slice(), &mut progress)
             .expect("the committed version 2 fixture was refused");
 
         assert_eq!(state.view, fixture_state(Vec::new()).view);
@@ -1613,7 +1628,8 @@ mod tests {
         expected.sort_by(|a, b| a.at.partial_cmp(&b.at).expect("no NaN in the fixture"));
         assert_eq!(state.keys, expected, "the trailer did not come back in order");
         assert_eq!(progress.bricks, 5);
-        assert_same_bricks(&fixture_volume(), &volume);
+        assert_eq!(doc.body_count(), 1, "a file with no node table is one implicit body");
+        assert_same_bricks(&fixture_volume(), doc.active_volume());
     }
 
     /// The two fixtures differ only in the version stamp and the trailer, so
@@ -1632,7 +1648,7 @@ mod tests {
 
         let (from_one, _) = read(&mut one.as_slice()).expect("version 1 refused");
         let (from_two, _) = read(&mut two.as_slice()).expect("version 2 refused");
-        assert_same_bricks(&from_one, &from_two);
+        assert_same_bricks(from_one.active_volume(), from_two.active_volume());
     }
 
     /// Compare two volumes brick for brick, so a fixture failure names the
@@ -1696,10 +1712,11 @@ mod tests {
             let mut reader = std::io::BufReader::with_capacity(1 << 20, file);
 
             let mut progress = Progress::default();
-            let (volume, state) = match read_reporting(&mut reader, &mut progress) {
+            let (doc, state) = match read_reporting(&mut reader, &mut progress) {
                 Ok(loaded) => loaded,
                 Err(error) => panic!("{} ({size} bytes) was refused: {error}", path.display()),
             };
+            let volume = doc.active_volume();
             assert_eq!(
                 progress.bricks,
                 volume.brick_coords().count() as u64,

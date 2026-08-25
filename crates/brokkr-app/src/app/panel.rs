@@ -608,7 +608,7 @@ impl Brokkr {
         let frame_ms = self.perf.average_frame_ms();
         let fps = if frame_ms > 0.0 { 1000.0 / frame_ms } else { 0.0 };
 
-        let volume_mb = self.volume_stats.resident_bytes as f64 / (1024.0 * 1024.0);
+        let volume_mb = self.doc_stats.resident_bytes as f64 / (1024.0 * 1024.0);
         let pool_mb =
             (pool.vertices as f64 * 24.0 + pool.triangles as f64 * 12.0) / (1024.0 * 1024.0);
         let history_mb = self.history_stats.bytes as f64 / (1024.0 * 1024.0);
@@ -646,13 +646,26 @@ impl Brokkr {
             ),
             format!(
                 "{} dense + {} uniform bricks   {volume_mb:.1} MB volume   {pool_mb:.1} MB mesh",
-                self.volume_stats.dense_bricks, self.volume_stats.uniform_bricks
+                self.doc_stats.dense_bricks, self.doc_stats.uniform_bricks
             ),
             format!(
-                "history {} undo / {} redo   {history_mb:.1} MB of {} MB{}",
+                "history {} undo / {} redo   {history_mb:.1} MB of {} MB{}{}",
                 self.history_stats.undo_entries,
                 self.history_stats.redo_entries,
                 self.history_stats.budget_bytes / (1024 * 1024),
+                // Only when there is one, because a deleted body is the
+                // uncommon case and a permanent "+ 0 MB" would read as noise --
+                // but while history IS holding one, the number it holds is not
+                // in the figure to its left and has its own allowance.
+                if self.history_stats.reclaim_bytes > 0 {
+                    format!(
+                        "   + {:.1} MB of {} MB deleted",
+                        self.history_stats.reclaim_bytes as f64 / (1024.0 * 1024.0),
+                        self.history_stats.reclaim_budget_bytes / (1024 * 1024)
+                    )
+                } else {
+                    String::new()
+                },
                 if self.history_stats.dropped > 0 {
                     format!("   {} dropped", self.history_stats.dropped)
                 } else {
@@ -871,7 +884,7 @@ impl Brokkr {
 
         // The pattern's own numbers only mean anything once one is chosen.
         if self.brush.pattern.kind != PatternKind::None {
-            let floor = self.voxel_size * brokkr_core::MIN_SCALE_VOXELS;
+            let floor = self.doc.voxel_size() * brokkr_core::MIN_SCALE_VOXELS;
             body = body.push(
                 column![
                     text(format!("Feature  {:.2} mm", self.brush.pattern.scale_mm))
@@ -1507,9 +1520,10 @@ impl Brokkr {
                 // than a few voxels cannot be represented, and offering it
                 // would only produce a model the exporter then refuses.
                 slider(
-                    (self.voxel_size * brokkr_core::MIN_SCALE_VOXELS)..=brokkr_core::MAX_SCALE_MM,
+                    (self.doc.voxel_size() * brokkr_core::MIN_SCALE_VOXELS)
+                        ..=brokkr_core::MAX_SCALE_MM,
                     pattern.scale_mm.clamp(
-                        self.voxel_size * brokkr_core::MIN_SCALE_VOXELS,
+                        self.doc.voxel_size() * brokkr_core::MIN_SCALE_VOXELS,
                         brokkr_core::MAX_SCALE_MM
                     ),
                     Message::PatternScaleChanged
@@ -1541,11 +1555,11 @@ impl Brokkr {
     /// straight past what the mesh pool holds. Two steps make the cost of each
     /// one obvious.
     fn detail_panel(&self) -> Element<'_, Message> {
-        let finer = self.voxel_size / 2.0;
-        let coarser = self.voxel_size * 2.0;
+        let finer = self.doc.voxel_size() / 2.0;
+        let coarser = self.doc.voxel_size() * 2.0;
 
         column![
-            text(format!("Voxel  {:.3} mm", self.voxel_size))
+            text(format!("Voxel  {:.3} mm", self.doc.voxel_size()))
                 .size(theme::TEXT_SIZE_SMALL)
                 .color(theme::TEXT_DIM),
             row![

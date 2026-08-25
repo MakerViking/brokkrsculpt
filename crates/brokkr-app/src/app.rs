@@ -9,8 +9,9 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use brokkr_core::{
-    BrickCoord, BrickMesh, Brush, BrushDirection, BrushKind, BrushScratch, History, HistoryStats,
-    MirrorAxis, MoveStroke, Stamp, Stroke, Symmetry, Volume, VolumeStats, lean_normal, raycast,
+    BrickCoord, BrickMesh, Brush, BrushDirection, BrushKind, BrushScratch, Document, Entry,
+    History, HistoryStats, MirrorAxis, MoveStroke, NodeId, Stamp, Stroke, Symmetry, UndoOutcome,
+    Volume, VolumeStats, lean_normal, raycast,
 };
 use glam::{Vec2, Vec3};
 use iced::{Subscription, Task};
@@ -244,7 +245,14 @@ impl Perf {
 }
 
 pub struct Brokkr {
-    volume: Volume,
+    /// Every body in the sculpt, on one lattice.
+    ///
+    /// This was a bare `Volume`. The application still holds exactly one body
+    /// and nothing in the interface can create a second, but the voxel size,
+    /// the dirty set and the meshing all belong to the document from here --
+    /// which is what makes "the volume" stop being a thing a call site can mean
+    /// by accident.
+    doc: Document,
     camera: OrbitCamera,
     brush: Brush,
     symmetry: Symmetry,
@@ -285,7 +293,12 @@ pub struct Brokkr {
     /// Stamp centres produced by the current pointer event. Reused so a stroke
     /// does not allocate.
     stamp_centres: Vec<Vec3>,
-    dirty: Vec<BrickCoord>,
+    /// Bricks waiting to be remeshed, each tagged with the body it belongs to.
+    ///
+    /// One list across the whole document rather than one per body, because
+    /// [`Document::mesh_dirty`] has to make the serial-or-parallel decision
+    /// once over the real total -- see its documentation.
+    dirty: Vec<(NodeId, BrickCoord)>,
     drag: Option<Drag>,
     /// Last pointer position in widget pixels, for drag deltas.
     cursor: Option<Vec2>,
@@ -295,10 +308,15 @@ pub struct Brokkr {
     /// Alt, which inverts the brush the same way control does.
     alt: bool,
     perf: Perf,
-    volume_stats: VolumeStats,
+    /// What the whole document costs, summed over every body, refreshed on
+    /// remesh.
+    ///
+    /// **There is deliberately no `voxel_size` field beside this.** There used
+    /// to be, and it was an application-side copy of a `Volume` property that
+    /// four separate sites re-derived; with a document lattice there is exactly
+    /// one correct value and `doc.voxel_size()` is it.
+    doc_stats: VolumeStats,
     history_stats: HistoryStats,
-    /// Current voxel size, which the resample operation changes.
-    voxel_size: f32,
     /// What the last export or resample did, for the interface to show.
     status: String,
     /// Which blocks of the properties panel are open, in `PanelSection::ALL`
@@ -321,9 +339,19 @@ pub struct Brokkr {
     /// Whether the radius tracks the model's size rather than staying a fixed
     /// number of millimetres.
     dynamic_radius: bool,
-    /// The model's bounding radius, refreshed on remesh. `Volume::bounding_radius`
-    /// walks the brick map, so it is not something to call per frame.
+    /// How big the active body is, refreshed on remesh.
+    /// [`Volume::content_radius`] walks the brick map, so it is not something
+    /// to call per frame.
     model_radius: f32,
+    /// Which body `model_radius` was last measured on.
+    ///
+    /// **This is what makes "Dynamic never resizes the brush because the
+    /// SELECTION changed" unrepresentable rather than merely avoided.** Without
+    /// it, a selection handler that does the obvious thing -- set the active
+    /// body, then remesh -- would compare a 5 mm rivet's radius against the
+    /// 200 mm bust's and scale the brush by forty. See
+    /// [`Brokkr::rescale_radius`].
+    model_radius_body: NodeId,
     /// What is typed in the working-size field, before it is committed. Held as
     /// text so a half-typed number is not rounded or rejected mid-keystroke.
     pub(crate) working_size_field: String,
@@ -664,8 +692,10 @@ impl Brokkr {
         // with no voxels of their own still own the quads on their low faces.
         volume.mark_everything_dirty();
 
+        let doc = Document::from_volume(volume);
         let mut app = Self {
-            volume,
+            model_radius_body: doc.active(),
+            doc,
             camera: OrbitCamera::framing(Vec3::ZERO, MODEL_RADIUS_MM),
             brush: Brush::default(),
             symmetry: Symmetry::OFF,
@@ -691,9 +721,8 @@ impl Brokkr {
             control: false,
             alt: false,
             perf: Perf::default(),
-            volume_stats: VolumeStats::default(),
+            doc_stats: VolumeStats::default(),
             history_stats: HistoryStats::default(),
-            voxel_size: VOXEL_SIZE_MM,
             status: String::new(),
             expanded: PanelSection::ALL.map(PanelSection::open_by_default),
             stats_open: false,
@@ -962,12 +991,12 @@ impl Brokkr {
     /// two live in one function and neither is callable by accident.
     fn rebuild_everything(&mut self) {
         self.shared.request_pool_reset();
-        self.volume.mark_everything_dirty();
+        self.doc.mark_everything_dirty();
         self.remesh_dirty();
     }
 
     fn remesh_dirty(&mut self) {
-        self.volume.take_dirty(&mut self.dirty);
+        self.doc.take_dirty(&mut self.dirty);
         self.perf.dirty_bricks = self.dirty.len();
         if self.dirty.is_empty() {
             return;
@@ -978,18 +1007,40 @@ impl Brokkr {
         while self.mesh_buffers.len() < count {
             self.mesh_buffers.push(self.shared.take_mesh());
         }
-        // Across every core. At the sizes M2 targets this is the difference
-        // between a remesh at 70 percent of its budget and one at under 10.
-        self.volume.mesh_bricks(&self.dirty, &mut self.mesh_buffers[..count]);
-        for (coord, mesh) in self.dirty.iter().zip(self.mesh_buffers.drain(..count)) {
-            self.shared.publish(*coord, mesh);
+        // Across every core, and across every BODY in one call: the threshold
+        // that chooses between the serial and the parallel path counts the
+        // coordinates in one call, so meshing body by body would drop a
+        // document's worth of scattered dirty bricks onto a single thread. At
+        // the sizes M2 targets the parallel path is the difference between a
+        // remesh at 70 percent of its budget and one at under 10.
+        self.doc.mesh_dirty(&self.dirty, &mut self.mesh_buffers[..count]);
+        for ((body, coord), mesh) in self.dirty.iter().zip(self.mesh_buffers.drain(..count)) {
+            self.shared.publish(*body, *coord, mesh);
         }
         self.perf.remesh_ms = started.elapsed().as_secs_f32() * 1000.0;
-        self.volume_stats = self.volume.stats();
+        self.doc_stats = self.doc.totals();
 
+        // Dynamic resizes the brush when the MODEL changed under it. Comparing
+        // against a radius measured on a DIFFERENT body would resize it because
+        // the selection changed, which is a different thing entirely and must
+        // never happen -- see `rescale_radius`. So the comparison is made only
+        // when the previous measurement was of the same body.
+        let same_body = self.model_radius_body == self.doc.active();
         let previous = self.model_radius;
-        self.model_radius = self.volume.bounding_radius().unwrap_or(MODEL_RADIUS_MM);
-        self.rescale_radius(previous);
+        self.refresh_model_radius();
+        if same_body {
+            self.rescale_radius(previous);
+        }
+    }
+
+    /// Re-measure the active body, for the camera, the mirror plane and the
+    /// Dynamic brush.
+    ///
+    /// **Separate from [`Brokkr::rescale_radius`] on purpose.** This one is
+    /// safe to call after a selection change; that one is not.
+    fn refresh_model_radius(&mut self) {
+        self.model_radius = self.doc.active_volume().content_radius().unwrap_or(MODEL_RADIUS_MM);
+        self.model_radius_body = self.doc.active();
     }
 
     /// Rebuild the brush ring and mirror planes and hand them to the renderer.
@@ -1007,7 +1058,7 @@ impl Brokkr {
         let mut batch = std::mem::take(&mut self.overlay);
         cursor::build(
             &mut batch,
-            &self.volume,
+            self.doc.active_volume(),
             &self.effective_brush(),
             self.symmetry,
             self.hover,
@@ -1027,6 +1078,19 @@ impl Brokkr {
     ///
     /// ZBrush calls this Dynamic. Without it a brush tuned on a 60 mm ball is
     /// the wrong size the moment the model is resampled or grows.
+    ///
+    /// **This must never run because the SELECTION changed.** It exists to
+    /// survive a *resample*, where the geometry moved under a fixed brush;
+    /// choosing a different body changes no geometry at all. Once
+    /// `model_radius` means the active body's, clicking a 5 mm rivet beside a
+    /// 200 mm bust with Dynamic on would take a 5 mm brush to `5 * 0.025 =
+    /// 0.125`, clamped up to [`MIN_RADIUS_MM`], and clicking back would take it
+    /// to `0.25 * 40 = 10 mm` -- the brush doubled and the user never touched
+    /// the slider. Worse, the press that resized it is the same press that
+    /// selects, so the next press carves at a radius they never chose.
+    /// Selection changes go through [`Brokkr::refresh_model_radius`] instead,
+    /// which re-measures for the camera and the mirror plane and leaves the
+    /// brush alone.
     fn rescale_radius(&mut self, previous_model_radius: f32) {
         if !self.dynamic_radius || previous_model_radius <= 0.0 || self.model_radius <= 0.0 {
             return;
@@ -1045,7 +1109,7 @@ impl Brokkr {
     /// millimetre ceiling alone reaches a brush that takes a quarter of a
     /// second per stamp.
     pub(crate) fn max_radius(&self) -> f32 {
-        MAX_RADIUS_MM.min(MAX_RADIUS_VOXELS * self.voxel_size).max(MIN_RADIUS_MM)
+        MAX_RADIUS_MM.min(MAX_RADIUS_VOXELS * self.doc.voxel_size()).max(MIN_RADIUS_MM)
     }
 
     /// The world space ray through a point in widget pixels.
@@ -1058,7 +1122,7 @@ impl Brokkr {
     /// Where the cursor meets the surface, if it does.
     fn surface_under(&self, pixel: Vec2) -> Option<Vec3> {
         let (origin, ray) = self.ray_through(pixel);
-        raycast(&self.volume, origin, ray, self.camera.far).map(|hit| hit.position)
+        raycast(self.doc.active_volume(), origin, ray, self.camera.far).map(|hit| hit.position)
     }
 
     /// Apply the brush along the stroke path up to the point under the cursor.
@@ -1122,7 +1186,7 @@ impl Brokkr {
             let Some(point) = self.surface_under(pixel) else {
                 return;
             };
-            self.move_stroke.begin(&self.volume, &brush, point, self.symmetry);
+            self.move_stroke.begin(self.doc.active_volume(), &brush, point, self.symmetry);
             self.move_grab = Some(point);
         }
         let Some(grab) = self.move_grab else {
@@ -1130,7 +1194,7 @@ impl Brokkr {
         };
 
         let target = self.view_plane_point(pixel, grab);
-        self.move_stroke.drag_to(&mut self.volume, target, pressure);
+        self.move_stroke.drag_to(self.doc.active_volume_mut(), target, pressure);
 
         // Re-anchor once this lock has warped as far as it safely can, and let
         // the drag carry on from where the material now is.
@@ -1150,7 +1214,7 @@ impl Brokkr {
         // one undo entry.
         if self.move_stroke.is_at_the_limit() {
             let carried = grab + self.move_stroke.applied();
-            self.move_stroke.begin(&self.volume, &brush, carried, self.symmetry);
+            self.move_stroke.begin(self.doc.active_volume(), &brush, carried, self.symmetry);
             self.move_grab = Some(carried);
         }
 
@@ -1183,7 +1247,7 @@ impl Brokkr {
         if start {
             self.stroke.begin(point, &mut self.stamp_centres);
         } else {
-            let spacing = self.effective_brush().spacing(self.volume.voxel_size());
+            let spacing = self.effective_brush().spacing(self.doc.voxel_size());
             self.stroke.advance(point, spacing, &mut self.stamp_centres);
         }
 
@@ -1214,12 +1278,12 @@ impl Brokkr {
                 // Leaning the pen rotates the direction the brush pushes in,
                 // which steers every brush at once because they all read this
                 // normal.
-                let normal = lean_normal(self.volume.gradient_world(centre), lean);
+                let normal = lean_normal(self.doc.active_volume().gradient_world(centre), lean);
                 let stamp = Stamp::new(centre, normal, direction)
                     .with_pressure(pressure)
                     .with_tangent(tangent);
                 brush.apply_symmetric(
-                    &mut self.volume,
+                    self.doc.active_volume_mut(),
                     &stamp,
                     self.symmetry,
                     &mut self.brush_scratch,
@@ -1342,14 +1406,38 @@ impl Brokkr {
             return;
         };
 
-        self.volume.begin_stroke();
-        let changed = self.volume.clip(plane);
-        match self.volume.end_stroke() {
+        // **THE CUT IS SINGLE-BODY, AND IT MUST NOT STAY THAT WAY.** The
+        // decision is that a cut crosses every VISIBLE body, because a cut is a
+        // line the user draws across what they can see; the rename that turned
+        // `self.volume` into the document made this quietly mean "the active
+        // body" with nothing anywhere failing, which is the exact shape of
+        // change that ships unnoticed. It becomes
+        // `Document::clip(plane, visible) -> CutOutcome` -- one `Entry` of N
+        // `Change::Bricks`, `changed > 0` becoming `bricks > 0`, and "the cut
+        // missed the model" reserved for `bodies_cut == 0` -- when there is a
+        // second body for it to cross and a compound undo entry to record it
+        // in. Until then this assertion is what says so out loud, and
+        // `a_cut_crosses_every_visible_body` is the test that has to go green
+        // when the loop lands.
+        debug_assert_eq!(
+            self.doc.body_count(),
+            1,
+            "the plane cut still cuts only the active body, and this document has more than one"
+        );
+        let body = self.doc.active();
+        let volume = self.doc.active_volume_mut();
+        volume.begin_stroke();
+        let changed = volume.clip(plane);
+        let edit = volume.end_stroke();
+        match edit {
             Some(edit) if changed > 0 => {
-                self.history.push(edit);
-                self.history_stats = self.history.stats();
+                let before = self.history.stats();
+                self.history.push(Entry::stroke(body, edit));
                 self.unsaved = true;
                 self.status = format!("cut {changed} bricks");
+                // After the cut's own message on purpose: an eviction that took
+                // a deleted body with it outranks a count of bricks.
+                self.record_history(before);
                 self.remesh_dirty();
                 self.refresh_overlay();
             }
@@ -1372,13 +1460,34 @@ impl Brokkr {
         // last one's copy.
         self.move_stroke.end();
         self.move_grab = None;
-        if let Some(edit) = self.volume.end_stroke() {
-            self.history.push(edit);
-            self.history_stats = self.history.stats();
+        let body = self.doc.active();
+        if let Some(edit) = self.doc.active_volume_mut().end_stroke() {
+            let before = self.history.stats();
+            self.history.push(Entry::stroke(body, edit));
+            self.record_history(before);
             // Inside the guard on purpose: a press and release that never
             // touched the model produces no edit, and must not raise a
             // "discard your work?" prompt on the way out.
             self.unsaved = true;
+        }
+    }
+
+    /// Take the history's counters, and say out loud when an eviction has taken
+    /// a deleted body with it.
+    ///
+    /// Entries are only ever dropped by a push, so this belongs at the push
+    /// sites and nowhere else. The reason a body gets a status line when a
+    /// dropped stroke gets only a counter in the stats readout: a dropped
+    /// stroke costs the user a redo they did not ask for, and a dropped body
+    /// costs them the body. Two folder deletes that each pass the reclaim
+    /// allowance on their own and then evict each other are the case no
+    /// per-operation prompt can catch, which is why the eviction has to be the
+    /// one that speaks.
+    fn record_history(&mut self, before: HistoryStats) {
+        self.history_stats = self.history.stats();
+        if self.history_stats.dropped_bodies > before.dropped_bodies {
+            self.status =
+                "undo history is full — a deleted body can no longer be brought back".to_string();
         }
     }
 
@@ -1477,10 +1586,10 @@ impl Brokkr {
         let _ = writeln!(
             out,
             "model: voxel {:.3} mm, {} dense + {} uniform bricks, {:.1} MB",
-            self.voxel_size,
-            self.volume_stats.dense_bricks,
-            self.volume_stats.uniform_bricks,
-            self.volume_stats.resident_bytes as f64 / (1024.0 * 1024.0),
+            self.doc.voxel_size(),
+            self.doc_stats.dense_bricks,
+            self.doc_stats.uniform_bricks,
+            self.doc_stats.resident_bytes as f64 / (1024.0 * 1024.0),
         );
         let pool = self.shared.stats();
         let _ = writeln!(
@@ -1515,16 +1624,16 @@ impl Brokkr {
     /// Extracted from the old `ResetSphere` arm so the menu and the panel button
     /// share one path rather than drifting.
     fn reset_sculpt(&mut self) {
-        let mut volume = Volume::new(self.voxel_size);
+        let mut volume = Volume::new(self.doc.voxel_size());
         volume.seed_sphere(Vec3::ZERO, MODEL_RADIUS_MM);
         volume.mark_everything_dirty();
         // The old bricks have to be cleared from the pool too, or their
         // triangles stay on screen. Marking them dirty meshes them to nothing,
         // which releases their slices.
-        for coord in self.volume.brick_coords() {
+        for coord in self.doc.active_volume().brick_coords() {
             volume.mark_dirty(coord);
         }
-        self.volume = volume;
+        self.doc = Document::from_volume(volume);
         // History refers to bricks of the volume that just went away, so keeping
         // it would let undo splice pieces of the discarded model into this one.
         self.history.clear();
@@ -1640,7 +1749,7 @@ impl Brokkr {
         let write = match std::fs::File::create(&temporary) {
             Ok(file) => {
                 let mut writer = std::io::BufWriter::new(file);
-                brokkr_core::project::write(&mut writer, &self.volume, &state)
+                brokkr_core::project::write(&mut writer, self.doc.active_volume(), &state)
                     .map_err(|error| error.to_string())
             }
             Err(error) => Err(error.to_string()),
@@ -1772,7 +1881,7 @@ impl Brokkr {
             }
         };
         let mut reader = std::io::BufReader::new(file);
-        let (volume, state) = match brokkr_core::project::read(&mut reader) {
+        let (doc, state) = match brokkr_core::project::read(&mut reader) {
             Ok(loaded) => loaded,
             Err(error) => {
                 // The message says what was expected as well as what was found,
@@ -1785,13 +1894,13 @@ impl Brokkr {
 
         // Clear the outgoing model from the mesh pool before swapping, exactly
         // as a reset does.
-        let stale: Vec<BrickCoord> = self.volume.brick_coords().collect();
-        self.volume = volume;
+        let stale: Vec<BrickCoord> = self.doc.active_volume().brick_coords().collect();
+        self.doc = doc;
+        let volume = self.doc.active_volume_mut();
         for coord in stale {
-            self.volume.mark_dirty(coord);
+            volume.mark_dirty(coord);
         }
 
-        self.voxel_size = self.volume.voxel_size();
         self.apply_view(&state.view);
         self.timeline.adopt(state.keys);
 
@@ -1825,18 +1934,18 @@ impl Brokkr {
     /// `project::read` does it, which is why neither this nor `open_project`
     /// appears to need it.
     ///
-    /// The camera is framed on `MODEL_RADIUS_MM` like every other call site, not
-    /// on `bounding_radius`: that is measured from the origin over brick
-    /// extents, so for a centred model it over-reports by up to about 1.7 times
+    /// The camera is framed on `MODEL_RADIUS_MM` like every other call site,
+    /// not on the model's own measured radius: the bound rounds out to whole
+    /// bricks, so for a centred model it over-reports by up to about 1.7 times
     /// plus padding and the camera sits visibly too far back.
     fn adopt_import(&mut self, imported: crate::message::Imported) {
-        let stale: Vec<BrickCoord> = self.volume.brick_coords().collect();
-        self.volume = imported.volume;
+        let stale: Vec<BrickCoord> = self.doc.active_volume().brick_coords().collect();
+        self.doc = Document::from_volume(imported.volume);
+        let volume = self.doc.active_volume_mut();
         for coord in stale {
-            self.volume.mark_dirty(coord);
+            volume.mark_dirty(coord);
         }
 
-        self.voxel_size = self.volume.voxel_size();
         self.camera = OrbitCamera::framing(Vec3::ZERO, MODEL_RADIUS_MM);
         self.history.clear();
         self.history_stats = self.history.stats();
@@ -1881,7 +1990,7 @@ impl Brokkr {
             }
         };
         let mut writer = std::io::BufWriter::new(file);
-        match brokkr_core::project::write(&mut writer, &self.volume, &state) {
+        match brokkr_core::project::write(&mut writer, self.doc.active_volume(), &state) {
             Ok(()) => {
                 self.project_path = Some(path.to_path_buf());
                 // Only here. Both failure arms leave the flag set, or a failed
@@ -1914,7 +2023,7 @@ impl Brokkr {
     /// is nothing to create and nothing to guess.
     fn export(&mut self, format: ExportFormat, path: &std::path::Path) {
         let started = Instant::now();
-        let (mesh, report) = self.volume.export_mesh();
+        let (mesh, report) = self.doc.active_volume().export_mesh();
 
         if !report.is_printable() {
             self.status = format!("not exported, {}", report.summary());
@@ -2005,7 +2114,7 @@ impl Brokkr {
     /// Rebuild the volume at a different voxel size.
     fn resample(&mut self, voxel_size: f32) {
         let mut voxel_size = Self::clamped_voxel_size(voxel_size);
-        if (voxel_size - self.voxel_size).abs() < 1.0e-6 {
+        if (voxel_size - self.doc.voxel_size()).abs() < 1.0e-6 {
             return;
         }
 
@@ -2017,7 +2126,7 @@ impl Brokkr {
         let mut capped = None;
         if let Some((why, finest)) = self.too_fine_for_the_pool(voxel_size) {
             let fallback = Self::clamped_voxel_size(finest);
-            if fallback < self.voxel_size * 0.98 {
+            if fallback < self.doc.voxel_size() * 0.98 {
                 capped = Some(voxel_size);
                 voxel_size = fallback;
             } else {
@@ -2029,16 +2138,11 @@ impl Brokkr {
         }
 
         let started = Instant::now();
-        let mut resampled = self.volume.resampled(voxel_size);
-        // The old bricks have to be cleared out of the renderer's pool, and
-        // after a resample their coordinates mean something different, so they
-        // are marked in the new volume to remesh to nothing.
-        for coord in self.volume.brick_coords() {
-            resampled.mark_dirty(coord);
-        }
-
-        self.volume = resampled;
-        self.voxel_size = voxel_size;
+        // Every body at once, because they share the lattice: the old bricks
+        // have to be cleared out of the renderer's pool, and after a resample
+        // their coordinates mean something different, so they are marked in the
+        // new volume to remesh to nothing.
+        self.doc.resample(voxel_size);
         // Past the early return above, so resampling to the size already in use
         // stays the no-op its test asserts it is.
         self.unsaved = true;
@@ -2053,14 +2157,14 @@ impl Brokkr {
             Some(wanted) => format!(
                 "resampled to {voxel_size:.3} mm -- the finest the mesh pool holds at this size \
                  ({wanted:.3} mm did not fit), {} dense bricks, {:.0} MB, {:.0} ms",
-                self.volume_stats.dense_bricks,
-                self.volume_stats.resident_bytes as f64 / (1024.0 * 1024.0),
+                self.doc_stats.dense_bricks,
+                self.doc_stats.resident_bytes as f64 / (1024.0 * 1024.0),
                 started.elapsed().as_secs_f64() * 1000.0
             ),
             None => format!(
                 "resampled to {voxel_size:.3} mm, {} dense bricks, {:.0} MB, {:.0} ms",
-                self.volume_stats.dense_bricks,
-                self.volume_stats.resident_bytes as f64 / (1024.0 * 1024.0),
+                self.doc_stats.dense_bricks,
+                self.doc_stats.resident_bytes as f64 / (1024.0 * 1024.0),
                 started.elapsed().as_secs_f64() * 1000.0
             ),
         };
@@ -2082,7 +2186,7 @@ impl Brokkr {
     /// from a measured reservation means the allocator's own padding is already
     /// baked into the figure rather than guessed at.
     fn too_fine_for_the_pool(&self, wanted: f32) -> Option<(String, f32)> {
-        if wanted >= self.voxel_size {
+        if wanted >= self.doc.voxel_size() {
             return None;
         }
 
@@ -2091,11 +2195,11 @@ impl Brokkr {
         // and costs 4.15 GB of RAM, so a pool-only guard would happily walk a
         // machine into swap or the OOM killer. Same square law -- a surface
         // has fixed area, so halving the voxel quadruples the shell.
-        let growth = (self.voxel_size / wanted).powi(2) as f64;
-        let bytes = self.volume_stats.resident_bytes as f64 * growth;
+        let growth = (self.doc.voxel_size() / wanted).powi(2) as f64;
+        let bytes = self.doc_stats.resident_bytes as f64 * growth;
         if bytes > MAX_VOLUME_BYTES {
-            let headroom = MAX_VOLUME_BYTES / self.volume_stats.resident_bytes.max(1) as f64;
-            let finest = self.voxel_size / headroom.sqrt() as f32 * 1.03;
+            let headroom = MAX_VOLUME_BYTES / self.doc_stats.resident_bytes.max(1) as f64;
+            let finest = self.doc.voxel_size() / headroom.sqrt() as f32 * 1.03;
             return Some((
                 format!(
                     "could not resample to {wanted:.3} mm: it needs about {:.1} GB of memory \
@@ -2129,7 +2233,7 @@ impl Brokkr {
         // than tell the user to.
         let headroom = (pool.vertex_capacity as f64 / pool.vertices_reserved as f64)
             .min(pool.index_capacity as f64 / pool.indices_reserved as f64);
-        let finest = self.voxel_size / headroom.sqrt() as f32 * 1.03;
+        let finest = self.doc.voxel_size() / headroom.sqrt() as f32 * 1.03;
         let why = format!(
             "could not resample to {wanted:.3} mm: it needs about {:.1}M vertices against a pool \
              of {:.1}M -- {finest:.3} mm is the finest that fits at this size",
@@ -2152,7 +2256,7 @@ impl Brokkr {
             self.status = "could not resize: that is not a length".into();
             return;
         }
-        let Some((lo, hi)) = self.volume.surface_bounds() else {
+        let Some((lo, hi)) = self.doc.active_volume().surface_bounds() else {
             self.status = "could not resize: there is no model".into();
             return;
         };
@@ -2166,7 +2270,7 @@ impl Brokkr {
         // The voxel size travels with the model, so the range that bounds it
         // bounds this too -- otherwise a resize could land somewhere the finer
         // and coarser buttons can never get back from.
-        let wanted_voxel = self.voxel_size * factor;
+        let wanted_voxel = self.doc.voxel_size() * factor;
         let clamped = Self::clamped_voxel_size(wanted_voxel);
         if (clamped - wanted_voxel).abs() > 1.0e-9 {
             self.status = format!(
@@ -2178,15 +2282,16 @@ impl Brokkr {
         }
 
         let previous_radius = self.model_radius;
-        self.volume.rescale(factor);
-        self.voxel_size = self.volume.voxel_size();
+        // Every body, because they share the lattice: scaling one alone would
+        // hand it a lattice its siblings do not have.
+        self.doc.rescale(factor);
         // The brush is in millimetres, so without this a resize leaves it the
         // wrong size relative to the model it is about to be used on.
         self.brush.radius = (self.brush.radius * factor).clamp(MIN_RADIUS_MM, self.max_radius());
         self.unsaved = true;
         // Every brick's world position moved, so everything has to be redrawn
         // even though not one voxel changed.
-        self.volume.mark_everything_dirty();
+        self.doc.mark_everything_dirty();
         self.rebuild_everything();
         let _ = previous_radius;
         self.camera = OrbitCamera::framing(Vec3::ZERO, self.model_radius.max(1.0e-3));
@@ -2214,21 +2319,21 @@ impl Brokkr {
     /// where a filament nozzle lays down 0.4 mm lines and cannot use anything
     /// like this much.
     fn measure_detail_advice(&self) -> String {
-        let Some((lo, hi)) = self.volume.surface_bounds() else {
+        let Some((lo, hi)) = self.doc.active_volume().surface_bounds() else {
             return "no model".into();
         };
+        let voxel_size = self.doc.voxel_size();
         let longest = (hi - lo).max_element();
-        let across = (longest / self.voxel_size).round() as i64;
-        let verdict = if self.voxel_size <= RESIN_XY_MM {
+        let across = (longest / voxel_size).round() as i64;
+        let verdict = if voxel_size <= RESIN_XY_MM {
             "at or below what a resin printer resolves"
-        } else if self.voxel_size <= FDM_LINE_MM {
+        } else if voxel_size <= FDM_LINE_MM {
             "finer than a filament nozzle, coarser than resin"
         } else {
             "coarse: a filament nozzle would not see the difference"
         };
         format!(
-            "{longest:.1} mm across, voxel {:.3} mm, {across} voxels wide -- {verdict}",
-            self.voxel_size
+            "{longest:.1} mm across, voxel {voxel_size:.3} mm, {across} voxels wide -- {verdict}"
         )
     }
 
@@ -2244,16 +2349,16 @@ impl Brokkr {
         }
 
         let started = Instant::now();
-        let mut turned = self.volume.rotated(rotation);
+        let mut turned = self.doc.active_volume().rotated(rotation);
         // The old bricks have to be cleared out of the renderer's pool. After a
         // turn their coordinates hold something else, or nothing at all, and a
         // brick nobody marks is one the pool keeps drawing -- the previous pose
         // would stay on screen underneath the new one.
-        for coord in self.volume.brick_coords() {
+        for coord in self.doc.active_volume().brick_coords() {
             turned.mark_dirty(coord);
         }
 
-        self.volume = turned;
+        self.doc.replace_active_volume(turned);
         self.unsaved = true;
         // Every entry names a brick of a volume that no longer exists, exactly
         // as after a resample. Snapshotting the whole field instead would
@@ -2432,19 +2537,62 @@ impl Brokkr {
     /// invalidated in three more places. Over-prompting costs a click;
     /// under-prompting costs the sculpt.
     fn undo(&mut self) {
-        if self.history.undo(&mut self.volume) {
-            self.history_stats = self.history.stats();
-            self.unsaved = true;
-            self.remesh_dirty();
+        let shown = self.shown_nodes();
+        match self.history.undo(&mut self.doc, &shown) {
+            UndoOutcome::Applied(_) => self.after_history_step(),
+            UndoOutcome::Refused(node) => self.refuse_history_step("undo", node),
+            UndoOutcome::Nothing => {}
         }
     }
 
     fn redo(&mut self) {
-        if self.history.redo(&mut self.volume) {
-            self.history_stats = self.history.stats();
-            self.unsaved = true;
-            self.remesh_dirty();
+        let shown = self.shown_nodes();
+        match self.history.redo(&mut self.doc, &shown) {
+            UndoOutcome::Applied(_) => self.after_history_step(),
+            UndoOutcome::Refused(node) => self.refuse_history_step("redo", node),
+            UndoOutcome::Nothing => {}
         }
+    }
+
+    /// Which rows are drawn, indexed by node position.
+    ///
+    /// A stand-in for the visibility resolver, which combines three inputs -- a
+    /// row's own eye, every ancestor folder's, and solo -- and arrives with the
+    /// second body there is to hide. With one row and no folders the answer IS
+    /// that row's own eye, and writing the stand-in as a map over `nodes` keeps
+    /// the call sites the shape the resolver wants.
+    ///
+    /// It allocates, which is right for a keystroke and would be wrong per
+    /// frame; the resolver fills a buffer the application keeps.
+    fn shown_nodes(&self) -> Vec<bool> {
+        self.doc.nodes().iter().map(|node| node.visible).collect()
+    }
+
+    /// What undo and redo both do once something has actually moved.
+    ///
+    /// `refresh_overlay` is in here because the brush ring and the mirror
+    /// planes are built from the field: sixteen other sites already refresh
+    /// them, and undo not doing so has been a staleness bug the whole time
+    /// there has been one body to see it on.
+    fn after_history_step(&mut self) {
+        self.history_stats = self.history.stats();
+        self.unsaved = true;
+        self.remesh_dirty();
+        self.refresh_overlay();
+    }
+
+    /// Say which body is in the way, and change nothing else.
+    ///
+    /// **Deliberately does not reveal or select it.** The eye bit is persisted,
+    /// undoable document state, so writing it from inside undo would destroy a
+    /// deliberate hide, set `unsaved` for a change the user never made, and
+    /// still not reveal the body if an ancestor folder were the one hiding it.
+    /// The user reveals it and presses again; the entry is untouched and costs
+    /// nothing while it waits.
+    fn refuse_history_step(&mut self, verb: &str, node: NodeId) {
+        let name = self.doc.node(node).map_or("a hidden body", |node| node.name.as_str());
+        self.status = format!("{verb} would change {name}, which is hidden");
+        self.refresh_overlay();
     }
 
     fn on_pointer(&mut self, event: PointerEvent) {
@@ -2538,7 +2686,7 @@ impl Brokkr {
                 if let DragKind::Sculpt(direction) = kind {
                     // One stroke is one undo entry, so recording opens here and
                     // closes when the button comes back up.
-                    self.volume.begin_stroke();
+                    self.doc.active_volume_mut().begin_stroke();
                     self.sculpt_to(position, direction, true);
                 }
                 self.update_hover(position);
@@ -2998,7 +3146,7 @@ impl Brokkr {
                     return Task::none();
                 };
                 self.status = format!("importing {}…", path.display());
-                let voxel_size = self.voxel_size;
+                let voxel_size = self.doc.voxel_size();
                 // Off the update loop, unlike open and save. Measured by
                 // `cargo bench -p brokkr-core --bench import`: a 542k triangle
                 // sphere reads in 62 ms and voxelises in 148 to 210 ms
@@ -3100,7 +3248,7 @@ mod tests {
     }
 
     use crate::tablet::PenState;
-    use brokkr_core::BrushKind;
+    use brokkr_core::{BrushKind, Change};
     use iced::Vector;
     use std::time::Duration;
 
@@ -3148,14 +3296,14 @@ mod tests {
     fn a_press_at_the_centre_of_the_viewport_changes_the_model() {
         let mut app = app();
         let front = app.camera.eye().normalize() * MODEL_RADIUS_MM;
-        let before = app.volume.sample_world(front);
+        let before = app.doc.active_volume().sample_world(front);
 
         press(&mut app, centre_of_viewport());
 
         assert!(app.perf.edit_ms > 0.0, "no edit was timed, so the raycast missed the sphere");
         assert!(app.perf.dirty_bricks > 0, "the stroke dirtied nothing");
         assert!(
-            app.volume.sample_world(front) < before,
+            app.doc.active_volume().sample_world(front) < before,
             "adding clay should have pushed the field negative at the surface"
         );
     }
@@ -3190,12 +3338,16 @@ mod tests {
     #[test]
     fn a_press_that_misses_the_model_changes_nothing() {
         let mut app = app();
-        let bricks_before = app.volume.brick_count();
+        let bricks_before = app.doc.active_volume().brick_count();
 
         // The far corner of the viewport looks past the sphere into empty space.
         press(&mut app, Vector::new(2.0, 2.0));
 
-        assert_eq!(app.volume.brick_count(), bricks_before, "a miss must not allocate");
+        assert_eq!(
+            app.doc.active_volume().brick_count(),
+            bricks_before,
+            "a miss must not allocate"
+        );
         assert_eq!(app.perf.dirty_bricks, 0, "a miss must not schedule a remesh");
     }
 
@@ -3203,7 +3355,7 @@ mod tests {
     fn orbiting_moves_the_camera_without_touching_the_model() {
         let mut app = app();
         let yaw = app.camera.yaw;
-        let bricks = app.volume.brick_count();
+        let bricks = app.doc.active_volume().brick_count();
 
         app.on_pointer(PointerEvent::Pressed {
             button: PointerButton::Right,
@@ -3213,7 +3365,7 @@ mod tests {
         app.on_pointer(PointerEvent::Moved { position: Vector::new(460.0, 300.0), size: SIZE });
 
         assert_ne!(app.camera.yaw, yaw, "a right drag should have orbited");
-        assert_eq!(app.volume.brick_count(), bricks, "orbiting must not sculpt");
+        assert_eq!(app.doc.active_volume().brick_count(), bricks, "orbiting must not sculpt");
     }
 
     #[test]
@@ -3246,22 +3398,104 @@ mod tests {
         );
     }
 
+    /// The eviction that has to speak for itself.
+    ///
+    /// A per-operation prompt cannot catch this: two folder deletes that each
+    /// pass the reclaim allowance on their own go on to evict each other, and
+    /// the only moment anything knows the body has become unrecoverable is the
+    /// eviction. The delete gesture itself does not exist yet, so the entry is
+    /// built here by hand -- what is under test is the path from
+    /// `HistoryStats::dropped_bodies` to something the user can read.
+    #[test]
+    fn an_eviction_that_takes_a_deleted_body_with_it_reaches_the_status_line() {
+        let mut app = app();
+        let mut second = Volume::new(app.doc.voxel_size());
+        second.seed_sphere(Vec3::new(60.0, 0.0, 0.0), 10.0);
+        let doomed = app.doc.add_body("Body 2", second);
+        app.remesh_dirty();
+
+        // An allowance of one byte, so the next push evicts the delete while
+        // the stroke budget is nowhere near its ceiling.
+        app.history = History::with_budgets(brokkr_core::DEFAULT_HISTORY_BUDGET, 1);
+        let at = app.doc.index_of(doomed).expect("the second body");
+        let node = app.doc.remove(at);
+        app.history.push(Entry::new(vec![Change::NodeRemoved { at, node: Box::new(node) }]));
+        assert!(app.status.is_empty(), "nothing has been evicted yet");
+
+        press(&mut app, centre_of_viewport());
+        release(&mut app);
+
+        assert_eq!(app.history_stats.dropped_bodies, 1, "the delete was not evicted");
+        assert!(
+            app.status.contains("deleted body"),
+            "the eviction left the user nothing to read: {:?}",
+            app.status
+        );
+    }
+
+    /// A body that comes back from the undo stack has to reach the GPU, and
+    /// the count the remesh reports is the only thing in the application that
+    /// says it did.
+    ///
+    /// `perf.dirty_bricks` and not `perf.remesh_ms`: the first is written
+    /// before `remesh_dirty`'s early return and the second only past it, so a
+    /// restored body that scheduled nothing would leave `remesh_ms` reading
+    /// whatever the last real remesh cost.
+    ///
+    /// The remesh before the delete is load-bearing -- it is what drains the
+    /// dirty set the second body was seeded with, so that the only thing that
+    /// can mark its bricks afterwards is `Document::insert`.
+    #[test]
+    fn undoing_a_body_delete_schedules_every_one_of_its_bricks_for_remesh() {
+        let mut app = app();
+        let mut second = Volume::new(app.doc.voxel_size());
+        second.seed_sphere(Vec3::new(60.0, 0.0, 0.0), 10.0);
+        let doomed = app.doc.add_body("Body 2", second);
+        app.remesh_dirty();
+
+        let bricks = app.doc.volume(doomed).expect("the second body").brick_count();
+        assert!(bricks > 0, "the fixture body must have bricks or this asserts nothing");
+
+        // The delete itself, which has no interface yet: the node moves out of
+        // the document and into the entry.
+        let at = app.doc.index_of(doomed).expect("the second body");
+        let node = app.doc.remove(at);
+        app.history.push(Entry::new(vec![Change::NodeRemoved { at, node: Box::new(node) }]));
+
+        update(&mut app, Message::Undo);
+
+        assert!(app.doc.volume(doomed).is_some(), "the body did not come back");
+        assert!(
+            app.perf.dirty_bricks >= bricks,
+            "the restored body scheduled {} bricks, not its {bricks}, so it never reaches the screen",
+            app.perf.dirty_bricks
+        );
+    }
+
     #[test]
     fn undo_returns_the_model_to_where_it_started() {
         let mut app = app();
         let front = app.camera.eye().normalize() * MODEL_RADIUS_MM;
-        let before = app.volume.sample_world(front);
+        let before = app.doc.active_volume().sample_world(front);
 
         press(&mut app, centre_of_viewport());
         release(&mut app);
-        assert_ne!(app.volume.sample_world(front), before);
+        assert_ne!(app.doc.active_volume().sample_world(front), before);
 
         update(&mut app, Message::Undo);
-        assert_eq!(app.volume.sample_world(front), before, "undo did not restore the field");
+        assert_eq!(
+            app.doc.active_volume().sample_world(front),
+            before,
+            "undo did not restore the field"
+        );
         assert!(app.perf.dirty_bricks > 0, "undo must schedule a remesh or the screen goes stale");
 
         update(&mut app, Message::Redo);
-        assert_ne!(app.volume.sample_world(front), before, "redo did not reapply the stroke");
+        assert_ne!(
+            app.doc.active_volume().sample_world(front),
+            before,
+            "redo did not reapply the stroke"
+        );
     }
 
     #[test]
@@ -3297,13 +3531,13 @@ mod tests {
             .surface_under(Vec2::new(off_centre.x, off_centre.y))
             .expect("the test needs a point that is on the model");
         let mirrored = Vec3::new(-hit.x, hit.y, hit.z);
-        let before = app.volume.sample_world(mirrored);
+        let before = app.doc.active_volume().sample_world(mirrored);
 
         press(&mut app, off_centre);
         release(&mut app);
 
         assert!(
-            app.volume.sample_world(mirrored) < before,
+            app.doc.active_volume().sample_world(mirrored) < before,
             "the mirrored half of the stroke never landed"
         );
     }
@@ -3345,14 +3579,14 @@ mod tests {
         let probe = app
             .surface_under(Vec2::new(SIZE.x / 2.0, SIZE.y / 2.0))
             .expect("the centre of the viewport should hit the sphere");
-        let flat = app.volume.sample_world(probe);
+        let flat = app.doc.active_volume().sample_world(probe);
 
         update(&mut app, Message::BrushKindChanged(BrushKind::Draw));
         for _ in 0..4 {
             press(&mut app, centre_of_viewport());
             release(&mut app);
         }
-        let raised = app.volume.sample_world(probe);
+        let raised = app.doc.active_volume().sample_world(probe);
         assert!(raised < flat, "drawing should have pushed the surface out past the probe");
 
         // Now the same gesture with shift held. Nothing about the selection
@@ -3365,7 +3599,7 @@ mod tests {
             press(&mut app, centre_of_viewport());
             release(&mut app);
         }
-        let smoothed = app.volume.sample_world(probe);
+        let smoothed = app.doc.active_volume().sample_world(probe);
 
         assert_ne!(smoothed, raised, "holding shift changed nothing at all");
         assert!(
@@ -3399,19 +3633,19 @@ mod tests {
             // On the surface, and off all three planes, so only the axis
             // under test can carry the stroke to the probe point.
             let at = Vec3::new(14.0, 14.0, 18.0).normalize() * MODEL_RADIUS_MM;
-            let normal = app.volume.gradient_world(at);
-            let before = app.volume.sample_world(at * probe);
+            let normal = app.doc.active_volume().gradient_world(at);
+            let before = app.doc.active_volume().sample_world(at * probe);
 
-            app.volume.begin_stroke();
+            app.doc.active_volume_mut().begin_stroke();
             app.brush.apply_symmetric(
-                &mut app.volume,
+                app.doc.active_volume_mut(),
                 &Stamp::new(at, normal, BrushDirection::Add),
                 app.symmetry,
                 &mut app.brush_scratch,
             );
 
             assert!(
-                app.volume.sample_world(at * probe) < before,
+                app.doc.active_volume().sample_world(at * probe) < before,
                 "{} symmetry never reached the other side",
                 axis.label()
             );
@@ -3466,7 +3700,7 @@ mod tests {
         let probe = app
             .surface_under(Vec2::new(SIZE.x / 2.0, SIZE.y / 2.0))
             .expect("the centre should hit the sphere");
-        let before = app.volume.sample_world(probe);
+        let before = app.doc.active_volume().sample_world(probe);
 
         update(&mut app, Message::SizingStarted(SizingTarget::Radius));
         press(&mut app, centre_of_viewport());
@@ -3478,7 +3712,11 @@ mod tests {
         }
         release(&mut app);
 
-        assert_eq!(app.volume.sample_world(probe), before, "a sizing drag cut into the model");
+        assert_eq!(
+            app.doc.active_volume().sample_world(probe),
+            before,
+            "a sizing drag cut into the model"
+        );
         assert!(!app.history.can_undo(), "a sizing drag recorded an undo entry");
     }
 
@@ -3538,8 +3776,8 @@ mod tests {
         update(&mut app, Message::SymmetryAxisToggled(MirrorAxis::Y));
         update(&mut app, Message::BrushRadiusChanged(5.5));
         app.camera.yaw = 1.25;
-        let sculpted = app.volume.sample_world(probe);
-        let expected_bricks: usize = app.volume.brick_coords().count();
+        let sculpted = app.doc.active_volume().sample_world(probe);
+        let expected_bricks: usize = app.doc.active_volume().brick_coords().count();
 
         app.save_project(&path);
         assert!(app.status.starts_with("saved"), "save reported: {}", app.status);
@@ -3550,8 +3788,12 @@ mod tests {
         reopened.open_project(&path);
         assert!(reopened.status.starts_with("opened"), "open reported: {}", reopened.status);
 
-        assert_eq!(reopened.volume.sample_world(probe), sculpted, "the field came back different");
-        assert_eq!(reopened.volume.brick_coords().count(), expected_bricks);
+        assert_eq!(
+            reopened.doc.active_volume().sample_world(probe),
+            sculpted,
+            "the field came back different"
+        );
+        assert_eq!(reopened.doc.active_volume().brick_coords().count(), expected_bricks);
         assert!((reopened.camera.yaw - 1.25).abs() < 1.0e-5, "the camera did not follow");
         assert!((reopened.brush.radius - 5.5).abs() < 1.0e-5, "the brush did not follow");
         assert!(reopened.symmetry.axis(MirrorAxis::Y), "the mirror planes did not follow");
@@ -3563,7 +3805,7 @@ mod tests {
             reopened.perf.dirty_bricks > 0,
             "the reopened model was never meshed, so it would load into an empty screen"
         );
-        let (_, report) = reopened.volume.export_mesh();
+        let (_, report) = reopened.doc.active_volume().export_mesh();
         assert!(report.is_printable(), "the reopened model is not printable: {}", report.summary());
 
         // History belongs to the model that went away.
@@ -3693,10 +3935,10 @@ mod tests {
     #[test]
     fn resampling_to_the_current_size_leaves_the_flag_alone() {
         let mut app = app();
-        app.resample(app.voxel_size);
+        app.resample(app.doc.voxel_size());
         assert!(!app.unsaved, "a resample that did nothing armed the unsaved marker");
 
-        app.resample(app.voxel_size * 2.0);
+        app.resample(app.doc.voxel_size() * 2.0);
         assert!(app.unsaved, "a real resample did not mark the document unsaved");
     }
 
@@ -3731,14 +3973,14 @@ mod tests {
     #[test]
     fn new_with_unsaved_work_raises_the_prompt_and_does_not_reset() {
         let mut app = app_with_unsaved_work();
-        let sculpted = app.volume.brick_coords().count();
+        let sculpted = app.doc.active_volume().brick_coords().count();
 
         update(&mut app, Message::NewSculpt);
 
         assert_eq!(app.confirm, Some(PendingAction::NewSculpt), "no prompt was raised");
         assert!(app.unsaved, "the document was reset behind the prompt");
         assert_eq!(
-            app.volume.brick_coords().count(),
+            app.doc.active_volume().brick_coords().count(),
             sculpted,
             "New threw the sculpt away before the user had answered"
         );
@@ -3800,14 +4042,18 @@ mod tests {
     fn a_viewport_press_does_not_dismiss_the_prompt_or_sculpt() {
         let mut app = app_with_unsaved_work();
         update(&mut app, Message::NewSculpt);
-        let before = app.volume.sample_world(Vec3::ZERO);
+        let before = app.doc.active_volume().sample_world(Vec3::ZERO);
         let entries = app.history_stats.undo_entries;
 
         press(&mut app, centre_of_viewport());
         release(&mut app);
 
         assert_eq!(app.confirm, Some(PendingAction::NewSculpt), "a stray click dismissed it");
-        assert_eq!(app.volume.sample_world(Vec3::ZERO), before, "it sculpted behind the prompt");
+        assert_eq!(
+            app.doc.active_volume().sample_world(Vec3::ZERO),
+            before,
+            "it sculpted behind the prompt"
+        );
         assert_eq!(
             app.history_stats.undo_entries, entries,
             "it recorded a stroke behind the prompt"
@@ -3842,13 +4088,17 @@ mod tests {
     #[test]
     fn cancel_leaves_everything_exactly_as_it_was() {
         let mut app = app_with_unsaved_work();
-        let bricks = app.volume.brick_coords().count();
+        let bricks = app.doc.active_volume().brick_coords().count();
         update(&mut app, Message::NewSculpt);
         update(&mut app, Message::ConfirmAnswered(ConfirmChoice::Cancel));
 
         assert!(app.confirm.is_none());
         assert!(app.unsaved, "cancel cleared the unsaved marker");
-        assert_eq!(app.volume.brick_coords().count(), bricks, "cancel reset the sculpt anyway");
+        assert_eq!(
+            app.doc.active_volume().brick_coords().count(),
+            bricks,
+            "cancel reset the sculpt anyway"
+        );
     }
 
     /// Save-then-continue, for a document that already has a file.
@@ -3972,7 +4222,7 @@ mod tests {
         let mut app = app_with_unsaved_work();
         app.autosave_file = Some(directory.join("autosave.brokkr"));
         let probe = Vec3::ZERO;
-        let sculpted = app.volume.sample_world(probe);
+        let sculpted = app.doc.active_volume().sample_world(probe);
 
         app.write_autosave();
 
@@ -3984,7 +4234,11 @@ mod tests {
         recovered.autosave_file = app.autosave_file.clone();
         recovered.recover_autosave();
 
-        assert_eq!(recovered.volume.sample_world(probe), sculpted, "the field came back different");
+        assert_eq!(
+            recovered.doc.active_volume().sample_world(probe),
+            sculpted,
+            "the field came back different"
+        );
         assert!(
             recovered.project_path.is_none(),
             "a recovered autosave adopted its own path, so the next Save would write back into \
@@ -4061,7 +4315,7 @@ mod tests {
         update(&mut app, Message::BrushRadiusChanged(10.0));
 
         let probe = Vec3::new(0.0, 0.0, 30.0);
-        let before = app.volume.sample_world(probe);
+        let before = app.doc.active_volume().sample_world(probe);
 
         press(&mut app, centre_of_viewport());
         // Well past the silhouette of the ball.
@@ -4074,7 +4328,7 @@ mod tests {
         release(&mut app);
 
         assert_ne!(
-            app.volume.sample_world(probe),
+            app.doc.active_volume().sample_world(probe),
             before,
             "the drag stopped at the silhouette, so it is still raycasting the surface"
         );
@@ -4097,7 +4351,7 @@ mod tests {
         let probe = app
             .surface_under(Vec2::new(SIZE.x / 2.0, SIZE.y / 2.0))
             .expect("the centre hits the ball");
-        let before = app.volume.sample_world(probe);
+        let before = app.doc.active_volume().sample_world(probe);
 
         press(&mut app, centre_of_viewport());
         for step in 1..=12 {
@@ -4113,7 +4367,7 @@ mod tests {
             "a Move drag recorded no undo entry, so it did nothing at all"
         );
         assert_ne!(
-            app.volume.sample_world(probe),
+            app.doc.active_volume().sample_world(probe),
             before,
             "a Move drag across the model left the field untouched"
         );
@@ -4188,7 +4442,7 @@ mod tests {
             // Where the surface crosses along +Z at this slice.
             let mut z = 60.0f32;
             while z > 0.0 {
-                if app.volume.sample_world(Vec3::new(x, 0.0, z)) < 0.0 {
+                if app.doc.active_volume().sample_world(Vec3::new(x, 0.0, z)) < 0.0 {
                     break;
                 }
                 z -= 0.05;
@@ -4276,7 +4530,8 @@ mod tests {
         let probes: Vec<Vec3> = (-40..=40)
             .map(|step| Vec3::new(step as f32 * 0.5, 0.0, MODEL_RADIUS_MM - 2.0))
             .collect();
-        let before: Vec<f32> = probes.iter().map(|p| app.volume.sample_world(*p)).collect();
+        let before: Vec<f32> =
+            probes.iter().map(|p| app.doc.active_volume().sample_world(*p)).collect();
 
         update(&mut app, Message::BrushKindChanged(BrushKind::Move));
         update(&mut app, Message::BrushRadiusChanged(10.0));
@@ -4296,7 +4551,7 @@ mod tests {
         let worst = probes
             .iter()
             .zip(&before)
-            .map(|(probe, was)| (app.volume.sample_world(*probe) - was).abs())
+            .map(|(probe, was)| (app.doc.active_volume().sample_world(*probe) - was).abs())
             .fold(0.0f32, f32::max);
         // Looser than the core test's thousandth, and for two reasons that are
         // the application's rather than the algorithm's. The world point comes
@@ -4342,8 +4597,8 @@ mod tests {
         assert!(!app.cut_armed, "the cut stayed armed after being used");
         assert!(app.unsaved, "a cut did not mark the document unsaved");
 
-        let above = app.volume.sample_world(Vec3::new(0.0, 12.0, 0.0));
-        let below = app.volume.sample_world(Vec3::new(0.0, -12.0, 0.0));
+        let above = app.doc.active_volume().sample_world(Vec3::new(0.0, 12.0, 0.0));
+        let below = app.doc.active_volume().sample_world(Vec3::new(0.0, -12.0, 0.0));
         assert_ne!(
             above < 0.0,
             below < 0.0,
@@ -4365,12 +4620,12 @@ mod tests {
     fn a_click_with_the_cut_armed_does_nothing() {
         let mut app = app();
         update(&mut app, Message::CutToggled);
-        let before = app.volume.brick_coords().count();
+        let before = app.doc.active_volume().brick_coords().count();
 
         press(&mut app, centre_of_viewport());
         release(&mut app);
 
-        assert_eq!(app.volume.brick_coords().count(), before, "a click cut the model");
+        assert_eq!(app.doc.active_volume().brick_coords().count(), before, "a click cut the model");
         assert!(!app.unsaved, "a click that cut nothing marked the document unsaved");
         assert!(app.status.contains("cancelled"), "reported: {}", app.status);
     }
@@ -4379,7 +4634,7 @@ mod tests {
     fn a_cut_is_undoable_through_the_application() {
         let mut app = app();
         let probe = Vec3::new(0.0, 12.0, 0.0);
-        let before = app.volume.sample_world(probe);
+        let before = app.doc.active_volume().sample_world(probe);
 
         update(&mut app, Message::CutToggled);
         press(&mut app, Vector::new(SIZE.x * 0.1, SIZE.y / 2.0));
@@ -4388,10 +4643,18 @@ mod tests {
             size: SIZE,
         });
         release(&mut app);
-        assert_ne!(app.volume.sample_world(probe), before, "the cut did nothing to undo");
+        assert_ne!(
+            app.doc.active_volume().sample_world(probe),
+            before,
+            "the cut did nothing to undo"
+        );
 
         app.undo();
-        assert_eq!(app.volume.sample_world(probe), before, "undo did not restore the cut");
+        assert_eq!(
+            app.doc.active_volume().sample_world(probe),
+            before,
+            "undo did not restore the cut"
+        );
     }
 
     /// Escape is the way out of every other mode, and a destructive one must
@@ -4433,7 +4696,7 @@ mod tests {
         release(&mut app);
 
         let imported = brokkr_core::import::read_path(&path).expect("the STL should read");
-        let options = brokkr_core::voxelise::VoxeliseOptions::at(app.voxel_size);
+        let options = brokkr_core::voxelise::VoxeliseOptions::at(app.doc.voxel_size());
         let (volume, voxel_report) =
             brokkr_core::voxelise::voxelise(&imported, &options).expect("it should voxelise");
         app.adopt_import(crate::message::Imported {
@@ -4454,7 +4717,7 @@ mod tests {
         assert!(app.perf.dirty_bricks > 0, "nothing was meshed, so the import is invisible");
         assert!(app.status.starts_with("imported"), "reported: {}", app.status);
 
-        let (_, after) = app.volume.export_mesh();
+        let (_, after) = app.doc.active_volume().export_mesh();
         assert!(after.is_printable(), "the imported model is not printable: {}", after.summary());
 
         std::fs::remove_dir_all(&directory).ok();
@@ -4471,7 +4734,7 @@ mod tests {
         let mut app = app();
         press(&mut app, centre_of_viewport());
         release(&mut app);
-        let before = app.volume.sample_world(Vec3::ZERO);
+        let before = app.doc.active_volume().sample_world(Vec3::ZERO);
 
         let payload = crate::message::ImportPayload::new(
             brokkr_core::import::read_path(&path).map(|_| unreachable!("it should not parse")),
@@ -4484,7 +4747,7 @@ mod tests {
             app.status
         );
         assert_eq!(
-            app.volume.sample_world(Vec3::ZERO),
+            app.doc.active_volume().sample_world(Vec3::ZERO),
             before,
             "a failed import changed the model"
         );
@@ -4552,16 +4815,20 @@ mod tests {
         std::fs::write(&path, b"this is not a sculpt").unwrap();
 
         let mut app = app();
-        let before = app.volume.brick_coords().count();
+        let before = app.doc.active_volume().brick_coords().count();
         app.open_project(&path);
 
         assert!(app.status.contains("not a BrokkrSculpt file"), "reported: {}", app.status);
-        assert_eq!(app.volume.brick_coords().count(), before, "a failed open lost the model");
+        assert_eq!(
+            app.doc.active_volume().brick_coords().count(),
+            before,
+            "a failed open lost the model"
+        );
         assert!(app.project_path.is_none(), "a failed open claimed the file");
 
         app.open_project(&directory.join("does-not-exist.brokkr"));
         assert!(app.status.contains("could not open"), "reported: {}", app.status);
-        assert_eq!(app.volume.brick_coords().count(), before);
+        assert_eq!(app.doc.active_volume().brick_coords().count(), before);
 
         std::fs::remove_dir_all(&directory).ok();
     }
@@ -4581,8 +4848,8 @@ mod tests {
         let mut dynamic = app();
         update(&mut dynamic, Message::DynamicRadiusToggled(true));
         let before = proportion(&dynamic);
-        dynamic.volume.seed_sphere(Vec3::ZERO, MODEL_RADIUS_MM * 2.0);
-        dynamic.volume.mark_everything_dirty();
+        dynamic.doc.active_volume_mut().seed_sphere(Vec3::ZERO, MODEL_RADIUS_MM * 2.0);
+        dynamic.doc.active_volume_mut().mark_everything_dirty();
         dynamic.remesh_dirty();
 
         assert!(
@@ -4596,6 +4863,132 @@ mod tests {
         );
     }
 
+    /// The same ball, moved bodily away from the origin, must report the same
+    /// size.
+    ///
+    /// This is what `content_radius` replaced `bounding_radius` for. The old
+    /// measure was taken from the WORLD ORIGIN, so a model 128 mm out reported
+    /// roughly 2.6 times its own radius and the Dynamic brush went with it --
+    /// and nothing in the interface would have said why the brush had grown.
+    ///
+    /// 128 mm rather than a round 100 because at the 0.25 mm voxel that is
+    /// exactly sixteen bricks, so the sphere's brick footprint is an exact
+    /// translation of the one at the origin and the two radii are identical to
+    /// the last bit. That is the shared-lattice property this whole design
+    /// rests on, exercised from the application's side.
+    #[test]
+    fn a_body_far_from_the_origin_does_not_resize_the_dynamic_brush() {
+        let mut app = app();
+        update(&mut app, Message::DynamicRadiusToggled(true));
+        let radius = app.brush.radius;
+        let at_origin = app.model_radius;
+
+        let mut moved = brokkr_core::Volume::new(app.doc.voxel_size());
+        moved.seed_sphere(Vec3::new(128.0, 0.0, 0.0), MODEL_RADIUS_MM);
+        moved.mark_everything_dirty();
+        app.doc.replace_active_volume(moved);
+        app.remesh_dirty();
+
+        assert_eq!(
+            app.model_radius, at_origin,
+            "the same ball measured {} at the origin and {} at 128 mm",
+            at_origin, app.model_radius
+        );
+        assert_eq!(app.brush.radius, radius, "moving the model resized the brush");
+    }
+
+    /// Selecting a different body changes no geometry, so it must not resize
+    /// the Dynamic brush -- not on the selection, and not on the next remesh
+    /// either, which is where a naive implementation would catch up on it a
+    /// frame later.
+    ///
+    /// The fixture is the one from the decision: a small body beside a large
+    /// one. Under a plain `previous == self.model_radius` comparison this took
+    /// a 3 mm brush to the 0.25 mm floor and then to 10 mm on the way back --
+    /// and the press that resizes it is the same press that selects, so the
+    /// next press would carve at a radius nobody chose.
+    #[test]
+    fn changing_the_active_body_does_not_resize_the_dynamic_brush() {
+        let mut app = app();
+        update(&mut app, Message::DynamicRadiusToggled(true));
+        let radius = app.brush.radius;
+
+        let mut rivet = brokkr_core::Volume::new(app.doc.voxel_size());
+        rivet.seed_sphere(Vec3::new(128.0, 0.0, 0.0), 2.5);
+        rivet.mark_everything_dirty();
+        let second = app.doc.add_body("Body 2", rivet);
+        app.remesh_dirty();
+        assert_eq!(app.brush.radius, radius, "ADDING a body resized the brush");
+
+        app.doc.set_active(second);
+        // Something then dirties a brick -- a stroke, an undo, a resample,
+        // anything -- and the remesh that follows measures the rivet where the
+        // last measurement was of the ball. That comparison is the whole
+        // hazard, so the test has to reach it rather than land on
+        // `remesh_dirty`'s empty-set early return.
+        app.doc.active_volume_mut().mark_everything_dirty();
+        app.remesh_dirty();
+        assert_eq!(app.brush.radius, radius, "selecting a smaller body resized the brush");
+        assert!(
+            app.model_radius < MODEL_RADIUS_MM,
+            "the framing radius did not follow the selection: {}",
+            app.model_radius
+        );
+
+        let first = app.doc.nodes()[0].id;
+        app.doc.set_active(first);
+        app.doc.active_volume_mut().mark_everything_dirty();
+        app.remesh_dirty();
+        assert_eq!(app.brush.radius, radius, "selecting back resized the brush");
+    }
+
+    /// **The plane cut crosses every VISIBLE body**, and today it crosses only
+    /// the active one.
+    ///
+    /// A cut is a line the user draws across what they can see, so it acts on
+    /// what is drawn. `finish_cut` was single-volume before there was a
+    /// document, and the rename that gave it one made it silently mean "the
+    /// active body" -- which is exactly the kind of change that ships with
+    /// nothing failing. This is the executable statement of what it owes,
+    /// ignored until `Document::clip(plane, visible) -> CutOutcome` exists to
+    /// satisfy it, alongside the compound undo entry that records one `Entry`
+    /// of N `Change::Bricks`. The `debug_assert!` at the top of `finish_cut` is
+    /// the same tripwire from the other side, and it is what this test trips
+    /// today.
+    #[test]
+    #[ignore = "the N-body cut lands with the primitives that can create a second body"]
+    fn a_cut_crosses_every_visible_body() {
+        let mut app = app();
+        app.camera.yaw = 0.0;
+        app.camera.pitch = 0.0;
+        app.publish_camera();
+
+        // A second ball overlapping the first, so one screen-space line crosses
+        // both of them.
+        let mut second = brokkr_core::Volume::new(app.doc.voxel_size());
+        second.seed_sphere(Vec3::new(10.0, 0.0, 0.0), MODEL_RADIUS_MM * 0.5);
+        second.mark_everything_dirty();
+        let other = app.doc.add_body("Body 2", second);
+        app.remesh_dirty();
+
+        let above = Vec3::new(10.0, 12.0, 0.0);
+        let before = app.doc.volume(other).expect("a live body").sample_world(above);
+
+        update(&mut app, Message::CutToggled);
+        press(&mut app, Vector::new(SIZE.x * 0.1, SIZE.y / 2.0));
+        app.on_pointer(PointerEvent::Moved {
+            position: Vector::new(SIZE.x * 0.9, SIZE.y / 2.0),
+            size: SIZE,
+        });
+        release(&mut app);
+
+        assert_ne!(
+            app.doc.volume(other).expect("a live body").sample_world(above),
+            before,
+            "the cut passed straight through the inactive body and left it whole"
+        );
+    }
+
     /// Clicking the cube must move the camera and must NOT sculpt. Getting that
     /// wrong takes a divot out of the model every time someone reaches for a
     /// standard view.
@@ -4606,7 +4999,7 @@ mod tests {
         let probe = app
             .surface_under(Vec2::new(SIZE.x / 2.0, SIZE.y / 2.0))
             .expect("the centre should hit the sphere");
-        let before_field = app.volume.sample_world(probe);
+        let before_field = app.doc.active_volume().sample_world(probe);
         let before_yaw = app.camera.yaw;
 
         let (origin, size) = crate::navcube::corner_rect(Vec2::new(SIZE.x, SIZE.y));
@@ -4616,7 +5009,7 @@ mod tests {
 
         assert!(app.flight.is_some(), "clicking the cube did not start a move");
         assert_eq!(
-            app.volume.sample_world(probe),
+            app.doc.active_volume().sample_world(probe),
             before_field,
             "clicking the cube carved the model"
         );
@@ -4758,12 +5151,16 @@ mod tests {
         let probe = app
             .surface_under(Vec2::new(SIZE.x / 2.0, SIZE.y / 2.0))
             .expect("the centre should hit the sphere");
-        let before = app.volume.sample_world(probe);
+        let before = app.doc.active_volume().sample_world(probe);
 
         press(&mut app, centre_of_viewport());
         release(&mut app);
         assert!(app.menu.is_none(), "a click elsewhere did not close the menu");
-        assert_eq!(app.volume.sample_world(probe), before, "dismissing the menu sculpted");
+        assert_eq!(
+            app.doc.active_volume().sample_world(probe),
+            before,
+            "dismissing the menu sculpted"
+        );
     }
 
     /// A numeric field is the reason the menu beats the panel, and the reason it
@@ -4836,6 +5233,79 @@ mod tests {
         assert!(
             app.shared.overlay_snapshot().lines.is_empty(),
             "a ring was drawn for a pointer that is off the model"
+        );
+    }
+
+    /// Undo has to walk the brush ring back onto the surface it restored.
+    ///
+    /// The ring is not a screen space circle drawn over the model: every one
+    /// of its points is pushed onto the field by `cursor::onto_surface`, so
+    /// the geometry the renderer is holding is only correct for the field it
+    /// was built from. Undo changes the field without the pointer moving,
+    /// which is the one way the two can come apart -- and before
+    /// [`Brokkr::after_history_step`] refreshed the overlay, ctrl+Z left the
+    /// ring standing on the surface the stroke had made, floating off the
+    /// model until some later pointer motion happened to rebuild it.
+    ///
+    /// **Measured rather than argued.** With the default sphere and a
+    /// full strength Draw at the centre of the viewport, the stale ring sits
+    /// 0.49 voxels off the restored field and a refreshed one sits 0.0016
+    /// voxels off it, against the 0.1 voxel tolerance `onto_surface` stops
+    /// walking at -- five times the tolerance apart in one direction and
+    /// sixty times inside it in the other. The first assertion is there
+    /// because a fixture whose stroke did not actually move the surface under
+    /// the ring would pass the second one while testing nothing.
+    ///
+    /// Deleting the `refresh_overlay` call from `after_history_step` fails
+    /// this test and, as of writing, nothing else in the workspace.
+    #[test]
+    fn undoing_a_stroke_walks_the_brush_ring_back_onto_the_surface_it_restores() {
+        // What `cursor::onto_surface` treats as "on the surface", in voxels.
+        const ON_SURFACE: f32 = 0.1;
+
+        let ring = |app: &Brokkr| -> Vec<Vec3> {
+            app.shared
+                .overlay_snapshot()
+                .lines
+                .iter()
+                .map(|vertex| Vec3::from_array(vertex.position))
+                .collect()
+        };
+        let worst_off_surface = |app: &Brokkr, points: &[Vec3]| -> f32 {
+            points
+                .iter()
+                .map(|point| app.doc.active_volume().sample_world(*point).abs())
+                .fold(0.0f32, f32::max)
+        };
+
+        let mut app = app();
+        app.on_pointer(PointerEvent::Moved { position: centre_of_viewport(), size: SIZE });
+        assert!(app.hover.is_some(), "the centre of the viewport should hit the sphere");
+
+        // Deep enough to move the surface the ring is standing on. The pointer
+        // does not move again after this, so nothing but undo can rebuild the
+        // overlay.
+        app.brush.strength = 1.0;
+        press(&mut app, centre_of_viewport());
+        release(&mut app);
+
+        let stale = ring(&app);
+        assert!(!stale.is_empty(), "no ring was handed to the renderer");
+
+        update(&mut app, Message::Undo);
+
+        let stale_error = worst_off_surface(&app, &stale);
+        assert!(
+            stale_error > ON_SURFACE,
+            "the fixture asserts nothing: the stroke left the ring only {stale_error} voxels \
+             off the surface undo restored, which a stale ring would pass"
+        );
+
+        let error = worst_off_surface(&app, &ring(&app));
+        assert!(
+            error <= ON_SURFACE,
+            "undo left the brush ring {error} voxels off the surface it restored, so the \
+             overlay was never rebuilt"
         );
     }
 
@@ -5002,7 +5472,10 @@ mod tests {
                 press(&mut app, centre_of_viewport());
                 release(&mut app);
             }
-            (app.volume.sample_world(hit + sideways), app.volume.sample_world(hit - sideways))
+            (
+                app.doc.active_volume().sample_world(hit + sideways),
+                app.doc.active_volume().sample_world(hit - sideways),
+            )
         };
 
         let (right_upright, left_upright) = sculpt(glam::Vec2::ZERO);
@@ -5080,10 +5553,10 @@ mod tests {
     /// looking exactly the same -- a test built on it would pass whether or not
     /// anything turned.
     fn lopsided(app: &mut Brokkr) {
-        let mut volume = brokkr_core::Volume::new(app.voxel_size);
+        let mut volume = brokkr_core::Volume::new(app.doc.voxel_size());
         volume.seed_sphere(Vec3::new(0.0, 30.0, 0.0), 8.0);
         volume.mark_everything_dirty();
-        app.volume = volume;
+        app.doc.replace_active_volume(volume);
         app.remesh_dirty();
     }
 
@@ -5124,12 +5597,16 @@ mod tests {
         right_release(&mut app);
         assert!(app.cube_menu.is_some());
 
-        let before = app.volume.sample_world(probe);
+        let before = app.doc.active_volume().sample_world(probe);
         press(&mut app, centre_of_viewport());
         release(&mut app);
 
         assert!(app.cube_menu.is_none(), "the menu stayed open");
-        assert_eq!(app.volume.sample_world(probe), before, "dismissing the menu also sculpted");
+        assert_eq!(
+            app.doc.active_volume().sample_world(probe),
+            before,
+            "dismissing the menu also sculpted"
+        );
     }
 
     #[test]
@@ -5148,7 +5625,7 @@ mod tests {
         let (yaw, pitch, roll) = (app.camera.yaw, app.camera.pitch, app.camera.roll);
         let above = Vec3::new(0.0, 30.0, 0.0);
         let in_front = Vec3::new(0.0, 0.0, 30.0);
-        assert!(app.volume.sample_world(above) < 0.0, "the fixture is wrong");
+        assert!(app.doc.active_volume().sample_world(above) < 0.0, "the fixture is wrong");
 
         app.cube_menu =
             Some(CubeMenu { at: Vec2::new(700.0, 20.0), facing: brokkr_core::Facing::Up });
@@ -5156,10 +5633,13 @@ mod tests {
 
         // The model moved...
         assert!(
-            app.volume.sample_world(in_front) < 0.0,
+            app.doc.active_volume().sample_world(in_front) < 0.0,
             "the material did not arrive in front of the origin"
         );
-        assert!(app.volume.sample_world(above) >= 0.0, "the material is still above the origin");
+        assert!(
+            app.doc.active_volume().sample_world(above) >= 0.0,
+            "the material is still above the origin"
+        );
         // ...and the camera did not. This is the whole difference between
         // turning the model and re-aiming the view, and it is what makes an
         // export land upright.
@@ -5179,12 +5659,12 @@ mod tests {
         lopsided(&mut app);
         app.unsaved = false;
         let above = Vec3::new(0.0, 30.0, 0.0);
-        let before = app.volume.sample_world(above);
+        let before = app.doc.active_volume().sample_world(above);
 
         app.cube_menu = Some(CubeMenu { at: Vec2::ZERO, facing: brokkr_core::Facing::Up });
         update(&mut app, Message::OrientFace(brokkr_core::Facing::Up));
 
-        assert_eq!(app.volume.sample_world(above), before);
+        assert_eq!(app.doc.active_volume().sample_world(above), before);
         assert!(!app.unsaved, "a turn that did nothing still marked the document dirty");
     }
 
@@ -5196,14 +5676,18 @@ mod tests {
         let mut app = app();
         lopsided(&mut app);
         let above = Vec3::new(0.0, 30.0, 0.0);
-        let before = app.volume.sample_world(above);
+        let before = app.doc.active_volume().sample_world(above);
 
         app.cube_menu = Some(CubeMenu { at: Vec2::ZERO, facing: brokkr_core::Facing::Up });
         update(&mut app, Message::OrientFace(brokkr_core::Facing::Front));
         app.cube_menu = Some(CubeMenu { at: Vec2::ZERO, facing: brokkr_core::Facing::Front });
         update(&mut app, Message::OrientFace(brokkr_core::Facing::Up));
 
-        assert_eq!(app.volume.sample_world(above), before, "turning back did not return the model");
+        assert_eq!(
+            app.doc.active_volume().sample_world(above),
+            before,
+            "turning back did not return the model"
+        );
     }
 
     /// Build what a finished import delivers, with a chosen guess about which
@@ -5264,7 +5748,10 @@ mod tests {
         update(&mut app, Message::OrientPromptAnswered(true));
 
         assert!(app.orient_prompt.is_none(), "the prompt stayed up after being answered");
-        assert!(app.volume.sample_world(turned) < 0.0, "the model did not turn the way promised");
+        assert!(
+            app.doc.active_volume().sample_world(turned) < 0.0,
+            "the model did not turn the way promised"
+        );
     }
 
     #[test]
@@ -5272,12 +5759,16 @@ mod tests {
         let mut app = app();
         app.adopt_import(imported_with(Some(brokkr_core::Facing::Back)));
         let above = Vec3::new(0.0, 20.0, 0.0);
-        let before = app.volume.sample_world(above);
+        let before = app.doc.active_volume().sample_world(above);
 
         update(&mut app, Message::OrientPromptAnswered(false));
 
         assert!(app.orient_prompt.is_none());
-        assert_eq!(app.volume.sample_world(above), before, "declining still turned the model");
+        assert_eq!(
+            app.doc.active_volume().sample_world(above),
+            before,
+            "declining still turned the model"
+        );
     }
 
     #[test]
@@ -5291,11 +5782,15 @@ mod tests {
         assert!(app.orient_prompt.is_some());
 
         let probe = app.camera.eye().normalize() * MODEL_RADIUS_MM;
-        let before = app.volume.sample_world(probe);
+        let before = app.doc.active_volume().sample_world(probe);
         press(&mut app, centre_of_viewport());
         release(&mut app);
 
-        assert_eq!(app.volume.sample_world(probe), before, "a press reached the model behind it");
+        assert_eq!(
+            app.doc.active_volume().sample_world(probe),
+            before,
+            "a press reached the model behind it"
+        );
         assert!(app.drag.is_none());
     }
 
@@ -5304,12 +5799,12 @@ mod tests {
         let mut app = app();
         app.adopt_import(imported_with(Some(brokkr_core::Facing::Back)));
         let above = Vec3::new(0.0, 20.0, 0.0);
-        let before = app.volume.sample_world(above);
+        let before = app.doc.active_volume().sample_world(above);
 
         update(&mut app, Message::MenuClosed);
 
         assert!(app.orient_prompt.is_none(), "escape did not dismiss it");
-        assert_eq!(app.volume.sample_world(above), before, "escape turned the model");
+        assert_eq!(app.doc.active_volume().sample_world(above), before, "escape turned the model");
     }
 }
 
@@ -5331,16 +5826,21 @@ mod working_size_tests {
     #[test]
     fn resizing_scales_the_model_without_touching_a_voxel() {
         let mut app = app();
-        let before: Vec<_> =
-            app.volume.brick_coords().map(|c| (c, app.volume.sample_voxel(c.origin()))).collect();
-        let was = app.volume.surface_bounds().expect("the starting ball has a surface");
+        let before: Vec<_> = app
+            .doc
+            .active_volume()
+            .brick_coords()
+            .map(|c| (c, app.doc.active_volume().sample_voxel(c.origin())))
+            .collect();
+        let was =
+            app.doc.active_volume().surface_bounds().expect("the starting ball has a surface");
         let longest_before = (was.1 - was.0).max_element();
-        let voxel_before = app.voxel_size;
+        let voxel_before = app.doc.voxel_size();
 
         app.working_size_field = "30".into();
         update(&mut app, Message::WorkingSizeCommitted);
 
-        let now = app.volume.surface_bounds().expect("still a surface");
+        let now = app.doc.active_volume().surface_bounds().expect("still a surface");
         let longest_after = (now.1 - now.0).max_element();
         assert!(
             (longest_after - 30.0).abs() < 0.5,
@@ -5349,12 +5849,12 @@ mod working_size_tests {
 
         let factor = 30.0 / longest_before;
         assert!(
-            (app.voxel_size - voxel_before * factor).abs() < 1.0e-6,
+            (app.doc.voxel_size() - voxel_before * factor).abs() < 1.0e-6,
             "the voxel size should have scaled with the model"
         );
         for (coord, value) in before {
             assert_eq!(
-                app.volume.sample_voxel(coord.origin()),
+                app.doc.active_volume().sample_voxel(coord.origin()),
                 value,
                 "a voxel changed, so this resampled instead of rescaling"
             );
@@ -5365,14 +5865,16 @@ mod working_size_tests {
     #[test]
     fn resizing_buys_no_extra_detail() {
         let mut app = app();
-        let bounds = app.volume.surface_bounds().expect("a surface");
-        let across_before = ((bounds.1 - bounds.0).max_element() / app.voxel_size).round() as i64;
+        let bounds = app.doc.active_volume().surface_bounds().expect("a surface");
+        let across_before =
+            ((bounds.1 - bounds.0).max_element() / app.doc.voxel_size()).round() as i64;
 
         app.working_size_field = "12".into();
         update(&mut app, Message::WorkingSizeCommitted);
 
-        let bounds = app.volume.surface_bounds().expect("a surface");
-        let across_after = ((bounds.1 - bounds.0).max_element() / app.voxel_size).round() as i64;
+        let bounds = app.doc.active_volume().surface_bounds().expect("a surface");
+        let across_after =
+            ((bounds.1 - bounds.0).max_element() / app.doc.voxel_size()).round() as i64;
         assert_eq!(
             across_before, across_after,
             "the model has the same number of voxels across it, whatever size it is"
@@ -5385,22 +5887,22 @@ mod working_size_tests {
     #[test]
     fn a_size_that_would_put_the_voxel_out_of_range_is_refused() {
         let mut app = app();
-        let voxel_before = app.voxel_size;
+        let voxel_before = app.doc.voxel_size();
 
         app.working_size_field = "0.001".into();
         update(&mut app, Message::WorkingSizeCommitted);
 
-        assert_eq!(app.voxel_size, voxel_before, "the model was resized anyway");
+        assert_eq!(app.doc.voxel_size(), voxel_before, "the model was resized anyway");
         assert!(app.status.contains("could not resize"), "no refusal shown: {}", app.status);
     }
 
     #[test]
     fn nonsense_in_the_field_is_refused_rather_than_parsed_as_zero() {
         let mut app = app();
-        let voxel_before = app.voxel_size;
+        let voxel_before = app.doc.voxel_size();
         app.working_size_field = "big".into();
         update(&mut app, Message::WorkingSizeCommitted);
-        assert_eq!(app.voxel_size, voxel_before);
+        assert_eq!(app.doc.voxel_size(), voxel_before);
         assert!(app.status.contains("could not resize"), "{}", app.status);
     }
 
@@ -5410,7 +5912,7 @@ mod working_size_tests {
     #[test]
     fn the_voxel_rule_does_not_touch_the_brush_at_the_default_size() {
         let app = app();
-        assert_eq!(app.voxel_size, VOXEL_SIZE_MM);
+        assert_eq!(app.doc.voxel_size(), VOXEL_SIZE_MM);
         assert_eq!(
             app.max_radius(),
             MAX_RADIUS_MM,
@@ -5421,10 +5923,23 @@ mod working_size_tests {
     /// And at a resin lattice it must bite, because the millimetre ceiling
     /// there is 640 voxels of radius -- measured at roughly a quarter of a
     /// second per stamp.
+    ///
+    /// The lattice is reached with [`Document::rescale`], which multiplies
+    /// `voxel_size` and touches no voxel, rather than with `resample`, which
+    /// rebuilds the default sphere's narrow band eight times finer.
+    /// `max_radius` reads nothing but `doc.voxel_size()`, and `0.25 * 0.125`
+    /// is `0.03125` to the bit, so the resample bought this assertion nothing
+    /// and was refused rather than merely not chosen: measured on the built
+    /// test binary it cost 4.6 s and 2.4 GB of peak RSS for one test, against
+    /// 0.08 s and 75 MB through `rescale`. Cargo runs test binaries and their
+    /// threads in parallel, so a 2.4 GB spike here is a spike beside the GPU
+    /// offscreen suite on a CI runner. If a later change gives `max_radius` a
+    /// reason to read actual voxels, this has to become a real resample --
+    /// and then say so here.
     #[test]
     fn the_voxel_rule_caps_the_brush_at_a_resin_lattice() {
         let mut app = app();
-        app.voxel_size = 0.03125;
+        app.doc.rescale(0.125);
         assert!(
             (app.max_radius() - 3.125).abs() < 1.0e-6,
             "expected 100 voxels of radius, got {} mm",
@@ -5461,9 +5976,9 @@ mod working_size_tests {
 
         let expected = VOXEL_SIZE_MM / (11.0f32 / 6.0).sqrt() * 1.03;
         assert!(
-            (app.voxel_size - expected).abs() < 1.0e-3,
+            (app.doc.voxel_size() - expected).abs() < 1.0e-3,
             "expected to land near {expected:.3} mm, landed at {:.3}",
-            app.voxel_size
+            app.doc.voxel_size()
         );
         assert!(
             app.status.contains("finest the mesh pool holds"),
@@ -5487,13 +6002,13 @@ mod working_size_tests {
             ..Default::default()
         });
         // ...but the volume is already 4 GB, so one halving would want 16.
-        app.volume_stats.resident_bytes = 4 * 1024 * 1024 * 1024;
-        let before = app.voxel_size;
+        app.doc_stats.resident_bytes = 4 * 1024 * 1024 * 1024;
+        let before = app.doc.voxel_size();
 
         update(&mut app, Message::Resample(before / 2.0));
 
-        assert!(app.voxel_size < before, "it should still go finer, just not that fine");
-        assert!(app.voxel_size > before / 2.0, "and not all the way to the requested size");
+        assert!(app.doc.voxel_size() < before, "it should still go finer, just not that fine");
+        assert!(app.doc.voxel_size() > before / 2.0, "and not all the way to the requested size");
         assert!(
             app.status.contains("finest the mesh pool holds"),
             "the cap should be reported: {}",
@@ -5513,11 +6028,11 @@ mod working_size_tests {
             index_capacity: 66_000_000,
             ..Default::default()
         });
-        let before = app.voxel_size;
+        let before = app.doc.voxel_size();
 
         update(&mut app, Message::Resample(before / 2.0));
 
-        assert_eq!(app.voxel_size, before, "there was no room, so nothing should move");
+        assert_eq!(app.doc.voxel_size(), before, "there was no room, so nothing should move");
         assert!(app.status.contains("could not resample"), "{}", app.status);
     }
 
@@ -5575,7 +6090,7 @@ mod export_tests {
     #[test]
     fn the_default_model_is_centred_on_every_mirror_plane() {
         let app = app();
-        let (mesh, _) = app.volume.export_mesh();
+        let (mesh, _) = app.doc.active_volume().export_mesh();
         assert!(!mesh.positions.is_empty());
 
         let mut low = Vec3::splat(f32::MAX);
@@ -5612,8 +6127,8 @@ mod export_tests {
             for flip in
                 [Vec3::new(-1.0, 1.0, 1.0), Vec3::new(1.0, -1.0, 1.0), Vec3::new(1.0, 1.0, -1.0)]
             {
-                let here = app.volume.sample_world(probe);
-                let mirrored = app.volume.sample_world(probe * flip);
+                let here = app.doc.active_volume().sample_world(probe);
+                let mirrored = app.doc.active_volume().sample_world(probe * flip);
                 assert!(
                     (here - mirrored).abs() < 1.0e-4,
                     "the field disagrees across {flip:?}: {here} against {mirrored}"
@@ -5627,7 +6142,7 @@ mod export_tests {
         // The most basic promise of a printing tool: what it opens with can be
         // printed.
         let app = app();
-        let (_, report) = app.volume.export_mesh();
+        let (_, report) = app.doc.active_volume().export_mesh();
         assert!(
             report.is_printable(),
             "the model the application starts with does not print: {}",
@@ -5649,20 +6164,20 @@ mod export_tests {
             app.on_pointer(PointerEvent::Released { button: PointerButton::Left });
         }
 
-        let (_, report) = app.volume.export_mesh();
+        let (_, report) = app.doc.active_volume().export_mesh();
         assert!(report.is_printable(), "{}", report.summary());
     }
 
     #[test]
     fn resampling_finer_increases_detail_and_keeps_it_printable() {
         let mut app = app();
-        let (_, before) = app.volume.export_mesh();
-        let coarse_voxel = app.voxel_size;
+        let (_, before) = app.doc.active_volume().export_mesh();
+        let coarse_voxel = app.doc.voxel_size();
 
         update(&mut app, Message::Resample(coarse_voxel / 2.0));
 
-        assert!((app.voxel_size - coarse_voxel / 2.0).abs() < 1.0e-6);
-        let (_, after) = app.volume.export_mesh();
+        assert!((app.doc.voxel_size() - coarse_voxel / 2.0).abs() < 1.0e-6);
+        let (_, after) = app.doc.active_volume().export_mesh();
         assert!(
             after.triangles > before.triangles * 2,
             "finer voxels should give far more triangles: {} against {}",
@@ -5704,8 +6219,8 @@ mod export_tests {
         app.on_pointer(PointerEvent::Released { button: PointerButton::Left });
         assert!(app.history.can_undo());
 
-        let old_coords: Vec<BrickCoord> = app.volume.brick_coords().collect();
-        let finer = app.voxel_size / 2.0;
+        let old_coords: Vec<BrickCoord> = app.doc.active_volume().brick_coords().collect();
+        let finer = app.doc.voxel_size() / 2.0;
         update(&mut app, Message::Resample(finer));
 
         assert!(
@@ -5718,10 +6233,10 @@ mod export_tests {
     #[test]
     fn resampling_to_the_current_size_does_nothing() {
         let mut app = app();
-        let before = app.volume.brick_count();
-        let same = app.voxel_size;
+        let before = app.doc.active_volume().brick_count();
+        let same = app.doc.voxel_size();
         update(&mut app, Message::Resample(same));
-        assert_eq!(app.volume.brick_count(), before);
+        assert_eq!(app.doc.active_volume().brick_count(), before);
         assert!(app.status.is_empty(), "nothing happened, so nothing should be reported");
     }
 }

@@ -9,6 +9,7 @@
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+pub use brokkr_core::NodeId;
 use brokkr_core::{BrickCoord, BrickMesh, Vertex};
 use glam::Vec3;
 use rustc_hash::FxHashMap;
@@ -84,33 +85,13 @@ const _: () = assert!(
 /// short and a brick meshing to three vertices does not get its own bucket.
 const GRANULARITY: u64 = 256;
 
-/// Which body a brick belongs to.
+/// The id `brokkr_core::Document::from_volume` gives the body it builds.
 ///
-/// This is the id `brokkr-core`'s node tree will hand out, and it appears here
-/// first because the pool is the first thing in the application that has to
-/// tell two bodies apart. It is deliberately `NodeId` and not `BodyId`: the
-/// tree the panel shows holds folder rows as well as bodies, so `BodyId` would
-/// be wrong the moment folders land -- and this is the one moment where the
-/// name costs nothing to choose, because nothing outside this crate refers to
-/// it yet.
-///
-/// **It moves to `brokkr_core::body` in increment 2**, when a `Document`
-/// actually holds nodes and can hand ids out; this definition becomes a
-/// re-export then. It lives here in the meantime because `brokkr-gpu` may not
-/// wait for the engine side, and `brokkr-core` may not depend on this crate --
-/// CI fails the build if it ever does.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct NodeId(pub u32);
-
-/// The one body that exists today.
-///
-/// Nothing in the application creates a second one yet, so every caller names
-/// this. It is a named constant rather than a `Default` or a bare `NodeId(1)`
-/// written out at each call site precisely so that `grep` finds every place
-/// that has to start passing a real id when increment 2 gives the document
-/// more than one node. **It becomes real then**; until it does, a pool that
-/// buckets by body is a pool with exactly one bucket per buffer pair, which
-/// costs nothing and is the same picture as before.
+/// The application no longer names this: it passes `doc.active()`, which is a
+/// real id out of a real node table. What is left are the callers on this side
+/// of the line -- the render tests and the render bench -- which draw bricks
+/// without a `Document` to ask, and want a name rather than a bare `NodeId(1)`
+/// repeated down the file.
 ///
 /// Nonzero because the node table reserves id zero for "no node".
 pub const THE_ONLY_BODY: NodeId = NodeId(1);

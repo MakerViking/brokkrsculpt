@@ -17,10 +17,8 @@
 
 use std::sync::{Arc, Mutex};
 
-use brokkr_core::{BrickCoord, BrickMesh, BrushKind, MirrorAxis};
-use brokkr_gpu::{
-    Frustum, OverlayBatch, PixelRect, PoolStats, SculptRenderer, SlotKey, THE_ONLY_BODY, Uniforms,
-};
+use brokkr_core::{BrickCoord, BrickMesh, BrushKind, MirrorAxis, NodeId};
+use brokkr_gpu::{Frustum, OverlayBatch, PixelRect, PoolStats, SculptRenderer, SlotKey, Uniforms};
 use iced::mouse;
 use iced::widget::shader;
 use iced::{Rectangle, Vector};
@@ -79,14 +77,14 @@ impl SharedFrame {
 
     /// Queue a filled mesh for upload on the next frame.
     ///
-    /// The body is [`THE_ONLY_BODY`] and not a parameter, because the
-    /// application has exactly one volume to publish bricks from. **Increment 2
-    /// gives `Document` more than one node, and this is where the active body's
-    /// id starts coming in from the caller** -- putting the constant here
-    /// rather than at the pool means `app.rs` needs no change until it has a
-    /// real id to pass.
-    pub fn publish(&self, coord: BrickCoord, mesh: BrickMesh) {
-        let key = SlotKey { body: THE_ONLY_BODY, coord };
+    /// **The body comes from the caller and is not a constant.** Every
+    /// `Volume` sits on the same lattice, so two bodies near the world origin
+    /// share brick coordinates -- that is the normal case, not a corner one --
+    /// and a pool keyed on the coordinate alone would have body B's upload
+    /// reuse the slice body A is drawing from. The application passes
+    /// `doc.active()` today, because that is the only body a stroke can reach.
+    pub fn publish(&self, body: NodeId, coord: BrickCoord, mesh: BrickMesh) {
+        let key = SlotKey { body, coord };
         self.pending.lock().expect("shared frame poisoned").push(PendingUpload { key, mesh });
     }
 
@@ -617,7 +615,8 @@ mod tests {
         let capacity = mesh.vertices.capacity();
         assert!(capacity >= 4096);
 
-        shared.publish(BrickCoord::new(0, 0, 0), mesh);
+        // Any body; this is about the buffer coming back, not about the key.
+        shared.publish(NodeId(1), BrickCoord::new(0, 0, 0), mesh);
         // Stand in for what prepare does once the upload has happened.
         let drained: Vec<PendingUpload> =
             std::mem::take(&mut *shared.pending.lock().expect("shared frame poisoned"));

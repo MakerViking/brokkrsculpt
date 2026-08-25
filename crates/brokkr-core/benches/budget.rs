@@ -14,8 +14,9 @@
 use std::time::{Duration, Instant};
 
 use brokkr_core::{
-    BrickCoord, BrickMesh, Brush, BrushDirection, BrushKind, BrushScratch, FalloffCurve, History,
-    MeshScratch, Pattern, PatternKind, Stamp, Stroke, Symmetry, Volume,
+    BrickCoord, BrickMesh, Brush, BrushDirection, BrushKind, BrushScratch, Document, Entry,
+    FalloffCurve, History, MeshScratch, Pattern, PatternKind, Stamp, Stroke, Symmetry, UndoOutcome,
+    Volume,
 };
 use glam::Vec3;
 
@@ -169,7 +170,13 @@ fn main() {
         EFFECTIVE_RESOLUTION as u32
     );
 
-    let mut volume = Volume::new(voxel_size);
+    // One body, because this measures the brush and the mesher rather than the
+    // document. The document is here at all because an undo entry names the
+    // body it edits, so `History` routes through one; `volume` below is that
+    // single body, borrowed for as long as each block of measurements needs it.
+    let mut doc = Document::from_volume(Volume::new(voxel_size));
+    let body = doc.active();
+    let volume = doc.active_volume_mut();
     let seed_start = Instant::now();
     volume.seed_sphere(centre, radius);
     let seed_time = seed_start.elapsed();
@@ -271,7 +278,7 @@ fn main() {
             for &at in &centres {
                 let normal = volume.gradient_world(at);
                 brush.apply_symmetric(
-                    &mut volume,
+                    volume,
                     &Stamp::new(at, normal, BrushDirection::Add)
                         .with_tangent(stroke.direction().unwrap_or(Vec3::ZERO)),
                     Symmetry::X,
@@ -303,7 +310,7 @@ fn main() {
                 edit.len(),
                 edit.bytes() as f64 / (1024.0 * 1024.0)
             );
-            history.push(edit);
+            history.push(Entry::stroke(body, edit));
         }
         println!(", recorded in {:.2} ms", millis(undo_start.elapsed()));
 
@@ -320,9 +327,14 @@ fn main() {
 
     // Undo and redo are not per frame work, so they carry no budget, but a
     // multi second undo would still be unusable and is worth watching.
+    // The single body goes back into the document for the call and comes
+    // straight back out: `History::undo` takes the whole document because an
+    // entry can span bodies, and this bench is the one-body case of that.
     let undo_start = Instant::now();
-    let undone = history.undo(&mut volume);
+    let shown = vec![true; doc.node_count()];
+    let undone = history.undo(&mut doc, &shown);
     let undo_time = undo_start.elapsed();
+    let volume = doc.active_volume_mut();
     volume.take_dirty(&mut dirty);
     let restore_start = Instant::now();
     while meshes.len() < dirty.len() {
@@ -332,7 +344,10 @@ fn main() {
     println!(
         "  undo of a whole stroke: {:.2} ms to restore {} bricks, {:.1} ms to remesh {} of them (no budget, not per frame)",
         millis(undo_time),
-        if undone { "the recorded" } else { "no" },
+        match undone {
+            UndoOutcome::Applied(_) => "the recorded",
+            _ => "no",
+        },
         millis(restore_start.elapsed()),
         dirty.len()
     );
@@ -351,7 +366,7 @@ fn main() {
             let normal = volume.gradient_world(at);
             let started = Instant::now();
             each.apply(
-                &mut volume,
+                volume,
                 // The way round the circle the stamps walk, which is the drag
                 // move needs before it will do any work. Costs the others
                 // nothing.
@@ -386,7 +401,7 @@ fn main() {
             let normal = volume.gradient_world(at);
             let started = Instant::now();
             each.apply(
-                &mut volume,
+                volume,
                 &Stamp::new(at, normal, BrushDirection::Add).with_tangent(Vec3::new(
                     -angle.sin(),
                     0.0,

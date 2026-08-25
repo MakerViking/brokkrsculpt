@@ -21,6 +21,7 @@
 //! the model. That is the property the whole design exists to protect.
 
 pub mod apron;
+pub mod body;
 pub mod brick;
 pub mod brush;
 pub mod cavity;
@@ -43,6 +44,7 @@ pub mod volume;
 pub mod voxelise;
 
 pub use apron::ApronBuffer;
+pub use body::{Document, MAX_BODIES, MAX_DEPTH, MAX_NODES, Node, NodeId, NodeMeta};
 pub use brick::{
     APRON_DIM, APRON_VOXELS, BRICK_DIM, BRICK_VOXELS, Brick, BrickCoord, INSIDE, NARROW_BAND,
     OUTSIDE,
@@ -61,5 +63,8 @@ pub use project::{Keyframe, ProjectError, ProjectState, View};
 pub use raycast::{Hit, raycast};
 pub use region::FieldRegion;
 pub use stroke::{MAX_STAMPS_PER_EVENT, Stroke};
-pub use undo::{DEFAULT_HISTORY_BUDGET, History, HistoryStats, StrokeEdit};
+pub use undo::{
+    Change, DEFAULT_HISTORY_BUDGET, DEFAULT_RECLAIM_BUDGET, Entry, History, HistoryStats,
+    StrokeEdit, UndoOutcome,
+};
 pub use volume::{BrickPreview, BrickVerdict, PlanStats, Volume, VolumeStats};
