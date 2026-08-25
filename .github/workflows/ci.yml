@@ -55,12 +55,20 @@ jobs:
       # The offscreen test is the end to end run: it renders the sculpt to a
       # texture and checks the pixels. It skips when no adapter is present, so
       # confirm one was actually found rather than trusting a green tick.
-      - name: Confirm the offscreen render test really ran
+      #
+      # Matched as a pattern and not as one exact string. This used to grep for
+      # "skipping the offscreen render test", and `offscreen.rs` already prints
+      # "skipping the pattern render test" and "skipping the overlay render
+      # test" -- neither of which this guard covered, so either could skip
+      # itself on a runner with no adapter and go green having rendered
+      # nothing. Every new offscreen test naturally invents a fourth string,
+      # and the guard has to cover it without anyone remembering to widen this.
+      - name: Confirm the offscreen render tests really ran
         run: |
           output=$(cargo test -p brokkr-gpu --test offscreen -- --nocapture 2>&1)
           echo "$output"
-          if echo "$output" | grep -q "skipping the offscreen render test"; then
-            echo "No Vulkan adapter was available, so the end to end test did not run."
+          if echo "$output" | grep -qE "skipping the .* test"; then
+            echo "No Vulkan adapter was available, so the end to end tests did not run."
             exit 1
           fi
 

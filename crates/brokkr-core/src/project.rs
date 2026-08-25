@@ -212,6 +212,52 @@ pub struct ProjectState {
     pub keys: Vec<Keyframe>,
 }
 
+/// How far a read got before it returned.
+///
+/// The reader answers with one `Result`, and the error variant is not enough to
+/// say *where* it gave up. [`ProjectError::NonFiniteValue`] is raised for a
+/// `voxel_size` that is not a positive finite number — read at byte 20, in the
+/// header — and again for a distance inside a brick, forty-three bytes and a
+/// whole section later. Anything that wants to distinguish "this file's header
+/// is wrong" from "this file's geometry is corrupt" has to be told, not left to
+/// infer it from the variant.
+///
+/// That inference is not hypothetical. The fuzz control below inferred it from
+/// a closed four-variant match for two versions of this file and counted every
+/// header refusal as having reached the geometry; against a 4 MB corpus that
+/// was four bytes' worth of noise, but the corpus is going to get much smaller.
+/// So the reader reports its own reach and the control counts it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Progress {
+    /// Nodes read from the node table.
+    ///
+    /// Always 0 in this build, and deliberately so: the container has no node
+    /// table, and a version 1 or 2 file is one implicit body. The field is
+    /// here rather than added later so that the shape of this struct is not
+    /// itself a variable when the counts it carries are recalibrated.
+    pub nodes: u32,
+    /// Bricks the reader has *started*, which is not the same as bricks it
+    /// finished.
+    ///
+    /// Counted at the top of each iteration, so after a successful read it is
+    /// the count the header claimed, and after a failure inside the loop it is
+    /// the one-based index of the brick that failed. Both readings are wanted:
+    /// the first is a progress figure and the second is the reach this type
+    /// exists to report. Counting *completed* bricks instead would report a
+    /// file whose very first brick is corrupt as never having reached the
+    /// geometry at all, which is the miscount in the other direction.
+    pub bricks: u64,
+    /// Values the reader repaired rather than refused.
+    ///
+    /// Always 0 in this build, for the same reason as `nodes`: the repairs
+    /// this counts are the node table's, and there is no node table yet. The
+    /// camera and key repairs in [`read_view`] are deliberately *not* counted
+    /// here — they happen on every ordinary file that was saved with a NaN
+    /// camera, so folding them in would give the field a second meaning that
+    /// the first caller to use it would have to subtract back out.
+    pub repairs: u32,
+}
+
 /// Why a `.brokkr` file could not be read.
 ///
 /// Every variant says what was expected as well as what was found, because the
@@ -495,7 +541,25 @@ pub fn write(out: &mut impl Write, volume: &Volume, state: &ProjectState) -> Res
 }
 
 /// Read a sculpt.
+///
+/// A thin wrapper over [`read_reporting`] for the callers that only want the
+/// sculpt. Keeping the reach reporting out of the public signature is
+/// deliberate: the shell opens a file and either gets a model or gets an error
+/// it can show, and threading an out-parameter through `File > Open` to be
+/// dropped at the other end would be ceremony.
 pub fn read(input: &mut impl Read) -> Result<(Volume, ProjectState)> {
+    read_reporting(input, &mut Progress::default())
+}
+
+/// Read a sculpt, recording how far the read got in `progress`.
+///
+/// `progress` is written as the read proceeds and is left holding whatever was
+/// reached when this returns, error or not — that is the whole point of it, so
+/// it must not be reset or rolled back on the way out.
+pub(crate) fn read_reporting(
+    input: &mut impl Read,
+    progress: &mut Progress,
+) -> Result<(Volume, ProjectState)> {
     let magic: [u8; 8] = read_exact(input)?;
     if &magic != MAGIC {
         return Err(ProjectError::NotABrokkrFile);
@@ -546,6 +610,10 @@ pub fn read(input: &mut impl Read) -> Result<(Volume, ProjectState)> {
 
     let mut volume = Volume::new(voxel_size);
     for _ in 0..count {
+        // Counted here rather than after the insert, so that a file whose very
+        // first brick is corrupt still reports the geometry as reached. See
+        // `Progress::bricks`.
+        progress.bricks += 1;
         let coord = BrickCoord(IVec3::new(
             i32::from_le_bytes(read_exact::<4>(input)?),
             i32::from_le_bytes(read_exact::<4>(input)?),
@@ -962,23 +1030,21 @@ mod tests {
                 }
 
                 tried += 1;
-                let volume = match read(&mut bytes.as_slice()) {
-                    Ok((volume, _)) => {
-                        reached_the_bricks += 1;
-                        volume
-                    }
-                    // Refusals that can only be raised from inside the brick
-                    // loop, so each one is proof the body ran on this mutant.
-                    Err(
-                        ProjectError::NonFiniteValue
-                        | ProjectError::OutsideTheBand { .. }
-                        | ProjectError::UnknownBrickTag(_)
-                        | ProjectError::BrickOutOfRange { .. },
-                    ) => {
-                        reached_the_bricks += 1;
-                        continue;
-                    }
-                    Err(_) => continue,
+                let mut progress = Progress::default();
+                let outcome = read_reporting(&mut bytes.as_slice(), &mut progress);
+                // Counted rather than inferred from which error came back.
+                // This used to match four variants said to be raisable "only
+                // from inside the brick loop", and one of them was not:
+                // `NonFiniteValue` is also how a corrupt `voxel_size` at byte
+                // 20 is refused, forty-three bytes before the brick count. So
+                // mutants stopped at the header were counted as having reached
+                // the geometry, and the control was measuring less than it
+                // claimed.
+                if progress.bricks > 0 {
+                    reached_the_bricks += 1;
+                }
+                let Ok((volume, _)) = outcome else {
+                    continue;
                 };
                 loaded += 1;
 
@@ -1003,8 +1069,25 @@ mod tests {
         // loaded, and the difference is the point. The band check refuses
         // almost every corrupted brick -- one flipped exponent bit is enough
         // -- so counting only what loads measures how strict the validation
-        // is rather than how far the reader got. Measured at 1200 of 1800
-        // reaching the loop, of which 20 loaded whole.
+        // is rather than how far the reader got.
+        //
+        // Measured, from the counter rather than from the error variants:
+        // **1800 of 1800** mutants reach the brick loop, of which **22** load
+        // whole. All 1800 is not a surprise once counted -- the header is 71 of
+        // 4,194,795 bytes, so a handful of flipped bits, a cut at a random
+        // offset or a 256-byte overwrite lands in the geometry essentially
+        // every time.
+        //
+        // The previously recorded "1200 of 1800" was wrong in both directions
+        // and must not be treated as a floor: it over-counted header refusals
+        // (`NonFiniteValue` from byte 20) and under-counted every mutant that
+        // died inside the loop with a variant the match did not list, chiefly
+        // `Truncated`, which is the whole of strategy 1.
+        eprintln!(
+            "{reached_the_bricks} of {tried} corrupted projects reached the brick loop, \
+             {loaded} loaded whole, from a {} byte corpus",
+            valid.len()
+        );
         assert!(
             reached_the_bricks > tried / 4,
             "only {reached_the_bricks} of {tried} corrupted projects got as far as the brick \
@@ -1178,7 +1261,11 @@ mod tests {
         let mut bytes = Vec::new();
         write(&mut bytes, &sculpted(), &ProjectState::default()).expect("write failed");
         let at = bytes.len() - EMPTY_TRAILER_BYTES;
-        bytes[at..].copy_from_slice(&u32::MAX.to_le_bytes());
+        // Bounded rather than written as `bytes[at..]`, which is the same four
+        // bytes today and a slice-length *panic* the moment the trailer grows
+        // -- and a panic here would read as this test having found a bug rather
+        // than as the test needing to move with the trailer.
+        bytes[at..at + 4].copy_from_slice(&u32::MAX.to_le_bytes());
         match read(&mut bytes.as_slice()) {
             Err(ProjectError::TooManyKeys { keys, limit }) => {
                 assert_eq!(keys, u32::MAX);
@@ -1227,5 +1314,408 @@ mod tests {
         let (_, loaded) = round_trip(&sculpted(), &state);
         assert!(loaded.keys[0].view.camera_target.is_finite());
         assert!(loaded.keys[0].view.camera_distance.is_finite());
+    }
+
+    /// The reach the error variant cannot express, pinned as its own case.
+    ///
+    /// Both halves of this return `NonFiniteValue`. One is refused at byte 20
+    /// of the header, before a single brick has been looked at; the other is
+    /// refused in the last brick of the file. Anything that tries to tell them
+    /// apart by matching on the variant gets the same answer for both, which
+    /// is exactly the bug this increment removes from the fuzz control.
+    #[test]
+    fn the_reader_says_how_far_it_got_because_the_error_variant_cannot() {
+        let volume = sculpted();
+        let bricks = volume.brick_coords().count() as u64;
+        let mut valid = Vec::new();
+        write(&mut valid, &volume, &ProjectState::default()).expect("write failed");
+
+        // `voxel_size` sits after the magic, the two versions and the lattice
+        // pair -- byte 20, forty-three bytes before the brick count at 63.
+        let voxel_size_at = MAGIC.len() + 2 + 2 + 4 + 4;
+        assert_eq!(voxel_size_at, 20);
+        let mut header_broken = valid.clone();
+        header_broken[voxel_size_at..voxel_size_at + 4].copy_from_slice(&f32::NAN.to_le_bytes());
+        let mut progress = Progress::default();
+        assert!(matches!(
+            read_reporting(&mut header_broken.as_slice(), &mut progress),
+            Err(ProjectError::NonFiniteValue)
+        ));
+        assert_eq!(progress.bricks, 0, "a header refusal reported reaching the geometry");
+
+        let mut brick_broken = valid.clone();
+        let at = last_distance_at(&brick_broken);
+        brick_broken[at..at + 4].copy_from_slice(&f32::NAN.to_le_bytes());
+        let mut progress = Progress::default();
+        assert!(matches!(
+            read_reporting(&mut brick_broken.as_slice(), &mut progress),
+            Err(ProjectError::NonFiniteValue)
+        ));
+        assert_eq!(
+            progress.bricks, bricks,
+            "a refusal in the last brick did not report the whole geometry as reached"
+        );
+
+        // And a whole file reports every brick it was given.
+        let mut progress = Progress::default();
+        read_reporting(&mut valid.as_slice(), &mut progress).expect("the valid file was refused");
+        assert_eq!(progress.bricks, bricks);
+        // The two counters the format does not carry yet, asserted so that
+        // whoever fills them in has to come past this line.
+        assert_eq!((progress.nodes, progress.repairs), (0, 0));
+    }
+
+    // ---------------------------------------------------------------------
+    // The committed version 1 and version 2 fixtures.
+    //
+    // These exist because the compatibility test above builds its old file
+    // out of this build's own writer, which proves the reader agrees with the
+    // writer it shipped beside -- and stops proving anything the moment the
+    // writer changes, which is the moment it is needed. A committed file
+    // cannot drift with the code.
+    //
+    // They are MANUFACTURED rather than cut down from the real projects on
+    // disk. A real file cannot be truncated and stay valid: the u64 count at
+    // byte 63 says how many bricks follow, so shortening one means rewriting
+    // that count, which needs a tool that already reads the format. And they
+    // are dense -- even a hundred bricks is about 13 MB, which does not
+    // belong in git. A handful of uniform bricks is a few hundred bytes and
+    // is byte for byte what the old writer produced for the same volume.
+    // ---------------------------------------------------------------------
+
+    /// Bytes the header occupied while versions 1 and 2 were current.
+    ///
+    /// Not counted from the writer but confirmed against the real files with
+    /// `od`: eight of magic, two versions, the lattice pair, `voxel_size` and
+    /// thirty-nine of view, and then the u64 brick count at 63.
+    const LEGACY_HEADER_BYTES: usize = 63;
+
+    fn fixture_path(name: &str) -> std::path::PathBuf {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures").join(name)
+    }
+
+    /// The volume both fixtures carry.
+    ///
+    /// Uniform bricks only, placed by `insert_brick` -- which is `pub(crate)`,
+    /// and is the reason a fixture of exactly chosen bricks can only be built
+    /// from inside this crate. The values are spread across the band and over
+    /// both signs so that a reader which misreads one produces a visibly
+    /// different answer rather than a plausible one, and the first coordinate
+    /// is `(-2, -3, -4)` because that is what sits at byte 71 of the three
+    /// real version 1 files.
+    fn fixture_volume() -> Volume {
+        let mut volume = Volume::new(0.5);
+        // Sorted by (z, y, x) on the way out, so the negative z comes first.
+        for (coord, value) in [
+            (BrickCoord::new(-2, -3, -4), INSIDE),
+            (BrickCoord::new(0, 0, -1), -0.75),
+            (BrickCoord::new(1, 0, 0), 0.0),
+            (BrickCoord::new(0, 5, 1), 1.5),
+            (BrickCoord::new(7, -1, 2), OUTSIDE),
+        ] {
+            volume.insert_brick(coord, Brick::Uniform(value));
+        }
+        volume
+    }
+
+    /// The session settings both fixtures carry. Deliberately not the
+    /// defaults: a reader that skipped the view entirely would still pass
+    /// against default values.
+    fn fixture_state(keys: Vec<Keyframe>) -> ProjectState {
+        ProjectState {
+            view: View {
+                camera_target: Vec3::new(-1.5, 2.0, 0.25),
+                camera_distance: 88.0,
+                camera_yaw: 1.25,
+                camera_pitch: -0.5,
+                camera_roll: 0.125,
+                brush_radius: 5.5,
+                brush_strength: 0.4,
+                mirror: [true, false, true],
+            },
+            keys,
+        }
+    }
+
+    /// Build a fixture's bytes: what a build of the given container version
+    /// would have written for [`fixture_volume`].
+    fn manufactured_fixture(container: u16, keys: Vec<Keyframe>) -> Vec<u8> {
+        assert!(
+            container >= 2 || keys.is_empty(),
+            "a version 1 file has no trailer to put keys in"
+        );
+
+        let mut bytes = Vec::new();
+        write(&mut bytes, &fixture_volume(), &fixture_state(keys)).expect("write failed");
+
+        // Take back out whatever this build has grown between the view and the
+        // brick count, because it is not in a version 1 or 2 file. Today that
+        // is nothing and this drain is empty. When the node table lands it is
+        // bytes 63..111 -- four of `node_count`, four of `active_index` and
+        // one forty-byte record -- and *not* 63..119, which would also swallow
+        // the u64 brick count and leave a brick coordinate where the count
+        // belongs.
+        let count_at = first_brick_at() - 8;
+        assert!(
+            count_at >= LEGACY_HEADER_BYTES,
+            "the header is shorter than it was at version 2, so these fixtures cannot be \
+             manufactured by stripping and have to be rebuilt by hand"
+        );
+        bytes.drain(LEGACY_HEADER_BYTES..count_at);
+
+        // Stamp the old layout number in. Everything after the header is
+        // already identical -- the brick encoding has not changed since
+        // version 1 -- so this is the whole of the difference.
+        bytes[MAGIC.len()..MAGIC.len() + 2].copy_from_slice(&container.to_le_bytes());
+        if container < 2 {
+            // A version 1 file ends with its last brick. There is no trailer,
+            // not even an empty one.
+            bytes.truncate(bytes.len() - EMPTY_TRAILER_BYTES);
+        }
+        bytes
+    }
+
+    /// Two keys, so the version 2 fixture exercises the trailer rather than
+    /// merely carrying an empty one. Written out of order on purpose: the
+    /// reader sorts, and the committed bytes record that it has to.
+    fn fixture_keys() -> Vec<Keyframe> {
+        vec![a_key(0.75, 12.0), a_key(0.2, 34.0)]
+    }
+
+    /// Writes the two fixtures. A one-off act rather than a check, and it
+    /// takes *two* deliberate steps to make it happen:
+    ///
+    /// ```text
+    /// BROKKR_REGENERATE_FIXTURES=1 cargo test -p brokkr-core --lib -- --ignored regenerate_the_committed_fixtures
+    /// ```
+    ///
+    /// `#[ignore]` alone was not enough, and the near-miss is worth recording
+    /// because it is exactly the failure this increment exists to prevent.
+    /// `--ignored` is not a per-test opt-in: it is a *sweep*, and the other
+    /// ignored test in this file --- `the_real_projects_on_this_machine_still_open`
+    /// --- is one the maintainer is told to run deliberately. So the natural
+    /// invocation `cargo test -p brokkr-core -- --ignored` used to rewrite the
+    /// committed fixtures in the same breath, from the current build. That
+    /// turns [`the_committed_fixtures_are_byte_for_byte_what_the_old_writers_produced`]
+    /// into a tautology: it would then be comparing the file against
+    /// `manufactured_fixture`, the very function that had just written it, and
+    /// would report "ok" having checked nothing. Demonstrated, not imagined ---
+    /// a single flipped byte in `container-v1.brokkr` failed three tests
+    /// loudly, and one `--ignored` run put it back and turned them all green.
+    ///
+    /// So the write is gated on an environment variable that nothing in CI and
+    /// no sweep sets. Without it the test passes without touching a byte,
+    /// which keeps the sweep quiet without letting it destroy anything.
+    #[test]
+    #[ignore = "regenerates the committed fixtures; running it is a decision, not a check"]
+    fn regenerate_the_committed_fixtures() {
+        if std::env::var_os("BROKKR_REGENERATE_FIXTURES").is_none() {
+            eprintln!(
+                "refusing to rewrite the committed fixtures as part of an --ignored sweep: set \
+                 BROKKR_REGENERATE_FIXTURES=1 if you really mean to replace them with what this \
+                 build writes. They stand in for files on users' disks, which do not change when \
+                 this code does."
+            );
+            return;
+        }
+
+        let directory = fixture_path("");
+        std::fs::create_dir_all(&directory).expect("could not make the fixtures directory");
+        for (name, bytes) in [
+            ("container-v1.brokkr", manufactured_fixture(1, Vec::new())),
+            ("container-v2.brokkr", manufactured_fixture(2, fixture_keys())),
+        ] {
+            let path = fixture_path(name);
+            std::fs::write(&path, &bytes).expect("could not write the fixture");
+            eprintln!("wrote {} bytes to {}", bytes.len(), path.display());
+        }
+    }
+
+    fn committed_fixture(name: &str) -> Vec<u8> {
+        let path = fixture_path(name);
+        std::fs::read(&path).unwrap_or_else(|error| {
+            panic!("could not read the committed fixture at {}: {error}", path.display())
+        })
+    }
+
+    /// The fixtures are still byte for byte what this build would produce for
+    /// the old layouts.
+    ///
+    /// **If this fails, do not regenerate them.** They stand in for the files
+    /// on users' disks, which do not change when this code does. A failure
+    /// here means the writer moved something inside a version 1 or 2 file, and
+    /// the question to answer is what the reader now does with the real ones.
+    /// The only legitimate reason to re-run `regenerate_the_committed_fixtures`
+    /// is that the header grew a section this build knows how to strip, which
+    /// `manufactured_fixture` handles without changing a byte of the output.
+    /// That regenerator will not run without `BROKKR_REGENERATE_FIXTURES` set,
+    /// precisely so that reaching for it has to be a decision.
+    #[test]
+    fn the_committed_fixtures_are_byte_for_byte_what_the_old_writers_produced() {
+        for (name, manufactured) in [
+            ("container-v1.brokkr", manufactured_fixture(1, Vec::new())),
+            ("container-v2.brokkr", manufactured_fixture(2, fixture_keys())),
+        ] {
+            let committed = committed_fixture(name);
+            assert_eq!(
+                committed.len(),
+                manufactured.len(),
+                "{name} is {} bytes and this build would write {}",
+                committed.len(),
+                manufactured.len()
+            );
+            let differs =
+                committed.iter().zip(&manufactured).position(|(theirs, ours)| theirs != ours);
+            if let Some(at) = differs {
+                panic!(
+                    "{name} differs from this build's output at byte {at}: the committed file \
+                     holds {:#04x} and this build writes {:#04x}",
+                    committed[at], manufactured[at]
+                );
+            }
+        }
+    }
+
+    /// A version 1 file -- the layout of every `.brokkr` written before the
+    /// timeline existed, and of three of the real projects on disk -- still
+    /// opens, from a committed file rather than from this build's own writer.
+    #[test]
+    fn the_committed_version_1_fixture_opens_with_its_geometry_and_settings() {
+        let bytes = committed_fixture("container-v1.brokkr");
+        assert_eq!(
+            u16::from_le_bytes([bytes[8], bytes[9]]),
+            1,
+            "the version 1 fixture is not stamped version 1"
+        );
+
+        let mut progress = Progress::default();
+        let (volume, state) = read_reporting(&mut bytes.as_slice(), &mut progress)
+            .expect("the committed version 1 fixture was refused");
+
+        assert_eq!(state.view, fixture_state(Vec::new()).view);
+        assert!(state.keys.is_empty(), "a file with no trailer gained keys");
+        assert_eq!(progress.bricks, 5);
+        assert_same_bricks(&fixture_volume(), &volume);
+    }
+
+    /// And a version 2 file, whose trailer has to come back sorted.
+    #[test]
+    fn the_committed_version_2_fixture_opens_with_its_timeline_keys() {
+        let bytes = committed_fixture("container-v2.brokkr");
+        assert_eq!(u16::from_le_bytes([bytes[8], bytes[9]]), 2);
+
+        let mut progress = Progress::default();
+        let (volume, state) = read_reporting(&mut bytes.as_slice(), &mut progress)
+            .expect("the committed version 2 fixture was refused");
+
+        assert_eq!(state.view, fixture_state(Vec::new()).view);
+        let mut expected = fixture_keys();
+        expected.sort_by(|a, b| a.at.partial_cmp(&b.at).expect("no NaN in the fixture"));
+        assert_eq!(state.keys, expected, "the trailer did not come back in order");
+        assert_eq!(progress.bricks, 5);
+        assert_same_bricks(&fixture_volume(), &volume);
+    }
+
+    /// The two fixtures differ only in the version stamp and the trailer, so
+    /// the same geometry has to come out of both.
+    #[test]
+    fn the_two_fixtures_are_the_same_sculpt_and_differ_only_in_the_trailer() {
+        let one = committed_fixture("container-v1.brokkr");
+        let two = committed_fixture("container-v2.brokkr");
+        assert_eq!(
+            one.len() + EMPTY_TRAILER_BYTES + fixture_keys().len() * (4 + 39),
+            two.len(),
+            "the two fixtures differ by more than the key trailer"
+        );
+        // Everything from the field encoding to the last brick is identical.
+        assert_eq!(one[10..], two[10..one.len()], "the fixtures carry different sculpts");
+
+        let (from_one, _) = read(&mut one.as_slice()).expect("version 1 refused");
+        let (from_two, _) = read(&mut two.as_slice()).expect("version 2 refused");
+        assert_same_bricks(&from_one, &from_two);
+    }
+
+    /// Compare two volumes brick for brick, so a fixture failure names the
+    /// brick rather than saying only that something changed.
+    fn assert_same_bricks(expected: &Volume, found: &Volume) {
+        assert_eq!(found.voxel_size(), expected.voxel_size(), "the voxel size changed");
+        let mut wanted: Vec<BrickCoord> = expected.brick_coords().collect();
+        let mut got: Vec<BrickCoord> = found.brick_coords().collect();
+        wanted.sort_unstable();
+        got.sort_unstable();
+        assert_eq!(wanted, got, "the set of bricks changed");
+        for coord in wanted {
+            match (expected.brick(coord).expect("listed"), found.brick(coord).expect("listed")) {
+                (Brick::Uniform(a), Brick::Uniform(b)) => assert_eq!(a, b, "at {coord:?}"),
+                (Brick::Dense(a), Brick::Dense(b)) => {
+                    assert_eq!(a.as_slice(), b.as_slice(), "at {coord:?}")
+                }
+                _ => panic!("the brick at {coord:?} changed kind"),
+            }
+        }
+    }
+
+    /// The real projects on the maintainer's machine, opened for real.
+    ///
+    /// Ignored, and it has to stay ignored: these are tens of megabytes each
+    /// and one of them has been a 2.3 GB autosave, so this is a deliberate act
+    /// on one machine and never part of a CI run. The manufactured fixtures
+    /// above are what guards the format continuously; this is what confirms
+    /// the guard is guarding the right thing.
+    ///
+    /// Every path that is absent is skipped and said so, because the file set
+    /// moves -- the autosave is rewritten every session and the downloads come
+    /// and go. **A run that reports "0 of 5" has checked nothing**, which the
+    /// summary line says out loud rather than passing quietly.
+    #[test]
+    #[ignore = "opens the real multi-megabyte projects on the maintainer's machine"]
+    fn the_real_projects_on_this_machine_still_open() {
+        let home = std::env::var("HOME").unwrap_or_default();
+        let paths = [
+            "/storage/offload/Downloads/sculpt.brokkr".to_string(),
+            "/storage/offload/Downloads/sculpt1.brokkr".to_string(),
+            "/storage/offload/Downloads/sculpt2.brokkr".to_string(),
+            "/storage/offload/Downloads/Meshy_AI_Dragonstone_Carver_0823214323_generate_obj/\
+             Brokkr.brokkr"
+                .to_string(),
+            format!("{home}/.local/state/brokkrsculpt/autosave.brokkr"),
+        ];
+
+        let mut opened = 0usize;
+        for path in &paths {
+            let path = std::path::Path::new(path);
+            if !path.exists() {
+                eprintln!("skipping {}, which is not on this machine", path.display());
+                continue;
+            }
+            let size = std::fs::metadata(path).expect("stat failed").len();
+            let file = std::fs::File::open(path).expect("could not open a file that exists");
+            // Buffered, and generously. The reader takes four bytes at a time
+            // by design -- little endian has to be explicit -- so an unbuffered
+            // read of a gigabyte file is hundreds of millions of syscalls.
+            let mut reader = std::io::BufReader::with_capacity(1 << 20, file);
+
+            let mut progress = Progress::default();
+            let (volume, state) = match read_reporting(&mut reader, &mut progress) {
+                Ok(loaded) => loaded,
+                Err(error) => panic!("{} ({size} bytes) was refused: {error}", path.display()),
+            };
+            assert_eq!(
+                progress.bricks,
+                volume.brick_coords().count() as u64,
+                "{} reported a different number of bricks than it loaded",
+                path.display()
+            );
+            assert!(volume.voxel_size() > 0.0);
+            eprintln!(
+                "{}: {size} bytes, {} bricks, voxel {} mm, {} keys",
+                path.display(),
+                progress.bricks,
+                volume.voxel_size(),
+                state.keys.len()
+            );
+            opened += 1;
+        }
+        eprintln!("opened {opened} of {} real projects", paths.len());
     }
 }
