@@ -412,6 +412,7 @@ dependencies = [
  "glam 0.33.3",
  "iced",
  "log",
+ "pollster",
  "rfd",
  "serde_json",
  "ureq",
