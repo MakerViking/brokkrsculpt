@@ -41,6 +41,31 @@ Do not start any of these. Do not scaffold for them. Do not add abstractions "in
 - Any web, cloud, or account features
 - Any parametric CAD features. That is SindriCAD's job.
 
+### What this list does and does not forbid, clarified 2026-08-25
+
+The asking this list invites has happened, for the bodies, primitives and
+masking arc. The answer was that **none of that arc is on this list**, and the
+list stays as it is. Written down because three of the entries above sit close
+enough to the new work to be misread as forbidding it:
+
+- **"Sculpt layers"** means ZBrush's Layers: recorded per-layer deltas over one
+  mesh, with an intensity slider to dial a recording up and down. Not built, not
+  planned. **Bodies are ZBrush's SubTools** — several independent sculpts in one
+  document — and **a mask is a per-voxel protection value**, not a recording.
+  Neither replays an edit at reduced strength, which is the thing this entry
+  exists to keep out.
+- **"IMM / insert mesh brushes"** means stamping a stored mesh onto a surface
+  along a stroke. Not built, not planned. **Adding a cube as a new body** is not
+  that: no mesh library, no stroke placement, no surface conforming.
+- **"Polypaint or vertex colors"** stands, and the planned colour feature is
+  deliberately not it — colour is a **filament slot number** resolved at use
+  time, not an RGB value per vertex.
+
+The plan those decisions live in is the maintainer's local note
+`~/.claude/plans/brokkr-bodies-and-primitives.md`, which will not resolve for a
+visitor; everything load-bearing from it that constrains this repository is
+restated in `handoff.md`.
+
 ## Stack
 
 Pinned choices. Do not substitute without asking.
