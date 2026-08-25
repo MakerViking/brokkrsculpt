@@ -8,12 +8,12 @@
 //! given. The Iced glue that satisfies the `shader` widget's traits lives in
 //! `brokkr-app`.
 
-use brokkr_core::{BrickCoord, BrickMesh, Vertex};
+use brokkr_core::{BrickMesh, Vertex};
 use bytemuck::{Pod, Zeroable};
 
 use crate::frustum::Frustum;
 use crate::matcap;
-use crate::mesh_pool::{MeshPool, PoolStats};
+use crate::mesh_pool::{MeshPool, PoolStats, SlotKey};
 use crate::overlay::{OverlayBatch, OverlayRenderer};
 
 /// Depth format. Depth32Float is universally supported and precise enough that
@@ -313,16 +313,19 @@ impl SculptRenderer {
     }
 
     /// Replace one brick's mesh in the pool.
+    ///
+    /// The key names the body as well as the brick coordinate, because two
+    /// bodies near the world origin share brick coordinates -- see [`SlotKey`].
     /// Takes the device as well as the queue because the pool grows itself a
     /// buffer when the ones it has are full.
     pub fn upload_brick(
         &mut self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
-        coord: BrickCoord,
+        key: SlotKey,
         mesh: &BrickMesh,
     ) {
-        self.pool.upload(device, queue, coord, mesh);
+        self.pool.upload(device, queue, key, mesh);
     }
 
     pub fn write_uniforms(&self, queue: &wgpu::Queue, uniforms: &Uniforms) {

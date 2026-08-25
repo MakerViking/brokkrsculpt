@@ -13,7 +13,7 @@
 use std::time::{Duration, Instant};
 
 use brokkr_core::{BrickCoord, BrickMesh, Volume};
-use brokkr_gpu::{Frustum, PixelRect, SculptRenderer, Uniforms};
+use brokkr_gpu::{Frustum, PixelRect, SculptRenderer, SlotKey, THE_ONLY_BODY, Uniforms};
 use glam::{Mat4, Vec3};
 
 const WIDTH: u32 = 1920;
@@ -92,7 +92,10 @@ fn main() {
 
     let upload_start = Instant::now();
     for (coord, mesh) in coords.iter().zip(meshes.iter()) {
-        renderer.upload_brick(&device, &queue, *coord, mesh);
+        // One body, so one bucket per buffer pair. Increment 2 is what makes
+        // the body half of the key vary.
+        let key = SlotKey { body: THE_ONLY_BODY, coord: *coord };
+        renderer.upload_brick(&device, &queue, key, mesh);
     }
     let upload_ms = millis(upload_start.elapsed());
 

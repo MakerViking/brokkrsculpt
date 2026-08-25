@@ -16,10 +16,12 @@
 //! PPM for a human to look at.
 
 use brokkr_core::{
-    BrickCoord, BrickMesh, Brush, BrushDirection, BrushKind, BrushScratch, MeshScratch, Pattern,
-    PatternKind, Stamp, Volume,
+    BrickCoord, BrickMesh, Brush, BrushDirection, BrushKind, BrushScratch, INSIDE, MeshScratch,
+    NARROW_BAND, OUTSIDE, Pattern, PatternKind, Stamp, Volume,
 };
-use brokkr_gpu::{Frustum, OverlayBatch, PixelRect, SculptRenderer, Uniforms};
+use brokkr_gpu::{
+    Frustum, NodeId, OverlayBatch, PixelRect, SculptRenderer, SlotKey, THE_ONLY_BODY, Uniforms,
+};
 use glam::{IVec3, Vec3};
 
 const WIDTH: u32 = 480;
@@ -161,6 +163,16 @@ impl Harness {
     }
 }
 
+/// Summed RGB above which a pixel counts as drawn rather than background.
+///
+/// It can be this low because the matcap has an ambient floor -- "so nothing is
+/// pure black" -- and the darkest colour it can produce sums to around 200
+/// against a background that sums to exactly 0. That margin is what makes an
+/// exact mask comparison safe: no drawn pixel is near the threshold, so which
+/// body wins the depth test at a given pixel cannot change whether it counts as
+/// drawn.
+const LIT: u32 = 24;
+
 /// Pixels that are not the black background, and their bounding box.
 fn coverage(pixels: &[u8]) -> (usize, [u32; 4]) {
     let mut count = 0;
@@ -169,7 +181,7 @@ fn coverage(pixels: &[u8]) -> (usize, [u32; 4]) {
         for x in 0..WIDTH {
             let index = ((y * WIDTH + x) * 4) as usize;
             let lit = pixels[index] as u32 + pixels[index + 1] as u32 + pixels[index + 2] as u32;
-            if lit > 24 {
+            if lit > LIT {
                 count += 1;
                 bounds[0] = bounds[0].min(x);
                 bounds[1] = bounds[1].min(y);
@@ -179,6 +191,14 @@ fn coverage(pixels: &[u8]) -> (usize, [u32; 4]) {
         }
     }
     (count, bounds)
+}
+
+/// One bool per pixel: was anything drawn there at all.
+fn mask(pixels: &[u8]) -> Vec<bool> {
+    pixels
+        .chunks_exact(4)
+        .map(|pixel| pixel[0] as u32 + pixel[1] as u32 + pixel[2] as u32 > LIT)
+        .collect()
 }
 
 fn dump(name: &str, pixels: &[u8]) {
@@ -212,15 +232,68 @@ fn upload_dirty(
     queue: &wgpu::Queue,
     volume: &mut Volume,
 ) -> usize {
+    upload_dirty_as(renderer, device, queue, volume, THE_ONLY_BODY).0
+}
+
+/// Mesh everything and upload it as `body`. Returns how many bricks actually
+/// produced geometry, which is how many pool SLOTS the upload created.
+///
+/// Not the same number as the dirty count: a brick the surface has left meshes
+/// to nothing and takes no slot at all. The distinction is what lets a test
+/// compare `PoolStats::bricks` against what it uploaded.
+fn upload_body(
+    renderer: &mut SculptRenderer,
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    volume: &mut Volume,
+    body: NodeId,
+) -> usize {
+    volume.mark_everything_dirty();
+    upload_dirty_as(renderer, device, queue, volume, body).1
+}
+
+/// Returns the number of bricks meshed and the number that produced geometry.
+fn upload_dirty_as(
+    renderer: &mut SculptRenderer,
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    volume: &mut Volume,
+    body: NodeId,
+) -> (usize, usize) {
     let mut scratch = MeshScratch::new();
     let mut mesh = BrickMesh::default();
     let mut dirty: Vec<BrickCoord> = Vec::new();
+    let mut filled = 0;
     volume.take_dirty(&mut dirty);
     for &coord in &dirty {
         volume.mesh_brick(coord, &mut scratch, &mut mesh);
-        renderer.upload_brick(device, queue, coord, &mesh);
+        if !mesh.indices.is_empty() {
+            filled += 1;
+        }
+        renderer.upload_brick(device, queue, SlotKey { body, coord }, &mesh);
     }
-    dirty.len()
+    (dirty.len(), filled)
+}
+
+/// Seed an axis aligned cube centred on the origin, the way `seed_sphere`
+/// seeds a ball: the exact signed distance in voxels, clamped into the narrow
+/// band by `edit_voxels`.
+///
+/// There is no `seed_cube` in the engine and this does not add one -- a box is
+/// four lines of `edit_box`, and giving `brokkr-core` a new primitive so that a
+/// render test can have a second shape would be a wider change than the one
+/// being tested. The `max_element().min(0.0)` term is what makes it exact
+/// inside the box as well as outside it.
+fn seed_cube(volume: &mut Volume, half: f32) {
+    let voxel_size = volume.voxel_size();
+    // Two bands past the face, so the exterior half of the band is written and
+    // the surface has a gradient to be meshed from.
+    let reach = Vec3::splat(half + NARROW_BAND * voxel_size * 2.0);
+    volume.edit_box(-reach, reach, move |position, _| {
+        let outside = position.abs() - Vec3::splat(half);
+        let distance = outside.max(Vec3::ZERO).length() + outside.max_element().min(0.0);
+        (distance / voxel_size).clamp(INSIDE, OUTSIDE)
+    });
 }
 
 /// A camera looking at the origin from a fixed direction, matching the
@@ -794,5 +867,139 @@ fn an_imported_mesh_renders() {
         (0.9..=1.1).contains(&ratio),
         "the imported sphere covers {imported_lit} pixels against the seeded sphere's \
          {seeded_lit} ({ratio:.2}x) -- it is on screen but it is not the same shape"
+    );
+}
+
+/// Two bodies that share brick coordinates must both reach the screen whole.
+///
+/// This is the picture behind [`brokkr_gpu::SlotKey`]. Every `Volume` sits on
+/// the same lattice -- there is no world origin held anywhere, voxel (0,0,0) is
+/// world (0,0,0) in all of them -- so two bodies near the origin occupy the
+/// same brick coordinates, which is the normal case rather than a corner one.
+/// Keyed on the coordinate alone, the second body's upload took over the first
+/// body's slice, or handed it back to the free list outright, and nothing
+/// logged it.
+///
+/// **The check is an exact mask and deliberately not a lit-pixel count.** Two
+/// bodies stacked on the origin have nearly the same silhouette, so a count
+/// goes green on a badly corrupted picture: lose every brick of the sphere on
+/// one side and the cube behind it still lights most of those pixels. Rendering
+/// each alone and requiring `both == a | b` pixel for pixel is the assertion
+/// that cannot be satisfied by accident.
+///
+/// `PoolStats::bricks` is asserted alongside, so a pool-side eviction (a slot
+/// that was never kept) and a render-side one (a slot kept but not drawn) are
+/// distinguishable rather than both arriving as "the picture is wrong".
+///
+/// **The plan asked for a sphere of radius 20 against a cube of half-extent
+/// 20, on the grounds that each reaches outside the other. It does not:** a
+/// sphere of radius 20 is inscribed in that cube, touching the six face centres
+/// and never leaving it, so `mask_a` would be a subset of `mask_b` and the
+/// union test would hold no matter what happened to the sphere. Half-extent 14
+/// is the geometry that has the property the plan wanted: the cube's corners
+/// reach 24.2 mm and stand outside the sphere, and the sphere at 20 mm bulges
+/// out through the middle of every face. Measured from this camera, that
+/// leaves 3,901 pixels the sphere alone lights and 1,455 the cube alone does.
+/// The two `only_in_*` assertions below pin both, so the test cannot quietly
+/// degenerate into a tautology again. 12 and 13 were measured too and are
+/// worse: 12 puts the cube entirely inside the silhouette (0 pixels of its
+/// own) and 13 leaves it only 275.
+#[test]
+fn two_bodies_sharing_bricks_each_render_whole() {
+    let Some(harness) = Harness::new() else {
+        eprintln!("no usable wgpu adapter, skipping the two body render test");
+        return;
+    };
+
+    /// Radius of body A.
+    const SPHERE_RADIUS: f32 = 20.0;
+    /// Half-extent of body B. See the note above about why this is not 20.
+    const CUBE_HALF: f32 = 14.0;
+
+    const BODY_A: NodeId = NodeId(1);
+    const BODY_B: NodeId = NodeId(2);
+
+    let distance = MODEL_RADIUS * 3.0;
+    let make_renderer = || {
+        let mut renderer = SculptRenderer::new(&harness.device, &harness.queue, TARGET_FORMAT);
+        renderer.resize(&harness.device, WIDTH, HEIGHT);
+        renderer.write_uniforms(&harness.queue, &uniforms(distance));
+        renderer
+    };
+
+    let mut sphere = Volume::new(VOXEL_SIZE);
+    sphere.seed_sphere(Vec3::ZERO, SPHERE_RADIUS);
+    let mut cube = Volume::new(VOXEL_SIZE);
+    seed_cube(&mut cube, CUBE_HALF);
+
+    // The premise of the whole test: these two really do want the same slots.
+    // Every brick the cube occupies is also one of the sphere's, which is what
+    // "sharing bricks near the origin" means and is the normal case for two
+    // bodies on one lattice -- not a contrived overlap.
+    let cube_bricks: std::collections::HashSet<BrickCoord> = cube.brick_coords().collect();
+    let shared = sphere.brick_coords().filter(|coord| cube_bricks.contains(coord)).count();
+    assert_eq!(
+        shared,
+        cube_bricks.len(),
+        "the cube occupies {} bricks and only {shared} of them are also the sphere's, so the two \
+         bodies are not really competing for slots",
+        cube_bricks.len()
+    );
+    assert!(shared >= 8, "only {shared} bricks are contested, which proves little");
+
+    // --- each body on its own ------------------------------------------------
+    let mut alone_a = make_renderer();
+    let slots_a = upload_body(&mut alone_a, &harness.device, &harness.queue, &mut sphere, BODY_A);
+    let frame_a = harness.frame(&alone_a);
+    dump("two-bodies-a", &frame_a);
+    let mask_a = mask(&frame_a);
+    assert_eq!(alone_a.stats().bricks, slots_a, "body A did not keep every slot it filled");
+
+    let mut alone_b = make_renderer();
+    let slots_b = upload_body(&mut alone_b, &harness.device, &harness.queue, &mut cube, BODY_B);
+    let frame_b = harness.frame(&alone_b);
+    dump("two-bodies-b", &frame_b);
+    let mask_b = mask(&frame_b);
+    assert_eq!(alone_b.stats().bricks, slots_b, "body B did not keep every slot it filled");
+
+    // Each has to be visible outside the other, or the union below is a
+    // tautology and would pass over a body that never drew at all.
+    let only_in_a = mask_a.iter().zip(&mask_b).filter(|(a, b)| **a && !**b).count();
+    let only_in_b = mask_a.iter().zip(&mask_b).filter(|(a, b)| !**a && **b).count();
+    assert!(only_in_a > 200, "the sphere only reaches outside the cube on {only_in_a} pixels");
+    assert!(only_in_b > 200, "the cube only reaches outside the sphere on {only_in_b} pixels");
+
+    // --- both bodies in one pool --------------------------------------------
+    let mut together = make_renderer();
+    let both_a = upload_body(&mut together, &harness.device, &harness.queue, &mut sphere, BODY_A);
+    let both_b = upload_body(&mut together, &harness.device, &harness.queue, &mut cube, BODY_B);
+    assert_eq!(both_a, slots_a, "body A meshed differently the second time");
+    assert_eq!(both_b, slots_b, "body B meshed differently the second time");
+
+    let stats = together.stats();
+    assert_eq!(stats.overflowed, 0, "the pool overflowed, so the picture is incomplete");
+    assert_eq!(
+        stats.bricks,
+        slots_a + slots_b,
+        "the pool holds {} slots for {slots_a} + {slots_b} uploaded bricks: the second body took \
+         the first body's slices",
+        stats.bricks
+    );
+
+    let frame_ab = harness.frame(&together);
+    dump("two-bodies-both", &frame_ab);
+    let mask_ab = mask(&frame_ab);
+
+    let wrong = mask_ab
+        .iter()
+        .zip(mask_a.iter().zip(&mask_b))
+        .filter(|(both, (a, b))| **both != (**a || **b))
+        .count();
+    assert_eq!(
+        wrong,
+        0,
+        "{wrong} pixels disagree with the union of the two bodies drawn alone, out of {} \
+         ({only_in_a} belong to the sphere alone, {only_in_b} to the cube alone)",
+        mask_ab.len()
     );
 }

@@ -15,8 +15,8 @@ pub mod renderer;
 
 pub use frustum::Frustum;
 pub use mesh_pool::{
-    INDEX_CAPACITY, MAX_BUFFERS, MeshPool, PoolStats, TOTAL_INDEX_CAPACITY, TOTAL_VERTEX_CAPACITY,
-    VERTEX_CAPACITY,
+    INDEX_CAPACITY, MAX_BUFFERS, MeshPool, NodeId, PoolStats, SlotKey, THE_ONLY_BODY,
+    TOTAL_INDEX_CAPACITY, TOTAL_VERTEX_CAPACITY, VERTEX_CAPACITY,
 };
 pub use overlay::{OverlayBatch, OverlayRenderer, OverlayVertex};
 pub use renderer::{PixelRect, SculptRenderer, Uniforms};

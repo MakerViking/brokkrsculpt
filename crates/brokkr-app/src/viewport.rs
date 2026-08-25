@@ -18,7 +18,9 @@
 use std::sync::{Arc, Mutex};
 
 use brokkr_core::{BrickCoord, BrickMesh, BrushKind, MirrorAxis};
-use brokkr_gpu::{Frustum, OverlayBatch, PixelRect, PoolStats, SculptRenderer, Uniforms};
+use brokkr_gpu::{
+    Frustum, OverlayBatch, PixelRect, PoolStats, SculptRenderer, SlotKey, THE_ONLY_BODY, Uniforms,
+};
 use iced::mouse;
 use iced::widget::shader;
 use iced::{Rectangle, Vector};
@@ -31,7 +33,9 @@ use crate::navcube;
 /// One brick's mesh on its way to the GPU.
 #[derive(Debug)]
 pub struct PendingUpload {
-    pub coord: BrickCoord,
+    /// Which brick of which body. The pool is keyed on both, because two bodies
+    /// near the world origin share brick coordinates.
+    pub key: SlotKey,
     pub mesh: BrickMesh,
 }
 
@@ -74,8 +78,16 @@ impl SharedFrame {
     }
 
     /// Queue a filled mesh for upload on the next frame.
+    ///
+    /// The body is [`THE_ONLY_BODY`] and not a parameter, because the
+    /// application has exactly one volume to publish bricks from. **Increment 2
+    /// gives `Document` more than one node, and this is where the active body's
+    /// id starts coming in from the caller** -- putting the constant here
+    /// rather than at the pool means `app.rs` needs no change until it has a
+    /// real id to pass.
     pub fn publish(&self, coord: BrickCoord, mesh: BrickMesh) {
-        self.pending.lock().expect("shared frame poisoned").push(PendingUpload { coord, mesh });
+        let key = SlotKey { body: THE_ONLY_BODY, coord };
+        self.pending.lock().expect("shared frame poisoned").push(PendingUpload { key, mesh });
     }
 
     pub fn set_camera(&self, camera: OrbitCamera) {
@@ -407,7 +419,7 @@ impl shader::Primitive for SculptPrimitive {
         if !drained.is_empty() {
             let mut spare = self.shared.spare.lock().expect("shared frame poisoned");
             for upload in drained {
-                pipeline.renderer.upload_brick(device, queue, upload.coord, &upload.mesh);
+                pipeline.renderer.upload_brick(device, queue, upload.key, &upload.mesh);
                 spare.push(upload.mesh);
             }
         }

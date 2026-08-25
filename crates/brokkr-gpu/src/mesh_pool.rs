@@ -84,6 +84,53 @@ const _: () = assert!(
 /// short and a brick meshing to three vertices does not get its own bucket.
 const GRANULARITY: u64 = 256;
 
+/// Which body a brick belongs to.
+///
+/// This is the id `brokkr-core`'s node tree will hand out, and it appears here
+/// first because the pool is the first thing in the application that has to
+/// tell two bodies apart. It is deliberately `NodeId` and not `BodyId`: the
+/// tree the panel shows holds folder rows as well as bodies, so `BodyId` would
+/// be wrong the moment folders land -- and this is the one moment where the
+/// name costs nothing to choose, because nothing outside this crate refers to
+/// it yet.
+///
+/// **It moves to `brokkr_core::body` in increment 2**, when a `Document`
+/// actually holds nodes and can hand ids out; this definition becomes a
+/// re-export then. It lives here in the meantime because `brokkr-gpu` may not
+/// wait for the engine side, and `brokkr-core` may not depend on this crate --
+/// CI fails the build if it ever does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct NodeId(pub u32);
+
+/// The one body that exists today.
+///
+/// Nothing in the application creates a second one yet, so every caller names
+/// this. It is a named constant rather than a `Default` or a bare `NodeId(1)`
+/// written out at each call site precisely so that `grep` finds every place
+/// that has to start passing a real id when increment 2 gives the document
+/// more than one node. **It becomes real then**; until it does, a pool that
+/// buckets by body is a pool with exactly one bucket per buffer pair, which
+/// costs nothing and is the same picture as before.
+///
+/// Nonzero because the node table reserves id zero for "no node".
+pub const THE_ONLY_BODY: NodeId = NodeId(1);
+
+/// Which brick of which body a pool slot holds.
+///
+/// **The body half is not decoration.** Every `Volume` sits on the same
+/// lattice -- voxel (0,0,0) is world (0,0,0) in all of them, there is no origin
+/// held anywhere -- so two bodies near the world origin share brick
+/// coordinates. That is the normal case, not a corner one. Keyed on the
+/// coordinate alone, body B's upload reuses the slice body A was drawing from,
+/// or, if B's brick meshes to nothing, hands A's block back to the free list
+/// outright. No log, no counter, `overflowed` stays zero: the geometry simply
+/// leaves the screen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct SlotKey {
+    pub body: NodeId,
+    pub coord: BrickCoord,
+}
+
 /// A range inside one of the big buffers, measured in elements.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Block {
@@ -198,22 +245,27 @@ struct BufferPair {
 }
 
 impl BufferPair {
-    fn new(device: &wgpu::Device, index: u16) -> Self {
+    /// The capacities are passed in rather than read from [`VERTEX_CAPACITY`]
+    /// and [`INDEX_CAPACITY`] so that a test can build a pool small enough to
+    /// FILL. The real one is 4.2 GB at full stretch, which is not a thing a
+    /// test can exhaust, and what happens at the ceiling is exactly the
+    /// behaviour worth pinning.
+    fn new(device: &wgpu::Device, index: u16, vertices: u64, indices: u64) -> Self {
         Self {
             vertices: device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("brokkr brick vertices"),
-                size: VERTEX_CAPACITY * size_of::<Vertex>() as u64,
+                size: vertices * size_of::<Vertex>() as u64,
                 usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
                 mapped_at_creation: false,
             }),
             indices: device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("brokkr brick indices"),
-                size: INDEX_CAPACITY * size_of::<u32>() as u64,
+                size: indices * size_of::<u32>() as u64,
                 usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
                 mapped_at_creation: false,
             }),
-            vertex_allocator: BlockAllocator::new(VERTEX_CAPACITY, index),
-            index_allocator: BlockAllocator::new(INDEX_CAPACITY, index),
+            vertex_allocator: BlockAllocator::new(vertices, index),
+            index_allocator: BlockAllocator::new(indices, index),
         }
     }
 }
@@ -281,7 +333,31 @@ pub struct MeshPool {
     /// buffers are reused by [`MeshPool::reset`] rather than dropped, because
     /// a rebuild almost always needs them again immediately.
     buffers: Vec<BufferPair>,
-    slots: FxHashMap<BrickCoord, Slot>,
+    /// Slots bucketed by the buffer pair they live in AND the body they belong
+    /// to, rather than held in one flat map.
+    ///
+    /// `draw` has to bind a buffer pair before it can draw out of it, so with a
+    /// flat map it walked EVERY slot once per pair and skipped the ones that
+    /// did not belong -- O(pairs x slots). At the scale this pool is built for
+    /// that is real money: a [`Slot`] is 80 bytes and a map entry about 103
+    /// once the key and hashbrown's load factor are counted, so 45,567 slots is
+    /// around 4.7 MB and eight passes over it is around 38 MB of memory traffic
+    /// per frame before a single triangle is drawn. Bucketing visits each slot
+    /// exactly once.
+    ///
+    /// The cost of the change is one extra pair of buffer binds per body per
+    /// pair, since a pair holding two bodies is now bound twice. That is two
+    /// commands against a whole extra walk of the slot map, and with one body
+    /// -- which is every model until increment 2 -- it is exactly what it was.
+    ///
+    /// The body half of the key is also what makes [`MeshPool::draw_body`] a
+    /// lookup rather than a rescan of every slot in the pool.
+    buckets: FxHashMap<(u16, NodeId), FxHashMap<BrickCoord, Slot>>,
+    /// Vertices and indices each buffer pair of this pool holds. Fields rather
+    /// than the constants, so a test can build a pool it can fill. See
+    /// [`MeshPool::with_capacities`].
+    vertex_capacity: u64,
+    index_capacity: u64,
     triangles: usize,
     vertices: usize,
     overflowed: usize,
@@ -294,9 +370,23 @@ pub struct MeshPool {
 
 impl MeshPool {
     pub fn new(device: &wgpu::Device) -> Self {
+        Self::with_capacities(device, VERTEX_CAPACITY, INDEX_CAPACITY)
+    }
+
+    /// A pool whose buffer pairs hold the given number of elements each.
+    ///
+    /// Private, and there are exactly two callers: [`MeshPool::new`] with the
+    /// real capacities, and the tests with capacities small enough that the
+    /// pool can actually be run out of. Overflow behaviour is the part of this
+    /// file that has put holes in a real model, and a ceiling of
+    /// [`TOTAL_VERTEX_CAPACITY`] vertices across 4.2 GB of buffers is not one
+    /// a test can reach.
+    fn with_capacities(device: &wgpu::Device, vertices: u64, indices: u64) -> Self {
         Self {
-            buffers: vec![BufferPair::new(device, 0)],
-            slots: FxHashMap::default(),
+            buffers: vec![BufferPair::new(device, 0, vertices, indices)],
+            buckets: FxHashMap::default(),
+            vertex_capacity: vertices,
+            index_capacity: indices,
             triangles: 0,
             vertices: 0,
             overflowed: 0,
@@ -339,11 +429,16 @@ impl MeshPool {
             "mesh pool growing to {} buffer pairs ({} MB reserved)",
             index + 1,
             (index as u64 + 1)
-                * (VERTEX_CAPACITY * size_of::<Vertex>() as u64
-                    + INDEX_CAPACITY * size_of::<u32>() as u64)
+                * (self.vertex_capacity * size_of::<Vertex>() as u64
+                    + self.index_capacity * size_of::<u32>() as u64)
                 / (1024 * 1024)
         );
-        self.buffers.push(BufferPair::new(device, index));
+        self.buffers.push(BufferPair::new(
+            device,
+            index,
+            self.vertex_capacity,
+            self.index_capacity,
+        ));
         let pair = self.buffers.last_mut()?;
         Some((
             pair.vertex_allocator.allocate(need_vertices)?,
@@ -351,21 +446,81 @@ impl MeshPool {
         ))
     }
 
+    /// The slot a key currently occupies, and which buffer pair it is in.
+    ///
+    /// A brick's pair is not known before the lookup -- `reserve` puts it in
+    /// whichever pair had room for both halves -- so this asks each pair in
+    /// turn. With one pair, which is every model that fits in 264 MB, that is
+    /// the single hash lookup the flat map used to do. Keeping a separate
+    /// key-to-pair index to save the other seven would be a second map to hold
+    /// in step with this one, and this runs per dirty brick rather than per
+    /// frame.
+    fn find(&self, key: SlotKey) -> Option<(u16, Slot)> {
+        (0..self.buffers.len() as u16).find_map(|pair| {
+            self.buckets
+                .get(&(pair, key.body))
+                .and_then(|bucket| bucket.get(&key.coord))
+                .map(|slot| (pair, *slot))
+        })
+    }
+
+    /// Drop a slot entirely: out of its bucket, its space back to the pair it
+    /// came from, and its mesh off the counters.
+    ///
+    /// All three always happen together, which is why they are one function.
+    /// They used to be spread across [`MeshPool::upload`], and the counters
+    /// ran ahead of the slot -- see the note there.
+    fn forget(&mut self, pair: u16, key: SlotKey, slot: Slot) {
+        if let Some(bucket) = self.buckets.get_mut(&(pair, key.body)) {
+            bucket.remove(&key.coord);
+            // An empty bucket is dropped rather than kept, so `draw` iterates
+            // over exactly the buckets that have something in them and the
+            // brick count in `stats` needs no separate tally.
+            if bucket.is_empty() {
+                self.buckets.remove(&(pair, key.body));
+            }
+        }
+        self.release(slot);
+        self.uncount(slot);
+    }
+
+    /// Take a slot's mesh off the triangle and vertex counters.
+    fn uncount(&mut self, slot: Slot) {
+        self.triangles -= slot.index_count as usize / 3;
+        self.vertices -= slot.vertex_count as usize;
+    }
+
+    /// Put one brick's mesh in the pool, replacing whatever that key held.
+    ///
+    /// **Space for the new mesh is reserved BEFORE the old slice is handed
+    /// back.** The other order reads as harmless and is not: it released the
+    /// block and removed the slot, and only THEN returned early if `reserve`
+    /// failed. So near a full pool a brick that GREW lost the space it already
+    /// had and got nothing in return -- and the brick that grows is the one
+    /// under the brush, so what the user saw was a permanent hole opening in
+    /// the part of the model they were actively sculpting, with nothing
+    /// putting it back until the whole model was rebuilt. Reserving first
+    /// costs one block of headroom for the length of this call and turns that
+    /// into "the previous mesh keeps drawing", which is one remesh out of date
+    /// and otherwise correct.
+    ///
+    /// **The triangle and vertex counters move with the slot for the same
+    /// reason.** They used to be decremented at the top, before anything could
+    /// fail, so a refused upload left them counting a slot that was still live
+    /// and still on screen.
     pub fn upload(
         &mut self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
-        coord: BrickCoord,
+        key: SlotKey,
         mesh: &BrickMesh,
     ) {
-        if let Some(previous) = self.slots.get(&coord) {
-            self.triangles -= previous.index_count as usize / 3;
-            self.vertices -= previous.vertex_count as usize;
-        }
+        let existing = self.find(key);
 
+        // Nothing to draw any more: the surface has left this brick.
         if mesh.indices.is_empty() {
-            if let Some(slot) = self.slots.remove(&coord) {
-                self.release(slot);
+            if let Some((pair, slot)) = existing {
+                self.forget(pair, key, slot);
             }
             return;
         }
@@ -375,31 +530,37 @@ impl MeshPool {
 
         // Keep the existing slices when the new mesh still fits them, which is
         // the common case during a stroke and avoids touching the free lists.
-        let slot = match self.slots.get(&coord).copied() {
-            Some(slot)
-                if slot.vertices.capacity >= need_vertices
-                    && slot.indices.capacity >= need_indices =>
-            {
+        let fits = existing.filter(|(_, slot)| {
+            slot.vertices.capacity >= need_vertices && slot.indices.capacity >= need_indices
+        });
+
+        let slot = match fits {
+            Some((_, slot)) => {
+                // The slice survives, but the mesh in it does not, so its
+                // counts come off here and the new ones go on below.
+                self.uncount(slot);
                 slot
             }
-            other => {
-                if let Some(slot) = other {
-                    self.release(slot);
-                    self.slots.remove(&coord);
-                }
+            None => {
                 let Some((vertices, indices)) = self.reserve(device, need_vertices, need_indices)
                 else {
                     self.overflowed += 1;
                     if !self.warned_about_overflow {
                         self.warned_about_overflow = true;
                         log::error!(
-                            "mesh pool is full at {MAX_BUFFERS} buffers ({TOTAL_VERTEX_CAPACITY} \
-                             vertices, {TOTAL_INDEX_CAPACITY} indices), so parts of the model are \
-                             missing from the screen"
+                            "mesh pool is full at {MAX_BUFFERS} buffers ({} vertices, {} \
+                             indices), so parts of the model are missing from the screen",
+                            self.vertex_capacity * MAX_BUFFERS as u64,
+                            self.index_capacity * MAX_BUFFERS as u64,
                         );
                     }
+                    // Whatever was here is deliberately left alone: a mesh one
+                    // remesh out of date beats a hole in the model.
                     return;
                 };
+                if let Some((pair, previous)) = existing {
+                    self.forget(pair, key, previous);
+                }
                 Slot {
                     vertices,
                     indices,
@@ -426,8 +587,8 @@ impl MeshPool {
         self.triangles += mesh.indices.len() / 3;
         self.vertices += mesh.vertices.len();
         let (minimum, maximum) = bounds(&mesh.vertices).unwrap_or((Vec3::ZERO, Vec3::ZERO));
-        self.slots.insert(
-            coord,
+        self.buckets.entry((slot.vertices.buffer, key.body)).or_default().insert(
+            key.coord,
             Slot {
                 vertex_count: mesh.vertices.len() as u32,
                 index_count: mesh.indices.len() as u32,
@@ -454,26 +615,25 @@ impl MeshPool {
     pub fn draw(&self, pass: &mut wgpu::RenderPass<'_>, frustum: &Frustum) {
         self.drawn.store(0, Ordering::Relaxed);
         self.culled.store(0, Ordering::Relaxed);
-        if self.slots.is_empty() {
+        if self.buckets.is_empty() {
             return;
         }
 
-        // Grouped by buffer pair, because a bind is per pass and a brick's
-        // vertices and indices always live in the same pair. One pass over the
-        // slots per pair keeps the binds to one each rather than one per brick,
-        // and with a single pair -- the common case -- this is exactly what it
-        // was before.
+        // One pass over each bucket, and a bucket is one buffer pair's slots
+        // for one body -- so every slot is visited exactly once and the pair is
+        // bound at most once per bucket. This used to walk all the slots once
+        // per pair and skip the ones that did not belong; see the field's
+        // documentation for what that cost.
         let mut drawn = 0;
         let mut culled = 0;
-        for (index, pair) in self.buffers.iter().enumerate() {
-            let index = index as u16;
+        for (&(index, _body), bucket) in &self.buckets {
+            let pair = &self.buffers[index as usize];
             let mut bound = false;
-            for slot in self.slots.values() {
-                if slot.vertices.buffer != index || slot.index_count == 0 {
+            for slot in bucket.values() {
+                if slot.index_count == 0 {
                     continue;
                 }
                 if !frustum.intersects(slot.minimum, slot.maximum) {
-                    // Counted once, on the pass that owns the brick.
                     culled += 1;
                     continue;
                 }
@@ -495,6 +655,58 @@ impl MeshPool {
         self.culled.store(culled, Ordering::Relaxed);
     }
 
+    /// Draw every brick of ONE body, with no culling at all.
+    ///
+    /// **There is deliberately no frustum parameter, and the absence is the
+    /// point.** The caller this exists for is the per-body thumbnail pass,
+    /// which frames the whole body by construction: every brick of it is
+    /// inside the view volume, so a cull test can only ever be wrong, and
+    /// skipping the AABB tests saves what they cost -- around 0.68 ms at the
+    /// 45,567 bricks this pool is built for.
+    ///
+    /// It is a distinct method rather than an `Option<&Frustum>` on
+    /// [`MeshPool::draw`] so that there is no parameter for anyone to pass a
+    /// frustum into. The only frustum in scope where a thumbnail would be
+    /// drained is the viewport's `pipeline.frustum` -- the USER'S camera,
+    /// rebuilt every frame eight lines above the drain -- and it would
+    /// typecheck, cull a thumbnail against a view it has nothing to do with,
+    /// and hand back a picture with most of the body missing. A signature with
+    /// no such parameter cannot be misused that way.
+    ///
+    /// It also must **not** write the `drawn` and `culled` counters. Those are
+    /// published as the viewport's per-frame readout, and a thumbnail drawn
+    /// between two sculpt frames would overwrite them with numbers about a
+    /// picture nobody is looking at.
+    ///
+    /// No caller yet: increment 15 is the thumbnail pass. What exists today is
+    /// the pool half of it, which is the half that had to land with the
+    /// bucketing rather than after it.
+    pub fn draw_body(&self, pass: &mut wgpu::RenderPass<'_>, body: NodeId) {
+        for index in 0..self.buffers.len() as u16 {
+            let Some(bucket) = self.buckets.get(&(index, body)) else {
+                continue;
+            };
+            let pair = &self.buffers[index as usize];
+            let mut bound = false;
+            for slot in bucket.values() {
+                if slot.index_count == 0 {
+                    continue;
+                }
+                if !bound {
+                    pass.set_vertex_buffer(0, pair.vertices.slice(..));
+                    pass.set_index_buffer(pair.indices.slice(..), wgpu::IndexFormat::Uint32);
+                    bound = true;
+                }
+                let start = slot.indices.offset as u32;
+                pass.draw_indexed(
+                    start..start + slot.index_count,
+                    slot.vertices.offset as i32,
+                    0..1,
+                );
+            }
+        }
+    }
+
     /// Discard every brick and start the allocator over.
     ///
     /// For the moments that rebuild the WHOLE model -- a resample, an import,
@@ -505,7 +717,7 @@ impl MeshPool {
     /// **The caller must remesh everything after this**, or the model is not on
     /// the GPU any more. `Volume::mark_everything_dirty` is the partner.
     pub fn reset(&mut self) {
-        self.slots.clear();
+        self.buckets.clear();
         for pair in &mut self.buffers {
             pair.vertex_allocator.reset();
             pair.index_allocator.reset();
@@ -518,7 +730,7 @@ impl MeshPool {
 
     pub fn stats(&self) -> PoolStats {
         PoolStats {
-            bricks: self.slots.len(),
+            bricks: self.buckets.values().map(FxHashMap::len).sum(),
             triangles: self.triangles,
             vertices: self.vertices,
             indices: self.triangles * 3,
@@ -526,8 +738,8 @@ impl MeshPool {
             indices_reserved: self.buffers.iter().map(|p| p.index_allocator.live()).sum(),
             vertices_watermark: self.buffers.iter().map(|p| p.vertex_allocator.watermark()).sum(),
             indices_watermark: self.buffers.iter().map(|p| p.index_allocator.watermark()).sum(),
-            vertex_capacity: TOTAL_VERTEX_CAPACITY,
-            index_capacity: TOTAL_INDEX_CAPACITY,
+            vertex_capacity: self.vertex_capacity * MAX_BUFFERS as u64,
+            index_capacity: self.index_capacity * MAX_BUFFERS as u64,
             overflowed: self.overflowed,
             drawn: self.drawn.load(Ordering::Relaxed),
             culled: self.culled.load(Ordering::Relaxed),
@@ -695,5 +907,179 @@ mod tests {
             TOTAL_VERTEX_CAPACITY as f64,
             "brokkr-core's VERTEX_CAPACITY has drifted from the pool's real total"
         );
+    }
+
+    // ------------------------------------------------------- against a device
+    //
+    // The tests below need a real `wgpu::Device`, because a slot is a slice of
+    // a real buffer and there is no way to reserve one without creating them.
+    // They build the pool through `with_capacities` with room for two bricks
+    // per pair, which is the only way to reach the ceiling: the real pool is
+    // 4.2 GB at full stretch.
+
+    /// A device, or `None` when this machine has no adapter.
+    fn open_device() -> Option<(wgpu::Device, wgpu::Queue)> {
+        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
+        let adapter =
+            pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default()))
+                .ok()?;
+        pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default())).ok()
+    }
+
+    /// A device, or `None` on a developer machine that has no adapter -- but a
+    /// FAILURE on CI, where an adapter is always meant to be there.
+    ///
+    /// The rest of this repo handles the adapter-less case by printing
+    /// "skipping the ... test" and returning, and CI catches a runner that
+    /// really has no adapter by running `tests/offscreen.rs` with `--nocapture`
+    /// and grepping that phrase out of the output. That guard covers exactly
+    /// one test binary. These two tests live in the LIB binary, which CI runs
+    /// as part of `cargo test --workspace` -- without `--nocapture`, so the
+    /// message is captured and thrown away, and nothing greps it either way.
+    /// Printing and returning here would therefore report `ok` having asserted
+    /// nothing, on the half of the increment (reserve-before-release) that
+    /// `tests/offscreen.rs` does not exercise at all: someone could put the
+    /// release back above the reserve, or collapse the bucket key back to the
+    /// bare coordinate, and the job would stay green.
+    ///
+    /// So the check is made by the test rather than by a grep in the workflow,
+    /// which also means it holds however CI decides to invoke `cargo test`.
+    /// `CI` is set to `true` by GitHub Actions for every step, and by every
+    /// other runner worth naming. The message is still printed, so widening the
+    /// workflow's grep to the lib binary would work too and would be belt and
+    /// braces rather than a duplicate.
+    fn device_or_skip(what: &str) -> Option<(wgpu::Device, wgpu::Queue)> {
+        if let Some(device) = open_device() {
+            return Some(device);
+        }
+        eprintln!("no usable wgpu adapter, skipping the {what} test");
+        assert!(
+            std::env::var_os("CI").is_none(),
+            "no usable wgpu adapter on CI, so the {what} test asserted nothing. \
+             The runner image is meant to provide one (Mesa's lavapipe); if it \
+             no longer does, fix the image rather than letting this pass."
+        );
+        None
+    }
+
+    /// A mesh of the requested size. The geometry is meaningless -- these tests
+    /// are about which slice a brick lands in, not about what is in it.
+    fn mesh_of(vertices: usize, indices: usize) -> BrickMesh {
+        BrickMesh {
+            vertices: vec![Vertex { position: [0.0; 3], normal: [0.0, 1.0, 0.0] }; vertices],
+            indices: (0..indices as u32).map(|index| index % vertices.max(1) as u32).collect(),
+            cells: Vec::new(),
+        }
+    }
+
+    fn key(body: u32, coord: i32) -> SlotKey {
+        SlotKey { body: NodeId(body), coord: BrickCoord::new(coord, 0, 0) }
+    }
+
+    /// The failure the widened key exists to stop.
+    ///
+    /// Two bodies near the world origin share brick coordinates -- there is no
+    /// origin held anywhere, so voxel (0,0,0) is world (0,0,0) in every volume
+    /// -- and keyed on the coordinate alone, the second body's upload took over
+    /// the first body's slice. Nothing logged it and `overflowed` stayed zero.
+    #[test]
+    fn two_bodies_sharing_a_brick_coordinate_keep_separate_slots() {
+        let Some((device, queue)) = device_or_skip("mesh pool slot key") else {
+            return;
+        };
+
+        let mut pool = MeshPool::with_capacities(&device, GRANULARITY * 8, GRANULARITY * 8);
+        let mesh = mesh_of(GRANULARITY as usize, GRANULARITY as usize - 1);
+        pool.upload(&device, &queue, key(1, 0), &mesh);
+        pool.upload(&device, &queue, key(2, 0), &mesh);
+
+        let (_, first) = pool.find(key(1, 0)).expect("body 1 kept its slot");
+        let (_, second) = pool.find(key(2, 0)).expect("body 2 got a slot of its own");
+        assert_ne!(
+            first.vertices.offset, second.vertices.offset,
+            "the two bodies were handed the same vertex slice"
+        );
+        assert_ne!(
+            first.indices.offset, second.indices.offset,
+            "the two bodies were handed the same index slice"
+        );
+
+        let stats = pool.stats();
+        assert_eq!(stats.bricks, 2, "one brick coordinate, two bodies, two slots");
+        assert_eq!(stats.overflowed, 0);
+
+        // And a body whose brick meshes to nothing must free only its OWN
+        // slice. This is the other half of the bug: an empty mesh at the shared
+        // coordinate handed the surviving body's block back to the free list.
+        pool.upload(&device, &queue, key(2, 0), &BrickMesh::default());
+        let (_, still_there) = pool.find(key(1, 0)).expect("body 1 still has its slot");
+        assert_eq!(still_there.vertices.offset, first.vertices.offset);
+        assert_eq!(still_there.vertex_count, mesh.vertices.len() as u32);
+        assert_eq!(pool.stats().bricks, 1);
+    }
+
+    /// A brick that grows when the pool is full keeps what it already had.
+    ///
+    /// `upload` used to release the old block and remove the slot BEFORE it
+    /// found out whether `reserve` could give it a new one, so near a full pool
+    /// a growing brick lost its space and got nothing back. The brick that
+    /// grows is the one under the brush, so that was a permanent hole opening
+    /// in the part of the model being sculpted -- and nothing put it back until
+    /// the whole model was rebuilt.
+    ///
+    /// "Still draws" here means the slot still exists, still points at the same
+    /// slice, and still declares the vertex and index counts of the mesh that
+    /// was written into it -- which is exactly what `draw` reads. The pixels
+    /// are checked in `tests/offscreen.rs`; this pins the bookkeeping, which is
+    /// where the bug was.
+    #[test]
+    fn a_brick_that_grows_when_the_pool_is_full_keeps_the_space_it_had() {
+        let Some((device, queue)) = device_or_skip("mesh pool overflow") else {
+            return;
+        };
+
+        // Two granules of each per pair, so a pair holds exactly two of the
+        // small meshes below and eight pairs hold sixteen.
+        let mut pool = MeshPool::with_capacities(&device, GRANULARITY * 2, GRANULARITY * 2);
+        let small = mesh_of(GRANULARITY as usize, GRANULARITY as usize - 1);
+        let filled = 2 * MAX_BUFFERS;
+        for brick in 0..filled {
+            pool.upload(&device, &queue, key(1, brick as i32), &small);
+        }
+
+        let full = pool.stats();
+        assert_eq!(full.bricks, filled, "the pool should have taken every brick");
+        assert_eq!(full.overflowed, 0, "filling it exactly must not overflow");
+
+        let (_, before) = pool.find(key(1, 0)).expect("brick zero has a slot");
+
+        // Now grow brick zero past its block. Nothing is free and no pair can
+        // bump, so the reservation must fail.
+        let grown = mesh_of(GRANULARITY as usize + 1, GRANULARITY as usize + 1);
+        pool.upload(&device, &queue, key(1, 0), &grown);
+
+        let after = pool.stats();
+        assert_eq!(after.overflowed, 1, "the refused upload must be counted");
+        assert_eq!(after.bricks, filled, "the slot was dropped instead of being kept");
+        assert_eq!(
+            after.triangles, full.triangles,
+            "the counters ran ahead of the slot: they must only move when it does"
+        );
+        assert_eq!(after.vertices, full.vertices);
+
+        let (_, kept) = pool.find(key(1, 0)).expect("brick zero must still have its slot");
+        assert_eq!(kept.vertices.offset, before.vertices.offset, "it lost its vertex slice");
+        assert_eq!(kept.indices.offset, before.indices.offset, "it lost its index slice");
+        assert_eq!(
+            kept.index_count,
+            small.indices.len() as u32,
+            "it must still draw the mesh that is actually in the buffer"
+        );
+
+        // The same brick shrinking back to a mesh that fits is fine, which is
+        // what makes the pool recoverable rather than merely not-worse.
+        pool.upload(&device, &queue, key(1, 0), &small);
+        assert_eq!(pool.stats().bricks, filled);
+        assert_eq!(pool.stats().overflowed, 1, "the count of refusals is cumulative");
     }
 }
