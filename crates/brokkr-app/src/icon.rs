@@ -512,6 +512,94 @@ const CUT_PLANE: Glyph = Glyph {
     ],
 };
 
+// --- the body panel ----------------------------------------------------------
+
+/// Shown: an eye.
+///
+/// Two arcs meeting at the corners rather than a circle in a lens, because at
+/// [`crate::theme::ICON_INLINE`] -- 11 px, where a grid unit is 0.46 of a pixel
+/// -- an outlined pupil inside an outlined lens is two rings 1.5 px apart and
+/// reads as a blob. The pupil is filled for the reason [`INFO`]'s dot is.
+const EYE: Glyph = Glyph {
+    subs: &[
+        Sub {
+            segs: &[
+                Seg::Move(3.5, 12.0),
+                Seg::Quad { cx: 12.0, cy: 4.5, x: 20.5, y: 12.0 },
+                Seg::Quad { cx: 12.0, cy: 19.5, x: 3.5, y: 12.0 },
+                Seg::Close,
+            ],
+            ink: Ink::Stroke,
+        },
+        Sub { segs: &[Seg::Circle { cx: 12.0, cy: 12.0, r: 2.4 }], ink: Ink::Fill },
+    ],
+};
+
+/// Hidden: the same eye, struck through, and **with the pupil gone**.
+///
+/// The pupil is dropped rather than kept under the slash, and that is the whole
+/// design of this pair. `no_two_icons_are_the_same_drawing` is exact structural
+/// equality, so an eye and an eye-plus-hairline pass it trivially while being
+/// one dot apart at 11 px. Losing the dark centre changes the icon's whole
+/// weight, which is a difference that survives being small — and the row's name
+/// is muted alongside it, so the eye is never the only signal.
+const EYE_OFF: Glyph = Glyph {
+    subs: &[
+        Sub {
+            segs: &[
+                Seg::Move(3.5, 12.0),
+                Seg::Quad { cx: 12.0, cy: 4.5, x: 20.5, y: 12.0 },
+                Seg::Quad { cx: 12.0, cy: 19.5, x: 3.5, y: 12.0 },
+                Seg::Close,
+            ],
+            ink: Ink::Stroke,
+        },
+        Sub { segs: &[Seg::Move(5.0, 19.5), Seg::Line(19.0, 4.5)], ink: Ink::Stroke },
+    ],
+};
+
+/// Add: a plus.
+///
+/// Upright, where [`CLOSE`] is the same two strokes turned forty-five degrees.
+/// The pair is the one place in this set where orientation carries the entire
+/// meaning, which is why both are centred on the same axes and drawn at the same
+/// length.
+const PLUS: Glyph = Glyph {
+    subs: &[
+        Sub { segs: &[Seg::Move(12.0, 6.0), Seg::Line(12.0, 18.0)], ink: Ink::Stroke },
+        Sub { segs: &[Seg::Move(6.0, 12.0), Seg::Line(18.0, 12.0)], ink: Ink::Stroke },
+    ],
+};
+
+/// Delete: a bin, with its lid and its handle.
+///
+/// Three sub-paths rather than a tapered box on its own: at 11 px the taper is
+/// under a pixel of difference across the whole glyph, and it is the lid line
+/// that makes this a bin rather than a bucket.
+const TRASH: Glyph = Glyph {
+    subs: &[
+        Sub { segs: &[Seg::Move(5.0, 7.0), Seg::Line(19.0, 7.0)], ink: Ink::Stroke },
+        Sub {
+            segs: &[
+                Seg::Move(7.0, 7.0),
+                Seg::Line(8.2, 19.5),
+                Seg::Line(15.8, 19.5),
+                Seg::Line(17.0, 7.0),
+            ],
+            ink: Ink::Stroke,
+        },
+        Sub {
+            segs: &[
+                Seg::Move(10.0, 7.0),
+                Seg::Line(10.0, 4.5),
+                Seg::Line(14.0, 4.5),
+                Seg::Line(14.0, 7.0),
+            ],
+            ink: Ink::Stroke,
+        },
+    ],
+};
+
 /// Every icon in the set.
 ///
 /// An enum rather than a string lookup for the reason SindriCAD moved to
@@ -541,6 +629,10 @@ pub enum IconName {
     BrushFlatten,
     BrushMove,
     CutPlane,
+    Eye,
+    EyeOff,
+    Plus,
+    Trash,
 }
 
 impl IconName {
@@ -552,7 +644,7 @@ impl IconName {
     /// set's index, and anything that needs the whole set rather than one icon
     /// starts here.
     #[allow(dead_code)]
-    pub const ALL: [IconName; 22] = [
+    pub const ALL: [IconName; 26] = [
         IconName::Close,
         IconName::Minimise,
         IconName::Maximise,
@@ -575,6 +667,10 @@ impl IconName {
         IconName::BrushFlatten,
         IconName::BrushMove,
         IconName::CutPlane,
+        IconName::Eye,
+        IconName::EyeOff,
+        IconName::Plus,
+        IconName::Trash,
     ];
 
     /// The icon standing for a sculpting brush.
@@ -634,6 +730,10 @@ impl IconName {
             IconName::BrushFlatten => &BRUSH_FLATTEN,
             IconName::BrushMove => &BRUSH_MOVE,
             IconName::CutPlane => &CUT_PLANE,
+            IconName::Eye => &EYE,
+            IconName::EyeOff => &EYE_OFF,
+            IconName::Plus => &PLUS,
+            IconName::Trash => &TRASH,
         }
     }
 }

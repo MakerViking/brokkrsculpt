@@ -29,7 +29,9 @@
 
 use glam::{IVec3, Vec3};
 
+use crate::body::{Document, NodeId};
 use crate::brick::{BRICK_DIM, Brick, BrickCoord, INSIDE, NARROW_BAND, OUTSIDE, brick_index};
+use crate::undo::{Change, Entry};
 use crate::volume::Volume;
 
 /// A half-space to cut away.
@@ -194,6 +196,108 @@ impl Volume {
             let _ = origin;
         }
         changed
+    }
+}
+
+/// What one plane cut did, across the whole document.
+///
+/// **Both counts, because the status line has to tell "the line missed
+/// everything" apart from "it crossed three bodies and changed two".** Those
+/// two produce the same brick count and mean completely different things: the
+/// first is a gesture that went nowhere near the model, the second is a cut
+/// that passed through empty space inside bodies it really did cross.
+pub struct CutOutcome {
+    /// Bricks changed, summed over every body.
+    pub bricks: usize,
+    /// Bodies at least one brick of which changed.
+    pub bodies_cut: usize,
+    /// Bodies the half-space reached at all, whether or not it found anything
+    /// there to remove. Always at least `bodies_cut`.
+    pub bodies_crossed: usize,
+    /// **ONE entry for the whole gesture**, or `None` when nothing changed.
+    ///
+    /// It is built here rather than handed back as a list of changes for the
+    /// caller to wrap, so that "one gesture is one undo entry" is a property of
+    /// this type rather than of everybody who calls it remembering. Undoing a
+    /// cut that crossed four bodies has to put all four back or none of them:
+    /// half a cut is not a document state anything downstream is written
+    /// against.
+    pub entry: Option<Entry>,
+}
+
+impl Document {
+    /// Cut every body that is DRAWN with one plane, as one gesture.
+    ///
+    /// `visible` is indexed by node position and comes from
+    /// [`Document::display_visibility`], which is where solo is applied -- so
+    /// solo narrows the cut, and a hidden body a line passes over comes out
+    /// bit-identical. That is the decision: **a cut is a line the user draws
+    /// across what they can see**, so it acts on what is drawn and nothing else.
+    /// Cutting a body that is not on screen would set `unsaved`, push history,
+    /// pay a remesh and an upload, and change not one pixel.
+    ///
+    /// # Why this is not a loop over `Volume::clip` at the call site
+    ///
+    /// Two things that a call-site loop gets wrong and this does not. The undo
+    /// entry is ONE [`Entry`] of N `Change::Bricks` rather than N entries, so
+    /// one ctrl+Z undoes the whole cut. And the box gate below skips a body the
+    /// half-space cannot reach without walking its brick map at all, which is
+    /// what keeps a cut across a two-body document from costing a full scan of
+    /// the dragon sitting behind it.
+    ///
+    /// [`Volume::clip`] itself is unchanged and still returns one `usize`; this
+    /// sums them.
+    pub fn clip(&mut self, plane: ClipPlane, visible: &[bool]) -> CutOutcome {
+        debug_assert_eq!(
+            visible.len(),
+            self.nodes().len(),
+            "the visibility mask is indexed by node position"
+        );
+
+        let band_mm = NARROW_BAND * self.voxel_size();
+        // Resolved up front, so the loop below can take each body mutably in
+        // turn without holding a borrow of the node list.
+        let crossed: Vec<NodeId> = self
+            .nodes()
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| visible.get(*index).copied().unwrap_or(false))
+            .filter_map(|(_, node)| {
+                let (low, high) = node.bounds()?;
+                let centre = (low + high) * 0.5;
+                let (_, farthest) = plane.range_over_box(centre, (high - low) * 0.5);
+                // Wholly behind the plane by at least the band: every brick in
+                // it would classify as `Keeps`, so there is nothing to do and
+                // the line did not reach this body at all.
+                (farthest > -band_mm).then_some(node.id)
+            })
+            .collect();
+
+        let mut outcome =
+            CutOutcome { bricks: 0, bodies_cut: 0, bodies_crossed: crossed.len(), entry: None };
+        let mut changes = Vec::new();
+
+        for body in crossed {
+            let Some(volume) = self.volume_mut(body) else {
+                continue;
+            };
+            volume.begin_stroke();
+            let bricks = volume.clip(plane);
+            let edit = volume.end_stroke();
+            // The recorder is the authority on whether anything changed: a
+            // count with no edit behind it would push an entry that restores
+            // nothing.
+            if let Some(edit) = edit.filter(|edit| !edit.is_empty()) {
+                outcome.bricks += bricks;
+                outcome.bodies_cut += 1;
+                changes.push(Change::Bricks { body, edit });
+            }
+        }
+
+        if !changes.is_empty() {
+            outcome.entry = Some(Entry::new(changes));
+        }
+        outcome
     }
 }
 
@@ -408,6 +512,164 @@ mod tests {
 
         let (_, report) = volume.export_mesh();
         assert!(report.is_printable(), "two cuts left it unprintable: {}", report.summary());
+    }
+}
+
+/// The cut across a whole document, which is where the decision that a cut
+/// crosses every VISIBLE body actually lives.
+#[cfg(test)]
+mod across_the_document {
+    use super::*;
+    use crate::body::Document;
+    use crate::undo::{History, UndoOutcome};
+
+    const VOXEL: f32 = 0.5;
+
+    /// Two balls side by side along X, both straddling the Y = 0 plane, so one
+    /// plane facing +Y takes the top off both.
+    fn two_bodies() -> Document {
+        let mut first = Volume::new(VOXEL);
+        first.seed_sphere(Vec3::new(-15.0, 0.0, 0.0), 8.0);
+        first.mark_everything_dirty();
+        let mut doc = Document::from_volume(first);
+
+        let mut second = Volume::new(VOXEL);
+        second.seed_sphere(Vec3::new(15.0, 0.0, 0.0), 8.0);
+        second.mark_everything_dirty();
+        doc.add_body("Body 2", second);
+        doc
+    }
+
+    fn shown(doc: &Document) -> Vec<bool> {
+        let mut out = Vec::new();
+        doc.display_visibility(None, &mut out);
+        out
+    }
+
+    /// The headline: a cut acts on everything on screen, not on the active body.
+    #[test]
+    fn a_cut_crosses_every_visible_body() {
+        let mut doc = two_bodies();
+        let above = [Vec3::new(-15.0, 5.0, 0.0), Vec3::new(15.0, 5.0, 0.0)];
+        let ids: Vec<_> = doc.bodies().map(|(id, _)| id).collect();
+        for (id, probe) in ids.iter().zip(above) {
+            assert!(doc.volume(*id).unwrap().sample_world(probe) < 0.0, "the fixture has a hole");
+        }
+
+        let visible = shown(&doc);
+        let outcome = doc.clip(ClipPlane::new(Vec3::ZERO, Vec3::Y).unwrap(), &visible);
+
+        assert_eq!(outcome.bodies_cut, 2, "the cut reached {} bodies", outcome.bodies_cut);
+        assert_eq!(outcome.bodies_crossed, 2);
+        assert!(outcome.bricks > 0);
+        for (id, probe) in ids.iter().zip(above) {
+            assert!(
+                doc.volume(*id).unwrap().sample_world(probe) > 0.0,
+                "the cut left {id:?} whole"
+            );
+        }
+    }
+
+    /// One gesture is ONE undo entry, however many bodies it touched. Undoing it
+    /// has to put all of them back, because half a cut is not a state anything
+    /// downstream is written against.
+    #[test]
+    fn a_cut_across_two_bodies_is_one_undo_entry_that_restores_both() {
+        let mut doc = two_bodies();
+        let ids: Vec<_> = doc.bodies().map(|(id, _)| id).collect();
+        let above = [Vec3::new(-15.0, 5.0, 0.0), Vec3::new(15.0, 5.0, 0.0)];
+        let before: Vec<f32> = ids
+            .iter()
+            .zip(above)
+            .map(|(id, at)| doc.volume(*id).unwrap().sample_world(at))
+            .collect();
+
+        let visible = shown(&doc);
+        let outcome = doc.clip(ClipPlane::new(Vec3::ZERO, Vec3::Y).unwrap(), &visible);
+        let mut history = History::new(64 * 1024 * 1024);
+        history.push(outcome.entry.expect("a cut that changed bricks records an entry"));
+        assert_eq!(history.stats().undo_entries, 1, "one gesture became more than one entry");
+
+        let visible = shown(&doc);
+        assert!(matches!(history.undo(&mut doc, &visible), UndoOutcome::Applied(_)));
+        for ((id, at), was) in ids.iter().zip(above).zip(before) {
+            assert_eq!(
+                doc.volume(*id).unwrap().sample_world(at),
+                was,
+                "one undo did not restore {id:?}"
+            );
+        }
+        assert!(!history.can_undo(), "the cut left a second entry behind");
+    }
+
+    /// A body the user cannot see must come back bit-identical: hiding is a
+    /// draw-time skip, so cutting one would cost a remesh and an upload and
+    /// change not one pixel.
+    #[test]
+    fn a_hidden_body_the_line_passes_over_is_left_untouched() {
+        let mut doc = two_bodies();
+        let ids: Vec<_> = doc.bodies().map(|(id, _)| id).collect();
+        let hidden = ids[1];
+        let mut meta = doc.meta(hidden).expect("the second body");
+        meta.visible = false;
+        doc.set_meta(&meta);
+
+        let probe = Vec3::new(15.0, 5.0, 0.0);
+        let before = doc.volume(hidden).unwrap().sample_world(probe);
+        let bricks_before = doc.volume(hidden).unwrap().brick_count();
+
+        let visible = shown(&doc);
+        let outcome = doc.clip(ClipPlane::new(Vec3::ZERO, Vec3::Y).unwrap(), &visible);
+
+        assert_eq!(outcome.bodies_cut, 1, "the cut reached the hidden body");
+        assert_eq!(outcome.bodies_crossed, 1);
+        assert_eq!(
+            doc.volume(hidden).unwrap().sample_world(probe),
+            before,
+            "the hidden body was cut"
+        );
+        assert_eq!(doc.volume(hidden).unwrap().brick_count(), bricks_before);
+    }
+
+    /// A plane nowhere near the model produces no entry at all -- an undo entry
+    /// for a no-op is worse than none, because it costs the user a real one.
+    #[test]
+    fn a_line_that_misses_everything_records_nothing() {
+        let mut doc = two_bodies();
+        let visible = shown(&doc);
+        let outcome =
+            doc.clip(ClipPlane::new(Vec3::new(0.0, 500.0, 0.0), Vec3::Y).unwrap(), &visible);
+
+        assert_eq!(outcome.bricks, 0);
+        assert_eq!(outcome.bodies_cut, 0);
+        assert_eq!(outcome.bodies_crossed, 0, "a plane 500 mm away counted as crossing a body");
+        assert!(outcome.entry.is_none(), "a cut that changed nothing recorded an entry");
+    }
+
+    /// The two counts have to be able to differ, or the status line cannot tell
+    /// "the line missed" from "it crossed something and found nothing there".
+    ///
+    /// The gate is a body's world BOX, and a box has corners the body does not
+    /// fill: two blobs on a diagonal leave the other two corners of their shared
+    /// box empty. A plane through one of those corners reaches the body and
+    /// removes nothing.
+    #[test]
+    fn a_body_the_plane_reaches_but_finds_nothing_in_counts_as_crossed_and_not_cut() {
+        let mut volume = Volume::new(VOXEL);
+        volume.seed_sphere(Vec3::new(-20.0, -20.0, 0.0), 8.0);
+        volume.seed_sphere(Vec3::new(20.0, 20.0, 0.0), 8.0);
+        volume.mark_everything_dirty();
+        let mut doc = Document::from_volume(volume);
+
+        // Through the empty +X, -Y corner of the shared box, facing out of it.
+        let plane = ClipPlane::new(Vec3::new(24.0, -24.0, 0.0), Vec3::new(1.0, -1.0, 0.0)).unwrap();
+
+        let visible = shown(&doc);
+        let outcome = doc.clip(plane, &visible);
+        assert_eq!(outcome.bodies_crossed, 1, "the plane did not reach the body's box");
+        assert_eq!(outcome.bodies_cut, 0, "the plane found something to remove in an empty corner");
+        assert_eq!(outcome.bricks, 0);
+        assert!(outcome.entry.is_none());
     }
 }
 

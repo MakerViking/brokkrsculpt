@@ -9,9 +9,9 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use brokkr_core::{
-    BrickCoord, BrickMesh, Brush, BrushDirection, BrushKind, BrushScratch, Document, Entry,
-    History, HistoryStats, MAX_VOLUME_BYTES, MirrorAxis, MoveStroke, NodeId, Stamp, Stroke,
-    Symmetry, UndoOutcome, Volume, VolumeStats, lean_normal, raycast,
+    BrickCoord, BrickMesh, Brush, BrushDirection, BrushKind, BrushScratch, Change, Document, Entry,
+    History, HistoryStats, MAX_VOLUME_BYTES, MirrorAxis, MoveStroke, NodeId, NodeMeta, Stamp,
+    Stroke, Symmetry, UndoOutcome, Volume, VolumeStats, lean_normal,
 };
 use glam::{Vec2, Vec3};
 use iced::{Subscription, Task};
@@ -36,6 +36,31 @@ use crate::viewport::SharedFrame;
 /// the 256 cubed effective volume the milestones are measured against.
 const MODEL_RADIUS_MM: f32 = 30.0;
 const VOXEL_SIZE_MM: f32 = 0.25;
+
+/// The point every enabled mirror plane passes through: the lattice origin.
+///
+/// **One constant, so there is one answer.** `Symmetry::mirrors` and
+/// `Symmetry::flips` take the centre as a parameter rather than assuming it,
+/// and `cursor::build` draws the planes where this says they are, so the
+/// mirroring the engine performs and the mirroring the viewport promises come
+/// from the same number.
+///
+/// The value is the origin because **the axis and the centre must have the same
+/// scope**. The three axis switches are global -- one setting for the whole
+/// document -- and a global switch whose plane came from the selected body
+/// would make "X on" a different physical plane depending on which row is
+/// highlighted, with the only evidence on screen a translucent patch that
+/// shrinks with that body's radius. A single world-fixed mirror on a shared
+/// lattice is defensible and it is what the interface has always drawn.
+///
+/// **Be honest about what that does not fix.** With the centre pinned here, a
+/// dent carved into a body sitting at x = +80 still gets its twin at x = -80:
+/// free-floating geometry that exports as an extra, unprintable shell. The
+/// parameter alone buys nothing today. What stops that happening is
+/// [`Brokkr::mirror_refusal`], which will not let an axis be enabled while the
+/// active body sits wholly to one side of it. The real fix is a per-body
+/// centre, and it is deferred with the per-body axis it has to move with.
+const MIRROR_CENTRE: Vec3 = Vec3::ZERO;
 
 /// Range the brush radius may be nudged to with the keyboard, in millimetres.
 /// The same range the slider offers, so the two cannot disagree.
@@ -168,6 +193,27 @@ enum DragKind {
     /// The pointer is dragging the line of a plane cut. Nothing happens to the
     /// model until the button comes back up, so the line can be adjusted.
     Cutting,
+    /// The press landed on a body that was not the active one, so it chose that
+    /// body and nothing else.
+    ///
+    /// It is a drag kind rather than nothing at all because the release has to
+    /// know what the press meant: a gesture that never opened a recorder must
+    /// not be finished as if it had. Dragging after it does nothing, which is
+    /// the correct answer -- the body under the cursor changed, and a stroke
+    /// the user had not chosen a target for is exactly the surprise this
+    /// ordering exists to remove.
+    Selecting,
+    /// The press had nothing it was allowed to do: the pointer was over
+    /// nothing that is drawn, and the body edits would land on is hidden.
+    ///
+    /// A drag kind rather than no drag at all for the same reason
+    /// [`DragKind::Selecting`] is one -- the release has to know that this
+    /// press opened no recorder -- and a kind of its own rather than
+    /// `Selecting` because no body was chosen. **Without it the press falls
+    /// through to a stroke**, and a stroke whose surface comes from
+    /// `pick_body`, which does not consult the eye, carves the invisible body
+    /// and marks the document unsaved with nothing on screen changing.
+    Refused,
 }
 
 /// A drag in progress, tagged with the button that started it so that
@@ -328,6 +374,14 @@ pub struct Brokkr {
     overlay: brokkr_gpu::OverlayBatch,
     /// Where the pointer last met the surface, which is where the ring goes.
     hover: Option<Vec3>,
+    /// Which body that surface belonged to, or `None` when the pointer is off
+    /// the model.
+    ///
+    /// The ring is built against this body rather than the active one. Without
+    /// it, hovering a second body draws a ring sampled from a field that does
+    /// not contain the point -- a confident flat ring below nothing -- and the
+    /// mood cannot say that a press there would select rather than carve.
+    hover_body: Option<NodeId>,
     /// A hold-and-drag brush resize in progress.
     sizing: Option<Sizing>,
     /// Whether the radius tracks the model's size rather than staying a fixed
@@ -448,6 +502,46 @@ pub struct Brokkr {
     /// value like `2.` does not parse and snapping the field back to the old
     /// number mid-edit makes it unusable.
     menu_edit: Option<(SizingTarget, String)>,
+    /// Whether the body list draws its thumbnail column.
+    ///
+    /// **Session state, and deliberately not in the file.** Photoshop's Panel
+    /// Options offers None alongside three sizes and the standard advice for a
+    /// heavy document is None, so an off switch is faithful to the reference
+    /// rather than a retreat from it -- and by the rule that nothing outside the
+    /// file may dirty the document, toggling it must not set `unsaved`.
+    thumbnails: bool,
+    /// Whether the `+` button's little menu of primitives is open.
+    ///
+    /// A plain flag rather than a `stack!` layer: the menu is drawn inside the
+    /// panel column, under the verb row, so it needs no scrim and cannot fall
+    /// into the trap that iced 0.14 stack layers do not block what is beneath
+    /// them.
+    adding: bool,
+    /// A body delete waiting on an answer, because it is large enough that undo
+    /// may not be able to hold it.
+    pending_delete: Option<PendingDelete>,
+    /// How large a delete has to be before it asks first.
+    ///
+    /// [`brokkr_core::DEFAULT_RECLAIM_BUDGET`] by default, and one number rather
+    /// than two that happen to coincide: a delete that would be evicted from
+    /// history before it could be undone is exactly the delete that has to warn.
+    ///
+    /// Carried rather than a constant read in place so that a test can point it
+    /// at a small number -- the alternative is a fixture that really does hold
+    /// 512 MB of bricks, which is half a gigabyte of allocation inside a test
+    /// process running alongside every other test in the crate.
+    delete_prompt_bytes: usize,
+}
+
+/// A delete the user has been asked about, held until they answer.
+///
+/// It carries the size it measured rather than re-measuring on the way out:
+/// `Volume::stats` walks a body's whole brick map, and the number the prompt
+/// showed has to be the number the decision was made about.
+pub(crate) struct PendingDelete {
+    pub(crate) id: NodeId,
+    pub(crate) name: String,
+    pub(crate) bytes: usize,
 }
 
 /// An animated camera move to an orientation.
@@ -511,9 +605,17 @@ impl BugReport {
 /// Something the user asked for that would discard unsaved work, held until
 /// they say what to do about it.
 ///
-/// Each of these throws the current field away: New reseeds the sphere, Open
-/// swaps a file in, and Quit ends the process. They are the complete set of
-/// ways work can be lost, which is why the gate lives in one place.
+/// Each of these throws the current document away: New reseeds the sphere, Open
+/// swaps a file in, and Quit ends the process.
+///
+/// **They are not, as this comment used to claim, "the complete set of ways
+/// work can be lost", and that sentence was becoming a lie a reader would
+/// trust.** Two things are true instead. The gate lives in one place, so the
+/// list of *guarded* actions is complete by construction. And what counts as
+/// something to lose is no longer just `unsaved`: importing a mesh replaces
+/// every body in the document, so with a saved multi-body project open it used
+/// to discard all of them silently, having asked nothing, because nothing was
+/// unsaved. See [`Brokkr::would_lose_work`].
 ///
 /// `Clone` rather than `Copy` because one variant carries a path.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -527,8 +629,10 @@ pub(crate) enum PendingAction {
     /// autosave path, because the document that comes back must NOT be owned by
     /// that path -- see [`Brokkr::recover_autosave`].
     RecoverAutosave,
-    /// Import a mesh. Discards the document exactly as Open does, so it goes
-    /// through the same gate.
+    /// Import a mesh, REPLACING the document. It discards every body exactly as
+    /// Open does, so it goes through the same gate -- and, unlike Open, it does
+    /// not put a file the user chose in their place, which is why it is guarded
+    /// on the body count as well as on `unsaved`.
     Import,
     /// Carries the window, because with `exit_on_close_request(false)` the
     /// close has to be issued by us against that specific window.
@@ -542,10 +646,25 @@ impl PendingAction {
             PendingAction::NewSculpt => "Starting a new sculpt",
             PendingAction::Open | PendingAction::OpenRecent(_) => "Opening another file",
             PendingAction::RecoverAutosave => "Recovering the autosave",
-            PendingAction::Import => "Importing a mesh",
+            PendingAction::Import => "Importing a mesh in place of every body",
             PendingAction::Quit(_) => "Quitting",
         }
     }
+}
+
+/// Whether a world space box has material on both sides of a mirror plane
+/// through [`MIRROR_CENTRE`].
+///
+/// Touching counts as straddling: a body whose surface reaches the plane
+/// exactly has its twin land against it rather than out in space, which is a
+/// join and not a free-floating shell.
+fn straddles((low, high): (Vec3, Vec3), axis: MirrorAxis) -> bool {
+    let component = match axis {
+        MirrorAxis::X => 0,
+        MirrorAxis::Y => 1,
+        MirrorAxis::Z => 2,
+    };
+    low[component] <= MIRROR_CENTRE[component] && MIRROR_CENTRE[component] <= high[component]
 }
 
 /// Where bug reports go.
@@ -778,6 +897,7 @@ impl Brokkr {
             stats_open: false,
             overlay: brokkr_gpu::OverlayBatch::default(),
             hover: None,
+            hover_body: None,
             sizing: None,
             dynamic_radius: false,
             model_radius: MODEL_RADIUS_MM,
@@ -804,6 +924,10 @@ impl Brokkr {
             last_autosave: Instant::now(),
             last_activity: Instant::now(),
             menu_edit: None,
+            thumbnails: true,
+            adding: false,
+            pending_delete: None,
+            delete_prompt_bytes: brokkr_core::DEFAULT_RECLAIM_BUDGET,
         };
         app.remesh_dirty();
         // Otherwise the overlay reports a zero byte budget until the first
@@ -908,9 +1032,9 @@ impl Brokkr {
         }
     }
 
-    /// Do `action`, or ask first if there is unsaved work to lose.
+    /// Do `action`, or ask first if there is work to lose.
     fn guard(&mut self, action: PendingAction) -> Task<Message> {
-        if self.unsaved {
+        if self.would_lose_work(&action) {
             // The prompt is about to draw over the viewport, and a menu left
             // open would sit on top of it.
             self.top_menu = None;
@@ -919,6 +1043,24 @@ impl Brokkr {
             return Task::none();
         }
         self.run_pending(action)
+    }
+
+    /// Whether carrying `action` out would cost the user something they cannot
+    /// get back with one gesture.
+    ///
+    /// `unsaved` for everything, and for an import **the body count as well,
+    /// whether or not anything is unsaved**. Import replaces every body with
+    /// the mesh it reads. With a saved five-body project open, `unsaved` is
+    /// false, so it used to discard all five having asked nothing: no dialog,
+    /// no prompt, nothing in the status line. The file on disk survives, which
+    /// is the only reason this is a prompt and not a refusal — reassembling
+    /// five bodies by hand is not a recovery a user should have to make because
+    /// a menu item did more than its name said.
+    ///
+    /// Open is deliberately NOT guarded the same way: it puts a document the
+    /// user picked in place of this one, which is what its name promises.
+    fn would_lose_work(&self, action: &PendingAction) -> bool {
+        self.unsaved || (matches!(action, PendingAction::Import) && self.doc.body_count() > 1)
     }
 
     /// Act on the answer to the unsaved-work prompt.
@@ -1099,6 +1241,395 @@ impl Brokkr {
         self.model_radius_body = self.doc.active();
     }
 
+    /// Choose the body that edits land on, with everything that has to follow.
+    ///
+    /// The one place a selection changes, so that the three things which follow
+    /// one cannot be forgotten: the measured radius the camera and the mirror
+    /// planes are sized by, the mirror axes the newly chosen body may not be
+    /// allowed to use, and a status line saying what was chosen — there is no
+    /// panel to show it yet.
+    ///
+    /// **It re-measures and must never rescale the brush**: selecting changes
+    /// no geometry, and a Dynamic brush that resized because the selection
+    /// changed would carve at a radius the user never chose. See
+    /// [`Brokkr::rescale_radius`], which spells out that failure in full.
+    ///
+    /// **It deliberately does not set `unsaved`.** Which row is active is
+    /// written to the file, so this does leave the document a shade out of step
+    /// with what is on disk; raising a "discard your work?" prompt because
+    /// somebody clicked a different body would be far worse, and no geometry is
+    /// at stake either way.
+    fn select_body(&mut self, body: NodeId) {
+        let name = self.doc.node(body).map_or("another body", |node| node.name.as_str());
+        let note = format!("selected {name}");
+        self.select_body_saying(body, note);
+    }
+
+    /// [`Brokkr::select_body`] with the caller's own line instead of "selected
+    /// X".
+    ///
+    /// The note has to be set HERE rather than by the caller afterwards,
+    /// because the mirror refusal below must have the last word: which body is
+    /// selected is visible in the panel, and a mirror plane going off is not
+    /// visible anywhere else. A caller that set its own status after selecting
+    /// would silently eat that refusal.
+    fn select_body_saying(&mut self, body: NodeId, note: String) {
+        if body == self.doc.active() {
+            return;
+        }
+        self.doc.set_active(body);
+        self.refresh_model_radius();
+        self.status = note;
+        self.refuse_mirrors_the_body_does_not_straddle("turned off");
+    }
+
+    /// Add one primitive as a NEW body, and select it.
+    ///
+    /// **The whole feature, from the user's chair: press `+`, pick Cube, and a
+    /// cube appears in the list and on screen.** Everything in the eight
+    /// increments before this one exists so that these few lines are the only
+    /// thing that had to be written to get there.
+    ///
+    /// One [`Change::NodeAdded`], so ctrl+Z removes it and ctrl+shift+Z brings
+    /// it back. **The camera does not move**: framing is something the user set,
+    /// and a tool that re-frames on every add makes a twelve-body layout
+    /// impossible to build.
+    fn add_primitive(&mut self, kind: brokkr_core::PrimitiveKind) {
+        // Refused BEFORE anything allocates, and named rather than silently
+        // ignored. The reader's own clamps do not cover this: nothing built by
+        // the interface goes through the reader.
+        if self.doc.body_count() >= brokkr_core::MAX_BODIES {
+            self.status = format!(
+                "could not add a {}: this document holds {} bodies, which is the limit",
+                kind.label().to_lowercase(),
+                self.doc.body_count()
+            );
+            return;
+        }
+        if self.doc.node_count() >= brokkr_core::MAX_NODES {
+            self.status = format!(
+                "could not add a {}: this document holds {} rows, which is the limit",
+                kind.label().to_lowercase(),
+                self.doc.node_count()
+            );
+            return;
+        }
+
+        let (centre, half) = brokkr_core::primitive::placement(&self.doc, MODEL_RADIUS_MM);
+
+        // The size ceilings, checked BEFORE `build` allocates a single brick.
+        // `MAX_BODIES` is nowhere near the binding limit: a cube is sized off
+        // the biggest body, so at a fine voxel the very first one can be tens
+        // of gigabytes, and sixty-four of anything is not what runs the machine
+        // out of room. The pool figure is the WATERMARK, because adding a body
+        // empties nothing and the bump pointer is what overflows -- see
+        // `GrowthGuard`, whose doc comment is the argument in full.
+        let pool = self.shared.stats();
+        // A capacity of zero is a pool that has never reported: before the
+        // first frame, and in every headless test. Judging against it would
+        // refuse every add there has ever been, so the vertex ceiling is simply
+        // not applied and the memory one still is. The resample guard makes the
+        // same call one line into itself -- `if pool.vertices_reserved == 0 {
+        // return None }` -- for the same reason.
+        let headroom = if pool.vertex_capacity == 0 {
+            u64::MAX
+        } else {
+            pool.vertex_capacity.saturating_sub(pool.vertices_watermark)
+        };
+        let (bytes, vertices) = brokkr_core::primitive::cost(kind, self.doc.voxel_size(), half);
+        if let Some((why, workable)) = self.doc.growth_guard(headroom).no_room_for(bytes, vertices)
+        {
+            self.status = format!(
+                "could not add a {} {:.1} mm across: {why} ({:.1} mm)",
+                kind.label().to_lowercase(),
+                half * 2.0,
+                half * 2.0 * workable,
+            );
+            return;
+        }
+
+        let volume = brokkr_core::primitive::build(kind, self.doc.voxel_size(), centre, half);
+        let id = self.doc.add_body(kind.label(), volume);
+        let at = self.doc.node_count() - 1;
+
+        let before = self.history.stats();
+        self.history.push(Entry::new(vec![Change::NodeAdded { at, id }]));
+        self.record_history(before);
+        self.unsaved = true;
+
+        let note = format!("added a {} {:.1} mm across", kind.label().to_lowercase(), half * 2.0);
+        self.select_body_saying(id, note);
+        self.remesh_dirty();
+        self.refresh_overlay();
+    }
+
+    /// Flip one row's OWN eye, as one undoable change.
+    ///
+    /// **Hiding the body that is active moves the selection**, evaluated against
+    /// [`Document::saved_visibility`] and never against what solo is showing: a
+    /// view mode must not be able to veto a structural rule. When there is no
+    /// other visible body to move to, the hide is refused outright rather than
+    /// leaving the application with an active body nobody can see and every
+    /// press reporting that it is hidden.
+    fn toggle_visibility(&mut self, id: NodeId) {
+        let Some(before_meta) = self.doc.meta(id) else {
+            return;
+        };
+        let after = NodeMeta { visible: !before_meta.visible, ..before_meta.clone() };
+        self.doc.set_meta(&after);
+
+        // Resolved rather than read off the bit, because an ancestor folder can
+        // hide a row whose own eye is on.
+        let mut saved = Vec::new();
+        self.doc.saved_visibility(&mut saved);
+        let active_is_hidden = self
+            .doc
+            .index_of(self.doc.active())
+            .and_then(|index| saved.get(index))
+            .is_some_and(|shown| !shown);
+
+        let mut note =
+            format!("{} {}", if after.visible { "showing" } else { "hiding" }, after.name);
+        let mut moved_to = None;
+        if active_is_hidden {
+            let replacement = self
+                .doc
+                .nodes()
+                .iter()
+                .zip(&saved)
+                .find(|(node, shown)| **shown && node.is_body())
+                .map(|(node, _)| (node.id, node.name.clone()));
+            match replacement {
+                Some((next, name)) => {
+                    note = format!("hiding {} — {name} is now selected", after.name);
+                    moved_to = Some(next);
+                }
+                None => {
+                    self.doc.set_meta(&before_meta);
+                    self.status =
+                        "cannot hide the last visible body — there would be nothing to sculpt"
+                            .to_string();
+                    return;
+                }
+            }
+        }
+
+        let before = self.history.stats();
+        self.history.push(Entry::new(vec![Change::NodeMeta { id, before: before_meta, after }]));
+        self.record_history(before);
+        // The eye is written to the file, so flipping it is a change to the
+        // document.
+        self.unsaved = true;
+        match moved_to {
+            Some(next) => self.select_body_saying(next, note),
+            None => self.status = note,
+        }
+    }
+
+    /// Turn every eye in the document on, as ONE undo entry.
+    ///
+    /// The way out of having hidden things and lost track of what. A no-op when
+    /// nothing is hidden, and it says so rather than pushing an empty entry that
+    /// would cost the user a real undo.
+    fn show_everything(&mut self) {
+        let changes: Vec<Change> = self
+            .doc
+            .nodes()
+            .iter()
+            .filter(|node| !node.visible)
+            .map(|node| {
+                let before = node.meta();
+                let after = NodeMeta { visible: true, ..before.clone() };
+                Change::NodeMeta { id: node.id, before, after }
+            })
+            .collect();
+        if changes.is_empty() {
+            self.status = "everything is already showing".to_string();
+            return;
+        }
+
+        let shown = changes.len();
+        for change in &changes {
+            if let Change::NodeMeta { after, .. } = change {
+                self.doc.set_meta(after);
+            }
+        }
+        let before = self.history.stats();
+        self.history.push(Entry::new(changes));
+        self.record_history(before);
+        self.unsaved = true;
+        self.status = format!("showing {shown} hidden {}", if shown == 1 { "row" } else { "rows" });
+    }
+
+    /// Delete the active body, asking first when undo may not be able to hold
+    /// it.
+    ///
+    /// **The prompt is on the SIZE and nothing else**, and the threshold is the
+    /// same 512 MB as the reclaim allowance because a delete that would be
+    /// evicted before it could be undone is exactly the one that has to warn.
+    /// It is measured over the whole subtree rather than the one row, so that a
+    /// folder delete asks about what it is really taking -- today a subtree is
+    /// always one body, and summing is what keeps that from having to be
+    /// rewritten when folders land.
+    fn delete_active_body(&mut self) {
+        let id = self.doc.active();
+        if self.doc.body_count() <= 1 {
+            self.status = "cannot delete the last body — a sculpt always holds one".to_string();
+            return;
+        }
+        let Some(node) = self.doc.node(id) else {
+            return;
+        };
+        let bytes = self.subtree_bytes(id);
+        if bytes >= self.delete_prompt_bytes {
+            self.pending_delete = Some(PendingDelete { id, name: node.name.clone(), bytes });
+            return;
+        }
+        self.remove_body(id);
+    }
+
+    /// What deleting this row would take with it, in bytes.
+    ///
+    /// A sum over the subtree, which today is the row itself. Walks the body's
+    /// brick map, so it belongs to a user action and never to a frame.
+    fn subtree_bytes(&self, id: NodeId) -> usize {
+        self.doc
+            .node(id)
+            .and_then(|node| node.volume())
+            .map_or(0, |volume| volume.stats().resident_bytes)
+    }
+
+    /// Take one body out of the document, recording the whole node so undo can
+    /// put it back.
+    ///
+    /// The volume MOVES into the entry -- `Volume` has no `Clone` at all -- so a
+    /// delete allocates nothing and peak memory does not rise; it merely does
+    /// not fall until the entry is evicted.
+    ///
+    /// **The three lines after the removal are one unit and increment 6 wrote
+    /// down why.** A removed body's bricks are in nobody's dirty set, so
+    /// `SharedFrame::forget_body` is what releases its slots -- queued rather
+    /// than called, because the pool lives inside the pipeline Iced owns and
+    /// releasing slots while that body's meshes still sit in `pending` would
+    /// re-upload them into fresh slices on the same frame. And the whole-document
+    /// remesh is the other half: `MeshPool::forget_body` clears the pool-full
+    /// banner when it frees space, and a brick the pool refused while it was
+    /// full was dropped on the floor with its coordinate long gone from the
+    /// dirty set. Freeing the space without re-offering everything takes the
+    /// warning down and leaves the geometry missing.
+    fn remove_body(&mut self, id: NodeId) {
+        let Some(at) = self.doc.index_of(id) else {
+            return;
+        };
+        let node = self.doc.remove(at);
+        let name = node.name.clone();
+        self.shared.forget_body(id);
+        self.doc.mark_everything_dirty();
+
+        let before = self.history.stats();
+        self.history.push(Entry::new(vec![Change::NodeRemoved { at, node: Box::new(node) }]));
+        self.unsaved = true;
+        self.status = format!("deleted {name}");
+        // After the delete's own line, so an eviction that took an older
+        // deleted body with it wins the status.
+        self.record_history(before);
+        self.refresh_model_radius();
+        self.remesh_dirty();
+        self.refresh_overlay();
+    }
+
+    /// Turn off every enabled mirror plane the active body sits wholly to one
+    /// side of, and say which.
+    ///
+    /// **This is the mitigation for the centre being the lattice origin.** With
+    /// [`MIRROR_CENTRE`] pinned there, a dent carved into a body at x = +80 has
+    /// its twin written at x = -80: free-floating geometry, in empty space, that
+    /// exports as an extra shell no slicer can print and nothing on screen
+    /// explains. Refusing the mirror is what stops the first primitive a user
+    /// adds from growing one.
+    ///
+    /// Turning the axis off rather than keeping it on and quietly ignoring it
+    /// is the honest form: there is then one answer to "is X mirroring on", the
+    /// strip highlight and the drawn plane agree with the sculpt, and nothing
+    /// has to carry an effective-versus-actual pair.
+    ///
+    /// # What it costs, and when it is allowed to run
+    ///
+    /// [`Volume::surface_bounds`] scans every dense brick and its own
+    /// documentation forbids calling it per frame, so this asks only at a user
+    /// action and only while a mirror is actually enabled — the `is_off` check
+    /// is what keeps the common case free. The two call sites are enabling an
+    /// axis and choosing a different body, which are the two ways the pairing
+    /// of "this axis" with "this body" can change.
+    ///
+    /// **The residual, said out loud:** sculpting a body across the plane while
+    /// the axis is off does not turn it back on by itself. The user toggles the
+    /// axis and it is re-measured. Re-measuring per stroke would put a
+    /// full-model scan on every button release, which is the thing the cache in
+    /// `brokkr-core` refuses to hold for exactly this reason.
+    fn refuse_mirrors_the_body_does_not_straddle(&mut self, verb: &str) {
+        if self.symmetry.is_off() {
+            return;
+        }
+        let Some(bounds) = self.doc.active_volume().surface_bounds() else {
+            // No surface, so there is nothing to be on one side of. A mirror of
+            // nothing is nothing.
+            return;
+        };
+        for axis in MirrorAxis::ALL {
+            if !self.symmetry.axis(axis) || straddles(bounds, axis) {
+                continue;
+            }
+            self.symmetry = self.symmetry.with_axis(axis, false);
+            self.status = self.mirror_refusal(axis, verb);
+        }
+    }
+
+    /// Whether the active body has material on both sides of one mirror plane.
+    ///
+    /// Separate from the sweep above because enabling an axis asks about one
+    /// axis and a selection asks about all three, and the sweep is what makes
+    /// one scan of the field answer for all of them.
+    fn mirror_straddles(&self, axis: MirrorAxis) -> bool {
+        self.doc.active_volume().surface_bounds().is_none_or(|bounds| straddles(bounds, axis))
+    }
+
+    /// What the user is told when a mirror plane misses the body.
+    fn mirror_refusal(&self, axis: MirrorAxis, verb: &str) -> String {
+        let name = self.doc.node(self.doc.active()).map_or("the body", |node| node.name.as_str());
+        format!(
+            "{} mirroring {verb}: {name} sits entirely to one side of the {} plane, so every \
+             mirrored stroke would land in empty space",
+            axis.label(),
+            axis.label(),
+        )
+    }
+
+    /// Turn one mirror plane on or off, refusing to turn one on that the
+    /// active body does not straddle.
+    ///
+    /// **The one gate every way of enabling a mirror goes through.** There is
+    /// more than one way: the symmetry strip sends a message, and a SpaceMouse
+    /// button mapped to `ToggleSymmetry` toggles X directly. While the refusal
+    /// lived inside the message arm the SpaceMouse route turned X on
+    /// unrefused, and every stroke after it wrote its twin into empty space --
+    /// with the strip highlight and the drawn plane both agreeing that nothing
+    /// was wrong, and the status line saying nothing at all. One function
+    /// rather than two spellings of one.
+    ///
+    /// Turning one OFF is never refused: the refusal exists to stop material
+    /// appearing where the user cannot see it, and nothing appears when a plane
+    /// goes away.
+    fn toggle_mirror(&mut self, axis: MirrorAxis) {
+        if self.symmetry.axis(axis) {
+            self.symmetry = self.symmetry.with_axis(axis, false);
+        } else if self.mirror_straddles(axis) {
+            self.symmetry = self.symmetry.with_axis(axis, true);
+        } else {
+            self.status = self.mirror_refusal(axis, "refused");
+        }
+    }
+
     /// Rebuild the brush ring and mirror planes and hand them to the renderer.
     ///
     /// Called from the places that change what it looks like -- pointer motion,
@@ -1112,22 +1643,101 @@ impl Brokkr {
         // frame's comes back with its capacity -- so nothing allocates once
         // warm.
         let mut batch = std::mem::take(&mut self.overlay);
+        // The body the pick returned, and not the active one. The ring is
+        // pushed onto the surface by sampling the field it is over, so building
+        // it from a body that does not contain the hover point draws a
+        // confident ring in mid air; see `cursor::build`.
+        let hovered = self.hover_body.unwrap_or_else(|| self.doc.active());
+        let volume = self.doc.volume(hovered).unwrap_or_else(|| self.doc.active_volume());
+        let selecting = self.hover_body.is_some_and(|body| body != self.doc.active());
         cursor::build(
             &mut batch,
-            self.doc.active_volume(),
+            volume,
             &self.effective_brush(),
             self.symmetry,
+            MIRROR_CENTRE,
             self.hover,
-            cursor::mood(self.stroke_direction(), self.sizing.is_some()),
+            cursor::mood(self.stroke_direction(), self.sizing.is_some(), selecting),
             self.model_radius,
         );
         self.shared.swap_overlay(&mut batch);
         self.overlay = batch;
     }
 
-    /// Where the pointer meets the surface, remembered for the cursor ring.
+    /// Where the pointer meets the surface, and on which body, remembered for
+    /// the cursor ring and read by the press.
     fn update_hover(&mut self, pixel: Vec2) {
+        match self.pick(pixel) {
+            Some((body, hit)) => {
+                self.hover = Some(hit.position);
+                self.hover_body = Some(body);
+            }
+            None => {
+                self.hover = None;
+                self.hover_body = None;
+            }
+        }
+    }
+
+    /// The same, except that a live stroke owns the ring.
+    ///
+    /// **While a stroke is running the ring belongs to the body being carved
+    /// and to no other.** [`Brokkr::update_hover`] picks across every drawn
+    /// body, so dragging a stroke over a second body moved the ring onto that
+    /// body's surface -- and [`Brokkr::refresh_overlay`] builds the ring out of
+    /// the hovered body's field and colours it as `CursorMood::Selecting` the
+    /// moment the hovered body is not the active one. The cursor was telling
+    /// the user "a press here would select", on the wrong surface, during a
+    /// press that was carving something else. The carve itself was never
+    /// affected, because the stroke asks [`Brokkr::surface_under`]; only the
+    /// overlay lied, which is worse than it sounds for a tool whose whole
+    /// feedback loop is that ring.
+    ///
+    /// Asking `surface_under` here costs one march of one body, where the pick
+    /// it replaces marched every drawn one, so the stroke path got cheaper
+    /// rather than dearer.
+    fn refresh_hover(&mut self, pixel: Vec2) {
+        if !matches!(self.drag.map(|drag| drag.kind), Some(DragKind::Sculpt(_))) {
+            self.update_hover(pixel);
+            return;
+        }
         self.hover = self.surface_under(pixel);
+        // Paired with the position rather than set unconditionally: a stroke
+        // dragged off the model has no ring, and a `hover_body` naming a body
+        // no ring is being drawn against would be a fact with no owner.
+        self.hover_body = self.hover.map(|_| self.doc.active());
+    }
+
+    /// The nearest DRAWN surface under a point in widget pixels, and the body
+    /// it belongs to.
+    ///
+    /// The visibility mask is the one `publish_visibility` already keeps, so
+    /// the pick, the renderer and the panel cannot disagree about what is on
+    /// screen — and a body the user cannot see cannot be picked, hovered or
+    /// carved.
+    fn pick(&self, pixel: Vec2) -> Option<(NodeId, brokkr_core::Hit)> {
+        let (origin, ray) = self.ray_through(pixel);
+        self.doc.pick(origin, ray, self.camera.far, &self.shown)
+    }
+
+    /// Whether the body edits land on is one of the ones being drawn.
+    ///
+    /// **The pick alone does not answer this**, and that is the whole reason
+    /// this exists. [`Document::pick`] refuses a hidden body, but a stroke
+    /// takes its surface from [`Document::pick_body`], which asks one named
+    /// body and deliberately does not consult the eye -- a live stroke keeps
+    /// carving the body it started on. So a press while the ACTIVE body is
+    /// hidden picks nothing, falls through to a sculpt, and then happily
+    /// marches the invisible body and carves it.
+    ///
+    /// The mask is `publish_visibility`'s, which is recomputed after every
+    /// message, so it is never stale by the time a pointer event reads it. A
+    /// body that is not in the document at all reads as not drawn, which is
+    /// the safe direction: the answer only ever refuses.
+    fn active_is_drawn(&self) -> bool {
+        self.doc
+            .index_of(self.doc.active())
+            .is_some_and(|index| self.shown.get(index).copied().unwrap_or(false))
     }
 
     /// Keep the brush a constant fraction of the model when asked to.
@@ -1175,10 +1785,39 @@ impl Brokkr {
         self.camera.ray(ndc, aspect)
     }
 
-    /// Where the cursor meets the surface, if it does.
+    /// Where the cursor meets the ACTIVE body's surface, if it does.
+    ///
+    /// A live stroke keeps carving the body it started on however many others
+    /// the cursor passes over, so this asks one body rather than picking. It
+    /// goes through [`Document::pick_body`] rather than calling `raycast`
+    /// directly, so that it shares the box gate and the box advance with the
+    /// picker: two marches that disagree about where the surface is would put
+    /// the ring in one place and the stroke in another.
     fn surface_under(&self, pixel: Vec2) -> Option<Vec3> {
         let (origin, ray) = self.ray_through(pixel);
-        raycast(self.doc.active_volume(), origin, ray, self.camera.far).map(|hit| hit.position)
+        self.doc.pick_body(self.doc.active(), origin, ray, self.camera.far).map(|hit| hit.position)
+    }
+
+    /// Open the undo recorder on the body this stroke is about to write to, if
+    /// a press has not already opened it.
+    ///
+    /// **This is called where the edit happens and not where the button goes
+    /// down, and that ordering is the whole point.** Recording used to open in
+    /// the `Pressed` arm before anything had been raycast, which with more than
+    /// one body means opening it on the wrong one -- and `record_for_undo` does
+    /// nothing at all when the volume it is called on has no recorder, so the
+    /// carve would land, no history entry would be pushed, `unsaved` would stay
+    /// false, and quitting would not even raise the discard prompt. One press,
+    /// unrecoverable work.
+    ///
+    /// Lazy rather than moved into the press for one behaviour worth keeping: a
+    /// press that starts off the model and drags onto it sculpts, and there is
+    /// no body to open a recorder on until it arrives.
+    fn arm_recorder(&mut self) {
+        let volume = self.doc.active_volume_mut();
+        if !volume.is_recording() {
+            volume.begin_stroke();
+        }
     }
 
     /// Apply the brush along the stroke path up to the point under the cursor.
@@ -1242,7 +1881,16 @@ impl Brokkr {
             let Some(point) = self.surface_under(pixel) else {
                 return;
             };
-            self.move_stroke.begin(self.doc.active_volume(), &brush, point, self.symmetry);
+            // Past the last early return, so the recorder opens on the body
+            // that is about to be warped and not a moment sooner.
+            self.arm_recorder();
+            self.move_stroke.begin(
+                self.doc.active_volume(),
+                &brush,
+                point,
+                self.symmetry,
+                MIRROR_CENTRE,
+            );
             self.move_grab = Some(point);
         }
         let Some(grab) = self.move_grab else {
@@ -1270,7 +1918,13 @@ impl Brokkr {
         // one undo entry.
         if self.move_stroke.is_at_the_limit() {
             let carried = grab + self.move_stroke.applied();
-            self.move_stroke.begin(self.doc.active_volume(), &brush, carried, self.symmetry);
+            self.move_stroke.begin(
+                self.doc.active_volume(),
+                &brush,
+                carried,
+                self.symmetry,
+                MIRROR_CENTRE,
+            );
             self.move_grab = Some(carried);
         }
 
@@ -1297,6 +1951,11 @@ impl Brokkr {
             // stamped in mid air.
             return;
         };
+
+        // Past the early return, so the recorder opens on the body that is
+        // about to be carved and only once there is something to carve. See
+        // `arm_recorder`.
+        self.arm_recorder();
 
         let started = Instant::now();
         self.stamp_centres.clear();
@@ -1342,6 +2001,7 @@ impl Brokkr {
                     self.doc.active_volume_mut(),
                     &stamp,
                     self.symmetry,
+                    MIRROR_CENTRE,
                     &mut self.brush_scratch,
                 );
             }
@@ -1425,6 +2085,10 @@ impl Brokkr {
 
     /// Turn the dragged line into a plane and cut with it.
     ///
+    /// **It cuts every body the user can SEE**, which is [`Document::clip`]'s
+    /// whole job: solo narrows the set, a hidden body the line passes over is
+    /// left bit-identical, and the whole gesture is one undo entry.
+    ///
     /// The plane is the one containing the eye and both ends of the line, so it
     /// is exactly the surface the line sweeps out going away from the viewer --
     /// which is what makes a screen-space drag mean something in three
@@ -1462,47 +2126,43 @@ impl Brokkr {
             return;
         };
 
-        // **THE CUT IS SINGLE-BODY, AND IT MUST NOT STAY THAT WAY.** The
-        // decision is that a cut crosses every VISIBLE body, because a cut is a
-        // line the user draws across what they can see; the rename that turned
-        // `self.volume` into the document made this quietly mean "the active
-        // body" with nothing anywhere failing, which is the exact shape of
-        // change that ships unnoticed. It becomes
-        // `Document::clip(plane, visible) -> CutOutcome` -- one `Entry` of N
-        // `Change::Bricks`, `changed > 0` becoming `bricks > 0`, and "the cut
-        // missed the model" reserved for `bodies_cut == 0` -- when there is a
-        // second body for it to cross and a compound undo entry to record it
-        // in. Until then this assertion is what says so out loud, and
-        // `a_cut_crosses_every_visible_body` is the test that has to go green
-        // when the loop lands.
-        debug_assert_eq!(
-            self.doc.body_count(),
-            1,
-            "the plane cut still cuts only the active body, and this document has more than one"
-        );
-        let body = self.doc.active();
-        let volume = self.doc.active_volume_mut();
-        volume.begin_stroke();
-        let changed = volume.clip(plane);
-        let edit = volume.end_stroke();
-        match edit {
-            Some(edit) if changed > 0 => {
-                let before = self.history.stats();
-                self.history.push(Entry::stroke(body, edit));
-                self.unsaved = true;
-                self.status = format!("cut {changed} bricks");
-                // After the cut's own message on purpose: an eviction that took
-                // a deleted body with it outranks a count of bricks.
-                self.record_history(before);
-                self.remesh_dirty();
-                self.refresh_overlay();
+        // **The cut crosses every VISIBLE body**, which is what
+        // `Document::clip` is for: solo narrows the set, a hidden body the line
+        // passes over comes back bit-identical, and the whole gesture is ONE
+        // undo entry of N `Change::Bricks`. Direct manipulation acts on what is
+        // drawn.
+        let visible = self.shown_nodes();
+        let outcome = self.doc.clip(plane, &visible);
+        if outcome.bricks > 0 {
+            let before = self.history.stats();
+            if let Some(entry) = outcome.entry {
+                self.history.push(entry);
             }
-            _ => {
-                // The plane missed the model. Nothing changed, so nothing is
-                // recorded -- an undo entry for a no-op would be worse than
-                // none.
-                self.status = "the cut missed the model".to_string();
-            }
+            self.unsaved = true;
+            self.status = if outcome.bodies_cut > 1 {
+                format!("cut {} bricks across {} bodies", outcome.bricks, outcome.bodies_cut)
+            } else {
+                format!("cut {} bricks", outcome.bricks)
+            };
+            // After the cut's own message on purpose: an eviction that took
+            // a deleted body with it outranks a count of bricks.
+            self.record_history(before);
+            self.remesh_dirty();
+            self.refresh_overlay();
+        } else {
+            // Nothing changed, so nothing is recorded -- an undo entry for a
+            // no-op would be worse than none. The two ways to get here read
+            // very differently to a user, so they are told apart: a line that
+            // went nowhere near anything, and a line that really did pass over
+            // a body and found only empty space inside its box.
+            self.status = if outcome.bodies_crossed > 0 {
+                format!(
+                    "the cut crossed {} bodies and found nothing to remove",
+                    outcome.bodies_crossed
+                )
+            } else {
+                "the cut missed the model".to_string()
+            };
         }
         // One cut per arming. A destructive tool that stays live is how a
         // stray click removes half the model.
@@ -1874,6 +2534,15 @@ impl Brokkr {
     /// a view can come from a file, and the radius ceiling has already moved
     /// once. A saved 12 mm brush is fine; a saved 40 mm one from some future
     /// build must not put the slider somewhere it cannot be dragged back from.
+    ///
+    /// The mirror planes are put back and then **swept**, for the same reason
+    /// choosing a body sweeps them: a file can name a mirror the body it was
+    /// saved with does not straddle -- it was saved from a build without the
+    /// refusal, or with a different body active -- and a restored mirror
+    /// carves twins into empty space exactly as an enabled one does. The sweep
+    /// costs one measurement of the field, at a file open or a key press,
+    /// which is a user action; see
+    /// [`Brokkr::refuse_mirrors_the_body_does_not_straddle`].
     fn apply_view(&mut self, view: &brokkr_core::View) {
         self.camera = OrbitCamera {
             target: view.camera_target,
@@ -1889,6 +2558,7 @@ impl Brokkr {
             .into_iter()
             .zip(view.mirror)
             .fold(Symmetry::OFF, |set, (axis, on)| set.with_axis(axis, on));
+        self.refuse_mirrors_the_body_does_not_straddle("turned off");
     }
 
     /// Whether there is a crash net to offer.
@@ -1944,6 +2614,12 @@ impl Brokkr {
         };
 
         self.doc = doc;
+        // Before `apply_view`, so that a mirror plane the loaded body does not
+        // straddle wins the status line: which file was opened is visible in
+        // the title and the recent list, and a mirror plane going off is not
+        // visible anywhere else. Same ordering, and same reason, as
+        // `select_body`.
+        self.status = format!("opened {}", path.display());
         self.apply_view(&state.view);
         self.timeline.adopt(state.keys);
 
@@ -1953,7 +2629,6 @@ impl Brokkr {
         self.project_path = Some(path.to_path_buf());
         self.unsaved = false;
         self.recent.record(path);
-        self.status = format!("opened {}", path.display());
         self.publish_camera();
         self.rebuild_everything();
         self.refresh_detail_advice();
@@ -2496,14 +3171,21 @@ impl Brokkr {
     /// Exact, unlike [`Brokkr::resample`]: a quarter turn maps voxels onto
     /// voxels, so nothing is resampled and turning back returns the same bits.
     /// That is also why there is no undo entry -- see below.
+    ///
+    /// **Every body turns, and turning only the active one would be wrong.**
+    /// Bodies share one lattice and have no transform, so where a body sits IS
+    /// its brick occupancy and the arrangement of the bodies is the only
+    /// positional state the document has. Turning one of them would scatter
+    /// that arrangement with nothing to put it back, and it would make this
+    /// function's own status line -- turn it back the same way to undo -- a
+    /// lie, because the bodies that did not turn would come back somewhere new.
     fn orient(&mut self, rotation: brokkr_core::AxisRotation) {
         if rotation.is_identity() {
             return;
         }
 
         let started = Instant::now();
-        let turned = self.doc.active_volume().rotated(rotation);
-        self.doc.replace_active_volume(turned);
+        self.doc.rotate(rotation);
         self.unsaved = true;
         // Every entry names a brick of a volume that no longer exists, exactly
         // as after a resample. Snapshotting the whole field instead would
@@ -2547,7 +3229,9 @@ impl Brokkr {
                     self.publish_camera();
                 }
                 ButtonAction::ToggleSymmetry => {
-                    self.symmetry = self.symmetry.toggled(MirrorAxis::X);
+                    // Through the same gate the strip uses, and not a bare
+                    // `toggled`: see `toggle_mirror`.
+                    self.toggle_mirror(MirrorAxis::X);
                 }
             }
         }
@@ -2794,7 +3478,10 @@ impl Brokkr {
     /// keyboard guard and NOT in the pointer one.** Split this function in two
     /// at that point rather than widening it and quietly killing the drag.
     fn modal_open(&self) -> bool {
-        self.confirm.is_some() || self.orient_prompt.is_some() || self.bug_report.is_some()
+        self.confirm.is_some()
+            || self.orient_prompt.is_some()
+            || self.bug_report.is_some()
+            || self.pending_delete.is_some()
     }
 
     /// What a key press means, now that nothing in the widget tree wanted it.
@@ -2913,7 +3600,40 @@ impl Brokkr {
                     // progress, in which case the pointer belongs to that
                     // gesture and a press must not lay down a stroke.
                     PointerButton::Left if self.sizing.is_some() => DragKind::Sizing,
-                    PointerButton::Left => DragKind::Sculpt(self.stroke_direction()),
+                    // **The body is resolved from the raycast BEFORE anything
+                    // opens a recorder**, which is the whole ordering this
+                    // increment exists for; see `arm_recorder`. A press over a
+                    // body that is not the active one selects it and carves
+                    // nothing, and the press after that sculpts -- the same
+                    // rule Photoshop's layer panel has, applied to the model
+                    // itself so that direct manipulation acts on what is drawn.
+                    // A press over a HIDDEN body picks nothing, because
+                    // `Document::pick` never marches one.
+                    PointerButton::Left => match self.pick(position) {
+                        Some((body, _)) if body != self.doc.active() => {
+                            self.select_body(body);
+                            DragKind::Selecting
+                        }
+                        Some(_) => DragKind::Sculpt(self.stroke_direction()),
+                        // Nothing drawn under the pointer. That is normally a
+                        // press beside the model, which is allowed to become a
+                        // stroke the moment it is dragged onto one -- but not
+                        // when the body it would carve is itself hidden. See
+                        // `active_is_drawn`: the stroke's own raycast does not
+                        // consult the eye, so without this the press carves a
+                        // body nobody can see. Saying which body is the honest
+                        // half; a press that silently does nothing is its own
+                        // puzzle.
+                        None if !self.active_is_drawn() => {
+                            let name = self
+                                .doc
+                                .node(self.doc.active())
+                                .map_or("the active body", |node| node.name.as_str());
+                            self.status = format!("{name} is hidden — show it before sculpting it");
+                            DragKind::Refused
+                        }
+                        None => DragKind::Sculpt(self.stroke_direction()),
+                    },
                     // Right and middle move the camera. Shift slides instead of
                     // turning.
                     PointerButton::Right | PointerButton::Middle => {
@@ -2933,12 +3653,9 @@ impl Brokkr {
                 });
 
                 if let DragKind::Sculpt(direction) = kind {
-                    // One stroke is one undo entry, so recording opens here and
-                    // closes when the button comes back up.
-                    self.doc.active_volume_mut().begin_stroke();
                     self.sculpt_to(position, direction, true);
                 }
-                self.update_hover(position);
+                self.refresh_hover(position);
                 self.refresh_overlay();
             }
             PointerEvent::Released { button } => {
@@ -2998,8 +3715,14 @@ impl Brokkr {
                     }
                     // The cut line is only drawn while it is being dragged;
                     // the model is not touched until the button comes up, so
-                    // the line can be adjusted freely.
-                    Some(DragKind::Cutting) | Some(DragKind::Sizing) | None => {}
+                    // the line can be adjusted freely. A press that chose a
+                    // body is over: dragging must not turn it into a stroke on
+                    // a body the user has only just arrived at.
+                    Some(DragKind::Cutting)
+                    | Some(DragKind::Sizing)
+                    | Some(DragKind::Selecting)
+                    | Some(DragKind::Refused)
+                    | None => {}
                 }
 
                 // Over the cube: light the part under the pointer, and draw no
@@ -3011,13 +3734,14 @@ impl Brokkr {
                 }
                 if over_cube.is_some() {
                     self.hover = None;
+                    self.hover_body = None;
                     self.refresh_overlay();
                     return;
                 }
 
                 // The ring follows the pointer, and the surface under it moves
                 // as a stroke cuts into it.
-                self.update_hover(position);
+                self.refresh_hover(position);
                 self.refresh_overlay();
             }
             PointerEvent::Scrolled { amount } => {
@@ -3091,7 +3815,7 @@ impl Brokkr {
                 self.brush.strength = strength;
                 self.strengths[Self::strength_slot(self.brush.kind)] = strength;
             }
-            Message::SymmetryAxisToggled(axis) => self.symmetry = self.symmetry.toggled(axis),
+            Message::SymmetryAxisToggled(axis) => self.toggle_mirror(axis),
             Message::PatternChanged(kind) => self.brush.pattern.kind = kind,
             Message::PatternScaleChanged(scale) => self.brush.pattern.scale_mm = scale,
             Message::PatternDepthChanged(depth) => self.brush.pattern.depth = depth,
@@ -3223,9 +3947,15 @@ impl Brokkr {
                 if self.confirm.is_some() {
                     return self.answer_confirm(ConfirmChoice::Cancel);
                 }
+                // Same reasoning one card down: Escape against the delete
+                // prompt means "don't", which is the harmless answer.
+                if self.pending_delete.take().is_some() {
+                    return Task::none();
+                }
                 // Escape is also the way out of an armed cut, which is the only
                 // mode in the application that changes what a click does.
                 self.cut_armed = false;
+                self.adding = false;
                 self.menu = None;
                 self.menu_edit = None;
                 self.top_menu = None;
@@ -3265,6 +3995,37 @@ impl Brokkr {
             }
             Message::DynamicRadiusToggled(on) => self.dynamic_radius = on,
 
+            // --- the body panel ----------------------------------------------
+            Message::BodySelected(id) => self.select_body(id),
+            Message::BodyVisibilityToggled(id) => self.toggle_visibility(id),
+            Message::ActiveBodyVisibilityToggled => {
+                let active = self.doc.active();
+                self.toggle_visibility(active);
+            }
+            Message::EveryBodyShown => self.show_everything(),
+            Message::PrimitiveMenuToggled => self.adding = !self.adding,
+            Message::PrimitiveAdded(kind) => {
+                // Closed whatever happens, including on a refusal: a menu that
+                // stays open after a press that was refused reads as a press
+                // that never landed.
+                self.adding = false;
+                self.add_primitive(kind);
+            }
+            Message::BodyDeleted => self.delete_active_body(),
+            Message::BodyDeleteConfirmed => {
+                if let Some(pending) = self.pending_delete.take() {
+                    self.remove_body(pending.id);
+                }
+            }
+            Message::BodyDeleteCancelled => {
+                // Nothing else: cancelling changes not one byte of the
+                // document, which is the whole promise of the prompt.
+                self.pending_delete = None;
+            }
+            // Session state, so deliberately NOT `unsaved`: nothing about it is
+            // written to the file.
+            Message::ThumbnailsToggled => self.thumbnails = !self.thumbnails,
+
             Message::TimelineResized(width) => self.timeline.resized(width),
             Message::TimelineHover(x) => {
                 self.timeline.hover(x);
@@ -3278,6 +4039,11 @@ impl Brokkr {
                 let view = self.current_view();
                 match self.timeline.press(view) {
                     Some(crate::timeline::Pressed::WentTo(index)) => {
+                        // Before the view is applied, so that a mirror plane
+                        // the body does not straddle wins the line: which key
+                        // was gone to is visible in the timeline, and a plane
+                        // going off is not visible anywhere else.
+                        self.status = format!("key {} of {}", index + 1, self.timeline.keys.len());
                         // Everything a key holds, not only the camera: going
                         // to a key is going back to a working setup.
                         if let Some(key) = self.timeline.keys.get(index).copied() {
@@ -3285,7 +4051,6 @@ impl Brokkr {
                             self.publish_camera();
                             self.refresh_overlay();
                         }
-                        self.status = format!("key {} of {}", index + 1, self.timeline.keys.len());
                     }
                     Some(crate::timeline::Pressed::Added(index)) => {
                         self.unsaved = true;
@@ -3918,6 +4683,7 @@ mod tests {
                 app.doc.active_volume_mut(),
                 &Stamp::new(at, normal, BrushDirection::Add),
                 app.symmetry,
+                MIRROR_CENTRE,
                 &mut app.brush_scratch,
             );
 
@@ -5494,6 +6260,427 @@ mod tests {
         assert_eq!(app.confirm, Some(PendingAction::Import));
     }
 
+    /// **A saved multi-body document is still work, and import throws all of it
+    /// away.**
+    ///
+    /// The gate consulted `unsaved` alone, so with a saved five-body project
+    /// open, File > Import replaced every body with the mesh and asked nothing:
+    /// no dialog, no prompt, no status line. The file survives on disk, which
+    /// is why this is a prompt rather than a refusal.
+    #[test]
+    fn importing_over_a_saved_document_of_several_bodies_asks_first() {
+        let mut app = app();
+        assert!(!app.unsaved, "the fixture must be clean or this measures the old gate");
+
+        // One body and saved: nothing to lose that Open would not also cost, so
+        // no prompt. This half is what says the guard did not simply become
+        // "always ask".
+        update(&mut app, Message::ImportRequested);
+        assert_eq!(app.confirm, None, "a single-body import should not be interrupted");
+
+        let mut second = Volume::new(app.doc.voxel_size());
+        second.seed_sphere(Vec3::new(60.0, 0.0, 0.0), 10.0);
+        app.doc.add_body("Body 2", second);
+        app.publish_visibility();
+        assert!(!app.unsaved, "adding the fixture body must not be what raises the prompt");
+
+        update(&mut app, Message::ImportRequested);
+        assert_eq!(
+            app.confirm,
+            Some(PendingAction::Import),
+            "importing discarded a second body without asking"
+        );
+    }
+
+    /// Two bodies, one in front of the other, both drawn.
+    ///
+    /// The second ball is placed on the line from the origin to the eye, so a
+    /// press at the centre of the viewport meets it before the starting sphere.
+    /// `publish_visibility` is called by hand because the fixture builds the
+    /// document directly rather than through a message, and the pick reads the
+    /// mask the application publishes.
+    fn two_bodies_in_a_line(app: &mut Brokkr) -> (NodeId, NodeId) {
+        let front = app.camera.eye().normalize() * 55.0;
+        let mut second = Volume::new(app.doc.voxel_size());
+        second.seed_sphere(front, 8.0);
+        second.mark_everything_dirty();
+        let other = app.doc.add_body("Body 2", second);
+        app.publish_visibility();
+        app.remesh_dirty();
+        (app.doc.active(), other)
+    }
+
+    /// **The press ordering, which is the one that loses work if it is wrong.**
+    ///
+    /// Recording used to open in the `Pressed` arm before anything had been
+    /// raycast. With two bodies that opens it on the wrong one, and
+    /// `record_for_undo` does nothing at all when the volume it is called on
+    /// has no recorder — so the carve lands, no entry is pushed, `unsaved` stays
+    /// false, and quitting does not even raise the discard prompt.
+    ///
+    /// The rule that falls out is the one Photoshop's layer list has: a press
+    /// on something that is not selected selects it, and the press after that
+    /// works on it.
+    #[test]
+    fn a_press_over_another_body_selects_it_and_carves_nothing_until_the_next_press() {
+        let mut app = app();
+        let (first, other) = two_bodies_in_a_line(&mut app);
+
+        // The surfaces the camera meets first: the starting ball at its own
+        // radius, and the second ball at its centre plus its radius, because
+        // the ray comes inwards from the eye.
+        let front_of_first = app.camera.eye().normalize() * MODEL_RADIUS_MM;
+        let front_of_other = app.camera.eye().normalize() * 63.0;
+        let first_before = app.doc.volume(first).expect("a live body").sample_world(front_of_first);
+        let other_before = app.doc.volume(other).expect("a live body").sample_world(front_of_other);
+
+        press(&mut app, centre_of_viewport());
+        release(&mut app);
+
+        assert_eq!(app.doc.active(), other, "the press did not choose the body it landed on");
+        assert!(!app.history.can_undo(), "a press that only selected recorded a stroke");
+        assert!(!app.unsaved, "a press that only selected dirtied the document");
+        assert_eq!(
+            app.doc.volume(first).expect("a live body").sample_world(front_of_first),
+            first_before,
+            "the press carved the body it was leaving"
+        );
+        assert_eq!(
+            app.doc.volume(other).expect("a live body").sample_world(front_of_other),
+            other_before,
+            "the press that selected also carved"
+        );
+
+        // And now it sculpts, on the body it chose.
+        press(&mut app, centre_of_viewport());
+        release(&mut app);
+
+        assert_eq!(app.doc.active(), other, "the second press moved the selection again");
+        assert!(app.history.can_undo(), "the second press recorded no undo entry");
+        assert!(app.unsaved, "the second press left the document looking saved");
+        assert_ne!(
+            app.doc.volume(other).expect("a live body").sample_world(front_of_other),
+            other_before,
+            "the second press did not carve the selected body"
+        );
+        assert_eq!(
+            app.doc.volume(first).expect("a live body").sample_world(front_of_first),
+            first_before,
+            "the stroke landed on the body that was NOT selected"
+        );
+    }
+
+    /// Hiding is a draw-time skip, so the depth buffer where a hidden body sits
+    /// is empty. A press there must go through it: carving something invisible
+    /// would set `unsaved`, push an entry, pay a remesh and an upload, and
+    /// change not one pixel.
+    #[test]
+    fn a_press_over_a_hidden_body_carves_nothing_and_reaches_what_is_behind_it() {
+        let mut app = app();
+        let (first, other) = two_bodies_in_a_line(&mut app);
+
+        let mut meta = app.doc.meta(other).expect("the second body");
+        meta.visible = false;
+        app.doc.set_meta(&meta);
+        app.publish_visibility();
+
+        let front_of_first = app.camera.eye().normalize() * MODEL_RADIUS_MM;
+        let front_of_other = app.camera.eye().normalize() * 63.0;
+        let other_before = app.doc.volume(other).expect("a live body").sample_world(front_of_other);
+        let first_before = app.doc.volume(first).expect("a live body").sample_world(front_of_first);
+
+        press(&mut app, centre_of_viewport());
+        release(&mut app);
+
+        assert_eq!(app.doc.active(), first, "a hidden body was selected by a press over it");
+        assert_eq!(
+            app.doc.volume(other).expect("a live body").sample_world(front_of_other),
+            other_before,
+            "the press carved a body that is not on screen"
+        );
+        assert_ne!(
+            app.doc.volume(first).expect("a live body").sample_world(front_of_first),
+            first_before,
+            "the press stopped at a body nothing is drawing"
+        );
+    }
+
+    /// The same rule, for the case the pick cannot answer on its own.
+    ///
+    /// [`Document::pick`] masks on visibility, so it refuses a hidden body --
+    /// but a stroke takes its surface from `pick_body`, which asks one named
+    /// body and never consults the eye. So a press while the ACTIVE body is
+    /// hidden picked nothing, fell through to a sculpt, and carved the
+    /// invisible body: an undo entry pushed, `unsaved` set, a remesh and an
+    /// upload paid for, and not one pixel changed. Reachable today only by
+    /// opening a file whose active row is hidden; a one-click bug the moment
+    /// the panel ships an eye.
+    #[test]
+    fn a_press_while_the_active_body_is_hidden_carves_nothing_and_says_which_body() {
+        let mut app = app();
+        let active = app.doc.active();
+        let mut meta = app.doc.meta(active).expect("the starting body");
+        meta.visible = false;
+        app.doc.set_meta(&meta);
+        app.publish_visibility();
+
+        let front = app.camera.eye().normalize() * MODEL_RADIUS_MM;
+        let before = app.doc.active_volume().sample_world(front);
+
+        press(&mut app, centre_of_viewport());
+        app.on_pointer(PointerEvent::Moved {
+            position: centre_of_viewport() + Vector::new(20.0, 0.0),
+            size: SIZE,
+        });
+        release(&mut app);
+
+        assert_eq!(
+            app.doc.active_volume().sample_world(front),
+            before,
+            "the press carved the body that is not on screen"
+        );
+        assert!(!app.history.can_undo(), "a press that carved nothing recorded a stroke");
+        assert!(!app.unsaved, "a press that carved nothing dirtied the document");
+        assert!(
+            app.status.contains("hidden") && app.status.contains(Document::FIRST_BODY_NAME),
+            "nothing said why the press did nothing: {:?}",
+            app.status
+        );
+
+        // Shown again, the very same press works: the refusal is about the
+        // eye and nothing else.
+        meta.visible = true;
+        app.doc.set_meta(&meta);
+        app.publish_visibility();
+        press(&mut app, centre_of_viewport());
+        release(&mut app);
+        assert_ne!(
+            app.doc.active_volume().sample_world(front),
+            before,
+            "the press stopped working on a body that is drawn"
+        );
+    }
+
+    /// **A live stroke owns the ring.**
+    ///
+    /// The `Moved` arm carved the active body and then picked across every
+    /// drawn body anyway, so a stroke dragged over a second body moved
+    /// `hover_body` onto that second body -- and the ring is built from the
+    /// hovered body's field and coloured `CursorMood::Selecting` whenever the
+    /// hovered body is not the active one. The cursor said "a press here would
+    /// select", on the wrong surface, during a press that was carving
+    /// something else.
+    #[test]
+    fn the_ring_stays_on_the_body_a_live_stroke_is_carving() {
+        let mut app = app();
+        let (first, other) = two_bodies_in_a_line(&mut app);
+
+        // The control. With no button down the centre of the viewport hovers
+        // the SECOND body, which is the whole reason a stroke dragged there
+        // could move the ring; without this the test would also pass on a
+        // build where the hover never reaches that body at all.
+        app.on_pointer(PointerEvent::Moved { position: centre_of_viewport(), size: SIZE });
+        assert_eq!(app.hover_body, Some(other), "the fixture never hovers the second body");
+
+        // Off to the side, where only the first body is, so the press starts a
+        // stroke instead of choosing the other body.
+        let beside = Vector::new(610.0, 300.0);
+        press(&mut app, beside);
+        assert_eq!(app.doc.active(), first, "the press beside the second ball chose a body");
+        assert!(
+            matches!(app.drag.map(|drag| drag.kind), Some(DragKind::Sculpt(_))),
+            "the press beside the second ball did not start a stroke: {:?}",
+            app.drag.map(|drag| drag.kind)
+        );
+
+        app.on_pointer(PointerEvent::Moved { position: centre_of_viewport(), size: SIZE });
+        assert_eq!(
+            app.hover_body,
+            Some(first),
+            "mid-stroke the ring hopped onto a body the stroke is not carving"
+        );
+        assert!(app.hover.is_some(), "the ring vanished from the body being carved");
+
+        // And it comes back the moment the stroke ends.
+        release(&mut app);
+        app.on_pointer(PointerEvent::Moved { position: centre_of_viewport(), size: SIZE });
+        assert_eq!(app.hover_body, Some(other), "the hover never returned to the pick");
+    }
+
+    /// **The mitigation for the mirror centre being the lattice origin.**
+    ///
+    /// With the centre pinned there, mirroring a body that sits wholly to one
+    /// side of a plane writes its twin out in empty space: a free-floating
+    /// shell that exports and that no slicer can print. The axis is refused
+    /// rather than enabled-and-ignored, so there is one answer to "is X on".
+    #[test]
+    fn a_mirror_the_active_body_does_not_straddle_is_refused_with_a_reason() {
+        let mut app = app();
+
+        // The starting ball is centred on the origin, so every plane crosses it
+        // and every axis is allowed. This half is what stops the refusal from
+        // being "always refuse".
+        update(&mut app, Message::SymmetryAxisToggled(MirrorAxis::X));
+        assert!(app.symmetry.axis(MirrorAxis::X), "a body on the origin was refused its mirror");
+        update(&mut app, Message::SymmetryAxisToggled(MirrorAxis::X));
+        assert!(!app.symmetry.axis(MirrorAxis::X));
+
+        let mut second = Volume::new(app.doc.voxel_size());
+        second.seed_sphere(Vec3::new(80.0, 0.0, 0.0), 10.0);
+        second.mark_everything_dirty();
+        let other = app.doc.add_body("Body 2", second);
+        app.publish_visibility();
+        app.remesh_dirty();
+        app.select_body(other);
+
+        update(&mut app, Message::SymmetryAxisToggled(MirrorAxis::X));
+        assert!(!app.symmetry.axis(MirrorAxis::X), "a mirror was enabled that misses the body");
+        assert!(
+            app.status.contains('X') && app.status.contains("Body 2"),
+            "the refusal said nothing useful: {:?}",
+            app.status
+        );
+
+        // The other two planes DO cross it, and must not be refused along with
+        // the one that does not.
+        update(&mut app, Message::SymmetryAxisToggled(MirrorAxis::Y));
+        assert!(app.symmetry.axis(MirrorAxis::Y), "a plane the body straddles was refused");
+    }
+
+    /// **A refusal wired into one event site is not a refusal.**
+    ///
+    /// The symmetry strip is not the only way to turn X mirroring on: a
+    /// SpaceMouse button bound to `ToggleSymmetry` did it with a bare
+    /// `Symmetry::toggled`, so a puck user on a body at x = +80 got every
+    /// stroke's twin written into empty space, with the strip highlight and
+    /// the drawn plane both agreeing that nothing was wrong. This drives the
+    /// application's real button path rather than calling the gate, because
+    /// the gate was never what was broken.
+    #[test]
+    fn the_spacemouse_symmetry_button_is_refused_the_mirror_the_strip_is_refused() {
+        let mut app = app();
+        let first = app.doc.active();
+        app.spacemouse.config.buttons[0] = ButtonAction::ToggleSymmetry;
+
+        let mut second = Volume::new(app.doc.voxel_size());
+        second.seed_sphere(Vec3::new(80.0, 0.0, 0.0), 10.0);
+        second.mark_everything_dirty();
+        let other = app.doc.add_body("Body 2", second);
+        app.publish_visibility();
+        app.remesh_dirty();
+        app.select_body(other);
+
+        app.spacemouse.simulate_press(0);
+        app.drive_from_spacemouse(16.0);
+
+        assert!(
+            !app.symmetry.axis(MirrorAxis::X),
+            "the puck turned on a mirror plane the body sits entirely to one side of"
+        );
+        assert!(
+            app.status.contains('X') && app.status.contains("Body 2"),
+            "the puck's refusal said nothing: {:?}",
+            app.status
+        );
+
+        // And it still works where the mirror is legitimate, so the fix is a
+        // gate and not a disconnected wire.
+        app.select_body(first);
+        app.spacemouse.simulate_press(0);
+        app.drive_from_spacemouse(16.0);
+        assert!(
+            app.symmetry.axis(MirrorAxis::X),
+            "the puck stopped turning on a mirror the body does straddle"
+        );
+    }
+
+    /// A view out of a file is a third way for a mirror to come on, and a
+    /// restored one carves twins into empty space exactly as an enabled one
+    /// does -- the file may have been written by a build without the refusal,
+    /// or with a different body active.
+    #[test]
+    fn a_mirror_restored_from_a_view_the_body_does_not_straddle_is_turned_off() {
+        let mut app = app();
+        let mut off_centre = Volume::new(app.doc.voxel_size());
+        off_centre.seed_sphere(Vec3::new(80.0, 0.0, 0.0), 10.0);
+        off_centre.mark_everything_dirty();
+        app.doc = Document::from_volume(off_centre);
+        app.publish_visibility();
+        app.remesh_dirty();
+
+        let mut view = app.current_view();
+        view.mirror = [true, true, true];
+        app.apply_view(&view);
+
+        assert!(!app.symmetry.axis(MirrorAxis::X), "a file turned on a mirror the body misses");
+        assert!(
+            app.symmetry.axis(MirrorAxis::Y) && app.symmetry.axis(MirrorAxis::Z),
+            "the two planes the body does straddle were dropped as well"
+        );
+    }
+
+    /// The axis and the centre have the same scope, so choosing a body the
+    /// enabled plane misses has to resolve the pairing one way or the other.
+    /// It turns the plane off and says so, rather than leaving the strip
+    /// claiming a mirror the sculpt is not applying.
+    #[test]
+    fn selecting_a_body_clear_of_an_enabled_mirror_plane_turns_that_plane_off() {
+        let mut app = app();
+        update(&mut app, Message::SymmetryAxisToggled(MirrorAxis::X));
+        assert!(app.symmetry.axis(MirrorAxis::X));
+
+        let mut second = Volume::new(app.doc.voxel_size());
+        second.seed_sphere(Vec3::new(80.0, 0.0, 0.0), 10.0);
+        second.mark_everything_dirty();
+        let other = app.doc.add_body("Body 2", second);
+        app.publish_visibility();
+        app.remesh_dirty();
+
+        app.select_body(other);
+        assert!(
+            !app.symmetry.axis(MirrorAxis::X),
+            "the mirror stayed on over a body it does not cross"
+        );
+        assert!(app.status.contains('X'), "nothing said the mirror went off: {:?}", app.status);
+    }
+
+    /// **A quarter turn turns the whole document.**
+    ///
+    /// Bodies share one lattice and have no transform, so their arrangement is
+    /// the only positional state there is. `orient` turned `active_volume()`
+    /// alone, which with two bodies scatters that arrangement — and makes its
+    /// own status line, "turn it back the same way to undo", untrue for every
+    /// body that stayed put. The bit-exactness of four turns is measured in
+    /// `brokkr-core`; this is the wiring.
+    #[test]
+    fn turning_the_model_turns_every_body_and_not_just_the_active_one() {
+        let mut app = app();
+        // Off the axis the turn is about: a ball sitting ON that axis comes
+        // back to the same box whether the turn reached it or not, and this
+        // test would then pass with `orient` still turning one body.
+        let mut second = Volume::new(app.doc.voxel_size());
+        second.seed_sphere(Vec3::new(0.0, 50.0, 0.0), 8.0);
+        second.mark_everything_dirty();
+        let other = app.doc.add_body("Body 2", second);
+        app.publish_visibility();
+        app.remesh_dirty();
+
+        let before =
+            app.doc.volume(other).expect("a live body").world_bounds().expect("a seeded ball");
+        app.orient(brokkr_core::AxisRotation::taking(
+            brokkr_core::Facing::Front,
+            brokkr_core::Facing::Up,
+        ));
+        let after =
+            app.doc.volume(other).expect("a live body").world_bounds().expect("still a ball");
+
+        assert_ne!(before, after, "the inactive body did not turn with the model");
+        assert!(
+            ((after.1 - after.0).length() - (before.1 - before.0).length()).abs() < 1.0e-3,
+            "the inactive body changed size rather than orientation: {before:?} to {after:?}"
+        );
+    }
+
     #[test]
     fn the_autosave_tick_waits_for_the_interval_and_for_the_stroke_to_end() {
         let directory = scratch("autosave-tick");
@@ -5672,21 +6859,18 @@ mod tests {
         assert_eq!(app.brush.radius, radius, "selecting back resized the brush");
     }
 
-    /// **The plane cut crosses every VISIBLE body**, and today it crosses only
-    /// the active one.
+    /// **The plane cut crosses every VISIBLE body.**
     ///
     /// A cut is a line the user draws across what they can see, so it acts on
     /// what is drawn. `finish_cut` was single-volume before there was a
     /// document, and the rename that gave it one made it silently mean "the
     /// active body" -- which is exactly the kind of change that ships with
-    /// nothing failing. This is the executable statement of what it owes,
-    /// ignored until `Document::clip(plane, visible) -> CutOutcome` exists to
-    /// satisfy it, alongside the compound undo entry that records one `Entry`
-    /// of N `Change::Bricks`. The `debug_assert!` at the top of `finish_cut` is
-    /// the same tripwire from the other side, and it is what this test trips
-    /// today.
+    /// nothing failing. This was written as the executable statement of what it
+    /// owed and left `#[ignore]`d, alongside a `debug_assert!` at the top of
+    /// `finish_cut` saying the same thing from the other side. Both were
+    /// discharged by `Document::clip`, which brackets each visible body and
+    /// records ONE `Entry` of N `Change::Bricks`.
     #[test]
-    #[ignore = "the N-body cut lands with the primitives that can create a second body"]
     fn a_cut_crosses_every_visible_body() {
         let mut app = app();
         app.camera.yaw = 0.0;
@@ -7762,5 +8946,551 @@ mod swap_site_tests {
         }
 
         let _ = std::fs::remove_dir_all(&directory);
+    }
+}
+
+/// The body panel: primitives, the eye, delete, and the element tree that draws
+/// them.
+///
+/// **`panel.rs` had literally zero coverage before this module**, because
+/// `view()` was never called by any test in the crate -- so no assertion at any
+/// level could see a row panic, a heading vanish, or a widget tree fail to
+/// build. Building an `Element` needs no GPU and no window, which is what makes
+/// the smoke test below possible at all.
+#[cfg(test)]
+mod body_panel_tests {
+    use super::*;
+    use brokkr_core::{MAX_BODIES, NodeMeta, PrimitiveKind};
+
+    fn update(app: &mut Brokkr, message: Message) {
+        drop(app.update(message));
+    }
+
+    fn app() -> Brokkr {
+        Brokkr::with_tablet(crate::tablet::Tablet::inert())
+    }
+
+    /// A body with nothing in it, for the cases that need rows rather than
+    /// geometry.
+    ///
+    /// A real primitive at every one of sixty-four rows is a few hundred
+    /// megabytes of bricks to draw a list, and the list does not read a voxel.
+    fn cheap_body(app: &mut Brokkr, name: &str) -> NodeId {
+        let volume = Volume::new(app.doc.voxel_size());
+        app.doc.add_body(name, volume)
+    }
+
+    fn names(app: &Brokkr) -> Vec<String> {
+        app.doc.nodes().iter().map(|node| node.name.clone()).collect()
+    }
+
+    /// **The waterline.** Press `+`, pick Cube, and there is a second body in
+    /// the document that does not overlap the first.
+    #[test]
+    fn adding_a_primitive_puts_a_new_body_clear_of_everything_already_there() {
+        let mut app = app();
+        let camera_before = (app.camera.yaw, app.camera.pitch, app.camera.distance);
+
+        update(&mut app, Message::PrimitiveMenuToggled);
+        assert!(app.adding, "the plus button did not open the menu");
+        update(&mut app, Message::PrimitiveAdded(PrimitiveKind::Cube));
+
+        assert!(!app.adding, "the menu stayed open after a choice");
+        assert_eq!(app.doc.body_count(), 2, "the cube did not become a body");
+        assert_eq!(names(&app)[1], "Cube");
+        assert_eq!(app.doc.active(), app.doc.nodes()[1].id, "the new body was not selected");
+        assert!(app.unsaved, "adding a body did not mark the document unsaved");
+
+        // The decision that makes the feature demonstrate itself: clear of the
+        // model, not at the origin inside it.
+        assert!(
+            app.doc.overlaps().is_empty(),
+            "the cube interpenetrates the ball: {:?}",
+            app.doc.overlaps()
+        );
+        let ball = app.doc.nodes()[0].volume().unwrap().surface_bounds().unwrap();
+        let cube = app.doc.nodes()[1].volume().unwrap().surface_bounds().unwrap();
+        assert!(cube.0.x > ball.1.x, "the cube's surface box overlaps the ball's along X");
+
+        // The camera is something the user set. A tool that re-frames on every
+        // add makes a twelve-body layout impossible to build.
+        assert_eq!(
+            (app.camera.yaw, app.camera.pitch, app.camera.distance),
+            camera_before,
+            "adding a body moved the camera"
+        );
+    }
+
+    /// Each of the three, so a new kind cannot be added without a shape.
+    #[test]
+    fn every_primitive_kind_lands_as_its_own_body() {
+        let mut app = app();
+        for kind in PrimitiveKind::ALL {
+            update(&mut app, Message::PrimitiveAdded(kind));
+        }
+        assert_eq!(app.doc.body_count(), 4);
+        assert_eq!(names(&app)[1..], ["Cube", "Sphere", "Cylinder"]);
+        assert!(app.doc.overlaps().is_empty(), "two primitives were placed inside each other");
+    }
+
+    /// One `Change::NodeAdded`, so one ctrl+Z removes it and one ctrl+shift+Z
+    /// brings it back.
+    #[test]
+    fn adding_a_primitive_is_one_undo_entry() {
+        let mut app = app();
+        let before = app.history_stats.undo_entries;
+        update(&mut app, Message::PrimitiveAdded(PrimitiveKind::Sphere));
+        assert_eq!(
+            app.history_stats.undo_entries,
+            before + 1,
+            "adding a body was not exactly one entry"
+        );
+
+        update(&mut app, Message::Undo);
+        assert_eq!(app.doc.body_count(), 1, "undo did not remove the primitive");
+        update(&mut app, Message::Redo);
+        assert_eq!(app.doc.body_count(), 2, "redo did not bring it back");
+        assert_eq!(names(&app)[1], "Sphere");
+    }
+
+    /// Dynamic radius follows the MODEL changing under the brush, never the
+    /// selection changing -- and an add does both at once, which is the case
+    /// that catches it.
+    #[test]
+    fn adding_a_primitive_dirties_only_the_new_body_and_leaves_the_brush_alone() {
+        let mut app = app();
+        update(&mut app, Message::DynamicRadiusToggled(true));
+        let radius = app.brush.radius;
+        // Drain whatever the fixture left behind, so what is measured is what
+        // the add produced.
+        app.remesh_dirty();
+
+        update(&mut app, Message::PrimitiveAdded(PrimitiveKind::Cube));
+        let added = app.doc.nodes()[1].id;
+
+        // `self.dirty` is the batch the add's own remesh consumed, and it is
+        // still there afterwards: every pair in it has to name the new body.
+        // The ball's bricks did not change, so not one of them may be in it.
+        assert!(!app.dirty.is_empty(), "the add dirtied nothing at all");
+        assert!(
+            app.dirty.iter().all(|(body, _)| *body == added),
+            "the add dirtied bricks belonging to a body it did not touch"
+        );
+        let mut left = Vec::new();
+        app.doc.take_dirty(&mut left);
+        assert!(left.is_empty(), "something dirtied bricks after the add: {left:?}");
+        assert!(
+            app.doc.volume(added).is_some_and(|volume| volume.brick_count() > 0),
+            "the cube has no bricks"
+        );
+        assert_eq!(app.brush.radius, radius, "adding a body resized a Dynamic brush");
+    }
+
+    /// A cap is a refusal with a line that names it, never a panic and never a
+    /// silent no-op. Nothing the interface builds goes through the reader, so
+    /// the reader's clamps do not cover this.
+    #[test]
+    fn adding_past_the_body_cap_is_refused_and_says_so() {
+        let mut app = app();
+        while app.doc.body_count() < MAX_BODIES {
+            let name = format!("Body {}", app.doc.body_count() + 1);
+            cheap_body(&mut app, &name);
+        }
+        update(&mut app, Message::PrimitiveAdded(PrimitiveKind::Cube));
+
+        assert_eq!(app.doc.body_count(), MAX_BODIES, "the cap let a body through");
+        assert!(
+            app.status.contains("could not add") && app.status.contains(&MAX_BODIES.to_string()),
+            "the refusal does not name the cap: {}",
+            app.status
+        );
+    }
+
+    /// **The ceiling `MAX_BODIES` is not.** A primitive is sized off the
+    /// biggest body in the document, so at a fine voxel the very FIRST one can
+    /// be tens of gigabytes; sixty-four rows is not a limit anybody reaches
+    /// before the machine does. And the refusal has to land before
+    /// `primitive::build`, because `build` is the allocation it is refusing.
+    ///
+    /// The fixture also pins WHICH pool number is read. The pool here has four
+    /// times the vertices this cube needs by `vertices_reserved` and half of
+    /// what it needs by the watermark, so a guard that took the reserved figure
+    /// -- the substitution `GrowthGuard`'s doc comment exists to forbid -- would
+    /// wave it through.
+    #[test]
+    fn a_primitive_the_pool_cannot_hold_is_refused_before_it_is_built() {
+        let mut app = app();
+        let (_, half) = brokkr_core::primitive::placement(&app.doc, MODEL_RADIUS_MM);
+        let (_, vertices) =
+            brokkr_core::primitive::cost(PrimitiveKind::Cube, app.doc.voxel_size(), half);
+        app.shared.set_stats_for_tests(brokkr_gpu::PoolStats {
+            vertices_reserved: 0,
+            vertices_watermark: (vertices * 2.0) as u64,
+            vertex_capacity: (vertices * 2.5) as u64,
+            ..Default::default()
+        });
+        let before = app.doc.body_count();
+        let bricks = app.doc.totals().dense_bricks;
+
+        update(&mut app, Message::PrimitiveAdded(PrimitiveKind::Cube));
+
+        assert_eq!(app.doc.body_count(), before, "the cube was added anyway");
+        assert_eq!(app.doc.totals().dense_bricks, bricks, "something was allocated regardless");
+        assert!(
+            app.status.contains("could not add a cube") && app.status.contains("mesh pool"),
+            "the refusal does not say what ran out: {}",
+            app.status
+        );
+        // Established pattern in this codebase: a refusal names the size that
+        // WOULD work, rather than leaving the user to bisect.
+        assert!(app.status.contains("mm)"), "the refusal names no workable size: {}", app.status);
+    }
+
+    /// Clicking one row's eye must leave the active body exactly where it was.
+    ///
+    /// This is the message-level half. The other half is that the eye's button
+    /// captures the press before the row's `mouse_area` can see it, which is a
+    /// widget property and is documented on `Brokkr::body_row`.
+    #[test]
+    fn toggling_another_rows_eye_does_not_change_the_active_body() {
+        let mut app = app();
+        update(&mut app, Message::PrimitiveAdded(PrimitiveKind::Cube));
+        let first = app.doc.nodes()[0].id;
+        let cube = app.doc.nodes()[1].id;
+        update(&mut app, Message::BodySelected(cube));
+
+        update(&mut app, Message::BodyVisibilityToggled(first));
+        assert!(!app.doc.node(first).unwrap().visible, "the eye did not go off");
+        assert_eq!(app.doc.active(), cube, "hiding another row moved the selection");
+    }
+
+    /// Hiding the body edits land on has to move the selection somewhere the
+    /// user can see, or every press afterwards reports that it is hidden.
+    #[test]
+    fn hiding_the_active_body_moves_the_selection_to_one_that_is_visible() {
+        let mut app = app();
+        update(&mut app, Message::PrimitiveAdded(PrimitiveKind::Cube));
+        let first = app.doc.nodes()[0].id;
+        let cube = app.doc.nodes()[1].id;
+        assert_eq!(app.doc.active(), cube);
+
+        update(&mut app, Message::BodyVisibilityToggled(cube));
+        assert_eq!(app.doc.active(), first, "the selection stayed on a body nobody can see");
+        assert!(app.status.contains("is now selected"), "nothing said why: {}", app.status);
+    }
+
+    /// ...and when there is nowhere for it to go, the hide is refused rather
+    /// than leaving the application with nothing to sculpt.
+    #[test]
+    fn hiding_the_last_visible_body_is_refused_and_changes_nothing() {
+        let mut app = app();
+        let only = app.doc.active();
+        let entries = app.history_stats.undo_entries;
+
+        update(&mut app, Message::BodyVisibilityToggled(only));
+
+        assert!(app.doc.node(only).unwrap().visible, "the last visible body was hidden");
+        assert!(!app.unsaved, "a refused hide marked the document unsaved");
+        assert_eq!(app.history_stats.undo_entries, entries, "a refused hide recorded an entry");
+        assert!(app.status.contains("cannot hide"), "the refusal said nothing: {}", app.status);
+    }
+
+    /// `ctrl+comma` acts on the active row, and `ctrl+alt+comma` is the way back
+    /// from having hidden things and lost track of what.
+    #[test]
+    fn the_visibility_chords_toggle_the_active_row_and_reveal_everything() {
+        let mut app = app();
+        update(&mut app, Message::PrimitiveAdded(PrimitiveKind::Cube));
+        let first = app.doc.nodes()[0].id;
+        let cube = app.doc.nodes()[1].id;
+
+        assert!(
+            matches!(
+                crate::viewport::shortcut(",", true, false, false),
+                Some(Message::ActiveBodyVisibilityToggled)
+            ),
+            "ctrl+comma spells nothing"
+        );
+        assert!(
+            matches!(
+                crate::viewport::shortcut(",", true, false, true),
+                Some(Message::EveryBodyShown)
+            ),
+            "ctrl+alt+comma spells nothing"
+        );
+
+        // The active body is the cube, and hiding it moves the selection.
+        update(&mut app, Message::ActiveBodyVisibilityToggled);
+        assert!(!app.doc.node(cube).unwrap().visible);
+        assert_eq!(app.doc.active(), first);
+
+        update(&mut app, Message::EveryBodyShown);
+        assert!(
+            app.doc.nodes().iter().all(|node| node.visible),
+            "ctrl+alt+comma left something hidden"
+        );
+        // One entry for the reveal, so one ctrl+Z puts the hide back.
+        update(&mut app, Message::Undo);
+        assert!(!app.doc.node(cube).unwrap().visible, "undoing the reveal did not restore the eye");
+    }
+
+    /// Nothing to reveal is said out loud rather than pushed onto the stack: an
+    /// empty entry costs the user a real undo.
+    #[test]
+    fn revealing_when_nothing_is_hidden_records_nothing() {
+        let mut app = app();
+        let entries = app.history_stats.undo_entries;
+        update(&mut app, Message::EveryBodyShown);
+        assert_eq!(app.history_stats.undo_entries, entries);
+        assert!(app.status.contains("already showing"), "{}", app.status);
+    }
+
+    /// Delete takes the active body, and one ctrl+Z brings it back whole --
+    /// bricks, name, eye and position in the list.
+    #[test]
+    fn deleting_a_body_is_undoable() {
+        let mut app = app();
+        update(&mut app, Message::PrimitiveAdded(PrimitiveKind::Cube));
+        let cube = app.doc.active();
+        let bricks = app.doc.volume(cube).unwrap().brick_count();
+
+        update(&mut app, Message::BodyDeleted);
+        assert_eq!(app.doc.body_count(), 1, "the delete did nothing");
+        assert!(app.status.contains("deleted Cube"), "{}", app.status);
+
+        update(&mut app, Message::Undo);
+        assert_eq!(app.doc.body_count(), 2, "undo did not bring the body back");
+        assert_eq!(names(&app)[1], "Cube");
+        assert_eq!(
+            app.doc.volume(cube).map(|volume| volume.brick_count()),
+            Some(bricks),
+            "the body came back with a different number of bricks"
+        );
+    }
+
+    /// **A delete owes the renderer two things, and neither is visible on
+    /// screen if it is missing.**
+    ///
+    /// The forget releases the deleted body's slots -- without it a sliver of
+    /// it is drawn forever, holding pool space, with no counter moving. The
+    /// whole-document remesh is the other half: `MeshPool::forget_body` clears
+    /// the pool-full banner when it frees space, and a brick the pool refused
+    /// while it was full is long gone from the dirty set, so freeing the space
+    /// without re-offering everything takes the warning down and leaves the
+    /// geometry missing.
+    #[test]
+    fn a_delete_tells_the_renderer_to_drop_the_body_and_re_offers_everything_left() {
+        let mut app = app();
+        update(&mut app, Message::PrimitiveAdded(PrimitiveKind::Cube));
+        let cube = app.doc.active();
+        let survivor = app.doc.nodes()[0].id;
+        // Whatever the add queued is not what is being measured.
+        let _ = app.shared.take_forgotten_for_tests();
+
+        update(&mut app, Message::BodyDeleted);
+
+        assert_eq!(
+            app.shared.take_forgotten_for_tests(),
+            vec![cube],
+            "the deleted body's slots were left in the pool"
+        );
+        assert!(
+            app.dirty.iter().any(|(body, _)| *body == survivor),
+            "the delete did not re-offer the surviving body, so a brick the pool refused while \
+             it was full stays missing with the banner gone"
+        );
+    }
+
+    /// **The cost of placing a primitive off the origin, paid.**
+    ///
+    /// [`MIRROR_CENTRE`] is the lattice origin, so a dent carved into a body at
+    /// x = +80 has its twin written at x = -80: free-floating geometry in empty
+    /// space that exports as an extra shell no slicer can print. The first body
+    /// a user can create off-origin is a primitive, which makes this the
+    /// increment where that stops being hypothetical -- and selecting it is what
+    /// turns the mirror off and says why.
+    #[test]
+    fn adding_a_primitive_clear_of_the_model_turns_off_a_mirror_it_cannot_use() {
+        let mut app = app();
+        update(&mut app, Message::SymmetryAxisToggled(brokkr_core::MirrorAxis::X));
+        assert!(app.symmetry.axis(brokkr_core::MirrorAxis::X), "the ball straddles X");
+
+        update(&mut app, Message::PrimitiveAdded(PrimitiveKind::Cube));
+
+        assert!(
+            !app.symmetry.axis(brokkr_core::MirrorAxis::X),
+            "X mirroring stayed on for a cube sitting entirely to one side of the plane, so \
+             every stroke on it would write a twin into empty space"
+        );
+        assert!(app.status.contains("empty space"), "the refusal said nothing: {}", app.status);
+    }
+
+    /// A document always holds one body, so the last one cannot go. Refused
+    #[test]
+    fn deleting_the_last_body_is_refused() {
+        let mut app = app();
+        update(&mut app, Message::BodyDeleted);
+        assert_eq!(app.doc.body_count(), 1);
+        assert!(app.status.contains("cannot delete the last body"), "{}", app.status);
+        assert!(app.pending_delete.is_none(), "the last body raised a prompt");
+    }
+
+    /// A delete big enough that undo may not hold it asks first, names the size,
+    /// and on Cancel changes nothing.
+    ///
+    /// The threshold is a field rather than the constant read in place
+    /// precisely so this test can exist: at the real 512 MB the fixture would
+    /// have to allocate half a gigabyte of bricks.
+    #[test]
+    fn a_large_delete_asks_first_and_cancelling_changes_nothing() {
+        let mut app = app();
+        update(&mut app, Message::PrimitiveAdded(PrimitiveKind::Cube));
+        let cube = app.doc.active();
+        let bytes = app.doc.volume(cube).unwrap().stats().resident_bytes;
+        assert!(bytes > 0, "the fixture body costs nothing, so nothing can be over the threshold");
+        app.delete_prompt_bytes = bytes;
+
+        update(&mut app, Message::BodyDeleted);
+        let pending = app.pending_delete.as_ref().expect("a large delete did not ask");
+        assert_eq!(pending.id, cube);
+        assert_eq!(pending.bytes, bytes);
+        assert_eq!(app.doc.body_count(), 2, "the prompt deleted the body anyway");
+        assert!(app.modal_open(), "the delete prompt is not modal, so a press behind it sculpts");
+
+        update(&mut app, Message::BodyDeleteCancelled);
+        assert_eq!(app.doc.body_count(), 2, "cancelling deleted the body");
+        assert!(app.pending_delete.is_none());
+
+        // ...and confirming goes through.
+        update(&mut app, Message::BodyDeleted);
+        update(&mut app, Message::BodyDeleteConfirmed);
+        assert_eq!(app.doc.body_count(), 1, "confirming did not delete");
+    }
+
+    /// The thumbnail switch is session state. Nothing about it is written to the
+    /// file, so by the rule that governs that it must not dirty the document.
+    #[test]
+    fn the_thumbnail_switch_does_not_dirty_the_document() {
+        let mut app = app();
+        assert!(app.thumbnails, "thumbnails default off");
+        update(&mut app, Message::ThumbnailsToggled);
+        assert!(!app.thumbnails);
+        assert!(!app.unsaved, "turning the pictures off marked the sculpt unsaved");
+    }
+
+    /// A cut drawn across the viewport crosses every body the user can see and
+    /// leaves the hidden one bit-identical, in ONE undo entry.
+    #[test]
+    fn a_cut_leaves_a_hidden_body_it_crosses_untouched() {
+        let mut app = app();
+        app.camera.yaw = 0.0;
+        app.camera.pitch = 0.0;
+        app.publish_camera();
+
+        let mut second = Volume::new(app.doc.voxel_size());
+        second.seed_sphere(Vec3::new(10.0, 0.0, 0.0), MODEL_RADIUS_MM * 0.5);
+        second.mark_everything_dirty();
+        let other = app.doc.add_body("Body 2", second);
+        let meta = NodeMeta { visible: false, ..app.doc.meta(other).unwrap() };
+        app.doc.set_meta(&meta);
+        app.publish_visibility();
+        app.remesh_dirty();
+
+        let probe = Vec3::new(10.0, 12.0, 0.0);
+        let before = app.doc.volume(other).unwrap().sample_world(probe);
+        let bricks = app.doc.volume(other).unwrap().brick_count();
+        let entries = app.history_stats.undo_entries;
+
+        update(&mut app, Message::CutToggled);
+        app.on_pointer(PointerEvent::Pressed {
+            button: PointerButton::Left,
+            position: iced::Vector::new(80.0, 300.0),
+            size: iced::Vector::new(800.0, 600.0),
+        });
+        app.on_pointer(PointerEvent::Moved {
+            position: iced::Vector::new(720.0, 300.0),
+            size: iced::Vector::new(800.0, 600.0),
+        });
+        app.on_pointer(PointerEvent::Released { button: PointerButton::Left });
+
+        assert_eq!(
+            app.doc.volume(other).unwrap().sample_world(probe),
+            before,
+            "the cut went through a body nobody can see"
+        );
+        assert_eq!(app.doc.volume(other).unwrap().brick_count(), bricks);
+        assert_eq!(
+            app.history_stats.undo_entries,
+            entries + 1,
+            "one gesture became more than one undo entry"
+        );
+    }
+
+    /// **The panel's smoke test.** Build the element tree after every operation,
+    /// at every list length that matters, with the pictures on and off.
+    ///
+    /// It asserts nothing about what the tree looks like, on purpose: what it
+    /// catches is a row that panics, a widget built from an index that is no
+    /// longer there, and a `view()` that stops compiling against its own state.
+    /// Before this existed, `panel.rs` had no coverage of any kind.
+    #[test]
+    fn the_widget_tree_builds_after_every_operation_at_every_size() {
+        type Step = (&'static str, fn(&mut Brokkr));
+        let steps: [Step; 10] = [
+            ("add a cube", |app| update(app, Message::PrimitiveAdded(PrimitiveKind::Cube))),
+            ("add a sphere", |app| update(app, Message::PrimitiveAdded(PrimitiveKind::Sphere))),
+            ("add a cylinder", |app| update(app, Message::PrimitiveAdded(PrimitiveKind::Cylinder))),
+            ("open the add menu", |app| update(app, Message::PrimitiveMenuToggled)),
+            ("select the first row", |app| {
+                let first = app.doc.nodes()[0].id;
+                update(app, Message::BodySelected(first));
+            }),
+            ("toggle an eye", |app| {
+                let last = app.doc.nodes().last().unwrap().id;
+                update(app, Message::BodyVisibilityToggled(last));
+            }),
+            ("reveal everything", |app| update(app, Message::EveryBodyShown)),
+            ("delete", |app| update(app, Message::BodyDeleted)),
+            ("undo", |app| update(app, Message::Undo)),
+            ("redo", |app| update(app, Message::Redo)),
+        ];
+
+        for rows in [1usize, 2, 12, 64] {
+            for thumbnails in [true, false] {
+                let mut app = app();
+                app.thumbnails = thumbnails;
+                while app.doc.node_count() < rows {
+                    let name = format!("Body {}", app.doc.node_count() + 1);
+                    cheap_body(&mut app, &name);
+                }
+                app.publish_visibility();
+                let _ = app.view();
+
+                for (what, step) in steps {
+                    step(&mut app);
+                    // The tree is built and dropped. `Element` borrows the
+                    // application, so it cannot outlive the loop body -- which
+                    // is also what stops a row from caching anything.
+                    let _ = app.view();
+                    assert!(
+                        app.doc.body_count() >= 1,
+                        "{what} at {rows} rows left the document with no body"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The sixth section is FIRST and open, and DETAIL is what paid for it.
+    #[test]
+    fn the_bodies_section_is_first_and_open_and_detail_now_starts_closed() {
+        assert_eq!(PanelSection::ALL[0], PanelSection::Bodies);
+        assert_eq!(PanelSection::ALL.len(), 6);
+        assert!(PanelSection::Bodies.open_by_default());
+        assert!(!PanelSection::Detail.open_by_default());
+
+        let app = app();
+        assert!(app.expanded[PanelSection::Bodies as usize], "BODIES did not start open");
+        assert!(!app.expanded[PanelSection::Detail as usize], "DETAIL did not start closed");
     }
 }

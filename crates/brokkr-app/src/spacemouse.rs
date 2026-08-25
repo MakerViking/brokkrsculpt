@@ -641,6 +641,13 @@ impl SpaceMouse {
             self.shared.set_axis(index, value);
         }
     }
+
+    /// Fire one button, for tests that need the application's own button path
+    /// rather than the action it happens to be bound to.
+    #[cfg(test)]
+    pub fn simulate_press(&self, button: usize) {
+        self.shared.press(button);
+    }
 }
 
 /// One line per input device and whether it is a puck, for `--spacemouse`.

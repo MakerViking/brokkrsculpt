@@ -31,6 +31,7 @@ pub mod import;
 pub mod mesh;
 pub mod orientation;
 pub mod pattern;
+pub mod primitive;
 pub mod project;
 pub mod raycast;
 pub mod region;
@@ -56,12 +57,13 @@ pub use brush::{
     Brush, BrushDirection, BrushKind, BrushScratch, FalloffCurve, MirrorAxis, MoveStroke, Stamp,
     Symmetry, lean_normal,
 };
-pub use clip::ClipPlane;
+pub use clip::{ClipPlane, CutOutcome};
 pub use export::{ExportMesh, ExportedBody, MeshReport, document_verdict};
 pub use import::{ImportError, MESH_EXTENSIONS};
 pub use mesh::{BrickMesh, MeshScratch, Vertex};
 pub use orientation::{AxisRotation, Facing, from_print_space, resting_up, to_print_space};
 pub use pattern::{MAX_SCALE_MM, MIN_SCALE_VOXELS, Pattern, PatternKind};
+pub use primitive::PrimitiveKind;
 pub use project::{Keyframe, MAX_VOLUME_BYTES, Outline, ProjectError, ProjectState, View};
 pub use raycast::{Hit, raycast};
 pub use region::FieldRegion;

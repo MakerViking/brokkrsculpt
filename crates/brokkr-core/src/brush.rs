@@ -390,14 +390,62 @@ impl MirrorAxis {
     }
 }
 
-/// Which world planes every stamp is mirrored across.
+/// Which planes every stamp is mirrored across.
 ///
 /// A set rather than a single choice, because the combinations are what make
 /// it useful: x and y together give the four way symmetry a face or a wheel
 /// wants, and all three give eight way.
+///
+/// # The centre is a parameter and not a field, and that is deliberate
+///
+/// [`Symmetry::mirrors`] and [`Symmetry::flips`] both take a `centre: Vec3`
+/// rather than reading one from here, so the mirror plane is a property of the
+/// call and not of the switch. **The value passed today is always the lattice
+/// origin**, which is what this type meant before the parameter existed and
+/// what the interface has always drawn.
+///
+/// The reason it is not a field is that the axis and the centre must have the
+/// same scope. This set is global -- one switch for the whole document -- and a
+/// global switch whose plane came from the selection would make "X on" a
+/// different physical plane depending on which row is highlighted, with the
+/// only evidence on screen a translucent patch. The day the axis becomes
+/// per-body, the centre moves with it, and the parameter is what makes that a
+/// change to the callers rather than to every mirroring formula.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Symmetry {
     enabled: [bool; 3],
+}
+
+/// One mirrored copy: where a point lands, and which way a direction turns.
+///
+/// A reflection across a plane through `centre` is `centre + (at - centre) *
+/// sign`, which is `at * sign + offset` with `offset = centre * (1 - sign)`.
+/// Splitting it that way is the whole reason this is a type rather than a bare
+/// sign: a **position** needs the offset and a **direction** -- a surface
+/// normal, a stroke tangent, a Move drag vector -- must not have it. Reflecting
+/// a direction through [`Flip::point`] would be silently correct while the
+/// centre is the lattice origin and would send every mirrored stroke across the
+/// model the day it is not.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct Flip {
+    /// Componentwise sign, `-1` on each mirrored axis. This alone reflects a
+    /// direction.
+    pub sign: Vec3,
+    /// What a reflected position picks up from the centre. `ZERO` while the
+    /// centre is the lattice origin, which it is at every call site today.
+    pub offset: Vec3,
+}
+
+impl Flip {
+    /// The copy that is not a copy: used to fill the caller's array before
+    /// [`Symmetry::flips`] says how much of it is real.
+    pub const IDENTITY: Flip = Flip { sign: Vec3::ONE, offset: Vec3::ZERO };
+
+    /// Where a world position lands on the other side of the plane.
+    #[inline]
+    pub fn point(self, at: Vec3) -> Vec3 {
+        at * self.sign + self.offset
+    }
 }
 
 impl Symmetry {
@@ -429,13 +477,13 @@ impl Symmetry {
         self.with_axis(axis, !self.axis(axis))
     }
 
-    /// Write the componentwise sign of every mirrored twin into `out`,
-    /// returning how many there are. Never includes the identity.
+    /// Write every mirrored twin as a [`Flip`] about `centre`, returning how
+    /// many there are. Never includes the identity.
     ///
     /// A mirror is a reflection, so it acts on a position, a normal and a
-    /// direction of travel alike: multiply by this and every one of them comes
-    /// out on the other side pointing the right way.
-    pub(crate) fn flips(self, out: &mut [Vec3; Self::MAX_MIRRORS]) -> usize {
+    /// direction of travel alike -- but only the sign is shared between those
+    /// three, which is why this hands back a [`Flip`] and not a bare vector.
+    pub(crate) fn flips(self, centre: Vec3, out: &mut [Flip; Self::MAX_MIRRORS]) -> usize {
         let mut count = 0;
         // Each combination is a bit per axis; 0 is the original, which is the
         // caller's to apply and not a twin.
@@ -450,7 +498,7 @@ impl Symmetry {
                     sign[index] = -1.0;
                 }
             }
-            out[count] = sign;
+            out[count] = Flip { sign, offset: centre * (Vec3::ONE - sign) };
             count += 1;
         }
         count
@@ -458,6 +506,10 @@ impl Symmetry {
 
     /// Write every mirrored twin of a stamp into `out`, returning how many
     /// there are. Never includes the stamp itself.
+    ///
+    /// `centre` is the point every enabled plane passes through; see the type's
+    /// documentation for why it is a parameter and why every caller passes the
+    /// lattice origin today.
     ///
     /// Fills a caller owned array rather than returning a `Vec`, because this
     /// runs once per stamp and a stroke lays down thousands: allocating here
@@ -467,18 +519,25 @@ impl Symmetry {
     /// place. That is deliberate: the two falloffs overlap smoothly, whereas
     /// suppressing the twin near the plane would put a visible step in the
     /// stroke strength exactly where the user is trying to work.
-    pub fn mirrors(self, stamp: &Stamp, out: &mut [Stamp; Self::MAX_MIRRORS]) -> usize {
-        let mut signs = [Vec3::ONE; Self::MAX_MIRRORS];
-        let count = self.flips(&mut signs);
-        for (twin, sign) in out.iter_mut().zip(&signs[..count]) {
+    pub fn mirrors(
+        self,
+        stamp: &Stamp,
+        centre: Vec3,
+        out: &mut [Stamp; Self::MAX_MIRRORS],
+    ) -> usize {
+        let mut flips = [Flip::IDENTITY; Self::MAX_MIRRORS];
+        let count = self.flips(centre, &mut flips);
+        for (twin, flip) in out.iter_mut().zip(&flips[..count]) {
             *twin = *stamp;
-            // Reflecting across a plane negates that component of the position,
-            // of the surface normal, and of the direction the stroke is
-            // travelling -- a twin that kept the original tangent would comb
-            // its pattern, and drag its material, the wrong way round.
-            twin.centre *= *sign;
-            twin.normal *= *sign;
-            twin.tangent *= *sign;
+            // Reflecting across a plane moves the position to the other side of
+            // it and negates the component of the surface normal and of the
+            // direction the stroke is travelling -- a twin that kept the
+            // original tangent would comb its pattern, and drag its material,
+            // the wrong way round. The normal and the tangent take the sign
+            // alone, because a direction has no position to reflect about.
+            twin.centre = flip.point(stamp.centre);
+            twin.normal *= flip.sign;
+            twin.tangent *= flip.sign;
         }
         count
     }
@@ -635,11 +694,16 @@ impl Brush {
     }
 
     /// Apply one stamp, plus its mirrors when symmetry is on.
+    ///
+    /// `centre` is the point the enabled mirror planes pass through. See
+    /// [`Symmetry`] for why it is threaded through as a parameter and why every
+    /// caller passes the lattice origin today.
     pub fn apply_symmetric(
         &self,
         volume: &mut Volume,
         stamp: &Stamp,
         symmetry: Symmetry,
+        centre: Vec3,
         scratch: &mut BrushScratch,
     ) {
         // Move mirrors itself, rather than being applied once per twin. Two
@@ -647,7 +711,7 @@ impl Brush {
         // own locked copy, so applying them in turn would have the second
         // rewrite the first's work with the field as it stood before it.
         if self.kind == BrushKind::Move {
-            self.drag_once(volume, stamp, symmetry, scratch, Skipping::On);
+            self.drag_once(volume, stamp, symmetry, centre, scratch, Skipping::On);
             return;
         }
 
@@ -656,7 +720,7 @@ impl Brush {
             return;
         }
         let mut twins = [*stamp; Symmetry::MAX_MIRRORS];
-        let count = symmetry.mirrors(stamp, &mut twins);
+        let count = symmetry.mirrors(stamp, centre, &mut twins);
         for twin in &twins[..count] {
             self.apply(volume, twin, scratch);
         }
@@ -674,13 +738,14 @@ impl Brush {
         volume: &mut Volume,
         stamp: &Stamp,
         symmetry: Symmetry,
+        centre: Vec3,
         scratch: &mut BrushScratch,
         skipping: Skipping,
     ) {
         if stamp.tangent == Vec3::ZERO {
             return;
         }
-        scratch.locked.begin(volume, self, stamp.centre, symmetry);
+        scratch.locked.begin(volume, self, stamp.centre, symmetry, centre);
         scratch.locked.drag_to_where(
             volume,
             stamp.centre + stamp.tangent,
@@ -836,7 +901,9 @@ impl Brush {
         // has nothing to tell it. Answered once per stamp rather than per
         // voxel, and before any of the work below.
         if self.kind == BrushKind::Move {
-            self.drag_once(volume, stamp, Symmetry::OFF, scratch, skipping);
+            // Symmetry is OFF here, so there is nothing for a centre to be the
+            // centre OF; `ZERO` is the value that cannot be wrong.
+            self.drag_once(volume, stamp, Symmetry::OFF, Vec3::ZERO, scratch, skipping);
             return;
         }
 
@@ -1349,10 +1416,20 @@ impl MoveStroke {
 
     /// Lock the field around `at`, plus one copy per mirror.
     ///
+    /// `centre` is the point the enabled mirror planes pass through; see
+    /// [`Symmetry`].
+    ///
     /// Reuses whatever storage the last gesture left behind. The snapshots are
     /// the whole cost of a Move gesture that is not a pointer event, and they
     /// are taken exactly once.
-    pub fn begin(&mut self, volume: &Volume, brush: &Brush, at: Vec3, symmetry: Symmetry) {
+    pub fn begin(
+        &mut self,
+        volume: &Volume,
+        brush: &Brush,
+        at: Vec3,
+        symmetry: Symmetry,
+        centre: Vec3,
+    ) {
         self.anchors.clear();
         self.applied = Vec3::ZERO;
         self.brush = *brush;
@@ -1361,16 +1438,18 @@ impl MoveStroke {
             return;
         }
 
-        let mut signs = [Vec3::ONE; Symmetry::MAX_MIRRORS];
-        let mirrors = if symmetry.is_off() { 0 } else { symmetry.flips(&mut signs) };
+        let mut flips = [Flip::IDENTITY; Symmetry::MAX_MIRRORS];
+        let mirrors = if symmetry.is_off() { 0 } else { symmetry.flips(centre, &mut flips) };
 
-        for flip in std::iter::once(Vec3::ONE).chain(signs[..mirrors].iter().copied()) {
-            let origin = at * flip;
+        for flip in std::iter::once(Flip::IDENTITY).chain(flips[..mirrors].iter().copied()) {
+            let origin = flip.point(at);
             let (lo, hi) = volume.voxel_bounds(
                 origin - Vec3::splat(brush.radius),
                 origin + Vec3::splat(brush.radius),
             );
-            self.anchors.push(MoveAnchor { origin, flip, lo, hi });
+            // The SIGN and not the whole flip: this is applied to the drag
+            // vector, which is a direction and takes no offset.
+            self.anchors.push(MoveAnchor { origin, flip: flip.sign, lo, hi });
         }
 
         // A voxel can only be inside two brushes at once if two anchors are
@@ -2010,6 +2089,7 @@ mod tests {
             &mut volume,
             &Stamp::new(at, normal, BrushDirection::Add),
             Symmetry::X,
+            Vec3::ZERO,
             &mut scratch,
         );
 
@@ -2032,7 +2112,7 @@ mod tests {
             (MirrorAxis::Y, Vec3::new(3.0, -5.0, 7.0)),
             (MirrorAxis::Z, Vec3::new(3.0, 5.0, -7.0)),
         ] {
-            let count = Symmetry::OFF.with_axis(axis, true).mirrors(&stamp, &mut twins);
+            let count = Symmetry::OFF.with_axis(axis, true).mirrors(&stamp, Vec3::ZERO, &mut twins);
             assert_eq!(count, 1, "{} alone should give one twin", axis.label());
             assert_eq!(twins[0].centre, expected);
         }
@@ -2040,10 +2120,10 @@ mod tests {
         // Two planes give three twins, three planes give seven: every octant
         // except the one the original is already in.
         let two = Symmetry::OFF.with_axis(MirrorAxis::X, true).with_axis(MirrorAxis::Y, true);
-        assert_eq!(two.mirrors(&stamp, &mut twins), 3);
+        assert_eq!(two.mirrors(&stamp, Vec3::ZERO, &mut twins), 3);
 
         let all = Symmetry { enabled: [true; 3] };
-        let count = all.mirrors(&stamp, &mut twins);
+        let count = all.mirrors(&stamp, Vec3::ZERO, &mut twins);
         assert_eq!(count, Symmetry::MAX_MIRRORS);
 
         let mut octants: Vec<[bool; 3]> = twins[..count]
@@ -2064,7 +2144,7 @@ mod tests {
         let stamp =
             Stamp::new(Vec3::new(4.0, 0.0, 0.0), Vec3::new(1.0, 0.0, 0.0), BrushDirection::Add);
         let mut twins = [stamp; Symmetry::MAX_MIRRORS];
-        Symmetry::X.mirrors(&stamp, &mut twins);
+        Symmetry::X.mirrors(&stamp, Vec3::ZERO, &mut twins);
 
         // Still pointing out of the sphere, not back into it. Reflecting the
         // position without the normal would make the mirrored stamp carve.
@@ -2072,12 +2152,41 @@ mod tests {
         assert!(twins[0].normal.dot(twins[0].centre) > 0.0);
     }
 
+    /// The centre parameter, measured somewhere it can actually be wrong.
+    ///
+    /// Every call site passes the lattice origin today, so with the centre at
+    /// zero a mirror that ignored the parameter entirely would pass every other
+    /// test in this file. This is the one that fails the day the offset is
+    /// dropped -- and the one that fails if it is applied to the normal or the
+    /// tangent as well, which would send the twin's material the wrong way.
+    #[test]
+    fn a_mirror_about_an_offset_centre_moves_the_position_and_not_the_direction() {
+        let stamp = Stamp::new(Vec3::new(12.0, 3.0, 0.0), Vec3::X, BrushDirection::Add)
+            .with_tangent(Vec3::new(0.0, 0.0, 1.0));
+        let mut twins = [stamp; Symmetry::MAX_MIRRORS];
+
+        let centre = Vec3::new(10.0, 0.0, 0.0);
+        assert_eq!(Symmetry::X.mirrors(&stamp, centre, &mut twins), 1);
+        // Two millimetres past the plane at x = 10 goes to two before it, and
+        // the axes the plane does not cross are untouched.
+        assert_eq!(twins[0].centre, Vec3::new(8.0, 3.0, 0.0));
+        // A direction has no position to be reflected about, so it takes the
+        // sign alone: an offset here would push every twin along +x by twice
+        // the centre.
+        assert_eq!(twins[0].normal, Vec3::NEG_X);
+        assert_eq!(twins[0].tangent, Vec3::new(0.0, 0.0, 1.0));
+
+        // And a centre of zero is the behaviour every caller has today.
+        assert_eq!(Symmetry::X.mirrors(&stamp, Vec3::ZERO, &mut twins), 1);
+        assert_eq!(twins[0].centre, Vec3::new(-12.0, 3.0, 0.0));
+    }
+
     #[test]
     fn symmetry_off_produces_no_twins_at_all() {
         let stamp = Stamp::new(Vec3::X, Vec3::X, BrushDirection::Add);
         let mut twins = [stamp; Symmetry::MAX_MIRRORS];
         assert!(Symmetry::OFF.is_off());
-        assert_eq!(Symmetry::OFF.mirrors(&stamp, &mut twins), 0);
+        assert_eq!(Symmetry::OFF.mirrors(&stamp, Vec3::ZERO, &mut twins), 0);
         assert_eq!(Symmetry::default(), Symmetry::OFF);
     }
 
@@ -2094,6 +2203,7 @@ mod tests {
             &mut volume,
             &Stamp::new(at, normal, BrushDirection::Add),
             Symmetry::OFF.with_axis(MirrorAxis::Y, true),
+            Vec3::ZERO,
             &mut scratch,
         );
 
@@ -2127,6 +2237,7 @@ mod tests {
             &mut volume,
             &Stamp::new(at, normal, BrushDirection::Add),
             Symmetry::OFF,
+            Vec3::ZERO,
             &mut scratch,
         );
         assert_eq!(volume.sample_world(mirrored_probe), before);
@@ -2210,6 +2321,7 @@ mod snapshot_tests {
                     &mut volume,
                     &Stamp::new(at, normal, BrushDirection::Add),
                     Symmetry::OFF,
+                    Vec3::ZERO,
                     &mut scratch,
                 );
                 volume
@@ -2259,6 +2371,7 @@ mod snapshot_tests {
             &mut volume,
             &Stamp::new(at, normal, BrushDirection::Add),
             Symmetry::OFF,
+            Vec3::ZERO,
             &mut scratch,
         );
         assert_ne!(
@@ -2716,7 +2829,7 @@ mod move_tests {
     /// while the drag is happening and leave no trace in where it ends up.
     fn gesture(volume: &mut Volume, brush: &Brush, at: Vec3, through: &[Vec3]) {
         let mut stroke = MoveStroke::new();
-        stroke.begin(volume, brush, at, Symmetry::OFF);
+        stroke.begin(volume, brush, at, Symmetry::OFF, Vec3::ZERO);
         for point in through {
             stroke.drag_to(volume, *point, 1.0);
         }
@@ -3086,7 +3199,7 @@ mod move_tests {
         let brush = Brush { kind: BrushKind::Move, radius: 9.0, strength: 1.0, ..Brush::default() };
         let at = Vec3::new(24.0, 0.0, 0.0);
         let mut stroke = MoveStroke::new();
-        stroke.begin(&volume, &brush, at, Symmetry::X);
+        stroke.begin(&volume, &brush, at, Symmetry::X, Vec3::ZERO);
         stroke.drag_to(&mut volume, at + Vec3::Y * 3.0, 1.0);
         stroke.end();
 
@@ -3148,7 +3261,7 @@ mod move_tests {
 
         let mut volume = ramp_along_x(slope);
         let mut stroke = MoveStroke::new();
-        stroke.begin(&volume, &brush, at, Symmetry::X);
+        stroke.begin(&volume, &brush, at, Symmetry::X, Vec3::ZERO);
         // Away from the plane, so the read at `at` goes further from the twin
         // rather than back toward it.
         stroke.drag_to(&mut volume, at - Vec3::X * cap, 1.0);
@@ -3181,7 +3294,7 @@ mod move_tests {
 
         volume.begin_stroke();
         let mut stroke = MoveStroke::new();
-        stroke.begin(&volume, &brush, at, Symmetry::OFF);
+        stroke.begin(&volume, &brush, at, Symmetry::OFF, Vec3::ZERO);
         for step in 1..=10 {
             stroke.drag_to(&mut volume, at + Vec3::Y * step as f32 * 0.4, 1.0);
         }
@@ -3214,7 +3327,7 @@ mod move_tests {
         let mut dirty = Vec::new();
 
         let mut stroke = MoveStroke::new();
-        stroke.begin(&volume, &brush, at, Symmetry::OFF);
+        stroke.begin(&volume, &brush, at, Symmetry::OFF, Vec3::ZERO);
         stroke.drag_to(&mut volume, at + Vec3::Y * 3.0, 1.0);
         volume.take_dirty(&mut dirty);
         assert!(!dirty.is_empty(), "the first event of a gesture must do the work");

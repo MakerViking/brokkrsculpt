@@ -60,6 +60,17 @@ pub enum CursorMood {
     Subtract,
     /// Mid gesture, resizing the brush rather than sculpting with it.
     Sizing,
+    /// Over a body that is not the active one, where a press SELECTS rather
+    /// than sculpts.
+    ///
+    /// **This overrides the add/subtract pair rather than sitting beside it.**
+    /// Holding ctrl over another body would otherwise draw the red ring that
+    /// means "this takes away" over a press that takes nothing away at all.
+    ///
+    /// Drawn as an unfilled ring — the outer ring alone, in a neutral colour —
+    /// and deliberately not as a fourth hue: the three hues are spent, and the
+    /// difference this is reporting is a verb rather than an intensity.
+    Selecting,
 }
 
 /// Convert a theme colour to the linear space the overlay shader expects.
@@ -167,6 +178,18 @@ fn push_ring(
 /// Clears and refills `batch` rather than returning a new one, because this runs
 /// on input events and the per frame path must not allocate.
 ///
+/// `volume` is the body the pick returned rather than the active one, which is
+/// what keeps the ring on the surface it is actually over. Building it against
+/// a volume that does not contain the point is worse than stale: far from any
+/// surface `sample_world` returns the clamped outside value and `gradient_world`
+/// falls through `try_normalize` to `Vec3::Y`, so `onto_surface` would draw a
+/// confident flat ring three millimetres below nothing.
+///
+/// `mirror_centre` is where the enabled mirror planes are drawn, and it is the
+/// same number the engine mirrors about — see `MIRROR_CENTRE`. Drawing them at
+/// the world origin regardless would be a promise the sculpt does not keep the
+/// day the centre moves.
+///
 /// `hover` is the surface point under the pointer, or `None` when the pointer is
 /// off the model — in which case there is no ring, which is itself the useful
 /// signal that a press would do nothing.
@@ -176,6 +199,7 @@ pub fn build(
     volume: &Volume,
     brush: &Brush,
     symmetry: Symmetry,
+    mirror_centre: Vec3,
     hover: Option<Vec3>,
     mood: CursorMood,
     model_radius: f32,
@@ -202,10 +226,10 @@ pub fn build(
             MirrorAxis::Z => (Vec3::X, Vec3::Y),
         };
         batch.push_quad(
-            (-u - v) * reach,
-            (u - v) * reach,
-            (u + v) * reach,
-            (-u + v) * reach,
+            mirror_centre + (-u - v) * reach,
+            mirror_centre + (u - v) * reach,
+            mirror_centre + (u + v) * reach,
+            mirror_centre + (-u + v) * reach,
             plane_colour,
         );
     }
@@ -221,21 +245,34 @@ pub fn build(
         // as "this takes away".
         CursorMood::Subtract => linear(theme::ERROR, 0.95),
         CursorMood::Sizing => linear(theme::ACCENT_HOT, 1.0),
+        CursorMood::Selecting => linear(theme::TEXT, 0.95),
     };
 
     push_ring(batch, volume, centre, normal, brush.radius, colour);
     // The inner ring is where the brush has fallen to half strength. Skipped
-    // when it would sit on top of the outer one.
+    // when it would sit on top of the outer one -- and skipped entirely while a
+    // press would only select, because there is no stroke for a falloff to
+    // describe and the empty middle is what makes that ring read as unfilled.
+    if mood == CursorMood::Selecting {
+        return;
+    }
     let inner = brush.radius * half_weight_distance(brush.falloff);
     if inner > brush.radius * 0.08 && inner < brush.radius * 0.92 {
         push_ring(batch, volume, centre, normal, inner, [colour[0], colour[1], colour[2], 0.45]);
     }
 }
 
-/// Which mood a cursor should have, from the stroke direction.
-pub fn mood(direction: BrushDirection, sizing: bool) -> CursorMood {
+/// Which mood a cursor should have.
+///
+/// `selecting` is answered before the stroke direction because it overrides it:
+/// see [`CursorMood::Selecting`]. Sizing outranks even that, because a sizing
+/// gesture is not a press on anything.
+pub fn mood(direction: BrushDirection, sizing: bool, selecting: bool) -> CursorMood {
     if sizing {
         return CursorMood::Sizing;
+    }
+    if selecting {
+        return CursorMood::Selecting;
     }
     match direction {
         BrushDirection::Add => CursorMood::Add,
@@ -294,6 +331,7 @@ mod tests {
             &volume,
             &brush(3.0, FalloffCurve::Smooth),
             Symmetry::OFF,
+            Vec3::ZERO,
             None,
             CursorMood::Add,
             20.0,
@@ -312,6 +350,7 @@ mod tests {
             &volume,
             &brush(radius, FalloffCurve::Smooth),
             Symmetry::OFF,
+            Vec3::ZERO,
             Some(centre),
             CursorMood::Add,
             20.0,
@@ -351,6 +390,7 @@ mod tests {
             &volume,
             &brush(10.0, FalloffCurve::Smooth),
             Symmetry::OFF,
+            Vec3::ZERO,
             Some(centre),
             CursorMood::Add,
             20.0,
@@ -379,6 +419,7 @@ mod tests {
                 &volume,
                 &brush(3.0, FalloffCurve::Smooth),
                 symmetry,
+                Vec3::ZERO,
                 None,
                 CursorMood::Add,
                 20.0,
@@ -402,6 +443,7 @@ mod tests {
             &volume,
             &brush(3.0, FalloffCurve::Smooth),
             Symmetry::X,
+            Vec3::ZERO,
             None,
             CursorMood::Add,
             model_radius,
@@ -427,6 +469,7 @@ mod tests {
                 &volume,
                 &brush(3.0, FalloffCurve::Smooth),
                 Symmetry::OFF,
+                Vec3::ZERO,
                 Some(centre),
                 mood,
                 20.0,
@@ -441,11 +484,15 @@ mod tests {
 
     #[test]
     fn the_mood_follows_the_stroke_direction_unless_sizing() {
-        assert_eq!(mood(BrushDirection::Add, false), CursorMood::Add);
-        assert_eq!(mood(BrushDirection::Subtract, false), CursorMood::Subtract);
+        assert_eq!(mood(BrushDirection::Add, false, false), CursorMood::Add);
+        assert_eq!(mood(BrushDirection::Subtract, false, false), CursorMood::Subtract);
         // Sizing wins: mid gesture the pointer is not sculpting at all, so the
         // direction it would have used is not what the ring should report.
-        assert_eq!(mood(BrushDirection::Add, true), CursorMood::Sizing);
-        assert_eq!(mood(BrushDirection::Subtract, true), CursorMood::Sizing);
+        assert_eq!(mood(BrushDirection::Add, true, false), CursorMood::Sizing);
+        assert_eq!(mood(BrushDirection::Subtract, true, false), CursorMood::Sizing);
+        // And over a body that is not the active one the press selects, which
+        // outranks the direction and is outranked by sizing.
+        assert_eq!(mood(BrushDirection::Subtract, false, true), CursorMood::Selecting);
+        assert_eq!(mood(BrushDirection::Add, true, true), CursorMood::Sizing);
     }
 }

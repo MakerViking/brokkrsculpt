@@ -729,9 +729,23 @@ fn surface_area(corners: &Corners) -> f64 {
 }
 
 /// Estimated bytes of voxel data for a surface of `area` at `voxel_size`.
-fn estimated_bytes(area: f64, voxel_size: f32) -> f64 {
+///
+/// `pub(crate)` because [`crate::primitive`] has to answer the same question
+/// about a body it has not built yet, and a second estimator with a second
+/// fudge factor would drift from this one silently. The area of a cube, a ball
+/// or a rod is a closed form, so the primitive path needs nothing else.
+pub(crate) fn estimated_bytes(area: f64, voxel_size: f32) -> f64 {
     let brick_mm = BRICK_DIM as f64 * voxel_size as f64;
     area / (brick_mm * brick_mm) * SHELL_FACTOR * BRICK_VOXELS as f64 * 4.0
+}
+
+/// Estimated mesh vertices for a surface of `area` at `voxel_size`.
+///
+/// The twin of [`estimated_bytes`], split out for the same reason: it is the
+/// second half of what an add path has to predict, and both ceilings are
+/// checked together or neither is.
+pub(crate) fn estimated_vertices(area: f64, voxel_size: f32) -> f64 {
+    area / (voxel_size as f64 * voxel_size as f64) * VERTEX_FACTOR
 }
 
 /// The finest voxel size the import ceilings can hold for a surface of
@@ -758,7 +772,7 @@ fn estimated_bytes(area: f64, voxel_size: f32) -> f64 {
 /// at, and a retry judging against an empty pool would coarsen to a size that
 /// still does not fit and then report success.
 fn workable_voxel_for(area: f64, voxel_size: f32, already_reserved: f64) -> Option<f32> {
-    let vertices = area / (voxel_size as f64 * voxel_size as f64) * VERTEX_FACTOR;
+    let vertices = estimated_vertices(area, voxel_size);
     // Clamped to leave a thousandth of the pool, so that a caller which has
     // already filled it names a very coarse size rather than dividing by zero
     // and returning an infinity the retry would then import at. Nothing should

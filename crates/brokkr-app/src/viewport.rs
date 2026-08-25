@@ -214,12 +214,11 @@ impl SharedFrame {
     /// takes the warning down and leaves the missing geometry missing, which is
     /// the silent-geometry-loss shape this project has shipped twice already.
     ///
-    /// No caller outside the tests yet: increment 9 is the one that can delete
-    /// a body, and the pairing above is its job. The channel lands here rather
-    /// than there because the ordering above is the part that is easy to get
-    /// wrong and impossible to see, and it is worth having pinned by a test
-    /// before the gesture that needs it exists.
-    #[allow(dead_code)]
+    /// Its caller is `Brokkr::remove_body`, which is the delete gesture, and
+    /// which makes the pairing above. The channel landed here an increment
+    /// earlier than that gesture because the ordering above is the part that is
+    /// easy to get wrong and impossible to see, and it was worth having pinned
+    /// by a test before anything depended on it.
     pub fn forget_body(&self, body: NodeId) {
         self.forget.lock().expect("shared frame poisoned").push(body);
     }
@@ -252,6 +251,17 @@ impl SharedFrame {
     #[cfg(test)]
     pub fn hidden_snapshot(&self) -> Vec<NodeId> {
         self.hidden.lock().expect("shared frame poisoned").clone()
+    }
+
+    /// The bodies queued to be dropped from the pool, taken.
+    ///
+    /// Taken rather than read for the same reason
+    /// [`SharedFrame::take_pool_reset_for_tests`] swaps: what a delete owes is
+    /// that the request is THERE afterwards, and a test that could see a
+    /// previous gesture's request would pass on the wrong evidence.
+    #[cfg(test)]
+    pub fn take_forgotten_for_tests(&self) -> Vec<NodeId> {
+        std::mem::take(&mut *self.forget.lock().expect("shared frame poisoned"))
     }
 
     /// Make the renderer match everything the application has published, in the
@@ -398,6 +408,16 @@ pub(crate) fn shortcut(character: &str, command: bool, shift: bool, alt: bool) -
         // belongs to the toolkit, to the window manager, or to a shortcut this
         // application has not defined yet -- and must not fall through to the
         // bare-key table below.
+        if command && character == "," {
+            // Photoshop's own pair, one level up: ctrl+comma hides the layer
+            // you are on, and the alt form is the "show me everything again"
+            // escape hatch for having hidden things and lost track of what.
+            return Some(if alt {
+                Message::EveryBodyShown
+            } else {
+                Message::ActiveBodyVisibilityToggled
+            });
+        }
         let undo_chord = command && !alt && character.eq_ignore_ascii_case("z");
         return undo_chord.then_some(if shift { Message::Redo } else { Message::Undo });
     }

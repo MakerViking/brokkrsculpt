@@ -282,6 +282,7 @@ fn main() {
                     &Stamp::new(at, normal, BrushDirection::Add)
                         .with_tangent(stroke.direction().unwrap_or(Vec3::ZERO)),
                     Symmetry::X,
+                    Vec3::ZERO,
                     &mut brush_scratch,
                 );
             }
@@ -491,6 +492,7 @@ fn main() {
                     &Stamp::new(at, normal, BrushDirection::Add)
                         .with_tangent(stroke.direction().unwrap_or(Vec3::ZERO)),
                     Symmetry::X,
+                    Vec3::ZERO,
                     &mut brush_scratch,
                 );
             }

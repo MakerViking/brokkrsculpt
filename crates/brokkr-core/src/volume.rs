@@ -1025,7 +1025,22 @@ impl Volume {
     /// down and [`Volume::end_stroke`] when it comes back up. Recording is per
     /// brick and happens on first touch only, so a stroke that passes over the
     /// same brick a hundred times still costs one snapshot of it.
+    ///
+    /// **Opening a recorder over a live one is a bug and no longer silent.**
+    /// It used to overwrite the map, which threw away every brick recorded so
+    /// far: the stroke went on carving, the entry that was finally pushed
+    /// restored only the tail of it, and nothing anywhere said so. With more
+    /// than one body it is also how a recorder ends up open on the body the
+    /// user is NOT sculpting -- and `record_for_undo` does nothing at all when
+    /// no recorder is open, so that carve is pushed nowhere, never sets
+    /// `unsaved`, and does not even raise the discard prompt on the way out.
+    /// A caller that cannot know whether a stroke is already live asks
+    /// [`Volume::is_recording`] first.
     pub fn begin_stroke(&mut self) {
+        debug_assert!(
+            self.recorder.is_none(),
+            "a stroke is already being recorded, and opening another would discard it"
+        );
         self.recorder = Some(FxHashMap::default());
     }
 

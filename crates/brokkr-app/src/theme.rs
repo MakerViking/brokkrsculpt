@@ -402,3 +402,56 @@ pub fn timeline_key_lit(_theme: &iced::Theme) -> iced::widget::container::Style 
 pub fn timeline_playhead(_theme: &iced::Theme) -> iced::widget::container::Style {
     iced::widget::container::Style { background: Some(ACCENT_HOT.into()), ..Default::default() }
 }
+
+// --- the body panel ----------------------------------------------------------
+
+/// A row of the body list that is not the active one.
+///
+/// No background at all, so the panel behind it shows through and a list of
+/// twelve reads as a list rather than as twelve cards.
+pub fn body_row(_theme: &iced::Theme) -> iced::widget::container::Style {
+    iced::widget::container::Style {
+        border: iced::Border { radius: RADIUS_SM.into(), ..Default::default() },
+        ..Default::default()
+    }
+}
+
+/// The row edits land on.
+///
+/// [`ACCENT_TINT`] rather than a solid fill: at 0.14 alpha the name stays
+/// legible in `TEXT`, where a solid accent would need the near-black `ON_ACCENT`
+/// and make the selected row the only one in the list with dark text.
+pub fn body_row_active(_theme: &iced::Theme) -> iced::widget::container::Style {
+    iced::widget::container::Style {
+        background: Some(ACCENT_TINT.into()),
+        border: iced::Border { radius: RADIUS_SM.into(), ..Default::default() },
+        ..Default::default()
+    }
+}
+
+/// The two-pixel bar down the inside edge of the active row.
+///
+/// The tint alone is 0.14 alpha over a dark panel, which survives a screenshot
+/// and not a bright room. The bar is what makes the selection readable at a
+/// glance, and it is the same device SindriCAD's tree uses.
+pub fn body_row_marker(_theme: &iced::Theme) -> iced::widget::container::Style {
+    iced::widget::container::Style {
+        background: Some(ACCENT.into()),
+        border: iced::Border { radius: 1.0.into(), ..Default::default() },
+        ..Default::default()
+    }
+}
+
+/// The placeholder where a body's picture will go.
+///
+/// A flat 28 px well, which is the shape the rendered thumbnail needs anyway --
+/// so nothing here is thrown away when increment 15 puts a picture in it. A type
+/// glyph instead would be three icons that have to pass two icon tests and then
+/// be deleted.
+pub fn body_thumbnail(_theme: &iced::Theme) -> iced::widget::container::Style {
+    iced::widget::container::Style {
+        background: Some(BG_DEEP.into()),
+        border: iced::Border { color: LINE, width: 1.0, radius: RADIUS_SM.into() },
+        ..Default::default()
+    }
+}

@@ -159,6 +159,7 @@ pub struct Imported {
 /// unrebindable. Collapsing keeps every heading reachable without a scroll.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PanelSection {
+    Bodies,
     Pattern,
     Pen,
     SpaceMouse,
@@ -167,7 +168,8 @@ pub enum PanelSection {
 }
 
 impl PanelSection {
-    pub const ALL: [PanelSection; 5] = [
+    pub const ALL: [PanelSection; 6] = [
+        PanelSection::Bodies,
         PanelSection::Pattern,
         PanelSection::Pen,
         PanelSection::SpaceMouse,
@@ -177,6 +179,7 @@ impl PanelSection {
 
     pub fn title(self) -> &'static str {
         match self {
+            PanelSection::Bodies => "BODIES",
             PanelSection::Pattern => "PATTERN",
             PanelSection::Pen => "PEN",
             PanelSection::SpaceMouse => "SPACEMOUSE",
@@ -185,10 +188,16 @@ impl PanelSection {
         }
     }
 
-    /// Whether it starts open. The two long ones start closed so every
-    /// heading is visible without scrolling.
+    /// Whether it starts open. The long ones start closed so every heading is
+    /// visible without scrolling.
+    ///
+    /// **DETAIL joined that list when BODIES arrived, and it is the sixth
+    /// section that pays for it.** The budget is a 1080 high window with every
+    /// heading reachable, and the handoff already reports DETAIL's advice line
+    /// clipped below the fold at that height -- so it was the block already
+    /// costing more than it showed.
     pub fn open_by_default(self) -> bool {
-        !matches!(self, PanelSection::Pen | PanelSection::SpaceMouse)
+        !matches!(self, PanelSection::Pen | PanelSection::SpaceMouse | PanelSection::Detail)
     }
 }
 
@@ -396,4 +405,37 @@ pub enum Message {
     StatsToggled,
     /// Arm or disarm the plane cut. The next left drag becomes the cut line.
     CutToggled,
+
+    // --- the body panel ------------------------------------------------------
+    /// Make this body the one edits land on.
+    BodySelected(brokkr_core::NodeId),
+    /// Flip one row's own eye.
+    ///
+    /// Its OWN eye, never the resolved answer: an ancestor folder's eye and solo
+    /// are masks applied on top, and a click here must not silently rewrite a
+    /// bit the user cannot see.
+    BodyVisibilityToggled(brokkr_core::NodeId),
+    /// Flip the eye of whichever body is active, for `ctrl+comma`.
+    ///
+    /// A variant of its own rather than `BodyVisibilityToggled(active)`, because
+    /// `viewport::shortcut` is a **pure decode** of a key and cannot see the
+    /// document -- that separation is what lets every shortcut be tested without
+    /// a window, and it is worth one message to keep.
+    ActiveBodyVisibilityToggled,
+    /// Turn every eye in the document on, for `ctrl+alt+comma`. The way out of
+    /// having hidden something and lost track of what.
+    EveryBodyShown,
+    /// Open or close the small menu the `+` button drops.
+    PrimitiveMenuToggled,
+    /// Add a primitive as a NEW body, placed clear of everything already there.
+    PrimitiveAdded(brokkr_core::PrimitiveKind),
+    /// Remove the active body. May raise a prompt first; see
+    /// `Brokkr::pending_delete`.
+    BodyDeleted,
+    /// Go ahead with a delete the prompt asked about.
+    BodyDeleteConfirmed,
+    BodyDeleteCancelled,
+    /// Show or hide the thumbnail column. Session state, so it must NOT dirty
+    /// the document: nothing about it is written to the file.
+    ThumbnailsToggled,
 }

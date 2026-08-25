@@ -75,6 +75,14 @@ impl Brokkr {
             return stack![body, self.confirm_card(pending), self.resize_frame()].into();
         }
 
+        // Same reasoning, one rank down: a delete asks about one body where the
+        // prompt above asks about the whole document, so losing the document
+        // outranks it. It cannot in practice be up at the same time as either
+        // of the two below, but the ordering is stated rather than assumed.
+        if let Some(pending) = &self.pending_delete {
+            return stack![body, self.delete_card(pending), self.resize_frame()].into();
+        }
+
         // Same reasoning, one rank down: the bug report is modal too, and it
         // yields to the unsaved prompt because losing work outranks filing a
         // report about it.
@@ -476,7 +484,13 @@ impl Brokkr {
                 let mut items = column![
                     entry("New", Message::NewSculpt),
                     entry("Open…", Message::OpenRequested),
-                    entry("Import mesh…", Message::ImportRequested),
+                    // "and replace" because that is what it does: the mesh
+                    // becomes the whole document, and every body already in it
+                    // goes. Named "Import mesh…" it read as an add, which is
+                    // the one thing it is not -- and the day importing a mesh
+                    // AS a new body ships, both entries can sit here and say
+                    // which is which.
+                    entry("Import and replace…", Message::ImportRequested),
                 ]
                 .spacing(1);
                 // Only when there is one to recover. A permanently greyed item
@@ -1200,6 +1214,7 @@ impl Brokkr {
 
         container(
             scrollable(column![
+                self.section(PanelSection::Bodies, || self.bodies_panel()),
                 text(self.brush.kind.label().to_uppercase())
                     .size(theme::CAPTION_SIZE)
                     .color(theme::TEXT_MUTE),
@@ -1453,6 +1468,259 @@ impl Brokkr {
         .on_press(Message::SectionToggled(which));
 
         if open { column![heading, body()].spacing(theme::S2).into() } else { heading.into() }
+    }
+
+    // --- the body list -------------------------------------------------------
+
+    /// Every body in the sculpt, the verbs that act on one, and the switch that
+    /// turns the pictures off.
+    ///
+    /// # Nothing in a row may compute anything
+    ///
+    /// `view()` runs at display rate off `window::frames()`, so a row that
+    /// formats a triangle count, measures a bound or diffs staleness repeats the
+    /// mistake `detail_advice` is cached to avoid, multiplied by the number of
+    /// bodies. Every value a row reads here is either already in a field
+    /// (`shown`, `active`) or is a borrowed `&str`; nothing allocates a string
+    /// and nothing walks a brick map.
+    ///
+    /// # A plain `column`, deliberately not a `keyed_column`
+    ///
+    /// `keyed::Column::draw` iterates every child with no viewport test
+    /// (`iced_widget-0.14.2/src/keyed/column.rs:355-364`) where plain
+    /// `Column::draw` filters on `layout.bounds().intersects(viewport)`
+    /// (`column.rs:328`), and a `scrollable` passes its translated visible
+    /// bounds down as that viewport. At 128 rows the keyed one pushes 128
+    /// heap-boxed primitives every frame to show six. The widget state it exists
+    /// to preserve does not survive the case it would be chosen for either: its
+    /// diff splices on a length change and otherwise zips by index
+    /// (`keyed/column.rs:228-244`), so state does not follow a row moved by a
+    /// same-length reorder.
+    ///
+    /// # Walked tree-shaped from the first commit
+    ///
+    /// Every row is at depth 0 today, so `indent` is always zero and
+    /// `skip_below` never fires. Three lines, and the walk does not have to be
+    /// rewritten when folders arrive.
+    fn bodies_panel(&self) -> Element<'_, Message> {
+        /// One row, with a thumbnail and without.
+        const ROW_H: f32 = 32.0;
+        const ROW_H_BARE: f32 = 22.0;
+        /// Six rows with pictures, eight without — the same 190-odd pixels
+        /// either way, so turning the pictures off buys rows rather than space.
+        const VISIBLE_ROWS: f32 = 6.0;
+        const VISIBLE_ROWS_BARE: f32 = 8.0;
+
+        let mut rows = column![].spacing(1);
+        // The depth below which rows belong to a collapsed subtree and are not
+        // drawn. A collapsed folder changes only what is DRAWN -- never what a
+        // command does -- which is the ZBrush failure this design is written
+        // against.
+        let mut skip_below: Option<u8> = None;
+        for (index, node) in self.doc.nodes().iter().enumerate() {
+            if let Some(depth) = skip_below {
+                if node.depth() > depth {
+                    continue;
+                }
+                skip_below = None;
+            }
+            if node.collapsed {
+                skip_below = Some(node.depth());
+            }
+            rows = rows.push(self.body_row(index, node));
+        }
+
+        let (row_h, visible_rows) =
+            if self.thumbnails { (ROW_H, VISIBLE_ROWS) } else { (ROW_H_BARE, VISIBLE_ROWS_BARE) };
+
+        let verbs = row![
+            button(icon::icon(icon::IconName::Plus, theme::ICON_INLINE, theme::TEXT_DIM))
+                .padding(Padding { top: 2.0, bottom: 2.0, left: theme::S3, right: theme::S3 })
+                .style(if self.adding { theme::tool_button_active } else { theme::tool_button })
+                .on_press(Message::PrimitiveMenuToggled),
+            button(icon::icon(icon::IconName::Trash, theme::ICON_INLINE, theme::TEXT_DIM))
+                .padding(Padding { top: 2.0, bottom: 2.0, left: theme::S3, right: theme::S3 })
+                .style(theme::tool_button)
+                // Greyed rather than refusing on press: the last body cannot go,
+                // and a button that looks pressable and is not teaches the user
+                // that the application ignores them.
+                .on_press_maybe((self.doc.body_count() > 1).then_some(Message::BodyDeleted)),
+        ]
+        .spacing(theme::S2);
+
+        let mut stacked = column![
+            // The pictures are session state and must not dirty the document.
+            // Photoshop's Panel Options offers None beside three sizes and the
+            // standard advice for a heavy document is None, so the switch is
+            // faithful to the reference rather than a retreat from it.
+            checkbox(self.thumbnails)
+                .label("Thumbnails")
+                .on_toggle(|_| Message::ThumbnailsToggled)
+                .text_size(theme::CAPTION_SIZE),
+            scrollable(rows).height(Length::Fixed(row_h * visible_rows)),
+            verbs,
+        ]
+        .spacing(theme::S2);
+
+        if self.adding {
+            // As TEXT and not icons. Three glyphs that are not drawn, and a cube
+            // at 11 px is a smudge -- the words are shorter to read than the
+            // pictures would be to learn.
+            let choices = brokkr_core::PrimitiveKind::ALL.into_iter().fold(
+                row![].spacing(theme::S1),
+                |assembled, kind| {
+                    assembled.push(
+                        button(text(kind.label()).size(theme::CAPTION_SIZE))
+                            .width(Length::Fill)
+                            .style(theme::tool_button)
+                            .on_press(Message::PrimitiveAdded(kind)),
+                    )
+                },
+            );
+            stacked = stacked.push(choices);
+        }
+
+        stacked.into()
+    }
+
+    /// One row of the body list.
+    ///
+    /// `[marker][indent][disclosure][thumbnail][name, Fill][eye]`.
+    ///
+    /// # Clicking the eye must never change the active body, and it costs no
+    /// code at all
+    ///
+    /// `MouseArea::update` (`iced_widget-0.14.2/src/mouse_area.rs:219-244`)
+    /// forwards to its content first and then returns early on
+    /// `shell.is_event_captured()`, and `Button` captures `ButtonPressed` when
+    /// it has an `on_press` and the cursor is over it. So the eye's button eats
+    /// the press and the row's `mouse_area` never sees it. **Do not "tidy" this
+    /// into a row of buttons or an `on_press` on the eye's parent** -- this is
+    /// Photoshop's quiet load-bearing property, the one that lets you audit
+    /// visibility across twelve bodies without losing the body you were
+    /// sculpting.
+    ///
+    /// The thumbnail is INERT for the same mechanism read the other way: it is a
+    /// styled `container`, which captures nothing, so the row press passes
+    /// through it. It must not become a `Button` -- it is the largest target in
+    /// the row, and Photoshop puts a different action on a ctrl-clicked layer
+    /// thumbnail that users hit constantly.
+    ///
+    /// # Every row's eye means the same thing, including the active row's
+    ///
+    /// ZBrush's does not: clicking the selected row's eye there hides
+    /// everything, and a click a few pixels lower hides just that one. That is
+    /// documented behaviour and exactly the presentation this brief exists to
+    /// escape.
+    fn body_row<'a>(&'a self, index: usize, node: &'a brokkr_core::Node) -> Element<'a, Message> {
+        const THUMBNAIL: f32 = 28.0;
+        /// Where a folder's caret will go. Reserved now so a body row and a
+        /// folder row line up the day there are both.
+        const DISCLOSURE: f32 = 11.0;
+        const INDENT_PER_DEPTH: f32 = 12.0;
+        const MARKER: f32 = 2.0;
+
+        let active = node.id == self.doc.active();
+        // Already resolved, once, by `publish_visibility`. A row must never
+        // resolve it for itself: that is the walk that makes twelve rows twelve
+        // walks, every frame.
+        let drawn = self.shown.get(index).copied().unwrap_or(true);
+        let ink = if drawn { theme::TEXT } else { theme::TEXT_MUTE };
+
+        // Two signals, because `ICON_INLINE` is 11 px and an eye with a hairline
+        // through it is a dot at that size: the glyph AND the name's colour.
+        let eye = if node.visible { icon::IconName::Eye } else { icon::IconName::EyeOff };
+        let eye_ink = if drawn { theme::TEXT } else { theme::TEXT_MUTE };
+
+        let mut line = row![
+            container(space()).width(Length::Fixed(MARKER)).height(Length::Fill).style(if active {
+                theme::body_row_marker
+            } else {
+                theme::body_row
+            }),
+            space().width(Length::Fixed(f32::from(node.depth()) * INDENT_PER_DEPTH)),
+            space().width(Length::Fixed(DISCLOSURE)),
+        ]
+        .spacing(theme::S2)
+        .align_y(Alignment::Center);
+
+        if self.thumbnails {
+            line = line.push(
+                container(space())
+                    .width(Length::Fixed(THUMBNAIL))
+                    .height(Length::Fixed(THUMBNAIL))
+                    .style(theme::body_thumbnail),
+            );
+        }
+
+        let line = line
+            .push(
+                text(node.name.as_str())
+                    .size(theme::TEXT_SIZE_SMALL)
+                    .color(ink)
+                    .width(Length::Fill),
+            )
+            .push(
+                button(icon::icon(eye, theme::ICON_INLINE, eye_ink))
+                    .padding(Padding { top: 2.0, bottom: 2.0, left: theme::S1, right: theme::S1 })
+                    .style(theme::section_heading)
+                    .on_press(Message::BodyVisibilityToggled(node.id)),
+            );
+
+        mouse_area(
+            container(line)
+                .padding(Padding { top: 0.0, bottom: 0.0, left: 0.0, right: theme::S1 })
+                .width(Length::Fill)
+                .style(if active { theme::body_row_active } else { theme::body_row }),
+        )
+        .on_press(Message::BodySelected(node.id))
+        .into()
+    }
+
+    /// "This body is large enough that undo may not be able to hold it."
+    ///
+    /// The size is in the question, because 512 MB is the reclaim allowance and
+    /// a delete at or over it is exactly the delete that can be evicted before
+    /// it can be undone. Modal on the same `modal_layer` as the unsaved-work
+    /// prompt, for the reason documented there.
+    fn delete_card<'a>(&'a self, pending: &'a super::PendingDelete) -> Element<'a, Message> {
+        type ButtonStyle = fn(&iced::Theme, button::Status) -> button::Style;
+        let answer = |label: &'static str, message: Message, style: ButtonStyle| {
+            button(text(label).size(theme::TEXT_SIZE))
+                .padding(Padding {
+                    top: theme::S2,
+                    bottom: theme::S2,
+                    left: theme::S5,
+                    right: theme::S5,
+                })
+                .style(style)
+                .on_press(message)
+        };
+
+        let card = container(
+            column![
+                text(format!("Delete {}?", pending.name)).size(theme::TEXT_SIZE).color(theme::TEXT),
+                text(format!(
+                    "It holds {:.0} MB. Undo keeps a deleted body only while it fits a {} MB \
+                     allowance, so this one may not be recoverable.",
+                    pending.bytes as f64 / (1024.0 * 1024.0),
+                    brokkr_core::DEFAULT_RECLAIM_BUDGET / (1024 * 1024),
+                ))
+                .size(theme::CAPTION_SIZE)
+                .color(theme::TEXT_MUTE),
+                row![
+                    answer("Delete", Message::BodyDeleteConfirmed, theme::danger_button),
+                    answer("Cancel", Message::BodyDeleteCancelled, theme::tool_button),
+                ]
+                .spacing(theme::S3),
+            ]
+            .spacing(theme::S4)
+            .width(Length::Fixed(420.0)),
+        )
+        .padding(theme::S5)
+        .style(theme::menu_card);
+
+        modal_layer(card)
     }
 
     /// The surface pattern, which multiplies into whichever brush is selected.

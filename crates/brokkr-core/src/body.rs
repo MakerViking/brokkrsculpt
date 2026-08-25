@@ -37,11 +37,13 @@
 //! shape of failure that passes locally and fails on CI. List order is also
 //! user-visible state that has to round-trip.
 
+use glam::Vec3;
 use rayon::prelude::*;
 
-use crate::brick::{BRICK_VOXELS, Brick, BrickCoord};
+use crate::brick::{BRICK_VOXELS, Brick, BrickCoord, NARROW_BAND};
 use crate::mesh::{BrickMesh, MeshScratch};
 use crate::project::MAX_VOLUME_BYTES;
+use crate::raycast::{Hit, raycast};
 use crate::volume::{PARALLEL_MESH_THRESHOLD, Volume, VolumeStats};
 
 /// Which node, for as long as the document lives.
@@ -90,23 +92,84 @@ pub const MAX_DEPTH: u8 = 8;
 /// What a body row holds that a folder row does not.
 ///
 /// Boxed inside [`Node`] so that a folder row does not carry a `Volume`-sized
-/// hole. It is a struct with one field rather than a bare `Box<Volume>`
-/// because the per-body cache -- the four numbers the panel, the guards and the
-/// pick gate read -- joins it later. That cache is deliberately **not** here
-/// yet: two of its four numbers come from `Volume::surface_bounds`, which scans
-/// every dense brick and whose own documentation forbids calling it per frame,
-/// so a cache filled on every remesh would be a per-stroke full-model scan. It
-/// arrives with the first caller that needs a bound it cannot afford to
-/// recompute.
-///
-/// Derives nothing, because [`Volume`] derives nothing -- not even `Debug`, and
-/// deliberately not `Clone`. A body delete MOVES its volume into the undo entry
-/// rather than cloning it; a clone is simply not available, and that pushes the
-/// right way. Duplicating a body will get an explicitly named
+/// hole. Derives nothing, because [`Volume`] derives nothing -- not even
+/// `Debug`, and deliberately not `Clone`. A body delete MOVES its volume into
+/// the undo entry rather than cloning it; a clone is simply not available, and
+/// that pushes the right way. Duplicating a body will get an explicitly named
 /// `Volume::duplicated`, because `.clone()` is one keystroke and a name is
 /// something a reviewer stops on.
 struct BodyData {
     volume: Volume,
+    cache: BodyCache,
+}
+
+/// The per-body numbers a caller cannot afford to work out for itself.
+///
+/// **One field, and the reason there is one rather than four is the cost of
+/// keeping each honest.** The design this came from listed four: the stats, the
+/// brick-extent box, the tight surface box and a radius. Three of those are not
+/// here:
+///
+/// - the stats are summed by [`Document::totals`], which walks the brick maps
+///   exactly as the single-volume code it replaced did, and a cache with one
+///   writer and one reader would buy nothing but a way for the two to disagree;
+/// - the tight surface box comes from [`Volume::surface_bounds`], which scans
+///   every dense brick and whose own documentation forbids calling it per
+///   frame. Held here it would have to be refreshed on every remesh, which is
+///   to say on every pointer event of every stroke: a full-model scan per
+///   event. Its callers -- the mirror-straddle refusal, the resize readout --
+///   are user actions and pay for it there;
+/// - the radius is [`Volume::content_radius`] over the box below.
+///
+/// So the cache holds the one number a per-pointer-event caller genuinely needs
+/// and cannot recompute: the pick gate's box.
+#[derive(Debug, Clone, Copy, Default)]
+struct BodyCache {
+    /// A world box that CONTAINS this body's bricks, or `None` when it holds
+    /// none.
+    ///
+    /// **A superset, never a subset, and that asymmetry is the whole safety
+    /// argument.** It gates a raycast: a box that is too big costs a march that
+    /// finds nothing, and a box that is too small drops a hit the user can see
+    /// on screen -- the cursor would simply stop working over part of the
+    /// model. So the incremental refresh in [`Document::take_dirty`] only ever
+    /// GROWS it, by taking in each dirty brick, and never shrinks it. A body
+    /// carved back down to a third of its size keeps the box it once needed
+    /// until something recomputes it in full, which costs a few marches that
+    /// miss and cannot cost a hit.
+    bounds: Option<(Vec3, Vec3)>,
+}
+
+impl BodyCache {
+    /// Take one brick into the box.
+    ///
+    /// Grows only. See [`BodyCache::bounds`] for why that direction is the safe
+    /// one and what it costs.
+    fn take_in(&mut self, coord: BrickCoord, voxel_size: f32) {
+        let low = coord.origin().as_vec3() * voxel_size;
+        let high = coord.max_voxel().as_vec3() * voxel_size;
+        self.bounds = Some(match self.bounds {
+            Some((was_low, was_high)) => (was_low.min(low), was_high.max(high)),
+            None => (low, high),
+        });
+    }
+}
+
+impl BodyData {
+    fn new(volume: Volume) -> Self {
+        let cache = BodyCache { bounds: volume.world_bounds() };
+        Self { volume, cache }
+    }
+
+    /// Recompute the box from scratch, for the operations that rewrite the
+    /// whole field or move the lattice under it.
+    ///
+    /// A walk of the brick map's keys. Rescale, resample and a quarter turn all
+    /// need it: each of them changes where an unchanged brick sits in the
+    /// world, so growing the old box would be growing the wrong box.
+    fn recompute_bounds(&mut self) {
+        self.cache.bounds = self.volume.world_bounds();
+    }
 }
 
 /// Everything about a node that is NOT its volume: the whole of what rename,
@@ -181,7 +244,7 @@ impl Node {
             name,
             visible: true,
             collapsed: false,
-            body: Some(Box::new(BodyData { volume })),
+            body: Some(Box::new(BodyData::new(volume))),
         }
     }
 
@@ -203,7 +266,7 @@ impl Node {
             name: meta.name,
             visible: meta.visible,
             collapsed: meta.collapsed,
-            body: Some(Box::new(BodyData { volume })),
+            body: Some(Box::new(BodyData::new(volume))),
         }
     }
 
@@ -227,6 +290,18 @@ impl Node {
     #[inline]
     pub fn volume_mut(&mut self) -> Option<&mut Volume> {
         self.body.as_mut().map(|data| &mut data.volume)
+    }
+
+    /// A world box that contains this body's bricks, or `None` for a folder row
+    /// and for a body holding nothing.
+    ///
+    /// Cached rather than measured, and a superset rather than a fit: see
+    /// [`BodyCache::bounds`]. This is what [`Document::pick`] tests a ray
+    /// against before it will march a body, which is what keeps a hover over a
+    /// document of bodies from costing one sphere trace each.
+    #[inline]
+    pub fn bounds(&self) -> Option<(Vec3, Vec3)> {
+        self.body.as_ref().and_then(|data| data.cache.bounds)
     }
 
     /// Everything about this row except its field.
@@ -431,17 +506,35 @@ impl Document {
 
     /// Swap the active body's field for another one on the SAME lattice.
     ///
-    /// For the operations that rewrite a whole field in place and keep the row
-    /// it belongs to -- re-orienting is the one today. The lattice check is a
-    /// `debug_assert!` rather than a refusal because every caller derives the
-    /// replacement from the volume it is replacing.
+    /// For an operation that rewrites a whole field in place and keeps the row
+    /// it belongs to. The lattice check is a `debug_assert!` rather than a
+    /// refusal because every caller derives the replacement from the volume it
+    /// is replacing.
+    ///
+    /// **Re-orienting used to be its one caller and is not any more**, because
+    /// a quarter turn turns every body rather than the active one; see
+    /// [`Document::rotate`]. What is left is the application's own test
+    /// fixtures, which is honest about how much of this is load-bearing today —
+    /// it is the shape merge and split will want, and it is not on any path a
+    /// user can reach right now.
     pub fn replace_active_volume(&mut self, volume: Volume) {
         debug_assert_eq!(
             volume.voxel_size(),
             self.voxel_size,
             "a body may not be swapped for one on a different lattice"
         );
-        *self.active_volume_mut() = volume;
+        let active = self.active;
+        let data = self
+            .nodes
+            .iter_mut()
+            .find(|node| node.id == active)
+            .and_then(|node| node.body.as_mut())
+            .expect("the active node always holds a volume");
+        data.volume = volume;
+        // In full rather than grown: the incoming field is a different one, and
+        // a box grown from the outgoing field's would be a box around geometry
+        // that is no longer there.
+        data.recompute_bounds();
     }
 
     /// Add a body at the end of the list and return its id.
@@ -605,6 +698,52 @@ impl Document {
         totals
     }
 
+    /// A world box containing every body's bricks, or `None` when the document
+    /// holds no geometry at all.
+    ///
+    /// **Over every body, visible or not**, and the two callers both need it
+    /// that way: a primitive placed clear of only the bodies that are drawn is a
+    /// primitive inside a hidden one, which is the same invisible-on-the-first-
+    /// press failure that placing off-origin exists to prevent, one reveal
+    /// later.
+    ///
+    /// Read from the per-body cache rather than measured, so it costs one min
+    /// and one max per row and may safely be asked at a user action. That cache
+    /// is a superset that only ever grows (see `BodyCache::bounds`), so this box
+    /// is a superset too -- which for placing something clear of it is the safe
+    /// direction to be wrong in.
+    pub fn world_bounds(&self) -> Option<(Vec3, Vec3)> {
+        self.nodes.iter().filter_map(Node::bounds).reduce(|(low, high), (other_low, other_high)| {
+            (low.min(other_low), high.max(other_high))
+        })
+    }
+
+    /// How big the BIGGEST SINGLE body is: the largest half-diagonal of any one
+    /// row's box, or `None` when the document holds no geometry.
+    ///
+    /// **Deliberately not half the diagonal of [`Document::world_bounds`], and
+    /// the difference is a bug this shipped with.** The union's diagonal spans
+    /// the *gaps between* bodies as well as the bodies, so it grows every time
+    /// anything is added away from the origin. Sizing a new primitive off it
+    /// made each one larger than the last: measured through
+    /// [`crate::primitive::placement`] on a 30 mm ball at a 0.25 mm voxel, eight
+    /// presses of `+` gave cubes 37, 48, 66, 93, 128, 181, 249 and 342 mm
+    /// across -- a factor of about 1.38 per press, unbounded, with the sixth one
+    /// alone allocating some 460 MB of bricks. Measured per body it is a fixed
+    /// point instead: a primitive at a third of the biggest body's radius is
+    /// smaller than that body, so the maximum does not move.
+    ///
+    /// Read from the per-body cache, like [`Document::world_bounds`], so it
+    /// costs one length per row and may be asked at a user action. A superset,
+    /// for the same reason and in the same safe direction.
+    pub fn largest_body_radius(&self) -> Option<f32> {
+        self.nodes
+            .iter()
+            .filter_map(Node::bounds)
+            .map(|(low, high)| (high - low).length() * 0.5)
+            .reduce(f32::max)
+    }
+
     /// What this document will and will not make room for, right now.
     ///
     /// The one place an add path asks "does another body fit"; see
@@ -681,10 +820,86 @@ impl Document {
         found
     }
 
+    /// The nearest surface a ray meets across every body that is DRAWN, and
+    /// which body that is.
+    ///
+    /// `visible` is indexed by node position and comes from
+    /// [`Document::display_visibility`]. A body the user cannot see cannot be
+    /// picked: hiding is a draw-time skip, so the depth buffer where that body
+    /// sits is empty, and a press that carved it would set `unsaved`, push a
+    /// history entry, pay a remesh and an upload, and change not one pixel.
+    ///
+    /// # The box gate is not an optimisation that can be left out
+    ///
+    /// A raycast that MISSES costs the whole march -- measured at 0.025 ms --
+    /// so 64 unguarded bodies is 1.6 ms of a 16 ms frame on every pointer move,
+    /// for a gesture that is mostly misses. A ray-slab test against a cached
+    /// box is about 20 ns. That ratio is why [`BodyCache`] exists at all.
+    ///
+    /// # The gate also buys a reach the march does not have
+    ///
+    /// [`crate::raycast`] advances by at most [`NARROW_BAND`] voxels a step,
+    /// because that is where the field saturates, so its total travel is
+    /// bounded by `MAX_STEPS * NARROW_BAND * voxel_size` -- 46 mm at a 0.03 mm
+    /// voxel, against a camera that frames a model from about three times its
+    /// radius. At the finest lattice the ray ran out of steps in the empty
+    /// space in front of the model and the cursor quietly stopped working.
+    /// Starting the march where the ray ENTERS the body's box spends none of
+    /// those steps crossing that emptiness.
+    pub fn pick(
+        &self,
+        origin: Vec3,
+        direction: Vec3,
+        far: f32,
+        visible: &[bool],
+    ) -> Option<(NodeId, Hit)> {
+        debug_assert_eq!(
+            visible.len(),
+            self.nodes.len(),
+            "the visibility mask is indexed by node position"
+        );
+        let mut best: Option<(NodeId, Hit)> = None;
+        for (index, node) in self.nodes.iter().enumerate() {
+            if !visible.get(index).copied().unwrap_or(false) {
+                continue;
+            }
+            // Never further than the nearest hit so far. A body behind one
+            // already found cannot win, and the march is the expensive part.
+            let reach = best.map_or(far, |(_, hit)| hit.distance);
+            if let Some(hit) = self.march(node, origin, direction, reach) {
+                best = Some((node.id, hit));
+            }
+        }
+        best
+    }
+
+    /// The surface one named body's ray meets, gated and advanced exactly as
+    /// [`Document::pick`] gates and advances.
+    ///
+    /// This is what a gesture already committed to a body wants -- a live
+    /// stroke keeps carving the body it started on, whatever the cursor passes
+    /// over on the way. It shares [`Document::march`] with the picker so that
+    /// the two cannot disagree about where the surface is, which they would the
+    /// moment one of them had the box advance and the other did not.
+    pub fn pick_body(&self, id: NodeId, origin: Vec3, direction: Vec3, far: f32) -> Option<Hit> {
+        self.march(self.node(id)?, origin, direction, far)
+    }
+
+    /// One body: the box test, the advance, and the march.
+    fn march(&self, node: &Node, origin: Vec3, direction: Vec3, far: f32) -> Option<Hit> {
+        let volume = node.volume()?;
+        let entry = ray_meets_box(origin, direction, node.bounds()?, far)?;
+        // Backed off a narrow band, because that is the width of the only part
+        // of the field that carries a distance: a surface sitting against the
+        // box face has to be bracketed from outside it to be found at all.
+        let start = (entry - NARROW_BAND * volume.voxel_size()).max(0.0);
+        let hit = raycast(volume, origin + direction * start, direction, far - start)?;
+        Some(Hit { distance: hit.distance + start, ..hit })
+    }
+
     /// What is DRAWN: the pick gate, the panel's muted names, and every
     /// direct-manipulation gesture (today: the plane cut). Indexed by NODE
-    /// position.
-    ///
+    /// position.    ///
     /// Solo belongs here and nowhere else in the two named call sites, because
     /// direct manipulation acts on what the user can see. See
     /// [`resolve_visibility`].
@@ -709,14 +924,26 @@ impl Document {
     ///
     /// The tag is what lets one remesh cover the whole document; see
     /// [`Document::mesh_dirty`].
+    ///
+    /// **This is also where the pick gate's box is kept honest**, and it is
+    /// here rather than in a dozen call sites because a write that does not
+    /// mark a brick dirty is already a bug -- it leaves the screen stale -- so
+    /// the dirty set is the one signal that cannot miss a change to the brick
+    /// map. Each drained coordinate is taken into the body's box, which costs
+    /// one min and one max per brick already being meshed.
     pub fn take_dirty(&mut self, out: &mut Vec<(NodeId, BrickCoord)>) {
         out.clear();
         for node in &mut self.nodes {
             let id = node.id;
-            let Some(volume) = node.volume_mut() else {
+            let Some(data) = node.body.as_mut() else {
                 continue;
             };
-            volume.drain_dirty(|coord| out.push((id, coord)));
+            let BodyData { volume, cache } = &mut **data;
+            let voxel_size = volume.voxel_size();
+            volume.drain_dirty(|coord| {
+                out.push((id, coord));
+                cache.take_in(coord, voxel_size);
+            });
         }
     }
 
@@ -792,8 +1019,11 @@ impl Document {
     /// **every** body because the lattice is shared: scaling one body alone
     /// would hand it a lattice its siblings do not have.
     pub fn rescale(&mut self, factor: f32) {
-        for (_, volume) in self.bodies_mut() {
-            volume.rescale(factor);
+        for data in self.bodies_data_mut() {
+            data.volume.rescale(factor);
+            // Every brick sits somewhere else in the world now, at the same
+            // coordinate, so the box has to be remeasured rather than grown.
+            data.recompute_bounds();
         }
         self.voxel_size *= factor;
         debug_assert!(self.lattice_agrees(), "rescale left the bodies on different lattices");
@@ -805,15 +1035,49 @@ impl Document {
     /// after a resample their coordinates mean something else: without that the
     /// renderer keeps drawing slices nothing will ever overwrite.
     pub fn resample(&mut self, voxel_size: f32) {
-        for (_, volume) in self.bodies_mut() {
-            let mut resampled = volume.resampled(voxel_size);
-            for coord in volume.brick_coords() {
+        for data in self.bodies_data_mut() {
+            let mut resampled = data.volume.resampled(voxel_size);
+            for coord in data.volume.brick_coords() {
                 resampled.mark_dirty(coord);
             }
-            *volume = resampled;
+            data.volume = resampled;
+            data.recompute_bounds();
         }
         self.voxel_size = voxel_size;
         debug_assert!(self.lattice_agrees(), "resample left the bodies on different lattices");
+    }
+
+    /// Turn **every** body by a multiple of a quarter turn, about the lattice
+    /// origin.
+    ///
+    /// Exact, and the same operation [`Volume::rotated`] performs, applied
+    /// across the document for the same reason [`Document::rescale`] is: the
+    /// lattice is shared.
+    ///
+    /// **Turning only the active body would destroy the relative placement of
+    /// the others**, which under a one-lattice design IS the bodies' only
+    /// positional state -- there is no per-body transform to compensate with.
+    /// It would also make the status line's promise that turning it back the
+    /// same way undoes it a lie, because the un-turned bodies would come back
+    /// somewhere new.
+    ///
+    /// Costs a permuted copy of every dense brick, so it is a user action.
+    /// Undo history is not this function's business and does not survive it;
+    /// see [`crate::rotate`] for why a quarter turn is its own undo.
+    pub fn rotate(&mut self, rotation: crate::orientation::AxisRotation) {
+        for data in self.bodies_data_mut() {
+            data.volume = data.volume.rotated(rotation);
+            data.recompute_bounds();
+        }
+    }
+
+    /// Every body's payload, for the operations that rewrite a whole field.
+    ///
+    /// Private, and it hands out the cache as well as the volume, which is what
+    /// makes "rewrote the field and left a box around where it used to be"
+    /// impossible to do by halves from inside this module.
+    fn bodies_data_mut(&mut self) -> impl Iterator<Item = &mut BodyData> {
+        self.nodes.iter_mut().filter_map(|node| node.body.as_deref_mut())
     }
 
     /// Whether every body really is on the document's lattice.
@@ -867,6 +1131,46 @@ impl Document {
             debug_assert!(node.is_body(), "every node holds a body in this build");
         }
     }
+}
+
+/// Where a ray enters a world space box, or `None` when it never does inside
+/// `far`.
+///
+/// Zero for a ray that starts inside, which is what a caller wants: the march
+/// begins where it already is.
+///
+/// **Written out per axis rather than as the branchless reciprocal form, and
+/// the reason is a failure this had before it had a test.** The usual trick
+/// multiplies by `1 / direction` and leans on `f32::min` discarding the NaN
+/// that `0 * infinity` produces. That works only while the other operand is
+/// finite: a ray running exactly along a box face gives NaN against `+infinity`
+/// on the same axis, `min` keeps the infinity, and the box is reported as
+/// missed by a ray that grazes it. Three explicit branches cost nothing
+/// measurable beside the sphere trace they are protecting and cannot be wrong
+/// that way.
+fn ray_meets_box(
+    origin: Vec3,
+    direction: Vec3,
+    (low, high): (Vec3, Vec3),
+    far: f32,
+) -> Option<f32> {
+    let mut enters = 0.0_f32;
+    let mut leaves = far;
+    for axis in 0..3 {
+        if direction[axis] == 0.0 {
+            // Parallel to this pair of faces: the ray is either between them
+            // for its whole length or it never meets the box at all.
+            if origin[axis] < low[axis] || origin[axis] > high[axis] {
+                return None;
+            }
+            continue;
+        }
+        let to_low = (low[axis] - origin[axis]) / direction[axis];
+        let to_high = (high[axis] - origin[axis]) / direction[axis];
+        enters = enters.max(to_low.min(to_high));
+        leaves = leaves.min(to_low.max(to_high));
+    }
+    (enters <= leaves).then_some(enters)
 }
 
 /// Whether two world space boxes share any volume at all.
@@ -1584,8 +1888,38 @@ mod tests {
         assert!(doc.overlaps().is_empty(), "touching bricks were reported as touching material");
     }
 
-    // --- the growth guard --------------------------------------------------
+    /// **The size of the biggest body is not the size of the document**, and
+    /// the difference is what [`Document::largest_body_radius`] exists for.
+    ///
+    /// Two small bodies laid out a long way apart have a union box far larger
+    /// than either of them. Sizing anything off that box makes it grow every
+    /// time something is added beside the model, which is exactly what
+    /// [`crate::primitive::placement`] did until this method replaced the
+    /// document-wide radius it was using.
+    #[test]
+    fn the_largest_body_radius_measures_a_body_and_not_the_gap_between_two() {
+        let mut near = Volume::new(0.5);
+        near.seed_sphere(Vec3::ZERO, 8.0);
+        // Through `from_volume` and `add_body` rather than `active_volume_mut`,
+        // because the per-body box is cached when the body arrives and seeding
+        // into a body already in the document does not refresh it.
+        let mut doc = Document::from_volume(near);
+        let mut far = Volume::new(0.5);
+        far.seed_sphere(Vec3::new(400.0, 0.0, 0.0), 8.0);
+        doc.add_body("Body 2", far);
 
+        let biggest = doc.largest_body_radius().expect("both bodies have bricks");
+        let (low, high) = doc.world_bounds().expect("both bodies have bricks");
+        let union = (high - low).length() * 0.5;
+
+        // A 16 mm ball rounds out to whole bricks, so the figure is tens of
+        // millimetres rather than eight -- and the point is that it does not
+        // move when the second body lands 400 mm away.
+        assert!(biggest < 40.0, "one 16 mm ball measured {biggest} mm of radius");
+        assert!(union > 200.0, "the fixture must be spread out or it tests nothing");
+    }
+
+    // --- the growth guard --------------------------------------------------
     /// A body the document has room for is admitted, and the guard says so by
     /// answering nothing at all.
     #[test]
@@ -1662,5 +1996,278 @@ mod tests {
         let (_, workable) = guard.no_room_for(1024.0, 1024.0).expect("there is no room at all");
         assert!(workable.is_finite(), "the refusal named {workable} as a size");
         assert_eq!(workable, 0.0, "nothing fits, so no fraction of it fits either");
+    }
+
+    // ------------------------------------------------------------- the pick
+
+    /// Two bodies side by side, both visible, at a voxel size a test can
+    /// afford.
+    fn two_balls() -> (Document, NodeId, NodeId) {
+        let mut near = Volume::new(0.5);
+        near.seed_sphere(Vec3::new(0.0, 0.0, 40.0), 8.0);
+        let mut doc = Document::from_volume(near);
+        let first = doc.active();
+
+        let mut far = Volume::new(0.5);
+        far.seed_sphere(Vec3::ZERO, 8.0);
+        let second = doc.add_body("Body 2", far);
+        (doc, first, second)
+    }
+
+    fn all_shown(doc: &Document) -> Vec<bool> {
+        let mut shown = Vec::new();
+        doc.saved_visibility(&mut shown);
+        shown
+    }
+
+    /// The whole point of picking rather than raycasting one body: with two
+    /// bodies on the ray, the one in front is the one the press means.
+    #[test]
+    fn the_pick_returns_the_nearest_body_the_ray_meets() {
+        let (doc, near, far) = two_balls();
+        let shown = all_shown(&doc);
+
+        // Down minus Z, so the ball at z = 40 is met before the one at the
+        // origin.
+        let (body, hit) = doc
+            .pick(Vec3::new(0.0, 0.0, 200.0), Vec3::NEG_Z, 1000.0, &shown)
+            .expect("the ray runs through both balls");
+        assert_eq!(body, near, "the pick chose the body behind the other one");
+        assert!(hit.position.z > 30.0, "the hit was on the far ball at {}", hit.position.z);
+
+        // And from the other end, the answer is the other body -- so this is
+        // measuring the ray and not the list order.
+        let (body, _) = doc
+            .pick(Vec3::new(0.0, 0.0, -200.0), Vec3::Z, 1000.0, &shown)
+            .expect("the ray runs through both balls");
+        assert_eq!(body, far, "approaching from behind picked the wrong body");
+    }
+
+    /// Hiding is a draw-time skip, so a hidden body is not on screen -- and a
+    /// press that carved one would set `unsaved`, push a history entry, pay a
+    /// remesh and change not one pixel.
+    #[test]
+    fn a_hidden_body_is_never_picked() {
+        let (mut doc, near, far) = two_balls();
+        let mut meta = doc.meta(near).expect("the near body");
+        meta.visible = false;
+        doc.set_meta(&meta);
+        let shown = all_shown(&doc);
+
+        let (body, _) = doc
+            .pick(Vec3::new(0.0, 0.0, 200.0), Vec3::NEG_Z, 1000.0, &shown)
+            .expect("the ball behind the hidden one is still there");
+        assert_eq!(body, far, "the pick went through a body that is not drawn");
+
+        // With both hidden there is nothing to pick at all, which is what makes
+        // a press over a hidden body do nothing rather than fall through to
+        // something else.
+        let mut meta = doc.meta(far).expect("the far body");
+        meta.visible = false;
+        doc.set_meta(&meta);
+        let shown = all_shown(&doc);
+        assert!(doc.pick(Vec3::new(0.0, 0.0, 200.0), Vec3::NEG_Z, 1000.0, &shown).is_none());
+    }
+
+    /// A ray that passes the document by finds nothing, and the box gate is
+    /// what makes that cheap rather than 64 full marches.
+    #[test]
+    fn a_ray_that_misses_everything_picks_nothing() {
+        let (doc, _, _) = two_balls();
+        let shown = all_shown(&doc);
+        assert!(
+            doc.pick(Vec3::new(500.0, 0.0, 200.0), Vec3::NEG_Z, 1000.0, &shown).is_none(),
+            "a ray five hundred millimetres to one side found a surface"
+        );
+    }
+
+    /// **The reach the march does not have on its own.**
+    ///
+    /// `raycast` advances by at most `NARROW_BAND` voxels a step, so its total
+    /// travel is `MAX_STEPS * NARROW_BAND * voxel_size`: 46 mm at a 0.03 mm
+    /// voxel. A camera framing the default model sits about 90 mm out, so at
+    /// the finest lattice the ray ran out of steps in the empty space in front
+    /// of the model and the cursor stopped working, with nothing anywhere
+    /// saying why.
+    ///
+    /// The fixture is a small ball at a far viewpoint rather than a large one,
+    /// because a 30 mm ball at 0.03 mm is some 12,000 dense bricks and over a
+    /// gigabyte. The distance is what the failure is about, and it is the same
+    /// distance either way.
+    ///
+    /// Both halves are asserted. Without the raycast line this would pass with
+    /// the gate deleted, on a march that simply had far enough to go.
+    #[test]
+    fn the_box_gate_reaches_a_model_the_march_alone_runs_out_of_steps_before() {
+        let voxel_size = 0.03;
+        let mut volume = Volume::new(voxel_size);
+        volume.seed_sphere(Vec3::ZERO, 3.0);
+        let doc = Document::from_volume(volume);
+        let body = doc.active();
+
+        // 512 steps of 3 voxels is 46.08 mm, and the eye is 90 mm out.
+        let eye = Vec3::new(0.0, 0.0, 90.0);
+        assert!(
+            crate::raycast::raycast(doc.active_volume(), eye, Vec3::NEG_Z, 1000.0).is_none(),
+            "the march reached the model unaided, so this fixture no longer measures anything"
+        );
+
+        let hit = doc
+            .pick_body(body, eye, Vec3::NEG_Z, 1000.0)
+            .expect("the gate should start the march at the body's box");
+        assert!(
+            (hit.position.z - 3.0).abs() < 0.5,
+            "the surface is at z = 3, and the pick reported {}",
+            hit.position.z
+        );
+        assert!(
+            (hit.distance - 87.0).abs() < 0.5,
+            "the distance must be measured from the EYE, not from the box; got {}",
+            hit.distance
+        );
+
+        // And through the picker, which is the path a hover actually takes.
+        let shown = all_shown(&doc);
+        let (picked, _) = doc
+            .pick(eye, Vec3::NEG_Z, 1000.0, &shown)
+            .expect("the same gate, reached the same way the pointer reaches it");
+        assert_eq!(picked, body);
+    }
+
+    /// A ray running exactly along a box face is where the branchless slab test
+    /// used to answer "misses" for a ray that hits, and it is why
+    /// [`ray_meets_box`] is written out per axis.
+    #[test]
+    fn the_box_test_survives_a_ray_lying_in_the_plane_of_a_face() {
+        let box_ = (Vec3::new(-1.0, -1.0, -1.0), Vec3::new(1.0, 1.0, 1.0));
+        // Along +X at exactly y = -1 and z = -1, which is an edge of the box.
+        let along = ray_meets_box(Vec3::new(-10.0, -1.0, -1.0), Vec3::X, box_, 100.0);
+        assert_eq!(along, Some(9.0), "a ray along an edge was refused");
+
+        assert_eq!(ray_meets_box(Vec3::ZERO, Vec3::X, box_, 100.0), Some(0.0), "inside is zero");
+        assert_eq!(
+            ray_meets_box(Vec3::new(-10.0, 5.0, 0.0), Vec3::X, box_, 100.0),
+            None,
+            "a ray passing above the box was admitted"
+        );
+        assert_eq!(
+            ray_meets_box(Vec3::new(-10.0, 0.0, 0.0), Vec3::X, box_, 5.0),
+            None,
+            "a box past `far` was admitted"
+        );
+        assert_eq!(
+            ray_meets_box(Vec3::new(10.0, 0.0, 0.0), Vec3::X, box_, 100.0),
+            None,
+            "a box behind the ray was admitted"
+        );
+    }
+
+    /// The cache is what the gate reads, so a body that has grown since it was
+    /// measured must not be gated out of its own new material. Growing is the
+    /// only direction this promises; see [`BodyCache::bounds`].
+    #[test]
+    fn the_cached_box_takes_in_material_a_stroke_adds() {
+        let mut volume = Volume::new(0.5);
+        volume.seed_sphere(Vec3::ZERO, 8.0);
+        let mut doc = Document::from_volume(volume);
+        let body = doc.active();
+        let mut dirty = Vec::new();
+        doc.take_dirty(&mut dirty);
+
+        let before = doc.node(body).expect("the body").bounds().expect("a seeded ball has bricks");
+
+        // A second ball well outside the first, written straight into the same
+        // body, which is what a Draw stroke walking outwards amounts to.
+        doc.active_volume_mut().seed_sphere(Vec3::new(60.0, 0.0, 0.0), 4.0);
+        doc.take_dirty(&mut dirty);
+
+        let after = doc.node(body).expect("the body").bounds().expect("still has bricks");
+        assert!(after.1.x > before.1.x + 40.0, "the box did not follow the material: {after:?}");
+
+        let truth = doc.active_volume().world_bounds().expect("bricks");
+        assert!(
+            after.0.cmple(truth.0).all() && after.1.cmpge(truth.1).all(),
+            "the cached box {after:?} does not contain the bricks {truth:?}"
+        );
+
+        // And the gate now admits a ray that only meets the new material.
+        let shown = all_shown(&doc);
+        assert!(
+            doc.pick(Vec3::new(60.0, 0.0, 200.0), Vec3::NEG_Z, 1000.0, &shown).is_some(),
+            "the new material is inside the box and still was not picked"
+        );
+    }
+
+    // ----------------------------------------------------------- the turning
+
+    /// **Every body turns, and the arrangement survives it.**
+    ///
+    /// Bodies share one lattice and have no transform, so the arrangement of
+    /// their bricks is the only positional state this document has. Turning the
+    /// active body alone would scatter it with nothing to put it back -- and it
+    /// would make the interface's promise that turning it back the same way
+    /// undoes the turn a lie for every body that did not move.
+    ///
+    /// Bit-identical rather than approximately equal: a quarter turn maps
+    /// voxels onto voxels, so there is nothing to be tolerant of, and a
+    /// tolerance would hide exactly the resampling this claims not to do.
+    #[test]
+    fn two_bodies_survive_four_quarter_turns_with_their_placement_and_their_bits() {
+        use crate::brick::BRICK_DIM;
+        use crate::orientation::{AxisRotation, Facing};
+
+        let mut here = Volume::new(0.5);
+        here.seed_sphere(Vec3::new(0.0, 0.0, 20.0), 6.0);
+        let mut doc = Document::from_volume(here);
+        let first = doc.active();
+        let mut there = Volume::new(0.5);
+        there.seed_sphere(Vec3::new(30.0, 0.0, 0.0), 4.0);
+        let second = doc.add_body("Body 2", there);
+
+        let snapshot = |doc: &Document, id: NodeId| -> Vec<(BrickCoord, Vec<f32>)> {
+            let volume = doc.volume(id).expect("a live body");
+            let mut coords: Vec<BrickCoord> = volume.brick_coords().collect();
+            coords.sort_unstable();
+            coords
+                .into_iter()
+                .map(|coord| {
+                    let brick = volume.brick(coord).expect("came from the map");
+                    let mut values = Vec::with_capacity(BRICK_VOXELS);
+                    for z in 0..BRICK_DIM {
+                        for y in 0..BRICK_DIM {
+                            for x in 0..BRICK_DIM {
+                                values.push(brick.get(x, y, z));
+                            }
+                        }
+                    }
+                    (coord, values)
+                })
+                .collect()
+        };
+        let before_first = snapshot(&doc, first);
+        let before_second = snapshot(&doc, second);
+        let apart = |doc: &Document| {
+            let one = doc.volume(first).expect("a live body").world_bounds().expect("bricks");
+            let other = doc.volume(second).expect("a live body").world_bounds().expect("bricks");
+            (one.0 + one.1) * 0.5 - (other.0 + other.1) * 0.5
+        };
+        let before_apart = apart(&doc);
+
+        // One turn first: the second body must have MOVED, or the four-turn
+        // assertion below would pass on a rotation that did nothing to it.
+        let quarter = AxisRotation::taking(Facing::Up, Facing::Front);
+        doc.rotate(quarter);
+        assert_ne!(apart(&doc), before_apart, "the second body did not turn with the first");
+        assert!(
+            (apart(&doc).length() - before_apart.length()).abs() < 1.0e-3,
+            "the bodies changed their distance apart, so the turn was not rigid"
+        );
+
+        for _ in 0..3 {
+            doc.rotate(quarter);
+        }
+        assert_eq!(snapshot(&doc, first), before_first, "the first body came back changed");
+        assert_eq!(snapshot(&doc, second), before_second, "the second body came back changed");
+        assert_eq!(apart(&doc), before_apart, "the arrangement did not come back");
     }
 }
