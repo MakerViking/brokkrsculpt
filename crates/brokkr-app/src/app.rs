@@ -1749,7 +1749,7 @@ impl Brokkr {
         let write = match std::fs::File::create(&temporary) {
             Ok(file) => {
                 let mut writer = std::io::BufWriter::new(file);
-                brokkr_core::project::write(&mut writer, self.doc.active_volume(), &state)
+                brokkr_core::project::write(&mut writer, &self.doc, &state)
                     .map_err(|error| error.to_string())
             }
             Err(error) => Err(error.to_string()),
@@ -1979,10 +1979,33 @@ impl Brokkr {
         self.refresh_overlay();
     }
 
+    /// Save the document, through a temporary file and a rename.
+    ///
+    /// **Two things here used to be wrong, and both got worse with every body
+    /// added.**
+    ///
+    /// It opened the user's real file with `File::create`, which truncates it
+    /// to zero before a byte of the new document is written. The crash net
+    /// already had a temp-and-rename and the document did not, so the *net* was
+    /// better protected than the thing it protects -- and at the measured
+    /// 1.55 GB/s a three gigabyte document is about two seconds of the user's
+    /// file existing as a truncated stub. A failed save now leaves the previous
+    /// file exactly as it was.
+    ///
+    /// And it cleared `unsaved` and deleted the crash net **on the writer's
+    /// word**. So the file is read back before either happens: its header and
+    /// node table only, a few hundred bytes and no geometry, compared against
+    /// the document that was meant to go into it. On a mismatch the temporary
+    /// is thrown away, the previous file is untouched, `unsaved` stays set, the
+    /// autosave survives, and the status says "could not" -- which is what
+    /// `panel.rs` colours red.
     fn save_project(&mut self, path: &std::path::Path) {
         let state = self.project_state();
 
-        let file = match std::fs::File::create(path) {
+        // Beside the target rather than in a temp directory, so the rename is
+        // within one filesystem and therefore atomic.
+        let temporary = path.with_extension("brokkr.tmp");
+        let file = match std::fs::File::create(&temporary) {
             Ok(file) => file,
             Err(error) => {
                 self.status = format!("could not write {}: {error}", path.display());
@@ -1990,21 +2013,74 @@ impl Brokkr {
             }
         };
         let mut writer = std::io::BufWriter::new(file);
-        match brokkr_core::project::write(&mut writer, self.doc.active_volume(), &state) {
-            Ok(()) => {
-                self.project_path = Some(path.to_path_buf());
-                // Only here. Both failure arms leave the flag set, or a failed
-                // write would let the next quit go through silently.
-                self.unsaved = false;
-                self.recent.record(path);
-                // The work is safely in a file the user chose, so the crash net
-                // has nothing left to protect and a stale one would only offer
-                // to restore something older than what is on disk.
-                self.clear_autosave();
-                self.status = format!("saved {}", path.display());
-            }
-            Err(error) => self.status = format!("could not write {}: {error}", path.display()),
+        if let Err(error) = brokkr_core::project::write(&mut writer, &self.doc, &state) {
+            self.status = format!("could not write {}: {error}", path.display());
+            std::fs::remove_file(&temporary).ok();
+            return;
         }
+        // `project::write` ends with its own flush and reports a failure there
+        // as an error, so nothing is left in the buffer by the time this
+        // returns. The drop is to CLOSE the file before it is reopened for the
+        // check below.
+        drop(writer);
+
+        if let Err(problem) = self.verify_written(&temporary) {
+            self.status = format!("could not write {}: {problem}", path.display());
+            std::fs::remove_file(&temporary).ok();
+            return;
+        }
+
+        if let Err(error) = std::fs::rename(&temporary, path) {
+            self.status = format!("could not replace {}: {error}", path.display());
+            std::fs::remove_file(&temporary).ok();
+            return;
+        }
+
+        self.project_path = Some(path.to_path_buf());
+        // Only here. Every failure arm above leaves the flag set, or a failed
+        // write would let the next quit go through silently.
+        self.unsaved = false;
+        self.recent.record(path);
+        // The work is safely in a file the user chose, so the crash net has
+        // nothing left to protect and a stale one would only offer to restore
+        // something older than what is on disk.
+        self.clear_autosave();
+        self.status = format!("saved {}", path.display());
+    }
+
+    /// Read back what was just written, far enough to know it is this document.
+    ///
+    /// The header and the node table, which is a few hundred bytes whatever the
+    /// sculpt weighs -- the geometry is deliberately not re-read, because doing
+    /// that on the draw thread would double the cost of every save.
+    ///
+    /// What it catches is the class the old code could not: a write that
+    /// reported success and produced a file this build will not open, or opens
+    /// as a different document. That is not hypothetical -- the format grew a
+    /// node table this release, and the first thing to exercise it in the wild
+    /// is the autosave, unwatched, every two minutes.
+    fn verify_written(&self, path: &std::path::Path) -> Result<(), String> {
+        let file = std::fs::File::open(path).map_err(|error| error.to_string())?;
+        let mut reader = std::io::BufReader::new(file);
+        let outline =
+            brokkr_core::project::read_outline(&mut reader).map_err(|error| error.to_string())?;
+        if outline.nodes != self.doc.node_count() || outline.bodies != self.doc.body_count() {
+            return Err(format!(
+                "the file came back with {} rows and {} bodies, and the document has {} and {}",
+                outline.nodes,
+                outline.bodies,
+                self.doc.node_count(),
+                self.doc.body_count()
+            ));
+        }
+        if outline.voxel_size != self.doc.voxel_size() {
+            return Err(format!(
+                "the file came back at a {} mm voxel, and the document is at {} mm",
+                outline.voxel_size,
+                self.doc.voxel_size()
+            ));
+        }
+        Ok(())
     }
 
     fn export_directory() -> std::path::PathBuf {
@@ -4270,7 +4346,98 @@ mod tests {
         std::fs::remove_dir_all(&directory).ok();
     }
 
-    /// Selecting a brush restores the strength that brush was last on.
+    /// **A failed save must leave the file it was replacing exactly as it
+    /// was.** Until this increment the save opened the user's real file with
+    /// `File::create`, which truncates it to zero before a byte of the new
+    /// document is written -- so a failure part way through left the work in
+    /// neither place.
+    ///
+    /// The failure is forced by putting a DIRECTORY where the temporary file
+    /// wants to be, which is the cheapest way to make `File::create` fail
+    /// without depending on permissions, a full disk or a mocked filesystem.
+    #[test]
+    fn a_save_that_fails_leaves_the_previous_file_and_the_crash_net_alone() {
+        let directory = scratch("save-atomic");
+        let path = directory.join("sculpt.brokkr");
+        std::fs::write(&path, b"the previous save, which must survive").unwrap();
+
+        let mut app = app_with_unsaved_work();
+        app.autosave_file = Some(directory.join("autosave.brokkr"));
+        app.recent = crate::recent::Recent::load_from(Some(directory.join("recent")));
+        app.write_autosave();
+        assert!(app.has_autosave(), "the fixture needs a crash net to protect");
+
+        // Where `save_project` will try to put its temporary.
+        std::fs::create_dir_all(path.with_extension("brokkr.tmp")).unwrap();
+
+        app.save_project(&path);
+
+        assert!(app.status.contains("could not"), "a failed save reported: {}", app.status);
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            b"the previous save, which must survive",
+            "a failed save destroyed the file it was replacing"
+        );
+        assert!(app.unsaved, "a failed save cleared the unsaved marker");
+        assert!(app.project_path.is_none(), "a failed save adopted the path anyway");
+        assert!(app.has_autosave(), "a failed save deleted the crash net");
+
+        std::fs::remove_dir_all(&directory).ok();
+    }
+
+    /// A save that works leaves the file and nothing else -- no temporary
+    /// beside it for the user to find and wonder about.
+    #[test]
+    fn a_save_that_works_leaves_no_temporary_behind() {
+        let directory = scratch("save-tidy");
+        let path = directory.join("sculpt.brokkr");
+        let mut app = app_with_unsaved_work();
+        app.autosave_file = Some(directory.join("autosave.brokkr"));
+        app.recent = crate::recent::Recent::load_from(Some(directory.join("recent")));
+
+        app.save_project(&path);
+
+        assert!(app.status.starts_with("saved"), "save reported: {}", app.status);
+        assert!(path.is_file(), "the file was not written");
+        assert!(
+            !path.with_extension("brokkr.tmp").exists(),
+            "the temporary the save writes through was left on disk"
+        );
+
+        std::fs::remove_dir_all(&directory).ok();
+    }
+
+    /// The save reads its own output back before it deletes the crash net.
+    ///
+    /// `clear_autosave` used to run on the writer's word alone: a write that
+    /// reported success and produced a file this build will not open took the
+    /// user's work, cleared the unsaved marker and deleted the one copy that
+    /// could have recovered it. The check is the header and the node table
+    /// only, which is a few hundred bytes whatever the sculpt weighs.
+    ///
+    /// Driven here by changing the document *after* the file is written, which
+    /// is the same disagreement a partial write would produce and the only one
+    /// a test can stage without a mocked filesystem.
+    #[test]
+    fn the_save_verification_notices_a_file_that_is_not_this_document() {
+        let directory = scratch("save-verify");
+        let path = directory.join("sculpt.brokkr");
+        let mut app = app_with_unsaved_work();
+        app.autosave_file = Some(directory.join("autosave.brokkr"));
+        app.recent = crate::recent::Recent::load_from(Some(directory.join("recent")));
+
+        app.save_project(&path);
+        assert!(app.status.starts_with("saved"), "save reported: {}", app.status);
+        assert!(app.verify_written(&path).is_ok(), "a file just written failed its own check");
+
+        // One more body than the file on disk knows about.
+        app.doc.add_body("Body 2", brokkr_core::Volume::new(app.doc.voxel_size()));
+        let problem = app.verify_written(&path).expect_err("a stale file passed the check");
+        assert!(problem.contains("2"), "the mismatch did not say what it found: {problem}");
+
+        std::fs::remove_dir_all(&directory).ok();
+    }
+
     ///
     /// One shared number made Move look broken: for Move, strength is the
     /// fraction of the drag the surface follows, so Draw's 0.15 meant the form

@@ -16,12 +16,55 @@
 //!
 //! SindriCAD's `.sindri` is a ZIP because it carries many separately addressed
 //! blobs plus JSON across a language boundary. A `.brokkr` file carries a header
-//! and one stream of bricks. Copying the ZIP shape would mean either a new
-//! dependency or a hand rolled ZIP reader, both of which cost more than this
+//! and one stream of bricks per body. Copying the ZIP shape would mean either a
+//! new dependency or a hand rolled ZIP reader, both of which cost more than this
 //! format is worth. What *is* worth copying from `container.rs` is its
 //! discipline, and that is all below: two independent version numbers, a size
 //! cap checked before anything is read, and never trusting a number from inside
 //! the file without bounding it first.
+//!
+//! # The exact layout, at container version 3
+//!
+//! ```text
+//!  0..8    MAGIC  b"BROKKR\x00\x01"
+//!  8..10   container u16 LE = 3
+//! 10..12   field     u16 LE            a RANGE, see `OLDEST_FIELD_VERSION`
+//! 12..16   BRICK_DIM u32 LE            refused on mismatch
+//! 16..20   NARROW_BAND f32 LE          refused on mismatch
+//! 20..24   voxel_size f32 LE           DOCUMENT-wide: bodies share the lattice
+//! 24..63   View, 39 bytes
+//! --- version 3 begins here; a version 1 or 2 file has the u64 brick count at 63
+//! 63..67   node_count   u32 LE   1 ..= MAX_NODES
+//! 67..71   active_index u32 LE   an index into the table; must name a body
+//! 71..     node_count records of EXACTLY NODE_RECORD_BYTES, in PREORDER
+//! --- then, IN TABLE ORDER, one brick stream per body record
+//!          brick_count u64 LE, then that many brick records
+//! --- then the key trailer, LAST
+//!          key_count u32 LE, then 43 bytes per key
+//! ```
+//!
+//! **Bytes 0..63 are byte for byte what version 2 wrote**, which is what lets
+//! every header offset the tests hardcode go on aiming at what it names. New
+//! header fields go after the view, never before the lattice constants.
+//!
+//! **The per-body brick streams are CONSECUTIVE, and the reader is
+//! `&mut impl Read` that never seeks.** There is no length prefix in front of a
+//! body's stream and there cannot be one: `read(&mut bytes.as_slice())`
+//! throughout the tests and `BufReader<File>` in the shell both depend on the
+//! reader being a forward stream. So appending a second stream per body -- a
+//! mask, a colour, anything per voxel -- is a [`FIELD_VERSION`] change and
+//! **never** a container change: the container says where the sections are, and
+//! the field version says what is in them.
+//!
+//! # Why the node table precedes the geometry
+//!
+//! Version 2 appended a strict *suffix*, so reading a version 1 file was a
+//! matter of not looking for the trailer -- no conversion, no second code path.
+//! A node table cannot be a suffix, because the reader never seeks and the
+//! table is what says how many brick streams follow. So the table sits before
+//! the geometry, and a version 1 or 2 file gets **one synthesized default
+//! body**. That is still not a converter and still one geometry loop, but it is
+//! a different shape, and this is where it is written down.
 //!
 //! # The lattice constants are the whole risk
 //!
@@ -44,7 +87,7 @@ use std::io::{Read, Write};
 
 use glam::{IVec3, Vec3};
 
-use crate::body::Document;
+use crate::body::{Document, MAX_BODIES, MAX_NODES, Node, NodeId, NodeMeta};
 use crate::brick::{BRICK_DIM, BRICK_VOXELS, Brick, BrickCoord, INSIDE, NARROW_BAND, OUTSIDE};
 use crate::volume::Volume;
 
@@ -54,35 +97,83 @@ const MAGIC: &[u8; 8] = b"BROKKR\x00\x01";
 
 /// Version of the file's *layout*: the header fields and the order of sections.
 ///
-/// 2 added the timeline key trailer after the brick stream. Bumping it did not
-/// have to orphan every file already written, and did not: see
-/// [`OLDEST_CONTAINER_VERSION`].
-const CONTAINER_VERSION: u16 = 2;
+/// 2 added the timeline key trailer after the brick stream. 3 added the node
+/// table between the view and the geometry, and made the brick stream one
+/// stream per body. Neither bump had to orphan the files already written, and
+/// neither did: see [`OLDEST_CONTAINER_VERSION`].
+///
+/// **Folders do not bump this.** They widen the legal range of two bytes that
+/// version 3 already reserves in every node record, which is the whole reason
+/// those two bytes are reserved rather than absent.
+const CONTAINER_VERSION: u16 = 3;
 
 /// The oldest layout this build still reads.
 ///
 /// Version 1 is version 2 without the key trailer, so reading one is a matter
-/// of not looking for the trailer -- there is no conversion and no second code
-/// path through the geometry. This exists because the alternative was refusing
-/// every `.brokkr` file in existence to add a feature none of them use, which
-/// is not a trade a save format gets to make. **Only add a version here when
-/// the old layout is genuinely still readable**; the point of refusing an
-/// unknown one is that a plausible-looking sculpt made of misread numbers is
-/// worse than an error.
+/// of not looking for the trailer. Version 2 is version 3 without the node
+/// table, so reading one is a matter of synthesizing a single default body --
+/// which is a different shape but still no conversion and still one geometry
+/// loop. This exists because the alternative was refusing every `.brokkr` file
+/// in existence to add a feature none of them use, which is not a trade a save
+/// format gets to make. **Only add a version here when the old layout is
+/// genuinely still readable**; the point of refusing an unknown one is that a
+/// plausible-looking sculpt made of misread numbers is worse than an error.
 const OLDEST_CONTAINER_VERSION: u16 = 1;
 
 /// Version of how a brick's field values are *encoded*. Kept separate from the
 /// container version, because the two change for different reasons — a new
 /// header field is not a new encoding, and a new encoding is not a new layout.
 /// SindriCAD's container learned this distinction the hard way.
+///
+/// This is the NEWEST encoding this build understands, and what it *writes* is
+/// [`lowest_field_version`] rather than this. See [`OLDEST_FIELD_VERSION`] for
+/// why both halves of that are needed.
 const FIELD_VERSION: u16 = 1;
 
-/// Largest file this will read, as a guard against a corrupt or hostile header
-/// asking for an allocation the machine cannot serve.
+/// The oldest field encoding this build still reads.
+///
+/// A range rather than the exact equality this check used to be, and it is the
+/// load-bearing half of the version discipline on this axis. Per-voxel payload
+/// -- a colour, a mask -- rides the field version, so the day one of those
+/// ships this constant is what stops every file ever written from being refused
+/// by the build that adds it, with an error that reads backwards.
+///
+/// It buys one direction only: a NEW build reading an OLD file. The other
+/// direction is bought by [`lowest_field_version`], and both are needed. A
+/// writer that stamped the newest version on every save would make each of
+/// today's documents unreadable by every build that predates the next
+/// encoding, whether or not the document uses any of it.
+const OLDEST_FIELD_VERSION: u16 = 1;
+
+/// The lowest field encoding that can express everything in `doc`.
+///
+/// **Write the lowest version the document NEEDS, never the newest the build
+/// knows.** There is nothing per-voxel beyond the field itself yet, so this is
+/// [`OLDEST_FIELD_VERSION`] for every document -- and it is here, with its
+/// caller and its test, from the commit that adds the range check, because the
+/// rule is what makes the next bump survivable in both directions and it is
+/// unenforceable once a second encoding exists and this function does not.
+fn lowest_field_version(doc: &Document) -> u16 {
+    // Nothing per-voxel beyond the field itself exists yet, so nothing in the
+    // document can ask for a newer encoding. The parameter is here because the
+    // CALLER has to be written to ask the document rather than to reach for
+    // the constant, and that is the whole of the rule.
+    let _ = doc;
+    OLDEST_FIELD_VERSION
+}
+
+/// Largest sculpt this will read, as a guard against a corrupt or hostile
+/// header asking for an allocation the machine cannot serve.
 ///
 /// Eight gigabytes is far above any real sculpt — the densest measured model,
 /// eleven million triangles at a 0.055 mm voxel, is about 1 GB resident — and
 /// far below anything that would take the process down.
+///
+/// **It is a running DOCUMENT total and not a per-body one.** Checked per body
+/// it would let a file claiming 64 bodies ask for 64 times this, which is the
+/// whole cap gone for the price of one extra node record. The ceiling is
+/// closer than it looks: the 6 GiB the renderer's own guard allows is 49,152
+/// dense bricks, so this count cap sits only 33% above the RAM cap.
 ///
 /// Note this is an *absolute* cap and not a compression ratio test. SindriCAD
 /// tried a ratio test and removed it because it fires on legitimately sparse
@@ -112,6 +203,50 @@ const MAX_BRICK_COORD: i32 = (i32::MAX - (BRICK_DIM as i32 - 1)) / BRICK_DIM as 
 /// here for the same reason [`MAX_BRICKS`] is -- a count read out of a file
 /// decides an allocation, and a corrupt one should not decide a large one.
 const MAX_KEYS: u32 = 1024;
+
+/// Bytes in one node record, and it is FIXED at forty.
+///
+/// Load-bearing rather than tidy. The tests find the start of the brick stream
+/// by *measuring* the length of an empty write, so a fixed record grows the
+/// empty header by a constant and every offset self-adjusts. A record whose
+/// length depended on the name would be right for the default document and
+/// wrong for every renamed one, which is the shape of failure that passes the
+/// suite and corrupts a user's file.
+const NODE_RECORD_BYTES: usize = 40;
+
+/// Bytes a node's name occupies in its record: fixed, UTF-8, NUL padded.
+///
+/// **The name is the bytes up to the first NUL, or all thirty-two of them if
+/// there is none.** Stated that way because a full thirty-two byte name has no
+/// terminator and must still round-trip -- the rename field in the interface
+/// enforces exactly this length, so the application actively encourages
+/// producing the one name a "must be NUL terminated" rule would destroy.
+const NAME_BYTES: usize = 32;
+
+/// `kind` for a row that holds a field.
+const KIND_BODY: u8 = 0;
+
+/// This row's own eye.
+const FLAG_VISIBLE: u16 = 1 << 0;
+
+/// Folders only, and repaired to false on a body row.
+const FLAG_COLLAPSED: u16 = 1 << 1;
+
+/// The fourteen flag bits that must be zero.
+///
+/// Refused rather than ignored, which reserves them at no cost on disk: a build
+/// that later *sets* one of these makes its files unreadable by every shipped
+/// version 3 build, so the refusal is what stops a future increment from
+/// spending a bit here by accident. Mask presence, when it arrives, is implied
+/// by a non-empty mask stream and spends none of them.
+const RESERVED_FLAGS: u16 = !(FLAG_VISIBLE | FLAG_COLLAPSED);
+
+/// The record's own arithmetic, checked at build time rather than trusted: four
+/// bytes of id, two of flags, one of kind, one of depth, then the name field.
+/// Widening the name without widening the record would move every brick stream
+/// in the file while leaving the tests that *measure* the header perfectly
+/// happy, because they measure the same wrong thing.
+const _: () = assert!(NODE_RECORD_BYTES == 4 + 2 + 1 + 1 + NAME_BYTES);
 
 /// Read one distance and hold it to what every writer here guarantees.
 fn read_distance(input: &mut impl Read) -> Result<f32> {
@@ -232,10 +367,11 @@ pub struct ProjectState {
 pub struct Progress {
     /// Nodes read from the node table.
     ///
-    /// Always 0 in this build, and deliberately so: the container has no node
-    /// table, and a version 1 or 2 file is one implicit body. The field is
-    /// here rather than added later so that the shape of this struct is not
-    /// itself a variable when the counts it carries are recalibrated.
+    /// Zero for a version 1 or 2 file, and that is a reading rather than a
+    /// miss: those layouts carry no table at all, so the one implicit body they
+    /// hold was synthesized rather than read. A version 3 file that refuses
+    /// part way through its table leaves this holding the rows that parsed,
+    /// which is the reach this type exists to report.
     pub nodes: u32,
     /// Bricks the reader has *started*, which is not the same as bricks it
     /// finished.
@@ -250,12 +386,13 @@ pub struct Progress {
     pub bricks: u64,
     /// Values the reader repaired rather than refused.
     ///
-    /// Always 0 in this build, for the same reason as `nodes`: the repairs
-    /// this counts are the node table's, and there is no node table yet. The
-    /// camera and key repairs in [`read_view`] are deliberately *not* counted
-    /// here — they happen on every ordinary file that was saved with a NaN
-    /// camera, so folding them in would give the field a second meaning that
-    /// the first caller to use it would have to subtract back out.
+    /// The node table's repairs, and only those: a name that was not UTF-8 or
+    /// was empty, a `collapsed` bit set on a body row, an `active_index` that
+    /// named nothing or named a folder. The camera and key repairs in
+    /// [`read_view`] are deliberately *not* counted here — they happen on every
+    /// ordinary file that was saved with a NaN camera, so folding them in would
+    /// give the field a second meaning that the first caller to use it would
+    /// have to subtract back out.
     pub repairs: u32,
 }
 
@@ -291,6 +428,46 @@ pub enum ProjectError {
         bricks: u64,
         limit: u64,
     },
+    /// A node table with no rows, or with more than [`MAX_NODES`].
+    NodeCount {
+        found: u32,
+        limit: u32,
+    },
+    /// More body rows than [`MAX_BODIES`].
+    TooManyBodies {
+        found: usize,
+        limit: usize,
+    },
+    /// A node id of 0, which is reserved for "no node", or of `u32::MAX`, which
+    /// is refused because the next id is reconstituted as `max(id) + 1` and
+    /// would overflow.
+    ReservedNodeId {
+        found: u32,
+    },
+    /// Two rows sharing one id, which aliases both the renderer's mesh pool key
+    /// and the routing of an undo entry.
+    DuplicateNodeId {
+        found: u32,
+    },
+    /// A node record with one of the fourteen reserved flag bits set.
+    ReservedFlags {
+        found: u16,
+    },
+    /// A node `kind` outside the legal set. It decides whether a brick stream
+    /// follows, so it sits on the geometry side of the refuse/repair line for
+    /// the same reason [`ProjectError::UnknownBrickTag`] does: repairing it
+    /// would misalign every stream after it.
+    UnknownNodeKind(u8),
+    /// A node at a non-zero `depth`, which container version 3 reserves. The
+    /// increment that makes folders representable replaces this refusal with a
+    /// clamp, because a clamped depth is still a valid forest.
+    ReservedDepth {
+        found: u8,
+    },
+    /// A node table holding no body rows at all. Nothing would then answer
+    /// "which body is active", and the first thing to touch the active body
+    /// would panic on a file that had otherwise loaded cleanly.
+    NoBodies,
     /// A brick tag that is neither uniform nor dense.
     UnknownBrickTag(u8),
     /// A distance value that is not a finite number.
@@ -335,8 +512,28 @@ impl std::fmt::Display for ProjectError {
                  Loading it would misread every value"
             ),
             ProjectError::TooLarge { bricks, limit } => {
-                write!(f, "the file claims {bricks} bricks, and the limit is {limit}")
+                write!(f, "{bricks} bricks is past this build's limit of {limit}")
             }
+            ProjectError::NodeCount { found, limit } => {
+                write!(f, "the file claims {found} rows, and a document holds 1 to {limit}")
+            }
+            ProjectError::TooManyBodies { found, limit } => {
+                write!(f, "the file claims {found} bodies, and the limit is {limit}")
+            }
+            ProjectError::ReservedNodeId { found } => {
+                write!(f, "the file gives a body the reserved id {found}")
+            }
+            ProjectError::DuplicateNodeId { found } => {
+                write!(f, "the file gives two rows the same id, {found}")
+            }
+            ProjectError::ReservedFlags { found } => {
+                write!(f, "the file sets a reserved flag bit: {found:#018b}")
+            }
+            ProjectError::UnknownNodeKind(kind) => write!(f, "unknown row kind {kind}"),
+            ProjectError::ReservedDepth { found } => {
+                write!(f, "the file nests a row {found} deep, and this build has no folders")
+            }
+            ProjectError::NoBodies => write!(f, "the file holds no bodies at all"),
             ProjectError::UnknownBrickTag(tag) => write!(f, "unknown brick kind {tag}"),
             ProjectError::TooManyKeys { keys, limit } => {
                 write!(f, "the file claims {keys} timeline keys, and the limit is {limit}")
@@ -480,33 +677,185 @@ fn read_view(input: &mut impl Read) -> Result<View> {
     Ok(view)
 }
 
-/// Write a sculpt.
+/// Write a document.
 ///
-/// Bricks go out in a deterministic order, so saving the same volume twice
-/// produces byte identical files. That is worth having for its own sake and it
-/// makes a round trip test able to compare bytes rather than semantics.
-pub fn write(out: &mut impl Write, volume: &Volume, state: &ProjectState) -> Result<()> {
+/// Bricks go out in a deterministic order and the body list is a `Vec` rather
+/// than a map, so saving the same document twice produces byte identical files.
+/// That is worth having for its own sake and it makes a round trip test able to
+/// compare bytes rather than semantics.
+///
+/// **Takes the whole [`Document`] and never one [`Volume`].** During the move
+/// to N bodies a signature taking the active volume went on compiling at every
+/// call site while silently saving one body of many, which is a whole document
+/// lost with "saved" in the status line.
+pub fn write(out: &mut impl Write, doc: &Document, state: &ProjectState) -> Result<()> {
+    refuse_what_could_not_be_read_back(doc)?;
+
     out.write_all(MAGIC)?;
     write_u16(out, CONTAINER_VERSION)?;
-    write_u16(out, FIELD_VERSION)?;
+    // The LOWEST encoding this document needs, not the newest this build knows.
+    write_u16(out, lowest_field_version(doc))?;
 
     // The lattice. Written as the values themselves rather than as a hash, so a
     // mismatch can say what it found.
     write_u32(out, BRICK_DIM as u32)?;
     write_f32(out, NARROW_BAND)?;
 
-    write_f32(out, volume.voxel_size())?;
+    // One voxel size for the whole document, because bodies share the lattice.
+    write_f32(out, doc.voxel_size())?;
 
     write_view(out, &state.view)?;
 
+    write_u32(out, doc.node_count() as u32)?;
+    write_u32(out, active_index(doc) as u32)?;
+    for node in doc.nodes() {
+        write_node_record(out, node)?;
+    }
+
+    // One brick stream per body, in TABLE ORDER, with nothing between them.
+    // `Document::bodies` yields the rows in display order, which is table
+    // order, which is the order the reader consumes them in.
+    for (_, volume) in doc.bodies() {
+        write_bricks(out, volume)?;
+    }
+
+    // The key trailer, after the bricks rather than in the header. A version 1
+    // file is exactly this file without it, which is what lets one still be
+    // read: the brick counts say where the geometry ends, and there is simply
+    // nothing after it.
+    write_u32(out, state.keys.len() as u32)?;
+    for key in &state.keys {
+        write_f32(out, key.at)?;
+        write_view(out, &key.view)?;
+    }
+
+    out.flush()?;
+    Ok(())
+}
+
+/// Refuse to write a file this build's own reader would refuse.
+///
+/// **Every one of these was a read-side check only, and that asymmetry is the
+/// bug.** Add bodies over an afternoon, cross the brick cap, press ctrl+S: the
+/// write succeeds, the status says "saved", the asterisk clears and the crash
+/// net is deleted -- and reopening the file refuses it. The work is then in a
+/// file nothing will open, with every safety net cleared on the writer's word.
+/// So the caps are checked on both sides of the format and a symmetry test
+/// pins them together.
+///
+/// Checked before a single byte goes out, so a refusal leaves the output
+/// untouched rather than half written.
+fn refuse_what_could_not_be_read_back(doc: &Document) -> Result<()> {
+    let nodes = doc.node_count();
+    if nodes == 0 || nodes > MAX_NODES {
+        return Err(ProjectError::NodeCount { found: nodes as u32, limit: MAX_NODES as u32 });
+    }
+    let bodies = doc.body_count();
+    if bodies == 0 {
+        return Err(ProjectError::NoBodies);
+    }
+    if bodies > MAX_BODIES {
+        return Err(ProjectError::TooManyBodies { found: bodies, limit: MAX_BODIES });
+    }
+    // The document total, exactly as the reader accumulates it.
+    let bricks: u64 = doc.bodies().map(|(_, volume)| volume.brick_count() as u64).sum();
+    if bricks > MAX_BRICKS {
+        return Err(ProjectError::TooLarge { bricks, limit: MAX_BRICKS });
+    }
+    Ok(())
+}
+
+/// Where the active body sits in the node table.
+///
+/// The search can fail, which is why this is not an `expect`: deleting a folder
+/// that transitively contains the active body removes it, and a stale `active`
+/// would then kill the session inside a save, on the UI thread, with the user's
+/// file already open for writing. A release build writes a repairable file --
+/// the reader moves `active_index` to the first body row -- and a debug build
+/// fails loudly in whatever test produced the stale id.
+fn active_index(doc: &Document) -> usize {
+    let found = doc.index_of(doc.active());
+    debug_assert!(found.is_some(), "the document's active id is not in its own node list");
+    found.unwrap_or(0)
+}
+
+/// One forty-byte node record.
+///
+/// **The field order at offset +4 is load-bearing and not cosmetic.** It is
+/// `flags u16`, then `kind u8`, then `depth u8`. A version 3 file can only
+/// carry `01 00 00 00` or `00 00 00 00` there, which under this layout reads as
+/// `flags = 1/0, kind = 0, depth = 0` -- correct, bit for bit. Reverse `kind`
+/// and `flags` and a visible body's `flags = 1` reads as `kind = 1`, a folder:
+/// every body becomes an empty folder with no brick stream, and the reader then
+/// takes the first body's brick count as the key trailer's key count. That is a
+/// plausible-looking sculpt made of misread numbers under an unchanged version
+/// number, which is the exact failure the lattice check exists to prevent.
+/// Someone will want to tidy this into `kind, depth, flags`; this comment is
+/// what stops them.
+fn write_node_record(out: &mut impl Write, node: &Node) -> Result<()> {
+    write_u32(out, node.id.0)?;
+
+    let mut flags = 0u16;
+    if node.visible {
+        flags |= FLAG_VISIBLE;
+    }
+    // `collapsed` belongs to a folder row, and the reader repairs it away on a
+    // body. Writing it on a body would make write -> read -> write differ by
+    // one bit, which is the property the save path's own verification rests on.
+    if node.collapsed && !node.is_body() {
+        flags |= FLAG_COLLAPSED;
+    }
+    write_u16(out, flags)?;
+
+    // `kind` and `depth`, RESERVED AT ZERO until folders exist. They are
+    // written as literal zeroes rather than derived from the node, because this
+    // build's reader refuses a non-zero value in either -- deriving them would
+    // let a document that should never exist produce a file this build cannot
+    // read. The increment that makes folders representable changes both ends
+    // together.
+    debug_assert!(node.is_body(), "there are no folder rows to write yet");
+    debug_assert_eq!(node.depth(), 0, "there is no nesting to write yet");
+    out.write_all(&[KIND_BODY, 0])?;
+
+    out.write_all(&name_bytes(&node.name))?;
+    Ok(())
+}
+
+/// A name in its fixed field: at most [`NAME_BYTES`] of UTF-8, NUL padded.
+///
+/// **Truncated on a CHAR BOUNDARY.** Slicing at byte 32 through the middle of a
+/// multi-byte sequence writes bytes that are not UTF-8; the reader then
+/// correctly repairs the name to `Body {n}`, and the user silently loses a name
+/// this build wrote itself. `is_char_boundary(0)` is true, so the walk back
+/// always terminates.
+fn name_bytes(name: &str) -> [u8; NAME_BYTES] {
+    let mut end = name.len().min(NAME_BYTES);
+    while !name.is_char_boundary(end) {
+        end -= 1;
+    }
+    let mut out = [0u8; NAME_BYTES];
+    out[..end].copy_from_slice(&name.as_bytes()[..end]);
+    out
+}
+
+/// One body's brick stream: a count, then that many brick records.
+///
+/// **The count is taken from the pairs actually resolved, not from the
+/// coordinate list.** The two can differ, and at version 2 the damage was
+/// bounded because the trailer was last and short. Now the streams are
+/// consecutive: a body that writes fewer records than it declared makes the
+/// reader consume the NEXT body's coordinates as this body's bricks, and every
+/// remaining body in the file is misparsed into plausible-looking rubbish.
+fn write_bricks(out: &mut impl Write, volume: &Volume) -> Result<()> {
     let mut coords: Vec<BrickCoord> = volume.brick_coords().collect();
     coords.sort_unstable();
-    write_u64(out, coords.len() as u64)?;
+    let pairs: Vec<(BrickCoord, &Brick)> = coords
+        .into_iter()
+        .filter_map(|coord| volume.brick(coord).map(|brick| (coord, brick)))
+        .collect();
 
-    for coord in coords {
-        let Some(brick) = volume.brick(coord) else {
-            continue;
-        };
+    write_u64(out, pairs.len() as u64)?;
+    for (coord, brick) in pairs {
         for component in coord.0.to_array() {
             out.write_all(&component.to_le_bytes())?;
         }
@@ -526,18 +875,6 @@ pub fn write(out: &mut impl Write, volume: &Volume, state: &ProjectState) -> Res
             }
         }
     }
-
-    // The key trailer, after the bricks rather than in the header. A version 1
-    // file is exactly this file without it, which is what lets one still be
-    // read: the brick count says where the geometry ends, and there is simply
-    // nothing after it.
-    write_u32(out, state.keys.len() as u32)?;
-    for key in &state.keys {
-        write_f32(out, key.at)?;
-        write_view(out, &key.view)?;
-    }
-
-    out.flush()?;
     Ok(())
 }
 
@@ -552,15 +889,53 @@ pub fn read(input: &mut impl Read) -> Result<(Document, ProjectState)> {
     read_reporting(input, &mut Progress::default())
 }
 
-/// Read a sculpt, recording how far the read got in `progress`.
+/// What a file says it holds, from its header and node table alone.
 ///
-/// `progress` is written as the read proceeds and is left holding whatever was
-/// reached when this returns, error or not — that is the whole point of it, so
-/// it must not be reset or rolled back on the way out.
-pub(crate) fn read_reporting(
-    input: &mut impl Read,
-    progress: &mut Progress,
-) -> Result<(Document, ProjectState)> {
+/// A few hundred bytes rather than gigabytes: the whole point is that this can
+/// be read back straight after a save, on the thread that draws, to check that
+/// what landed on disk is the document that was in memory. See
+/// `Brokkr::save_project`, which will not delete the crash net until it agrees.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Outline {
+    pub voxel_size: f32,
+    /// Rows in the node table, bodies and folders together.
+    pub nodes: usize,
+    /// Rows that carry a field.
+    pub bodies: usize,
+}
+
+/// Read a file's header and node table, and stop before the geometry.
+///
+/// Every refusal the full reader makes about the header and the table is made
+/// here too, because it is the same code. What it does NOT do is validate one
+/// brick, so a file that passes this can still be refused by [`read`].
+pub fn read_outline(input: &mut impl Read) -> Result<Outline> {
+    let header = read_header(input)?;
+    let mut progress = Progress::default();
+    let (rows, _) = read_table_or_synthesize(input, header.container, &mut progress)?;
+    Ok(Outline {
+        voxel_size: header.voxel_size,
+        nodes: rows.len(),
+        bodies: rows.iter().filter(|row| row.is_body).count(),
+    })
+}
+
+/// One row of a file's node table: everything about it except the field it
+/// may own.
+struct Row {
+    meta: NodeMeta,
+    is_body: bool,
+}
+
+/// Everything the fixed header carries, once it has been checked.
+struct Header {
+    container: u16,
+    voxel_size: f32,
+    view: View,
+}
+
+/// The first sixty-three bytes, which are the same in every version.
+fn read_header(input: &mut impl Read) -> Result<Header> {
     let magic: [u8; 8] = read_exact(input)?;
     if &magic != MAGIC {
         return Err(ProjectError::NotABrokkrFile);
@@ -573,8 +948,15 @@ pub(crate) fn read_reporting(
             supported: CONTAINER_VERSION,
         });
     }
+    // A RANGE on this axis too, and it is the whole of what the next per-voxel
+    // encoding asks of this commit. Exact equality here would refuse every file
+    // ever written on the day a mask or a colour bumps the field version --
+    // including every multi-body file saved between now and then -- with an
+    // error that reads backwards. Still only downward: a file written by a
+    // NEWER encoding is refused flatly, because reading one as though it were
+    // this one is the plausible-looking-sculpt failure again.
     let field = read_u16(input)?;
-    if field != FIELD_VERSION {
+    if !(OLDEST_FIELD_VERSION..=FIELD_VERSION).contains(&field) {
         return Err(ProjectError::FieldVersion { found: field, supported: FIELD_VERSION });
     }
 
@@ -602,13 +984,242 @@ pub(crate) fn read_reporting(
         return Err(ProjectError::NonFiniteValue);
     }
 
-    let mut state = ProjectState { view: read_view(input)?, keys: Vec::new() };
+    Ok(Header { container, voxel_size, view: read_view(input)? })
+}
 
-    let count = read_u64(input)?;
-    if count > MAX_BRICKS {
-        return Err(ProjectError::TooLarge { bricks: count, limit: MAX_BRICKS });
+/// The node table of a version 3 file, or the one implicit body an older one
+/// holds.
+///
+/// **This is the whole of the compatibility branch**, and it has the shape of
+/// the one already above it for the key trailer. A version 1 or 2 file carries
+/// no table, so what it holds is one default body -- and the brick loop below
+/// then runs exactly once, reading the u64 at byte 63 exactly as it always did.
+fn read_table_or_synthesize(
+    input: &mut impl Read,
+    container: u16,
+    progress: &mut Progress,
+) -> Result<(Vec<Row>, usize)> {
+    if container >= 3 {
+        return read_node_table(input, progress);
+    }
+    let meta = NodeMeta {
+        id: NodeId(1),
+        depth: 0,
+        name: Document::FIRST_BODY_NAME.to_string(),
+        visible: true,
+        collapsed: false,
+    };
+    // `progress.nodes` stays 0: nothing was read from a table that is not there.
+    Ok((vec![Row { meta, is_body: true }], 0))
+}
+
+/// Read the flat preorder node table, and the index of the active row.
+///
+/// **Cycles are unrepresentable here rather than merely detected**, and that is
+/// the whole reason for this encoding. A row's position in the tree is
+/// `(preorder index, depth)` and nothing else: there is no parent pointer to
+/// point at a descendant, no traversal, no `visited` set and no recursion, so a
+/// crafted file has no lever that could make this loop run twice over one row.
+/// Whatever the depth column holds, the result is a forest. That is what keeps
+/// the mutation fuzz below meaningful without a recursive parser for it to
+/// overflow.
+///
+/// Validating the tree is therefore a fold over one `u8` -- and at version 3 it
+/// is the degenerate case of that fold, since `depth` is reserved at zero and
+/// refused otherwise. The increment that makes folders representable replaces
+/// the refusal with the clamp
+/// `depth[i] = min(depth[i], depth[i - 1] + 1, MAX_DEPTH - 1)`, which is closed
+/// over the invariant and so needs no error variant of its own.
+///
+/// A crafted file's only levers are `node_count`, bounded before the allocation
+/// it decides; `kind`, a set membership test; and `depth`, above.
+fn read_node_table(input: &mut impl Read, progress: &mut Progress) -> Result<(Vec<Row>, usize)> {
+    let node_count = read_u32(input)?;
+    if node_count == 0 || node_count as usize > MAX_NODES {
+        return Err(ProjectError::NodeCount { found: node_count, limit: MAX_NODES as u32 });
+    }
+    let active_index = read_u32(input)?;
+
+    // Bounded above, so this allocation is at most MAX_NODES records however
+    // hostile the file: the table is read and validated whole before one brick
+    // is allocated.
+    let mut rows: Vec<Row> = Vec::with_capacity(node_count as usize);
+    let mut bodies = 0usize;
+    for index in 0..node_count as usize {
+        let id = read_u32(input)?;
+        // Zero is "no node" and `u32::MAX` would overflow the `max(id) + 1`
+        // that reconstitutes the next id; a duplicate aliases both the mesh
+        // pool's key and the routing of an undo entry.
+        if id == 0 || id == u32::MAX {
+            return Err(ProjectError::ReservedNodeId { found: id });
+        }
+        if rows.iter().any(|row| row.meta.id.0 == id) {
+            return Err(ProjectError::DuplicateNodeId { found: id });
+        }
+
+        let flags = read_u16(input)?;
+        if flags & RESERVED_FLAGS != 0 {
+            return Err(ProjectError::ReservedFlags { found: flags });
+        }
+
+        let kind = read_exact::<1>(input)?[0];
+        if kind != KIND_BODY {
+            return Err(ProjectError::UnknownNodeKind(kind));
+        }
+        let depth = read_exact::<1>(input)?[0];
+        if depth != 0 {
+            return Err(ProjectError::ReservedDepth { found: depth });
+        }
+
+        let name = read_name(input, index, progress)?;
+
+        // Every row is a body while `kind` must be zero. The count is kept
+        // rather than derived so that the two checks that need it -- the body
+        // cap and the "no bodies at all" refusal -- read the same way from the
+        // increment that makes a folder row representable.
+        let is_body = kind == KIND_BODY;
+        if is_body {
+            bodies += 1;
+            if bodies > MAX_BODIES {
+                return Err(ProjectError::TooManyBodies { found: bodies, limit: MAX_BODIES });
+            }
+        }
+
+        let mut collapsed = flags & FLAG_COLLAPSED != 0;
+        if collapsed && is_body {
+            // Repaired, not refused: it decides only whether a triangle is
+            // drawn beside a row.
+            collapsed = false;
+            progress.repairs += 1;
+        }
+
+        rows.push(Row {
+            meta: NodeMeta {
+                id: NodeId(id),
+                depth,
+                name,
+                visible: flags & FLAG_VISIBLE != 0,
+                collapsed,
+            },
+            is_body,
+        });
+        progress.nodes += 1;
     }
 
+    // A table of folders and nothing else parses perfectly, consumes exactly
+    // the right number of bytes, and leaves a document with no body for
+    // `active` to name -- so the first thing that touches the active body
+    // panics on a file that loaded without complaint. The mutation fuzz cannot
+    // catch it either: its band assertion loops over zero bodies and passes.
+    // Unreachable while `kind` must be zero, and one line ahead of the
+    // increment that makes it reachable.
+    if bodies == 0 {
+        return Err(ProjectError::NoBodies);
+    }
+
+    // Moved to the first BODY row rather than to row 0, because row 0 may be a
+    // folder once folders exist.
+    let active = match rows.get(active_index as usize) {
+        Some(row) if row.is_body => active_index as usize,
+        _ => {
+            progress.repairs += 1;
+            rows.iter().position(|row| row.is_body).expect("a table with no bodies was refused")
+        }
+    };
+    Ok((rows, active))
+}
+
+/// One name field, repaired rather than refused.
+///
+/// A name decides only what a row is called, so a file whose geometry is intact
+/// and whose name field is rubbish should open and show the sculpt under a
+/// default name -- exactly as a NaN camera does.
+fn read_name(input: &mut impl Read, index: usize, progress: &mut Progress) -> Result<String> {
+    let field: [u8; NAME_BYTES] = read_exact(input)?;
+    // Up to the first NUL, or the whole field when there is none. A full
+    // thirty-two byte name has no terminator and has to round-trip.
+    let end = field.iter().position(|byte| *byte == 0).unwrap_or(NAME_BYTES);
+    match std::str::from_utf8(&field[..end]) {
+        Ok(name) if !name.is_empty() => Ok(name.to_string()),
+        _ => {
+            progress.repairs += 1;
+            Ok(format!("Body {}", index + 1))
+        }
+    }
+}
+
+/// Read a sculpt, recording how far the read got in `progress`.
+///
+/// `progress` is written as the read proceeds and is left holding whatever was
+/// reached when this returns, error or not — that is the whole point of it, so
+/// it must not be reset or rolled back on the way out.
+pub(crate) fn read_reporting(
+    input: &mut impl Read,
+    progress: &mut Progress,
+) -> Result<(Document, ProjectState)> {
+    let header = read_header(input)?;
+    let mut state = ProjectState { view: header.view, keys: Vec::new() };
+
+    let (rows, active) = read_table_or_synthesize(input, header.container, progress)?;
+
+    // The brick streams, one per body, consecutive and in table order.
+    let mut total = 0u64;
+    let mut loaded: Vec<(NodeMeta, Volume)> = Vec::with_capacity(rows.len());
+    for row in rows {
+        debug_assert!(row.is_body, "a version 3 file's rows are all bodies");
+        let count = read_u64(input)?;
+        // The running DOCUMENT total, checked before this body's bricks are
+        // touched. A per-body check would let sixty-four bodies ask for
+        // sixty-four times the cap.
+        //
+        // It cannot be a *sum of every count up front*: the counts are
+        // interleaved with the streams they describe and the reader never
+        // seeks, so a file whose first body alone is legal necessarily gets
+        // that body read before the second count is even visible. What this
+        // does buy is that no body is allocated once the declared total is
+        // past the cap, which is what bounds the damage.
+        total = total.saturating_add(count);
+        if total > MAX_BRICKS {
+            return Err(ProjectError::TooLarge { bricks: total, limit: MAX_BRICKS });
+        }
+        loaded.push((row.meta, read_bricks(input, count, header.voxel_size, progress)?));
+    }
+
+    // The key trailer, which only version 2 and later carry. A version 1 file
+    // ends with its last brick, and reading one is a matter of not looking.
+    if header.container >= 2 {
+        let count = read_u32(input)?;
+        if count > MAX_KEYS {
+            return Err(ProjectError::TooManyKeys { keys: count, limit: MAX_KEYS });
+        }
+        state.keys.reserve(count as usize);
+        for _ in 0..count {
+            let at = read_f32(input)?;
+            // Repaired rather than refused, like the view itself: a key at a
+            // nonsense position is a key in the wrong place, not a reason to
+            // lose the sculpt it was saved beside.
+            let at = if at.is_finite() { at.clamp(0.0, 1.0) } else { 0.0 };
+            state.keys.push(Keyframe { at, view: read_view(input)? });
+        }
+        // Sorted on the way in, because everything downstream asks for
+        // neighbours and a file is free to have been written by anything.
+        state.keys.sort_by(|a, b| a.at.partial_cmp(&b.at).expect("clamped, so no NaN"));
+    }
+
+    let mut doc = Document::from_table(header.voxel_size, loaded, active);
+    // Nothing has been meshed yet, and the renderer holds whatever the previous
+    // model left. Marking everything dirty is what makes the load visible.
+    doc.mark_everything_dirty();
+    Ok((doc, state))
+}
+
+/// One body's brick stream, into a volume of its own.
+fn read_bricks(
+    input: &mut impl Read,
+    count: u64,
+    voxel_size: f32,
+    progress: &mut Progress,
+) -> Result<Volume> {
     let mut volume = Volume::new(voxel_size);
     for _ in 0..count {
         // Counted here rather than after the insert, so that a file whose very
@@ -652,37 +1263,7 @@ pub(crate) fn read_reporting(
         };
         volume.insert_brick(coord, brick);
     }
-
-    // The key trailer, which only version 2 and later carry. A version 1 file
-    // ends with its last brick, and reading one is a matter of not looking.
-    if container >= 2 {
-        let count = read_u32(input)?;
-        if count > MAX_KEYS {
-            return Err(ProjectError::TooManyKeys { keys: count, limit: MAX_KEYS });
-        }
-        state.keys.reserve(count as usize);
-        for _ in 0..count {
-            let at = read_f32(input)?;
-            // Repaired rather than refused, like the view itself: a key at a
-            // nonsense position is a key in the wrong place, not a reason to
-            // lose the sculpt it was saved beside.
-            let at = if at.is_finite() { at.clamp(0.0, 1.0) } else { 0.0 };
-            state.keys.push(Keyframe { at, view: read_view(input)? });
-        }
-        // Sorted on the way in, because everything downstream asks for
-        // neighbours and a file is free to have been written by anything.
-        state.keys.sort_by(|a, b| a.at.partial_cmp(&b.at).expect("clamped, so no NaN"));
-    }
-
-    // Nothing has been meshed yet, and the renderer holds whatever the previous
-    // model left. Marking everything dirty is what makes the load visible.
-    volume.mark_everything_dirty();
-
-    // A version 1 or 2 file carries no node table, so what it holds is one
-    // implicit body -- which is exactly what `Document::from_volume` builds,
-    // named [`Document::FIRST_BODY_NAME`]. `Progress::nodes` stays 0 for the
-    // same reason: nothing was read from a table that is not there.
-    Ok((Document::from_volume(volume), state))
+    Ok(volume)
 }
 
 #[cfg(test)]
@@ -705,6 +1286,20 @@ mod tests {
         volume
     }
 
+    /// The sculpt every test below saves, as the one-body document the format
+    /// actually takes.
+    fn sculpted_doc() -> Document {
+        Document::from_volume(sculpted())
+    }
+
+    /// A ball as a one-body document, for the tests that only need some bricks
+    /// to corrupt.
+    fn ball(voxel_size: f32, radius: f32) -> Document {
+        let mut volume = Volume::new(voxel_size);
+        volume.seed_sphere(Vec3::ZERO, radius);
+        Document::from_volume(volume)
+    }
+
     /// Bytes the key trailer occupies when there are no keys: just its count.
     ///
     /// Several tests below reach for the *last brick value*, which used to mean
@@ -715,24 +1310,52 @@ mod tests {
     const EMPTY_TRAILER_BYTES: usize = 4;
 
     /// Where the final brick's last distance value starts.
+    ///
+    /// **Single body and folder free**, like [`first_brick_at`]: it assumes the
+    /// file ends with one body's last brick and then the empty trailer. Add a
+    /// second body to a fixture that uses this and it aims into that body
+    /// rather than the first, silently.
     fn last_distance_at(bytes: &[u8]) -> usize {
         bytes.len() - EMPTY_TRAILER_BYTES - 4
     }
 
-    /// Where the first brick's coordinate starts, found by measuring the
-    /// header with an empty volume rather than by counting field widths.
+    /// Where the first brick's coordinate starts, found by measuring the header
+    /// of an empty document rather than by counting field widths.
+    ///
+    /// **This is why the node record is a fixed forty bytes.** The measurement
+    /// self-adjusts for anything that grows the header *before* the brick
+    /// stream -- the node table did, and not one offset here had to move -- but
+    /// it cannot adjust for a record whose length depends on a name.
+    ///
+    /// **Single body and folder free.** It measures a one-body document, so the
+    /// answer is where the FIRST body's stream begins. A future test that adds
+    /// a folder or a second body to the shared fixture gets a silently wrong
+    /// offset and a passing assertion, not a failure. It also does not
+    /// self-adjust for anything appended AFTER the bricks -- see
+    /// `EMPTY_TRAILER_BYTES`.
     fn first_brick_at() -> usize {
         let mut empty = Vec::new();
-        write(&mut empty, &Volume::new(0.5), &ProjectState::default()).expect("write failed");
+        write(&mut empty, &Document::new(0.5), &ProjectState::default()).expect("write failed");
         empty.len() - EMPTY_TRAILER_BYTES
     }
 
+    /// Where the node table begins: the whole of the version 1 and 2 header.
+    ///
+    /// Confirmed against the real files with `od` rather than counted from the
+    /// writer, and asserted against the writer in
+    /// [`the_version_3_header_is_the_version_2_header_plus_a_node_table`].
+    const NODE_TABLE_AT: usize = 63;
+
+    /// Where one node record begins.
+    fn record_at(index: usize) -> usize {
+        NODE_TABLE_AT + 4 + 4 + index * NODE_RECORD_BYTES
+    }
+
     /// Returns a whole [`Document`], because that is what the reader answers
-    /// with: a version 1 or 2 file is one implicit body, and the tests that
-    /// care about the field reach through `active_volume`.
-    fn round_trip(volume: &Volume, state: &ProjectState) -> (Document, ProjectState) {
+    /// with.
+    fn round_trip(doc: &Document, state: &ProjectState) -> (Document, ProjectState) {
         let mut bytes = Vec::new();
-        write(&mut bytes, volume, state).expect("write failed");
+        write(&mut bytes, doc, state).expect("write failed");
         read(&mut bytes.as_slice()).expect("read failed")
     }
 
@@ -740,8 +1363,9 @@ mod tests {
     /// something that merely looks like it.
     #[test]
     fn a_sculpted_model_survives_a_round_trip_value_for_value() {
-        let volume = sculpted();
-        let (loaded, _) = round_trip(&volume, &ProjectState::default());
+        let doc = sculpted_doc();
+        let volume = doc.active_volume();
+        let (loaded, _) = round_trip(&doc, &ProjectState::default());
 
         assert_eq!(loaded.voxel_size(), volume.voxel_size());
 
@@ -770,12 +1394,12 @@ mod tests {
     /// compare semantics and a file diff means nothing.
     #[test]
     fn writing_the_same_volume_twice_gives_identical_bytes() {
-        let volume = sculpted();
+        let doc = sculpted_doc();
         let state = ProjectState::default();
         let mut first = Vec::new();
         let mut second = Vec::new();
-        write(&mut first, &volume, &state).unwrap();
-        write(&mut second, &volume, &state).unwrap();
+        write(&mut first, &doc, &state).unwrap();
+        write(&mut second, &doc, &state).unwrap();
         assert_eq!(first, second);
     }
 
@@ -794,7 +1418,7 @@ mod tests {
             },
             keys: Vec::new(),
         };
-        let (_, loaded) = round_trip(&sculpted(), &state);
+        let (_, loaded) = round_trip(&sculpted_doc(), &state);
         assert_eq!(loaded, state);
     }
 
@@ -802,7 +1426,7 @@ mod tests {
     /// screen and looks like a failure.
     #[test]
     fn everything_is_marked_dirty_so_the_load_is_visible() {
-        let (mut loaded, _) = round_trip(&sculpted(), &ProjectState::default());
+        let (mut loaded, _) = round_trip(&sculpted_doc(), &ProjectState::default());
         let mut dirty: Vec<(NodeId, BrickCoord)> = Vec::new();
         loaded.take_dirty(&mut dirty);
         assert!(!dirty.is_empty(), "a freshly loaded model had nothing to mesh");
@@ -814,7 +1438,7 @@ mod tests {
     #[test]
     fn a_file_written_at_a_different_lattice_is_refused() {
         let mut bytes = Vec::new();
-        write(&mut bytes, &sculpted(), &ProjectState::default()).unwrap();
+        write(&mut bytes, &sculpted_doc(), &ProjectState::default()).unwrap();
 
         // The brick size sits after the magic and the two versions.
         let offset = MAGIC.len() + 2 + 2;
@@ -855,7 +1479,7 @@ mod tests {
     #[test]
     fn a_newer_layout_or_encoding_is_refused_with_both_versions_named() {
         let mut bytes = Vec::new();
-        write(&mut bytes, &sculpted(), &ProjectState::default()).unwrap();
+        write(&mut bytes, &sculpted_doc(), &ProjectState::default()).unwrap();
 
         let mut newer = bytes.clone();
         newer[MAGIC.len()..MAGIC.len() + 2].copy_from_slice(&(CONTAINER_VERSION + 1).to_le_bytes());
@@ -877,7 +1501,7 @@ mod tests {
     #[test]
     fn a_truncated_file_is_refused_rather_than_loaded_short() {
         let mut bytes = Vec::new();
-        write(&mut bytes, &sculpted(), &ProjectState::default()).unwrap();
+        write(&mut bytes, &sculpted_doc(), &ProjectState::default()).unwrap();
 
         for fraction in [0.2, 0.5, 0.9, 0.999] {
             let cut = (bytes.len() as f64 * fraction) as usize;
@@ -891,7 +1515,7 @@ mod tests {
     #[test]
     fn an_absurd_brick_count_is_refused_before_anything_is_read() {
         let mut bytes = Vec::new();
-        write(&mut bytes, &sculpted(), &ProjectState::default()).unwrap();
+        write(&mut bytes, &sculpted_doc(), &ProjectState::default()).unwrap();
 
         let count_at = first_brick_at() - 8;
 
@@ -909,10 +1533,8 @@ mod tests {
 
     #[test]
     fn a_non_finite_distance_is_refused() {
-        let mut volume = Volume::new(0.5);
-        volume.seed_sphere(Vec3::ZERO, 10.0);
         let mut bytes = Vec::new();
-        write(&mut bytes, &volume, &ProjectState::default()).unwrap();
+        write(&mut bytes, &ball(0.5, 10.0), &ProjectState::default()).unwrap();
 
         // Poison the final brick's last value, which sits just before the
         // key trailer rather than at the end of the file.
@@ -924,9 +1546,7 @@ mod tests {
     #[test]
     fn an_unknown_brick_kind_is_refused() {
         let mut bytes = Vec::new();
-        let mut volume = Volume::new(0.5);
-        volume.seed_sphere(Vec3::ZERO, 10.0);
-        write(&mut bytes, &volume, &ProjectState::default()).unwrap();
+        write(&mut bytes, &ball(0.5, 10.0), &ProjectState::default()).unwrap();
 
         // First brick's tag: past the header, past the count, past the coord.
         let tag_at = first_brick_at() + 12;
@@ -951,12 +1571,12 @@ mod tests {
         assert!(stats.dense_bricks > 0, "this model has no dense bricks to test with");
 
         let mut bytes = Vec::new();
-        write(&mut bytes, &volume, &ProjectState::default()).unwrap();
+        write(&mut bytes, &Document::from_volume(volume), &ProjectState::default()).unwrap();
 
         // An empty volume is exactly the header plus the brick count, which is
         // how the fixed part is measured rather than counted by hand.
         let mut empty = Vec::new();
-        write(&mut empty, &Volume::new(1.0), &ProjectState::default()).unwrap();
+        write(&mut empty, &Document::new(1.0), &ProjectState::default()).unwrap();
 
         // Per brick: twelve bytes of coordinate, one tag byte, then either one
         // value or the whole array.
@@ -980,8 +1600,7 @@ mod tests {
 
     #[test]
     fn an_empty_volume_round_trips_as_an_empty_volume() {
-        let volume = Volume::new(0.25);
-        let (loaded, _) = round_trip(&volume, &ProjectState::default());
+        let (loaded, _) = round_trip(&Document::new(0.25), &ProjectState::default());
         assert_eq!(loaded.voxel_size(), 0.25);
         assert_eq!(loaded.active_volume().brick_coords().count(), 0);
     }
@@ -1001,7 +1620,7 @@ mod tests {
         // band, because a value outside it means a brick that meshes into
         // nothing or into a surface where there is none.
         let mut valid = Vec::new();
-        write(&mut valid, &sculpted(), &ProjectState::default()).expect("write failed");
+        write(&mut valid, &sculpted_doc(), &ProjectState::default()).expect("write failed");
 
         let mut loaded = 0usize;
         let mut reached_the_bricks = 0usize;
@@ -1084,10 +1703,14 @@ mod tests {
         //
         // Measured, from the counter rather than from the error variants:
         // **1800 of 1800** mutants reach the brick loop, of which **22** load
-        // whole. All 1800 is not a surprise once counted -- the header is 71 of
-        // 4,194,795 bytes, so a handful of flipped bits, a cut at a random
+        // whole. All 1800 is not a surprise once counted -- the header is 119
+        // of 4,194,843 bytes, so a handful of flipped bits, a cut at a random
         // offset or a 256-byte overwrite lands in the geometry essentially
         // every time.
+        //
+        // **Both numbers are unchanged by the node table**, re-measured when it
+        // landed: the table added 48 bytes to a four megabyte corpus, which is
+        // one mutant in eighty-seven thousand.
         //
         // The previously recorded "1200 of 1800" was wrong in both directions
         // and must not be treated as a floor: it over-counted header refusals
@@ -1118,7 +1741,7 @@ mod tests {
         // with nothing reported. Nothing here writes such a file; a corrupt
         // one is what carries it.
         let mut bytes = Vec::new();
-        write(&mut bytes, &sculpted(), &ProjectState::default()).expect("write failed");
+        write(&mut bytes, &sculpted_doc(), &ProjectState::default()).expect("write failed");
 
         let coord_at = first_brick_at();
 
@@ -1154,10 +1777,8 @@ mod tests {
         // not come from this build. It is refused rather than clamped: a file
         // that is provably corrupt should say so, not show something
         // plausible.
-        let mut volume = Volume::new(0.5);
-        volume.seed_sphere(Vec3::ZERO, 10.0);
         let mut bytes = Vec::new();
-        write(&mut bytes, &volume, &ProjectState::default()).expect("write failed");
+        write(&mut bytes, &ball(0.5, 10.0), &ProjectState::default()).expect("write failed");
 
         for offending in [OUTSIDE * 2.0, INSIDE * 2.0, 1e30, -1e30] {
             let mut broken = bytes.clone();
@@ -1189,7 +1810,7 @@ mod tests {
             view: View { camera_distance: 77.0, ..View::default() },
             keys: vec![a_key(0.0, 10.0), a_key(0.25, 20.0), a_key(0.9, 30.0)],
         };
-        let (_, loaded) = round_trip(&sculpted(), &state);
+        let (_, loaded) = round_trip(&sculpted_doc(), &state);
         assert_eq!(loaded, state, "the keys did not come back as they went in");
     }
 
@@ -1202,7 +1823,7 @@ mod tests {
             view: View::default(),
             keys: vec![a_key(0.8, 1.0), a_key(0.1, 2.0), a_key(0.5, 3.0)],
         };
-        let (_, loaded) = round_trip(&sculpted(), &state);
+        let (_, loaded) = round_trip(&sculpted_doc(), &state);
         let order: Vec<f32> = loaded.keys.iter().map(|key| key.at).collect();
         assert_eq!(order, vec![0.1, 0.5, 0.8]);
         // And each key kept its own view rather than merely its position.
@@ -1210,27 +1831,25 @@ mod tests {
         assert_eq!(loaded.keys[2].view.camera_distance, 1.0);
     }
 
-    /// The one that matters most about the version bump: every `.brokkr` file
-    /// already written is a version 1 file, and there were real ones on disk
-    /// when the timeline was added.
+    /// The one that matters most about the version bumps: every `.brokkr` file
+    /// already written is a version 1 or 2 file, and there are real ones on
+    /// disk.
     ///
-    /// A version 1 file is a version 2 file without the key trailer, so one is
-    /// built here by writing a version 2 file and taking the trailer back off.
-    /// That is exactly what the old writer produced, byte for byte, which is
-    /// what makes this a test of compatibility rather than of a fixture.
+    /// An old file is this build's own output with the node table taken back
+    /// out and, for version 1, the key trailer as well -- which is exactly what
+    /// the old writers produced, byte for byte, and is what makes this a test
+    /// of compatibility rather than of a fixture. See [`as_older_container`].
     #[test]
     fn a_file_from_before_the_timeline_still_opens() {
-        let volume = sculpted();
+        let doc = sculpted_doc();
+        let bricks = doc.active_volume().brick_coords().count();
         let state = ProjectState {
             view: View { camera_distance: 55.0, brush_radius: 7.0, ..View::default() },
             keys: Vec::new(),
         };
         let mut bytes = Vec::new();
-        write(&mut bytes, &volume, &state).expect("write failed");
-
-        // Back to version 1: stamp the old number in, and drop the trailer.
-        bytes[8..10].copy_from_slice(&1u16.to_le_bytes());
-        bytes.truncate(bytes.len() - EMPTY_TRAILER_BYTES);
+        write(&mut bytes, &doc, &state).expect("write failed");
+        let bytes = as_older_container(1, bytes);
 
         let (loaded, loaded_state) =
             read(&mut bytes.as_slice()).expect("a version 1 file was refused");
@@ -1238,9 +1857,11 @@ mod tests {
         assert!(loaded_state.keys.is_empty(), "a file with no trailer gained keys");
         assert_eq!(
             loaded.active_volume().brick_coords().count(),
-            volume.brick_coords().count(),
+            bricks,
             "the geometry did not survive"
         );
+        assert_eq!(loaded.body_count(), 1, "a file with no node table is one implicit body");
+        assert_eq!(loaded.nodes()[0].name, Document::FIRST_BODY_NAME);
     }
 
     #[test]
@@ -1250,7 +1871,7 @@ mod tests {
         // it as though it were this one is the plausible-looking-sculpt failure
         // the version numbers exist to prevent.
         let mut bytes = Vec::new();
-        write(&mut bytes, &sculpted(), &ProjectState::default()).expect("write failed");
+        write(&mut bytes, &sculpted_doc(), &ProjectState::default()).expect("write failed");
         bytes[8..10].copy_from_slice(&(CONTAINER_VERSION + 1).to_le_bytes());
         match read(&mut bytes.as_slice()) {
             Err(ProjectError::ContainerVersion { found, supported }) => {
@@ -1271,7 +1892,7 @@ mod tests {
     #[test]
     fn an_absurd_key_count_is_refused_before_anything_is_read() {
         let mut bytes = Vec::new();
-        write(&mut bytes, &sculpted(), &ProjectState::default()).expect("write failed");
+        write(&mut bytes, &sculpted_doc(), &ProjectState::default()).expect("write failed");
         let at = bytes.len() - EMPTY_TRAILER_BYTES;
         // Bounded rather than written as `bytes[at..]`, which is the same four
         // bytes today and a slice-length *panic* the moment the trailer grows
@@ -1299,7 +1920,7 @@ mod tests {
                 view: View::default(),
                 keys: vec![Keyframe { at: offending, view: View::default() }],
             };
-            let (_, loaded) = round_trip(&sculpted(), &state);
+            let (_, loaded) = round_trip(&sculpted_doc(), &state);
             let at = loaded.keys[0].at;
             assert!(
                 (0.0..=1.0).contains(&at),
@@ -1323,7 +1944,7 @@ mod tests {
                 },
             }],
         };
-        let (_, loaded) = round_trip(&sculpted(), &state);
+        let (_, loaded) = round_trip(&sculpted_doc(), &state);
         assert!(loaded.keys[0].view.camera_target.is_finite());
         assert!(loaded.keys[0].view.camera_distance.is_finite());
     }
@@ -1337,13 +1958,13 @@ mod tests {
     /// is exactly the bug this increment removes from the fuzz control.
     #[test]
     fn the_reader_says_how_far_it_got_because_the_error_variant_cannot() {
-        let volume = sculpted();
-        let bricks = volume.brick_coords().count() as u64;
+        let doc = sculpted_doc();
+        let bricks = doc.active_volume().brick_coords().count() as u64;
         let mut valid = Vec::new();
-        write(&mut valid, &volume, &ProjectState::default()).expect("write failed");
+        write(&mut valid, &doc, &ProjectState::default()).expect("write failed");
 
         // `voxel_size` sits after the magic, the two versions and the lattice
-        // pair -- byte 20, forty-three bytes before the brick count at 63.
+        // pair -- byte 20, forty-three bytes before the node table at 63.
         let voxel_size_at = MAGIC.len() + 2 + 2 + 4 + 4;
         assert_eq!(voxel_size_at, 20);
         let mut header_broken = valid.clone();
@@ -1354,6 +1975,7 @@ mod tests {
             Err(ProjectError::NonFiniteValue)
         ));
         assert_eq!(progress.bricks, 0, "a header refusal reported reaching the geometry");
+        assert_eq!(progress.nodes, 0, "a header refusal reported reading a node table");
 
         let mut brick_broken = valid.clone();
         let at = last_distance_at(&brick_broken);
@@ -1367,14 +1989,606 @@ mod tests {
             progress.bricks, bricks,
             "a refusal in the last brick did not report the whole geometry as reached"
         );
+        assert_eq!(
+            progress.nodes, 1,
+            "the table was read whole before the geometry, so its rows are reached even when the \
+             geometry is not"
+        );
 
         // And a whole file reports every brick it was given.
         let mut progress = Progress::default();
         read_reporting(&mut valid.as_slice(), &mut progress).expect("the valid file was refused");
         assert_eq!(progress.bricks, bricks);
-        // The two counters the format does not carry yet, asserted so that
-        // whoever fills them in has to come past this line.
-        assert_eq!((progress.nodes, progress.repairs), (0, 0));
+        // The other two counters, now that the format carries a node table for
+        // them to count. One row, and nothing repaired: this build's writer
+        // must not produce anything this build's reader has to fix.
+        assert_eq!((progress.nodes, progress.repairs), (1, 0));
+    }
+
+    // ---------------------------------------------------------------------
+    // The node table.
+    // ---------------------------------------------------------------------
+
+    /// One node record's forty bytes, built field by field so that a test can
+    /// put anything at all in any of them. The writer above cannot produce most
+    /// of what these tests need -- that is the point of them.
+    struct Record {
+        id: u32,
+        flags: u16,
+        kind: u8,
+        depth: u8,
+        name: &'static str,
+    }
+
+    impl Record {
+        /// A visible body, which is every legal record this build can write.
+        fn body(id: u32, name: &'static str) -> Self {
+            Self { id, flags: FLAG_VISIBLE, kind: KIND_BODY, depth: 0, name }
+        }
+
+        fn bytes(&self) -> Vec<u8> {
+            let mut out = Vec::with_capacity(NODE_RECORD_BYTES);
+            out.extend_from_slice(&self.id.to_le_bytes());
+            out.extend_from_slice(&self.flags.to_le_bytes());
+            out.push(self.kind);
+            out.push(self.depth);
+            out.extend_from_slice(&name_bytes(self.name));
+            assert_eq!(out.len(), NODE_RECORD_BYTES);
+            out
+        }
+    }
+
+    /// A version 3 file with a node table of the caller's choosing and one
+    /// empty brick stream per body row.
+    ///
+    /// The header comes from this build's own writer, so a test built on this
+    /// is aiming at the table and at nothing else.
+    fn crafted(active: u32, records: &[Record]) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        write(&mut bytes, &Document::new(0.5), &ProjectState::default()).expect("write failed");
+        bytes.truncate(NODE_TABLE_AT);
+        bytes.extend_from_slice(&(records.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(&active.to_le_bytes());
+        for record in records {
+            bytes.extend_from_slice(&record.bytes());
+        }
+        for _ in records.iter().filter(|record| record.kind == KIND_BODY) {
+            bytes.extend_from_slice(&0u64.to_le_bytes());
+        }
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+        bytes
+    }
+
+    /// A volume holding exactly one uniform brick, for the tests that care
+    /// about where a stream starts and ends rather than what is in it.
+    fn one_brick(at: BrickCoord, value: f32) -> Volume {
+        let mut volume = Volume::new(0.5);
+        volume.insert_brick(at, Brick::Uniform(value));
+        volume
+    }
+
+    /// Three bodies, each with its own bricks, none of them empty.
+    fn three_bodies() -> Document {
+        let mut doc = Document::from_volume(one_brick(BrickCoord::new(0, 0, 0), INSIDE));
+        doc.add_body("Left arm", one_brick(BrickCoord::new(-4, 1, 2), -0.5));
+        let third = doc.add_body("Right arm", one_brick(BrickCoord::new(7, -1, 3), 1.25));
+        doc.set_active(third);
+        doc
+    }
+
+    /// The layout claim, measured against this build's own writer rather than
+    /// counted by hand.
+    ///
+    /// Bytes 0..63 must stay byte for byte what version 2 wrote, because every
+    /// header offset the tests above hardcode aims into that range -- and
+    /// because it is what lets an older file be manufactured by stripping.
+    #[test]
+    fn the_version_3_header_is_the_version_2_header_plus_a_node_table() {
+        let mut empty = Vec::new();
+        write(&mut empty, &Document::new(0.5), &ProjectState::default()).expect("write failed");
+
+        assert_eq!(
+            u16::from_le_bytes([empty[8], empty[9]]),
+            3,
+            "this build no longer writes container version 3"
+        );
+        assert_eq!(
+            NODE_TABLE_AT, 63,
+            "the node table moved, so every offset keyed off it is now wrong"
+        );
+        // Four of `node_count`, four of `active_index`, one record, then the
+        // u64 brick count.
+        assert_eq!(first_brick_at(), NODE_TABLE_AT + 4 + 4 + NODE_RECORD_BYTES + 8);
+        // The whole of an empty single-body file, to the byte.
+        assert_eq!(empty.len(), 123);
+
+        assert_eq!(u32::from_le_bytes(empty[63..67].try_into().unwrap()), 1, "one row");
+        assert_eq!(u32::from_le_bytes(empty[67..71].try_into().unwrap()), 0, "the first row");
+        assert_eq!(u32::from_le_bytes(empty[71..75].try_into().unwrap()), 1, "id 1");
+        assert_eq!(u16::from_le_bytes([empty[75], empty[76]]), FLAG_VISIBLE);
+        assert_eq!((empty[77], empty[78]), (KIND_BODY, 0), "kind and depth are reserved at zero");
+        assert_eq!(&empty[79..79 + Document::FIRST_BODY_NAME.len()], b"Body 1");
+    }
+
+    /// N bodies come back as N bodies, in order, each with its own field.
+    #[test]
+    fn a_three_body_document_comes_back_with_its_names_order_and_geometry() {
+        let doc = three_bodies();
+        let (loaded, _) = round_trip(&doc, &ProjectState::default());
+
+        assert_eq!(loaded.body_count(), 3);
+        let names: Vec<&str> = loaded.nodes().iter().map(|node| node.name.as_str()).collect();
+        assert_eq!(names, vec!["Body 1", "Left arm", "Right arm"]);
+        let ids: Vec<NodeId> = loaded.nodes().iter().map(|node| node.id).collect();
+        assert_eq!(ids, doc.nodes().iter().map(|node| node.id).collect::<Vec<_>>());
+
+        // Each body's own bricks, which is what the consecutive streams have to
+        // keep apart. Meshing one body's brick against another body's field is
+        // the failure this catches.
+        for ((_, before), (_, after)) in doc.bodies().zip(loaded.bodies()) {
+            assert_same_bricks(before, after);
+        }
+
+        assert_eq!(
+            loaded.active(),
+            doc.active(),
+            "the body the user had selected did not come back selected"
+        );
+    }
+
+    /// **Write, read, write, and compare the two files byte for byte.**
+    ///
+    /// The test that did not exist and that the repair rules make necessary.
+    /// `writing_the_same_volume_twice_gives_identical_bytes` writes the same
+    /// in-memory value twice and never runs the reader; the round trip above
+    /// compares semantics rather than bytes. So "this build's reader repairs
+    /// nothing this build's writer produced" was asserted by nothing at all --
+    /// and a reader that quietly renamed a body, dropped a flag or reordered
+    /// the list would pass both of them.
+    #[test]
+    fn a_three_body_document_survives_write_read_write_byte_for_byte() {
+        let doc = three_bodies();
+        let state = ProjectState {
+            view: View { camera_distance: 12.0, ..View::default() },
+            keys: vec![a_key(0.4, 9.0)],
+        };
+
+        let mut first = Vec::new();
+        write(&mut first, &doc, &state).expect("write failed");
+
+        // And twice from the same document, because a hash order in the body
+        // list would break this nondeterministically -- passing locally and
+        // failing on CI. `Document::nodes` is a `Vec` for exactly this reason.
+        let mut again = Vec::new();
+        write(&mut again, &doc, &state).expect("write failed");
+        assert_eq!(first, again, "two writes of one document differ");
+
+        let mut progress = Progress::default();
+        let (reread, reread_state) = read_reporting(&mut first.as_slice(), &mut progress)
+            .expect("this build refused its own file");
+        assert_eq!(progress.nodes, 3);
+        assert_eq!(progress.repairs, 0, "the reader repaired something this build wrote");
+
+        let mut second = Vec::new();
+        write(&mut second, &reread, &reread_state).expect("write failed");
+        assert_eq!(first.len(), second.len(), "the rewrite is a different length");
+        let differs = first.iter().zip(&second).position(|(one, other)| one != other);
+        assert_eq!(differs, None, "the rewrite differs at byte {differs:?}");
+    }
+
+    /// A body with no bricks at all still frames its stream, or every body
+    /// after it is misparsed.
+    #[test]
+    fn an_empty_body_writes_an_empty_stream_and_the_bodies_after_it_survive() {
+        let mut doc = Document::from_volume(one_brick(BrickCoord::new(0, 0, 0), INSIDE));
+        doc.add_body("Nothing yet", Volume::new(0.5));
+        doc.add_body("Something", one_brick(BrickCoord::new(3, 3, 3), -1.0));
+
+        let (loaded, _) = round_trip(&doc, &ProjectState::default());
+        assert_eq!(loaded.body_count(), 3);
+        assert_eq!(loaded.nodes()[1].volume().expect("a body").brick_count(), 0);
+        assert_eq!(loaded.nodes()[2].volume().expect("a body").brick_count(), 1);
+        assert_same_bricks(
+            doc.nodes()[2].volume().expect("a body"),
+            loaded.nodes()[2].volume().expect("a body"),
+        );
+    }
+
+    /// The id policy, which nothing in the file carries and everything
+    /// downstream depends on.
+    ///
+    /// Ids never reuse, so a saved file routinely holds a sparse set. Deriving
+    /// the next one from the row count would mint an id that is already in the
+    /// document: two rows under one id, one body's mesh slots overwriting the
+    /// other's, undo entries routed to the wrong body -- and the next save
+    /// writing a file this build refuses for duplicate ids.
+    #[test]
+    fn a_body_added_to_a_sparse_id_file_gets_the_highest_id_plus_one() {
+        let records =
+            [Record::body(1, "Body 1"), Record::body(5, "Body 5"), Record::body(9, "Body 9")];
+        let bytes = crafted(0, &records);
+        let (mut doc, _) = read(&mut bytes.as_slice()).expect("a sparse id file was refused");
+        assert_eq!(
+            doc.nodes().iter().map(|node| node.id.0).collect::<Vec<_>>(),
+            vec![1, 5, 9],
+            "the ids in the file were not the ids in the document"
+        );
+
+        let fresh = doc.add_body("Body 10", Volume::new(0.5));
+        assert_eq!(fresh, NodeId(10), "the next id must clear the highest one in the file");
+    }
+
+    /// Every refusal that decides how the rest of the file is parsed, in one
+    /// place. Each of these aliases a key, misaligns a stream or leaves the
+    /// document without an active body.
+    #[test]
+    fn a_node_table_that_could_not_be_this_builds_own_is_refused() {
+        let good = Record::body(1, "Body 1");
+        assert!(read(&mut crafted(0, &[good]).as_slice()).is_ok(), "the control file was refused");
+
+        // Zero is "no node"; `u32::MAX` would overflow `max(id) + 1`.
+        for offending in [0, u32::MAX] {
+            let bytes = crafted(0, &[Record::body(offending, "Body 1")]);
+            match read(&mut bytes.as_slice()) {
+                Err(ProjectError::ReservedNodeId { found }) => assert_eq!(found, offending),
+                Ok(_) => panic!("the reserved id {offending} was accepted"),
+                Err(other) => panic!("expected an id refusal for {offending}, got {other}"),
+            }
+        }
+
+        let bytes = crafted(0, &[Record::body(3, "One"), Record::body(3, "Two")]);
+        assert!(
+            matches!(read(&mut bytes.as_slice()), Err(ProjectError::DuplicateNodeId { found: 3 })),
+            "two rows shared an id, which aliases the mesh pool key and the undo routing"
+        );
+
+        // A reserved flag bit. Bit 5 is one of the fourteen held at zero, and
+        // holding them there is what stops a future build from spending one and
+        // making its files unreadable by every shipped version 3 build.
+        let bytes =
+            crafted(0, &[Record { flags: FLAG_VISIBLE | 1 << 5, ..Record::body(1, "Body 1") }]);
+        assert!(matches!(read(&mut bytes.as_slice()), Err(ProjectError::ReservedFlags { .. })));
+
+        // `kind` decides whether a brick stream follows, so it is refused
+        // rather than repaired: repairing it would misalign every stream after
+        // it, exactly as an unknown brick tag would.
+        let bytes = crafted(0, &[Record { kind: 1, ..Record::body(1, "Folder") }]);
+        assert!(matches!(read(&mut bytes.as_slice()), Err(ProjectError::UnknownNodeKind(1))));
+
+        // `depth` is reserved at zero until folders exist. The increment that
+        // makes them representable replaces this refusal with a clamp.
+        let bytes = crafted(0, &[Record { depth: 1, ..Record::body(1, "Body 1") }]);
+        assert!(matches!(
+            read(&mut bytes.as_slice()),
+            Err(ProjectError::ReservedDepth { found: 1 })
+        ));
+    }
+
+    /// A count read out of a file decides an allocation, so it is bounded
+    /// before the allocation happens.
+    #[test]
+    fn a_row_count_of_zero_or_past_the_cap_is_refused() {
+        for offending in [0u32, MAX_NODES as u32 + 1, u32::MAX] {
+            let mut bytes = crafted(0, &[Record::body(1, "Body 1")]);
+            bytes[NODE_TABLE_AT..NODE_TABLE_AT + 4].copy_from_slice(&offending.to_le_bytes());
+            match read(&mut bytes.as_slice()) {
+                Err(ProjectError::NodeCount { found, limit }) => {
+                    assert_eq!(found, offending);
+                    assert_eq!(limit, MAX_NODES as u32);
+                }
+                Ok(_) => panic!("a row count of {offending} was accepted"),
+                Err(other) => panic!("expected a row count refusal for {offending}, got {other}"),
+            }
+        }
+    }
+
+    /// One more body than the cap allows, refused while reading the table and
+    /// before one brick stream is touched.
+    #[test]
+    fn a_sixty_fifth_body_is_refused() {
+        let records: Vec<Record> =
+            (1..=MAX_BODIES as u32 + 1).map(|id| Record::body(id, "Body")).collect();
+        let bytes = crafted(0, &records);
+        let mut progress = Progress::default();
+        match read_reporting(&mut bytes.as_slice(), &mut progress) {
+            Err(ProjectError::TooManyBodies { found, limit }) => {
+                assert_eq!((found, limit), (MAX_BODIES + 1, MAX_BODIES));
+            }
+            Ok(_) => panic!("a 65 body file was accepted"),
+            Err(other) => panic!("expected a body count refusal, got {other}"),
+        }
+        assert_eq!(progress.bricks, 0, "the table was refused after a brick had been read");
+
+        // And the cap itself is not so tight that it refuses what it allows.
+        let records: Vec<Record> =
+            (1..=MAX_BODIES as u32).map(|id| Record::body(id, "Body")).collect();
+        let (doc, _) = read(&mut crafted(0, &records).as_slice()).expect("64 bodies were refused");
+        assert_eq!(doc.body_count(), MAX_BODIES);
+    }
+
+    /// The hole every source design left open, and where it is actually
+    /// plugged today.
+    ///
+    /// A table whose rows are all folders parses perfectly, declares no brick
+    /// stream and consumes exactly the right number of bytes -- and leaves a
+    /// document with no body for `active` to name, so the first thing to touch
+    /// the active body panics on a file that loaded without complaint. The
+    /// mutation fuzz cannot catch it either: its band assertion loops over zero
+    /// bodies and passes. At container version 3 that file cannot be built,
+    /// because `kind` must be zero and the row is refused one check earlier.
+    /// [`ProjectError::NoBodies`] is the same hole guarded one layer later; it
+    /// becomes reachable in the increment that makes a folder row legal, and
+    /// this test is what records that the two guards are for one thing.
+    #[test]
+    fn a_table_whose_only_row_is_a_folder_is_refused_at_the_kind() {
+        let bytes = crafted(0, &[Record { kind: 1, ..Record::body(1, "Folder") }]);
+        // 63 of header, 8 of counts, 40 of record, 4 of empty trailer: no brick
+        // stream at all, and every length in the file agrees with every other.
+        assert_eq!(bytes.len(), NODE_TABLE_AT + 8 + NODE_RECORD_BYTES + 4);
+        assert!(matches!(read(&mut bytes.as_slice()), Err(ProjectError::UnknownNodeKind(1))));
+    }
+
+    /// A name decides only what a row is called, so it is repaired rather than
+    /// refused -- exactly as a NaN camera is.
+    #[test]
+    fn a_name_that_is_empty_or_not_utf8_is_repaired_to_a_default() {
+        let mut bytes = crafted(0, &[Record::body(1, "One"), Record::body(2, "Two")]);
+
+        // The second row's name field, filled with a byte no UTF-8 sequence
+        // may start with.
+        let at = record_at(1) + 8;
+        bytes[at..at + NAME_BYTES].fill(0xff);
+        // And the first row's, emptied.
+        let at = record_at(0) + 8;
+        bytes[at..at + NAME_BYTES].fill(0);
+
+        let mut progress = Progress::default();
+        let (doc, _) = read_reporting(&mut bytes.as_slice(), &mut progress)
+            .expect("a rubbish name lost the sculpt");
+        assert_eq!(doc.nodes()[0].name, "Body 1", "an empty name was not repaired");
+        assert_eq!(doc.nodes()[1].name, "Body 2", "a name that is not UTF-8 was not repaired");
+        assert_eq!(progress.repairs, 2, "the repairs were not counted");
+    }
+
+    /// A full thirty-two byte name has no terminator, and the rename field in
+    /// the interface enforces exactly that length -- so the application
+    /// actively encourages producing the one name a "must be NUL terminated"
+    /// rule would destroy.
+    #[test]
+    fn a_full_thirty_two_byte_name_round_trips_unchanged() {
+        let name = "0123456789abcdef0123456789abcdef";
+        assert_eq!(name.len(), NAME_BYTES);
+        let doc = named(name);
+
+        let mut bytes = Vec::new();
+        write(&mut bytes, &doc, &ProjectState::default()).expect("write failed");
+        let mut progress = Progress::default();
+        let (loaded, _) =
+            read_reporting(&mut bytes.as_slice(), &mut progress).expect("read failed");
+        assert_eq!(loaded.nodes()[0].name, name);
+        assert_eq!(progress.repairs, 0, "a full length name was repaired away");
+    }
+
+    /// A name too long for the field is cut on a CHAR BOUNDARY.
+    ///
+    /// Slicing at byte 32 through the middle of a multi-byte sequence writes
+    /// bytes that are not UTF-8; the reader then correctly repairs the name to
+    /// a default, and the user silently loses a name this build wrote itself.
+    #[test]
+    fn a_name_too_long_for_the_field_is_cut_on_a_char_boundary() {
+        // Eleven three-byte characters is thirty-three bytes, so the eleventh
+        // straddles byte thirty-two: a naive slice would leave one byte of it
+        // behind and make the whole field invalid UTF-8.
+        let name = "。。。。。。。。。。。";
+        assert_eq!(name.len(), 33);
+        let doc = named(name);
+
+        let mut bytes = Vec::new();
+        write(&mut bytes, &doc, &ProjectState::default()).expect("write failed");
+        let mut progress = Progress::default();
+        let (loaded, _) =
+            read_reporting(&mut bytes.as_slice(), &mut progress).expect("read failed");
+
+        assert_eq!(
+            loaded.nodes()[0].name,
+            "。。。。。。。。。。",
+            "the name was cut mid character"
+        );
+        assert_eq!(progress.repairs, 0, "a truncated name came back as rubbish and was repaired");
+    }
+
+    /// A one-body document whose body carries the given name.
+    fn named(name: &str) -> Document {
+        let mut doc = Document::new(0.5);
+        let meta = doc.meta(doc.active()).expect("the active row is in the document");
+        doc.set_meta(&NodeMeta { name: name.to_string(), ..meta });
+        doc
+    }
+
+    /// An `active_index` that names nothing is moved to the first BODY row,
+    /// which is what keeps `Option<NodeId>` out of every signature downstream.
+    #[test]
+    fn an_active_index_past_the_end_is_moved_to_a_body_rather_than_refused() {
+        for offending in [2u32, 99, u32::MAX] {
+            let bytes = crafted(offending, &[Record::body(4, "One"), Record::body(6, "Two")]);
+            let mut progress = Progress::default();
+            let (doc, _) = read_reporting(&mut bytes.as_slice(), &mut progress)
+                .expect("an active index off the end lost the sculpt");
+            assert_eq!(doc.active(), NodeId(4), "the selection did not move to the first body");
+            assert_eq!(progress.repairs, 1, "the repair was not counted");
+        }
+
+        // And an index that names a real body is left exactly where it is.
+        let bytes = crafted(1, &[Record::body(4, "One"), Record::body(6, "Two")]);
+        let mut progress = Progress::default();
+        let (doc, _) = read_reporting(&mut bytes.as_slice(), &mut progress).expect("read failed");
+        assert_eq!(doc.active(), NodeId(6));
+        assert_eq!(progress.repairs, 0);
+    }
+
+    /// The brick cap is a DOCUMENT total. Checked per body it would let a file
+    /// claiming sixty-four bodies ask for sixty-four times the cap.
+    #[test]
+    fn the_brick_cap_is_a_document_total_and_not_a_per_body_one() {
+        let mut doc = Document::from_volume(one_brick(BrickCoord::new(0, 0, 0), INSIDE));
+        doc.add_body("Body 2", one_brick(BrickCoord::new(1, 1, 1), OUTSIDE));
+        let mut bytes = Vec::new();
+        write(&mut bytes, &doc, &ProjectState::default()).expect("write failed");
+
+        // The second body's count sits after the first body's stream: its own
+        // u64, then twelve of coordinate, one tag byte and one value.
+        let second_count_at = record_at(2) + 8 + 12 + 1 + 4;
+        assert_eq!(
+            u64::from_le_bytes(bytes[second_count_at..second_count_at + 8].try_into().unwrap()),
+            1,
+            "the second body's brick count is not where this test thinks it is"
+        );
+        // A count that is legal on its own -- it is exactly the cap -- and puts
+        // the document one brick past it.
+        bytes[second_count_at..second_count_at + 8].copy_from_slice(&MAX_BRICKS.to_le_bytes());
+
+        let mut progress = Progress::default();
+        match read_reporting(&mut bytes.as_slice(), &mut progress) {
+            Err(ProjectError::TooLarge { bricks, limit }) => {
+                assert_eq!(bricks, MAX_BRICKS + 1);
+                assert_eq!(limit, MAX_BRICKS);
+            }
+            Ok(_) => panic!("a document past the cap was accepted"),
+            Err(other) => panic!("expected a size refusal, got {other}"),
+        }
+        assert_eq!(
+            progress.bricks, 1,
+            "the refusal came after the second body's bricks had been read, not before"
+        );
+    }
+
+    /// A hostile file's claim is bounded before it decides an allocation.
+    ///
+    /// Sixty-four bodies of sixty-five thousand bricks is half a terabyte of
+    /// claim in a hundred and seventy bytes of header. Note what the reader can
+    /// and cannot do about it: the counts are interleaved with the streams they
+    /// describe and it never seeks, so it cannot sum them up front. What it can
+    /// do -- and does -- is refuse the moment the running total passes the cap,
+    /// before the body that pushed it over is allocated at all.
+    #[test]
+    fn a_hostile_brick_claim_is_refused_before_any_allocation() {
+        let records: Vec<Record> =
+            (1..=MAX_BODIES as u32).map(|id| Record::body(id, "Body")).collect();
+        let mut bytes = crafted(0, &records);
+        let claim = MAX_BODIES as u64 * MAX_BRICKS;
+        let at = record_at(records.len());
+        bytes[at..at + 8].copy_from_slice(&claim.to_le_bytes());
+
+        let mut progress = Progress::default();
+        match read_reporting(&mut bytes.as_slice(), &mut progress) {
+            Err(ProjectError::TooLarge { bricks, limit }) => {
+                assert_eq!(bricks, claim);
+                assert_eq!(limit, MAX_BRICKS);
+            }
+            Ok(_) => panic!("a claim of {claim} bricks was accepted"),
+            Err(other) => panic!("expected a size refusal, got {other}"),
+        }
+        assert_eq!(progress.bricks, 0, "a brick was read before the claim was refused");
+        assert_eq!(progress.nodes, MAX_BODIES as u32, "the table itself parsed");
+    }
+
+    /// **The cap is enforced on the WRITE side too, and it was not before.**
+    ///
+    /// Add bodies over an afternoon, cross the cap, press ctrl+S: the write
+    /// succeeded, the status said "saved", the asterisk cleared and
+    /// `clear_autosave` deleted the crash net -- and reopening the file refused
+    /// it. Never let this build write a file this build will not read.
+    #[test]
+    fn a_document_past_the_brick_cap_is_refused_by_the_writer_as_well() {
+        // Split across two bodies, so this also pins the write-side check as a
+        // document total: neither body is anywhere near the cap alone.
+        let each = MAX_BRICKS / 2 + 1;
+        let mut first = Volume::new(0.5);
+        let mut second = Volume::new(0.5);
+        for index in 0..each as i32 {
+            first.insert_brick(BrickCoord::new(index, 0, 0), Brick::Uniform(OUTSIDE));
+            second.insert_brick(BrickCoord::new(index, 1, 0), Brick::Uniform(OUTSIDE));
+        }
+        let mut doc = Document::from_volume(first);
+        doc.add_body("Body 2", second);
+
+        let mut bytes = Vec::new();
+        match write(&mut bytes, &doc, &ProjectState::default()) {
+            Err(ProjectError::TooLarge { bricks, limit }) => {
+                assert_eq!(bricks, each * 2);
+                assert_eq!(limit, MAX_BRICKS);
+            }
+            Ok(()) => panic!("an oversized document was written, and could not be read back"),
+            Err(other) => panic!("expected a size refusal, got {other}"),
+        }
+        assert!(bytes.is_empty(), "a refused write left a partial file behind");
+    }
+
+    /// The field version is a RANGE, and the writer stamps the lowest version
+    /// the document needs rather than the newest this build knows.
+    ///
+    /// The range protects a new build reading an old file. It does nothing for
+    /// an old build reading a new one -- that is what writing the lowest
+    /// version buys, and both halves are needed. Without the second, the day a
+    /// mask bumps the field version every save stamps the new number whether or
+    /// not the document uses any of it, and every one of those files is refused
+    /// by every build that predates the mask.
+    #[test]
+    fn the_field_version_is_a_range_and_the_writer_stamps_the_lowest_needed() {
+        const _: () = assert!(OLDEST_FIELD_VERSION <= FIELD_VERSION);
+
+        let mut bytes = Vec::new();
+        write(&mut bytes, &three_bodies(), &ProjectState::default()).expect("write failed");
+        let stamped = u16::from_le_bytes([bytes[10], bytes[11]]);
+        assert_eq!(
+            stamped, OLDEST_FIELD_VERSION,
+            "a document that needs nothing new was stamped with a newer encoding, which would \
+             refuse it on every build that predates that encoding"
+        );
+
+        // Still only downward. A file written by a newer encoding may put
+        // anything in a brick, and reading it as though it were this one is the
+        // plausible-looking-sculpt failure the versions exist to prevent.
+        let mut newer = bytes.clone();
+        newer[10..12].copy_from_slice(&(FIELD_VERSION + 1).to_le_bytes());
+        assert!(matches!(
+            read(&mut newer.as_slice()),
+            Err(ProjectError::FieldVersion { found, .. }) if found == FIELD_VERSION + 1
+        ));
+
+        // And an encoding older than anything that ever existed is refused too.
+        let mut older = bytes.clone();
+        older[10..12].copy_from_slice(&(OLDEST_FIELD_VERSION - 1).to_le_bytes());
+        assert!(matches!(read(&mut older.as_slice()), Err(ProjectError::FieldVersion { .. })));
+    }
+
+    /// The outline is what a save reads back to check that what landed on disk
+    /// is the document that was meant to go into it.
+    #[test]
+    fn the_outline_reports_the_rows_without_reading_the_geometry() {
+        let doc = three_bodies();
+        let mut bytes = Vec::new();
+        write(&mut bytes, &doc, &ProjectState::default()).expect("write failed");
+
+        let outline = read_outline(&mut bytes.as_slice()).expect("the outline was refused");
+        assert_eq!(outline.nodes, 3);
+        assert_eq!(outline.bodies, 3);
+        assert_eq!(outline.voxel_size, doc.voxel_size());
+
+        // The geometry is deliberately not read, so a file that stops right
+        // after its table still has a readable outline.
+        let table_ends = record_at(3);
+        let outline = read_outline(&mut bytes[..table_ends].as_ref())
+            .expect("the outline needed bytes past the table");
+        assert_eq!(outline.bodies, 3);
+
+        // An older file has no table, and the one implicit body it holds is
+        // what the outline reports.
+        let mut single = Vec::new();
+        write(&mut single, &sculpted_doc(), &ProjectState::default()).expect("write failed");
+        let older = as_older_container(1, single);
+        let outline = read_outline(&mut older.as_slice()).expect("a version 1 outline was refused");
+        assert_eq!((outline.nodes, outline.bodies), (1, 1));
     }
 
     // ---------------------------------------------------------------------
@@ -1458,26 +2672,39 @@ mod tests {
         );
 
         let mut bytes = Vec::new();
-        write(&mut bytes, &fixture_volume(), &fixture_state(keys)).expect("write failed");
+        write(&mut bytes, &Document::from_volume(fixture_volume()), &fixture_state(keys))
+            .expect("write failed");
+        as_older_container(container, bytes)
+    }
 
-        // Take back out whatever this build has grown between the view and the
-        // brick count, because it is not in a version 1 or 2 file. Today that
-        // is nothing and this drain is empty. When the node table lands it is
-        // bytes 63..111 -- four of `node_count`, four of `active_index` and
-        // one forty-byte record -- and *not* 63..119, which would also swallow
-        // the u64 brick count and leave a brick coordinate where the count
-        // belongs.
+    /// What a build of an older container version would have written for the
+    /// same one-body document, byte for byte.
+    ///
+    /// The whole difference between the layouts is a section this build knows
+    /// how to take back out, which is what lets a committed fixture stay
+    /// meaningful: the brick encoding has not changed since version 1, so
+    /// everything after the header is already identical.
+    ///
+    /// **The strip is MEASURED rather than written as a literal range**, and
+    /// that measurement was in place before the node table existed, when the
+    /// drain was empty. It is bytes 63..111 today -- four of `node_count`, four
+    /// of `active_index` and one forty-byte record -- and it is emphatically
+    /// *not* 63..119, which would also swallow the u64 brick count and leave a
+    /// brick coordinate where the count belongs. Measuring is what makes the
+    /// right answer automatic when the header grows again.
+    ///
+    /// Single body only, like everything else keyed off [`first_brick_at`]: a
+    /// two-body document has a second brick stream that no older layout can
+    /// express at all.
+    fn as_older_container(container: u16, mut bytes: Vec<u8>) -> Vec<u8> {
         let count_at = first_brick_at() - 8;
         assert!(
             count_at >= LEGACY_HEADER_BYTES,
-            "the header is shorter than it was at version 2, so these fixtures cannot be \
-             manufactured by stripping and have to be rebuilt by hand"
+            "the header is shorter than it was at version 2, so an older file cannot be \
+             manufactured by stripping and has to be rebuilt by hand"
         );
         bytes.drain(LEGACY_HEADER_BYTES..count_at);
 
-        // Stamp the old layout number in. Everything after the header is
-        // already identical -- the brick encoding has not changed since
-        // version 1 -- so this is the whole of the difference.
         bytes[MAGIC.len()..MAGIC.len() + 2].copy_from_slice(&container.to_le_bytes());
         if container < 2 {
             // A version 1 file ends with its last brick. There is no trailer,
@@ -1671,13 +2898,42 @@ mod tests {
         }
     }
 
-    /// The real projects on the maintainer's machine, opened for real.
+    /// Compare two documents body for body, so a failure names the body and
+    /// the brick rather than saying only that something changed.
+    fn assert_same_document(expected: &Document, found: &Document) {
+        assert_eq!(found.voxel_size(), expected.voxel_size(), "the document's lattice changed");
+        assert_eq!(found.body_count(), expected.body_count(), "the number of bodies changed");
+        assert_eq!(found.node_count(), expected.node_count(), "the number of rows changed");
+        assert_eq!(found.active(), expected.active(), "the selection moved");
+        for (before, after) in expected.nodes().iter().zip(found.nodes()) {
+            assert_eq!(after.id, before.id, "the ids came back in a different order");
+            assert_eq!(after.name, before.name, "{:?} came back renamed", before.id);
+            assert_eq!(after.visible, before.visible, "{:?} came back with another eye", before.id);
+            match (before.volume(), after.volume()) {
+                (Some(before), Some(after)) => assert_same_bricks(before, after),
+                (None, None) => {}
+                _ => panic!("a row changed between a body and a folder"),
+            }
+        }
+    }
+
+    /// The real projects on the maintainer's machine, opened for real -- and,
+    /// at container version 3, written back out and read again.
     ///
     /// Ignored, and it has to stay ignored: these are tens of megabytes each
-    /// and one of them has been a 2.3 GB autosave, so this is a deliberate act
-    /// on one machine and never part of a CI run. The manufactured fixtures
-    /// above are what guards the format continuously; this is what confirms
-    /// the guard is guarding the right thing.
+    /// and one of them is a 2.3 GB document, so this is a deliberate act on one
+    /// machine and never part of a CI run. The manufactured fixtures above are
+    /// what guards the format continuously; this is what confirms the guard is
+    /// guarding the right thing.
+    ///
+    /// **The round trip is the half that is new, and it is here because the
+    /// first thing to exercise a new container version in the wild is the
+    /// autosave -- unwatched, every two minutes, over the user's own crash
+    /// net.** It costs scratch space and memory equal to the file: the document
+    /// is held, written to a temporary, and read back into a second document
+    /// beside the first. `BROKKR_SCRATCH` moves the temporary off the default
+    /// temp directory, which is worth doing here because on this machine that
+    /// directory is a RAM disk.
     ///
     /// Every path that is absent is skipped and said so, because the file set
     /// moves -- the autosave is rewritten every session and the downloads come
@@ -1724,6 +2980,7 @@ mod tests {
                 path.display()
             );
             assert!(volume.voxel_size() > 0.0);
+            assert_eq!(doc.body_count(), 1, "these files all predate the node table");
             eprintln!(
                 "{}: {size} bytes, {} bricks, voxel {} mm, {} keys",
                 path.display(),
@@ -1731,8 +2988,53 @@ mod tests {
                 volume.voxel_size(),
                 state.keys.len()
             );
+
+            round_trip_through_version_3(path, &doc, &state);
             opened += 1;
         }
         eprintln!("opened {opened} of {} real projects", paths.len());
+    }
+
+    /// Save a real document at the current container version and read it back,
+    /// comparing brick for brick.
+    ///
+    /// Through a file rather than a `Vec`, because that is what the application
+    /// does and because a `BufWriter` over a file is where a partial write
+    /// would actually happen.
+    fn round_trip_through_version_3(
+        source: &std::path::Path,
+        doc: &Document,
+        state: &ProjectState,
+    ) {
+        let scratch = std::env::var_os("BROKKR_SCRATCH")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir);
+        let name = source.file_name().expect("a file has a name");
+        let target = scratch.join(format!("brokkr-v3-check-{}", name.to_string_lossy()));
+
+        let started = std::time::Instant::now();
+        {
+            let file = std::fs::File::create(&target).expect("could not create the scratch file");
+            let mut writer = std::io::BufWriter::with_capacity(1 << 20, file);
+            write(&mut writer, doc, state).expect("this build could not write a real document");
+        }
+        let written = std::fs::metadata(&target).expect("stat failed").len();
+
+        let file = std::fs::File::open(&target).expect("could not reopen the scratch file");
+        let mut reader = std::io::BufReader::with_capacity(1 << 20, file);
+        let reread = read(&mut reader);
+        // Removed before the assertion, so a failure does not leave gigabytes
+        // behind in a temp directory that may be a RAM disk.
+        std::fs::remove_file(&target).ok();
+
+        let (reread, reread_state) =
+            reread.expect("this build refused a file it had just written itself");
+        assert_same_document(doc, &reread);
+        assert_eq!(reread_state.view, state.view, "the view did not survive the round trip");
+        assert_eq!(reread_state.keys, state.keys, "the timeline did not survive the round trip");
+        eprintln!(
+            "  round tripped through container {CONTAINER_VERSION}: {written} bytes, {:.0} ms",
+            started.elapsed().as_secs_f64() * 1000.0
+        );
     }
 }

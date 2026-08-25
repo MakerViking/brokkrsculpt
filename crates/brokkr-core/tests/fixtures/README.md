@@ -31,6 +31,15 @@ Layout, confirmed with `od` against both these files and the real ones:
 | … | | four more bricks |
 | end | 0 or 4+ | nothing at all in v1; the key trailer in v2 |
 
+**This build writes container version 3, and these two files are unchanged by
+that.** Version 3 puts a node table between the view and the geometry, so what a
+version 1 or 2 file has at byte 63 is where a version 3 file has `node_count`.
+The manufacturing step takes that section back out again by *measuring* the
+header rather than by naming a byte range, which is why the node table landed
+without touching a byte of either file — checked, not assumed: both fixtures
+still compare byte for byte against what this build produces for the old
+layouts, and both still open as one body named `Body 1`.
+
 **If a test says these no longer match what this build writes, do not
 regenerate them.** They represent files that do not change when this code does.
 The one legitimate regeneration is when the header has grown a section that

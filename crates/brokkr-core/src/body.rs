@@ -184,6 +184,28 @@ impl Node {
         }
     }
 
+    /// A body row rebuilt from a snapshot, which is what a node table read out
+    /// of a file amounts to.
+    ///
+    /// **The depth is clamped here rather than trusted, and this is the
+    /// clamping constructor [`MAX_DEPTH`] refers to.** `resolve_visibility`
+    /// walks a fixed `[bool; MAX_DEPTH]` ancestor chain, and a depth past the
+    /// end of it is an index out of bounds -- a panic in the one function every
+    /// frame calls. The reader refuses a non-zero depth outright at container
+    /// version 3, so nothing reaches this clamp today; it is here because the
+    /// reader is not the only thing that builds a document, and the split, the
+    /// group and every test helper come through this constructor instead.
+    pub(crate) fn from_meta(meta: NodeMeta, volume: Volume) -> Self {
+        Self {
+            id: meta.id,
+            depth: meta.depth.min(MAX_DEPTH - 1),
+            name: meta.name,
+            visible: meta.visible,
+            collapsed: meta.collapsed,
+            body: Some(Box::new(BodyData { volume })),
+        }
+    }
+
     #[inline]
     pub fn depth(&self) -> u8 {
         self.depth
@@ -277,6 +299,55 @@ impl Document {
             active: id,
             next_id: 2,
         };
+        doc.assert_invariants();
+        doc
+    }
+
+    /// A document rebuilt from a file's node table, in the file's own order.
+    ///
+    /// `active` is an INDEX rather than a [`NodeId`], because that is what the
+    /// file carries and what the reader has already repaired to name a body
+    /// row. It is clamped here as well rather than trusted, so that no
+    /// arrangement of bytes can leave `active` naming a row that is not there.
+    ///
+    /// **`next_id` is `max(id) + 1` and nothing else will do.** Nothing in the
+    /// file carries it, and ids never reuse, so a saved document routinely has
+    /// a sparse set: delete bodies 2, 3 and 4 from a five-body document and the
+    /// file holds [1, 5]. Deriving the next id from `rows.len()` instead would
+    /// mint 3, then 4, then 5 -- and 5 is already here. The document would then
+    /// hold two nodes under one id, so one body's mesh slots would overwrite
+    /// the other's and an undo entry would route to the wrong body; and the
+    /// very next save would write a file the reader refuses for duplicate ids.
+    /// **The build would have written a file it will not read.**
+    ///
+    /// Every row is a body, because container version 3 refuses a `kind` byte
+    /// that is not zero. Folders widen this to `Vec<(NodeMeta, Option<Volume>)>`
+    /// in the increment that makes a folder row representable at all.
+    pub(crate) fn from_table(
+        voxel_size: f32,
+        rows: Vec<(NodeMeta, Volume)>,
+        active: usize,
+    ) -> Self {
+        let nodes: Vec<Node> = rows
+            .into_iter()
+            .map(|(meta, volume)| {
+                debug_assert_eq!(
+                    volume.voxel_size(),
+                    voxel_size,
+                    "every body shares the document's lattice"
+                );
+                Node::from_meta(meta, volume)
+            })
+            .collect();
+        let highest = nodes.iter().map(|node| node.id.0).max().expect(
+            "the reader refuses a table with no rows before it gets here, and every other \
+             caller builds its own",
+        );
+        let active = nodes[active.min(nodes.len() - 1)].id;
+        // `highest + 1` cannot overflow: the reader refuses an id of
+        // `u32::MAX` for exactly this reason, so the highest id that can reach
+        // here is `u32::MAX - 1`.
+        let doc = Self { voxel_size, nodes, active, next_id: highest + 1 };
         doc.assert_invariants();
         doc
     }
