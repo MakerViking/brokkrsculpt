@@ -22,7 +22,13 @@ use crate::orientation::to_print_space;
 
 /// Bytes an STL takes, so a caller can size a buffer or check free space.
 pub fn size_of(mesh: &ExportMesh) -> usize {
-    80 + 4 + mesh.triangles.len() * 50
+    size_of_all(&[("", mesh)])
+}
+
+/// The same, for the several bodies of a document.
+pub fn size_of_all(bodies: &[(&str, &ExportMesh)]) -> usize {
+    let triangles: usize = bodies.iter().map(|(_, mesh)| mesh.triangles.len()).sum();
+    80 + 4 + triangles * 50
 }
 
 /// Write `mesh` as binary STL.
@@ -31,12 +37,31 @@ pub fn size_of(mesh: &ExportMesh) -> usize {
 /// sniff that word to decide a file is ASCII, and would then fail on the binary
 /// body.
 pub fn write(mesh: &ExportMesh, out: &mut impl Write) -> io::Result<()> {
+    write_all(&[("", mesh)], out)
+}
+
+/// Write several bodies as one binary STL.
+///
+/// **The names are ignored, because an STL has nowhere to put them.** The
+/// format is a flat triangle soup with no object structure at all -- no names,
+/// no groups, no way to tell one body from the next -- so N bodies concatenate
+/// into one lump that a slicer will load as a single part. The parameter is
+/// taken anyway so the three writers share one shape, and the caller is
+/// expected to say so in whatever it reports: the user chose this format, and
+/// finding out that eleven bodies arrived as one after slicing is worse than
+/// being told here.
+///
+/// A single body writes byte for byte what [`write`] has always written, which
+/// is what makes this refactor checkable: there is no per-body furniture to
+/// leak into the one-body case, because there is no per-body furniture at all.
+pub fn write_all(bodies: &[(&str, &ExportMesh)], out: &mut impl Write) -> io::Result<()> {
     let mut header = [0u8; 80];
     let banner = b"Exported by BrokkrSculpt. Units are millimetres.";
     header[..banner.len()].copy_from_slice(banner);
     out.write_all(&header)?;
 
-    let count = u32::try_from(mesh.triangles.len()).map_err(|_| {
+    let total: usize = bodies.iter().map(|(_, mesh)| mesh.triangles.len()).sum();
+    let count = u32::try_from(total).map_err(|_| {
         io::Error::new(
             io::ErrorKind::InvalidInput,
             "STL cannot hold more than about four billion triangles",
@@ -44,22 +69,25 @@ pub fn write(mesh: &ExportMesh, out: &mut impl Write) -> io::Result<()> {
     })?;
     out.write_all(&count.to_le_bytes())?;
 
-    for triangle in &mesh.triangles {
-        // Rotated to Z-up before anything is measured off it, so the face
-        // normal below is derived from the corners as they are written rather
-        // than from the sculpt's own axes.
-        let [a, b, c] = triangle.map(|index| to_print_space(mesh.positions[index as usize]));
-        // STL stores a face normal. Some readers trust it over the winding, so
-        // it has to agree with the winding rather than being left at zero.
-        let normal = (b - a).cross(c - a).try_normalize().unwrap_or(glam::Vec3::Z);
+    for (_, mesh) in bodies {
+        for triangle in &mesh.triangles {
+            // Rotated to Z-up before anything is measured off it, so the face
+            // normal below is derived from the corners as they are written
+            // rather than from the sculpt's own axes.
+            let [a, b, c] = triangle.map(|index| to_print_space(mesh.positions[index as usize]));
+            // STL stores a face normal. Some readers trust it over the winding,
+            // so it has to agree with the winding rather than being left at
+            // zero.
+            let normal = (b - a).cross(c - a).try_normalize().unwrap_or(glam::Vec3::Z);
 
-        for vector in [normal, a, b, c] {
-            for component in vector.to_array() {
-                out.write_all(&component.to_le_bytes())?;
+            for vector in [normal, a, b, c] {
+                for component in vector.to_array() {
+                    out.write_all(&component.to_le_bytes())?;
+                }
             }
+            // Attribute byte count, unused.
+            out.write_all(&0u16.to_le_bytes())?;
         }
-        // Attribute byte count, unused.
-        out.write_all(&0u16.to_le_bytes())?;
     }
 
     Ok(())
@@ -177,6 +205,74 @@ mod tests {
         write(&mesh, &mut bytes).unwrap();
         assert_eq!(bytes.len(), 84);
         assert_eq!(parse(&bytes).len(), 0);
+    }
+
+    /// **The bytes a known mesh produces are what the committed golden holds.**
+    ///
+    /// This is the test that actually pins the file. Its neighbour below --- and
+    /// the two of the same name in `obj.rs` and `threemf.rs` --- compares
+    /// `write` against `write_all`, which since the refactor is the *same code*
+    /// on both sides: `write` is a one-line wrapper. Mutating the 80 byte banner
+    /// above left the entire workspace suite green, which is how that gap was
+    /// found rather than argued. A committed file cannot move with the code.
+    ///
+    /// See [`crate::export::golden`] for why the fixture is a hand-written cube
+    /// rather than anything the mesher produced.
+    #[test]
+    fn a_known_mesh_writes_the_bytes_committed_in_the_golden() {
+        let mesh = crate::export::golden::cube();
+        let mut bytes = Vec::new();
+        write(&mesh, &mut bytes).unwrap();
+        crate::export::golden::assert_bytes("export-cube.stl", &bytes);
+        assert_eq!(bytes.len(), size_of(&mesh), "size_of disagrees with the golden's length");
+    }
+
+    /// **A single body writes byte for byte what the single-mesh writer always
+    /// has.** This proves the name is the only parameter that reaches the
+    /// one-body path --- and nothing more, because `write` now *is* `write_all`.
+    /// The bytes themselves are pinned by
+    /// [`a_known_mesh_writes_the_bytes_committed_in_the_golden`]; keep both.
+    #[test]
+    fn one_body_through_the_document_writer_is_byte_identical() {
+        let (mesh, _) = sphere().export_mesh();
+        let mut alone = Vec::new();
+        let mut through = Vec::new();
+        write(&mesh, &mut alone).unwrap();
+        write_all(&[("Body 1", &mesh)], &mut through).unwrap();
+        assert_eq!(alone, through, "the N-body path changed the one-body file");
+        assert_eq!(size_of(&mesh), size_of_all(&[("Body 1", &mesh)]));
+    }
+
+    /// Several bodies concatenate into one triangle soup, in list order, with
+    /// one count covering all of them.
+    ///
+    /// The count is the trap: it is a single `u32` at offset 80 for the WHOLE
+    /// file, so writing each body's own count would produce a file whose header
+    /// disagrees with its length and which every reader truncates at the first
+    /// body.
+    #[test]
+    fn several_bodies_concatenate_under_one_triangle_count() {
+        let (one, _) = sphere().export_mesh();
+        let (other, _) = tall_model().export_mesh();
+
+        let mut bytes = Vec::new();
+        write_all(&[("Body 1", &one), ("Body 2", &other)], &mut bytes).unwrap();
+
+        let triangles = parse(&bytes);
+        assert_eq!(triangles.len(), one.triangles.len() + other.triangles.len());
+        assert_eq!(bytes.len(), size_of_all(&[("Body 1", &one), ("Body 2", &other)]));
+
+        // In order, and each corner is the body's own -- an offset applied here
+        // would be meaningless, because STL repeats corners rather than
+        // indexing them.
+        for (written, original) in triangles.iter().zip(&one.triangles) {
+            let expected = original.map(|index| to_print_space(one.positions[index as usize]));
+            assert_eq!(*written, expected);
+        }
+        for (written, original) in triangles[one.triangles.len()..].iter().zip(&other.triangles) {
+            let expected = original.map(|index| to_print_space(other.positions[index as usize]));
+            assert_eq!(*written, expected);
+        }
     }
 
     #[test]

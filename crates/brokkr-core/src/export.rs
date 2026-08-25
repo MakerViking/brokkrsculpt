@@ -44,6 +44,7 @@ pub mod threemf;
 use glam::Vec3;
 use rustc_hash::FxHashMap;
 
+use crate::body::{Document, NodeMeta};
 use crate::mesh::BrickMesh;
 use crate::volume::Volume;
 
@@ -164,6 +165,106 @@ impl MeshReport {
             );
         }
         format!("{} triangles, {} vertices, watertight", self.triangles, self.vertices)
+    }
+
+    /// Every body's report added together, for a line that says what the whole
+    /// document came to.
+    ///
+    /// **The verdict is NOT taken from this**, and that is the entire reason
+    /// this is a separate function from [`document_verdict`] rather than a
+    /// convenience it could be built on. Every field here is additive, so a
+    /// document of two bodies -- one with 40,000 triangles and one with none at
+    /// all -- sums to 40,000 triangles, zero holes, and
+    /// [`MeshReport::is_printable`] returns true. Half the print is missing and
+    /// the union says it is fine. `is_printable` asks a mesh whether it is
+    /// closed; asking it about a pile of meshes is asking a different question
+    /// and getting the wrong answer confidently.
+    ///
+    /// So: this is for the status line, and [`document_verdict`] decides
+    /// whether a file is written.
+    pub fn summed(reports: impl IntoIterator<Item = MeshReport>) -> MeshReport {
+        let mut total = MeshReport::default();
+        for report in reports {
+            total.vertices += report.vertices;
+            total.triangles += report.triangles;
+            total.collapsed_triangles += report.collapsed_triangles;
+            total.boundary_edges += report.boundary_edges;
+            total.non_manifold_edges += report.non_manifold_edges;
+            total.inconsistent_edges += report.inconsistent_edges;
+            total.zero_area_triangles += report.zero_area_triangles;
+        }
+        total
+    }
+}
+
+/// One exported body: what it is called, what it welded to, and what that
+/// turned out to be.
+///
+/// A tuple rather than a struct because it is exactly the three things every
+/// consumer wants together and no fourth is coming: the writers take the name
+/// and the mesh, and the verdict takes the name and the report.
+pub type ExportedBody = (NodeMeta, ExportMesh, MeshReport);
+
+/// The whole document's verdict, which is every body's and never the union's.
+///
+/// `Ok(())` only when there is at least one body to write and **every one of
+/// them** is fit to print. The error names the body, because "not watertight"
+/// over a twelve-body document is not an answer anybody can act on.
+///
+/// A visible body with nothing in it refuses the whole export rather than being
+/// skipped. That is the safe direction and it is deliberate: the alternative is
+/// a file that quietly holds fewer parts than the panel shows, which is the
+/// failure the omitted count exists to make impossible, arriving through
+/// another door.
+pub fn document_verdict(bodies: &[ExportedBody]) -> Result<(), String> {
+    let Some((meta, _, report)) = bodies.iter().find(|(_, _, report)| !report.is_printable())
+    else {
+        if bodies.is_empty() {
+            return Err("nothing to export -- every body is hidden".to_string());
+        }
+        return Ok(());
+    };
+    Err(format!("{}: {}", meta.name, report.summary()))
+}
+
+impl Document {
+    /// Weld every VISIBLE body into its own mesh, ready to write out.
+    ///
+    /// `visible` is indexed by NODE position and comes from
+    /// [`Document::saved_visibility`] -- never from `display_visibility`, and
+    /// the two are named apart precisely so this call site cannot pick up solo
+    /// by accident. A view mode silently dropping a part from a print is the
+    /// class of failure the eye is being careful about.
+    ///
+    /// **Welded per body and never through one shared weld map.** The weld key
+    /// is a lattice cell, and every body in a document shares the lattice
+    /// (that is the whole design), so one map across all of them would fuse two
+    /// unrelated bodies into a single vertex wherever their cells coincide.
+    /// Where their cells coincide is exactly where they touch or interpenetrate
+    /// -- so the failure appears only on the documents where it matters, joins
+    /// two parts with triangles neither one has, and produces a mesh that
+    /// validates as watertight while being wrong.
+    ///
+    /// The caller is expected to name how many bodies were left out:
+    /// `body_count() - result.len()`. That count is unconditional in the
+    /// status line, because the eye is one unprotected bit in a 40-byte record
+    /// and it is the bit that decides whether a part reaches the printer.
+    pub fn export_bodies(&self, visible: &[bool]) -> Vec<ExportedBody> {
+        assert_eq!(
+            visible.len(),
+            self.node_count(),
+            "the visibility mask is indexed by node position and must cover every node"
+        );
+        self.nodes()
+            .iter()
+            .zip(visible)
+            .filter(|(_, shown)| **shown)
+            .filter_map(|(node, _)| {
+                let volume = node.volume()?;
+                let (mesh, report) = volume.export_mesh();
+                Some((node.meta(), mesh, report))
+            })
+            .collect()
     }
 }
 
@@ -311,6 +412,232 @@ fn expand_by_one(coords: &mut Vec<crate::brick::BrickCoord>) {
     }
     coords.clear();
     coords.extend(set);
+}
+
+/// The committed export goldens, and the one mesh they are written from.
+///
+/// # Why a file on disk rather than a comparison in memory
+///
+/// Each of the three writers has a `write(mesh)` that is now a one-line wrapper
+/// over `write_all(&[(name, mesh)])`. Asserting that those two agree therefore
+/// asserts nothing: both sides are the same code, they move together, and a
+/// change to the shared body is invisible to the comparison. That was
+/// **measured, not argued** -- mutating the OBJ header comment and the STL 80
+/// byte banner left the whole workspace suite green.
+///
+/// So the bytes are pinned against something that cannot move with the code: a
+/// file in `tests/fixtures/`, beside the container fixtures and for the same
+/// reason. An STL out of a build of this exporter has been sliced and printed;
+/// "the bytes did not move" is the cheapest regression check this module has,
+/// and it only means anything if one side of the comparison is frozen.
+///
+/// # Why a hand-written cube rather than a meshed sphere
+///
+/// The golden pins the *writers*, not the mesher. A mesh taken from
+/// [`Volume::export_mesh`] would make every surface-nets change a golden
+/// failure, which trains the reader to regenerate rather than to look. [`cube`]
+/// is eight literal positions and twelve literal triangles, so the only thing
+/// that can move the golden bytes is a writer.
+///
+/// # Why the coordinates look the way they do
+///
+/// Every number in [`cube`] is exactly representable as an `f32` and stays
+/// exact through [`to_print_space`](crate::orientation::to_print_space), which
+/// is an axis swap with a sign flip rather than an arithmetic rotation. So no
+/// golden byte depends on rounding, and the face normal the STL writer computes
+/// from a cross product comes out as an exact `±1.0` on an axis. The three
+/// extents are deliberately 4, 3 and 5 millimetres and the box is off centre,
+/// so a writer that swapped or mirrored an axis produces visibly different
+/// bytes instead of a symmetric file that still matches.
+#[cfg(test)]
+pub(crate) mod golden {
+    use super::ExportMesh;
+    use glam::Vec3;
+
+    /// One component of a unit vector down a cube's body diagonal, near enough
+    /// to `1/sqrt(3)`. A literal rather than a computed value: this module is
+    /// pinning text that a float turns into, so the float has to be fixed too.
+    const OCTANT: f32 = 0.577_350_26;
+
+    /// The mesh every golden is written from: a closed, correctly wound box.
+    ///
+    /// It is watertight and manifold --- see
+    /// [`the_golden_cube_is_a_mesh_the_writers_would_be_allowed_to_write`] ---
+    /// because a golden built from a mesh the exporter would have refused would
+    /// pin bytes no user can ever receive.
+    ///
+    /// The slots are mixed on purpose: the 3MF writer takes a triangle's
+    /// filament from its first corner, and the golden has to exercise both
+    /// branches of that. Slot 0 leaves a `<triangle>` bare, and slots 1, 3 and 4
+    /// produce the paint codes `4`, `0C` and `1C` --- one single character and
+    /// two double, so a writer that assumed a fixed code width shows up here.
+    pub(crate) fn cube() -> ExportMesh {
+        let (x0, x1) = (-3.0, 1.0);
+        let (y0, y1) = (-0.5, 2.5);
+        let (z0, z1) = (0.25, 5.25);
+
+        let positions = vec![
+            Vec3::new(x0, y0, z0),
+            Vec3::new(x1, y0, z0),
+            Vec3::new(x1, y1, z0),
+            Vec3::new(x0, y1, z0),
+            Vec3::new(x0, y0, z1),
+            Vec3::new(x1, y0, z1),
+            Vec3::new(x1, y1, z1),
+            Vec3::new(x0, y1, z1),
+        ];
+
+        // A corner's normal is the average of the three faces meeting there,
+        // which for a box is the body diagonal pointing out of that octant.
+        let normals = positions
+            .iter()
+            .map(|position| {
+                let sign = |value: f32, low: f32| if value == low { -OCTANT } else { OCTANT };
+                Vec3::new(sign(position.x, x0), sign(position.y, y0), sign(position.z, z0))
+            })
+            .collect();
+
+        // Wound counter-clockwise seen from outside, so the STL writer's face
+        // normals agree with the winding rather than fighting it.
+        let triangles = vec![
+            [4, 5, 6],
+            [4, 6, 7], // +Z
+            [1, 0, 3],
+            [1, 3, 2], // -Z
+            [0, 4, 7],
+            [0, 7, 3], // -X
+            [5, 1, 2],
+            [5, 2, 6], // +X
+            [3, 7, 6],
+            [3, 6, 2], // +Y
+            [0, 1, 5],
+            [0, 5, 4], // -Y
+        ];
+
+        let slots = vec![0, 1, 2, 3, 4, 0, 2, 3];
+
+        ExportMesh { positions, normals, triangles, slots }
+    }
+
+    /// Where the goldens live: beside the container fixtures, because they are
+    /// the same kind of thing --- a committed file that does not change when
+    /// this code does.
+    pub(crate) fn path(name: &str) -> std::path::PathBuf {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures").join(name)
+    }
+
+    /// Assert that `produced` is byte for byte the committed golden `name`.
+    ///
+    /// **If this fails, do not reach for the regenerator first.** A golden moves
+    /// only when the file a user receives moves, and that is a decision about
+    /// what slicers get, not a test to be made green. The message names the
+    /// first differing byte so the answer to "what moved" is in the failure
+    /// rather than in a diff the reader has to go and produce.
+    pub(crate) fn assert_bytes(name: &str, produced: &[u8]) {
+        let path = path(name);
+        let committed = std::fs::read(&path).unwrap_or_else(|error| {
+            panic!(
+                "could not read the committed golden at {}: {error}. If it is missing, write it \
+                 once with BROKKR_REGENERATE_EXPORT_GOLDENS=1 -- see \
+                 regenerate_the_committed_export_goldens.",
+                path.display()
+            )
+        });
+
+        if let Some(at) = committed.iter().zip(produced).position(|(theirs, ours)| theirs != ours) {
+            panic!(
+                "{name} differs from what this build writes at byte {at}: the committed golden \
+                 holds {:#04x} and this build writes {:#04x}",
+                committed[at], produced[at]
+            );
+        }
+        assert_eq!(
+            committed.len(),
+            produced.len(),
+            "{name} is {} bytes and this build writes {} -- the shorter one is a prefix of the \
+             other, so a section was added or dropped rather than changed",
+            committed.len(),
+            produced.len()
+        );
+    }
+
+    /// Every golden, and the writer call that has to reproduce it.
+    ///
+    /// The name passed in is `BrokkrSculpt` --- what `write` has always put in
+    /// an OBJ `o` line and a 3MF sidecar --- so the goldens pin the file the
+    /// previous build produced rather than a file that only the N-body path can
+    /// make. A real one-body export names the body instead (`Body 1`), which is
+    /// the single byte range that moves; see the byte-identical tests in each
+    /// writer for why that narrowing was taken deliberately.
+    fn each_golden() -> Vec<(&'static str, Vec<u8>)> {
+        let mesh = cube();
+        let bodies = [("BrokkrSculpt", &mesh)];
+
+        let mut stl = Vec::new();
+        super::stl::write_all(&bodies, &mut stl).expect("writing to a vector cannot fail");
+        let mut obj = Vec::new();
+        super::obj::write_all(&bodies, &mut obj).expect("writing to a vector cannot fail");
+        let mut threemf = Vec::new();
+        super::threemf::write_all(&bodies, &mut threemf).expect("writing to a vector cannot fail");
+
+        vec![("export-cube.stl", stl), ("export-cube.obj", obj), ("export-cube.3mf", threemf)]
+    }
+
+    /// Writes the three goldens. A one-off act rather than a check, and like
+    /// `regenerate_the_committed_fixtures` in `project.rs` it takes *two*
+    /// deliberate steps:
+    ///
+    /// ```text
+    /// BROKKR_REGENERATE_EXPORT_GOLDENS=1 cargo test -p brokkr-core --lib -- --ignored regenerate_the_committed_export_goldens
+    /// ```
+    ///
+    /// The variable is deliberately **not** the `BROKKR_REGENERATE_FIXTURES`
+    /// that the container fixtures use, even though both live in the same
+    /// directory. `--ignored` is a sweep rather than a per-test opt-in, so one
+    /// shared variable would mean that anyone legitimately regenerating a
+    /// container fixture also silently rewrote all three export goldens from
+    /// the build in front of them --- which is precisely the tautology this
+    /// module exists to remove. Two variables, two decisions.
+    #[test]
+    #[ignore = "regenerates the committed export goldens; running it is a decision, not a check"]
+    fn regenerate_the_committed_export_goldens() {
+        if std::env::var_os("BROKKR_REGENERATE_EXPORT_GOLDENS").is_none() {
+            eprintln!(
+                "refusing to rewrite the committed export goldens as part of an --ignored sweep: \
+                 set BROKKR_REGENERATE_EXPORT_GOLDENS=1 if you really mean to replace them with \
+                 what this build writes. They record the bytes a slicer has already been given."
+            );
+            return;
+        }
+
+        let directory = path("");
+        std::fs::create_dir_all(&directory).expect("could not make the fixtures directory");
+        for (name, bytes) in each_golden() {
+            let path = path(name);
+            std::fs::write(&path, &bytes).expect("could not write the golden");
+            eprintln!("wrote {} bytes to {}", bytes.len(), path.display());
+        }
+    }
+
+    /// The fixture is a mesh this exporter would actually agree to write.
+    ///
+    /// Without this the golden could quietly be pinning the bytes of a model
+    /// that [`crate::Brokkr::export`] refuses, and the regression check would be
+    /// guarding a file no user can ever receive.
+    #[test]
+    fn the_golden_cube_is_a_mesh_the_writers_would_be_allowed_to_write() {
+        let mesh = cube();
+        assert_eq!(mesh.normals.len(), mesh.positions.len(), "OBJ needs a normal per vertex");
+        assert_eq!(mesh.slots.len(), mesh.positions.len(), "3MF indexes slots by vertex");
+
+        let report = mesh.validate();
+        assert!(
+            report.is_printable(),
+            "the golden cube would be refused by the exporter: {}",
+            report.summary()
+        );
+        assert_eq!(report.boundary_edges, 0, "the golden cube has holes: {}", report.summary());
+    }
 }
 
 #[cfg(test)]
@@ -569,5 +896,149 @@ mod tests {
         }
         let fraction = outward as f32 / mesh.positions.len() as f32;
         assert!(fraction > 0.99, "only {:.1}% of normals faced outward", fraction * 100.0);
+    }
+
+    // --- the document path -------------------------------------------------
+
+    use crate::body::Document;
+
+    /// A document of `count` bodies, each a sphere, laid out along X so they do
+    /// not touch. Returns it with the ids in display order.
+    fn document_of(count: usize) -> Document {
+        let mut doc = Document::new(1.0);
+        doc.active_volume_mut().seed_sphere(Vec3::ZERO, 12.0);
+        for index in 1..count {
+            let mut volume = Volume::new(1.0);
+            volume.seed_sphere(Vec3::new(index as f32 * 64.0, 0.0, 0.0), 12.0);
+            doc.add_body(format!("Body {}", index + 1), volume);
+        }
+        doc
+    }
+
+    #[test]
+    fn the_export_omits_hidden_bodies_and_keeps_the_rest_in_order() {
+        let doc = document_of(4);
+        let hidden = doc.nodes()[2].id;
+        let mut visible = vec![true; doc.node_count()];
+        visible[2] = false;
+
+        let bodies = doc.export_bodies(&visible);
+        assert_eq!(bodies.len(), 3, "one of four bodies was hidden");
+        assert!(
+            bodies.iter().all(|(meta, _, _)| meta.id != hidden),
+            "a hidden body reached the export"
+        );
+        let names: Vec<&str> = bodies.iter().map(|(meta, _, _)| meta.name.as_str()).collect();
+        assert_eq!(names, vec!["Body 1", "Body 2", "Body 4"], "display order was not kept");
+        for (_, mesh, report) in &bodies {
+            assert!(report.is_printable(), "{}", report.summary());
+            assert!(!mesh.is_empty());
+        }
+        // The caller's arithmetic for the omitted count, which is the line the
+        // whole defence rests on.
+        assert_eq!(doc.body_count() - bodies.len(), 1);
+    }
+
+    /// **Each body is welded on its own, and the proof is that it comes out
+    /// exactly as it would alone.**
+    ///
+    /// The weld key is a lattice cell and every body shares the lattice, so one
+    /// map across the document would fuse two bodies into a single vertex
+    /// wherever their cells coincide. The fixture is two spheres that
+    /// interpenetrate, because that is where their cells DO coincide -- two
+    /// bodies laid out apart would pass this test with a shared map and prove
+    /// nothing at all.
+    #[test]
+    fn two_bodies_sharing_lattice_cells_are_welded_separately() {
+        let mut doc = Document::new(1.0);
+        doc.active_volume_mut().seed_sphere(Vec3::ZERO, 12.0);
+        let mut through = Volume::new(1.0);
+        through.seed_sphere(Vec3::new(6.0, 0.0, 0.0), 12.0);
+        doc.add_body("Body 2", through);
+        assert!(!doc.overlaps().is_empty(), "the fixture must actually interpenetrate");
+
+        let bodies = doc.export_bodies(&vec![true; doc.node_count()]);
+        assert_eq!(bodies.len(), 2);
+        for ((meta, mesh, report), (_, volume)) in bodies.iter().zip(doc.bodies()) {
+            let (alone, alone_report) = volume.export_mesh();
+            assert_eq!(
+                mesh.positions, alone.positions,
+                "{} welded differently as part of a document",
+                meta.name
+            );
+            assert_eq!(mesh.triangles, alone.triangles, "{}", meta.name);
+            assert_eq!(*report, alone_report, "{}", meta.name);
+        }
+    }
+
+    /// **The verdict is per body and the summary is over the union, and this is
+    /// the case that tells them apart.**
+    ///
+    /// A document whose second body is empty sums to a report with triangles,
+    /// no holes and no winding disagreements -- `is_printable` on the sum says
+    /// yes -- while half of what the panel shows would be missing from the
+    /// print. Asking a pile of meshes whether it is closed is a different
+    /// question from asking each one, and it is the one with the comfortable
+    /// wrong answer.
+    #[test]
+    fn a_document_with_an_empty_body_is_refused_even_though_the_union_reads_printable() {
+        let mut doc = Document::new(1.0);
+        doc.active_volume_mut().seed_sphere(Vec3::ZERO, 12.0);
+        doc.add_body("Body 2", Volume::new(1.0));
+
+        let bodies = doc.export_bodies(&vec![true; doc.node_count()]);
+        let union = MeshReport::summed(bodies.iter().map(|(_, _, report)| *report));
+        assert!(
+            union.is_printable(),
+            "the union has to look fine, or this test is not about what it says it is"
+        );
+
+        let refusal = document_verdict(&bodies).expect_err("an empty body must refuse the export");
+        assert!(refusal.starts_with("Body 2"), "the refusal must name the body: {refusal}");
+        assert!(refusal.contains("nothing to export"), "{refusal}");
+    }
+
+    #[test]
+    fn a_document_whose_bodies_all_print_is_admitted() {
+        let doc = document_of(3);
+        let bodies = doc.export_bodies(&vec![true; doc.node_count()]);
+        assert_eq!(document_verdict(&bodies), Ok(()));
+    }
+
+    /// Hiding everything is refused rather than silently writing an empty file.
+    #[test]
+    fn a_document_with_every_body_hidden_is_refused_and_says_why() {
+        let doc = document_of(2);
+        let bodies = doc.export_bodies(&vec![false; doc.node_count()]);
+        assert!(bodies.is_empty());
+        let refusal = document_verdict(&bodies).expect_err("there is nothing to write");
+        assert!(refusal.contains("every body is hidden"), "{refusal}");
+    }
+
+    #[test]
+    fn the_summed_report_adds_every_field() {
+        let one = MeshReport {
+            vertices: 3,
+            triangles: 5,
+            collapsed_triangles: 7,
+            boundary_edges: 11,
+            non_manifold_edges: 13,
+            inconsistent_edges: 17,
+            zero_area_triangles: 19,
+        };
+        let total = MeshReport::summed([one, one, one]);
+        assert_eq!(
+            total,
+            MeshReport {
+                vertices: 9,
+                triangles: 15,
+                collapsed_triangles: 21,
+                boundary_edges: 33,
+                non_manifold_edges: 39,
+                inconsistent_edges: 51,
+                zero_area_triangles: 57,
+            },
+            "a field added to MeshReport and not to `summed` would show up here"
+        );
     }
 }

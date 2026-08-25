@@ -127,6 +127,7 @@ fn main() {
             repair_broken_scan_lines: true,
             coarsen_to_fit: false,
             refine_to_resolve: false,
+            already_reserved: 0.0,
         };
         let (built, taken) = timed(|| voxelise(&read_stl, &options));
         let (volume, voxel_report) = built.expect("the fixture should voxelise");
@@ -169,6 +170,7 @@ fn main() {
         repair_broken_scan_lines: true,
         coarsen_to_fit: false,
         refine_to_resolve: false,
+        already_reserved: 0.0,
     };
     let (rebuilt, _) = voxelise(&read_stl, &options).expect("the fixture should voxelise");
     let (again, again_report) = rebuilt.export_mesh();

@@ -305,6 +305,16 @@ pub struct PoolStats {
     /// Bricks drawn and bricks culled on the last frame.
     pub drawn: usize,
     pub culled: usize,
+    /// Bricks skipped on the last frame because the body holding them is not
+    /// visible.
+    ///
+    /// A third category rather than more `culled`, because the two are
+    /// different answers to different questions: culled means "off screen this
+    /// frame", hidden means "the user turned the eye off". Reported separately
+    /// so that `drawn + culled + hidden` accounts for every brick in the pool
+    /// -- a readout where they did not add up would look like the leak this
+    /// pool has already shipped twice.
+    pub hidden: usize,
 }
 
 /// The shared mesh buffers and the map from brick to slice.
@@ -343,10 +353,29 @@ pub struct MeshPool {
     vertices: usize,
     overflowed: usize,
     warned_about_overflow: bool,
+    /// The bodies that must not be drawn, replaced wholesale by
+    /// [`MeshPool::set_hidden`].
+    ///
+    /// **Bodies, not a bitmask, and the difference is not cosmetic.** The
+    /// design this was built from called for a `hidden: u64` on the frame
+    /// channel, indexed by a body's position in the document, with that
+    /// position stored on each [`Slot`]. That does not survive a delete: the
+    /// bodies after the deleted one all shift down by one, so every slot they
+    /// own is left naming the wrong bit -- and the pool cannot repair it,
+    /// because a body that had no bricks in the pool leaves no record of the
+    /// position it used to occupy, and the shift is invisible from here. A
+    /// pool keyed on [`NodeId`] (which is what the buckets already are, since
+    /// increment 1) needs no position at all: an id is stable for the life of
+    /// the body, so nothing here can drift out of step with the document.
+    ///
+    /// Held as the HIDDEN set rather than the shown one because it is almost
+    /// always empty, and an empty `Vec` makes the per-bucket test free.
+    hidden: Vec<NodeId>,
     /// Counts from the last draw. Atomic because drawing takes a shared borrow
     /// and Iced requires the pipeline it owns to be `Sync`.
     drawn: AtomicUsize,
     culled: AtomicUsize,
+    skipped_as_hidden: AtomicUsize,
 }
 
 impl MeshPool {
@@ -372,8 +401,13 @@ impl MeshPool {
             vertices: 0,
             overflowed: 0,
             warned_about_overflow: false,
+            // Never allocated again: a document holds at most `MAX_BODIES`
+            // bodies, so the set of hidden ones can never outgrow this and
+            // `set_hidden` runs on the frame path.
+            hidden: Vec::with_capacity(brokkr_core::MAX_BODIES),
             drawn: AtomicUsize::new(0),
             culled: AtomicUsize::new(0),
+            skipped_as_hidden: AtomicUsize::new(0),
         }
     }
 
@@ -528,9 +562,16 @@ impl MeshPool {
                     self.overflowed += 1;
                     if !self.warned_about_overflow {
                         self.warned_about_overflow = true;
+                        // The remedy is named because the obvious one does not
+                        // work: hiding a body is a draw-time skip and it keeps
+                        // every slice it holds, so the eye frees nothing at
+                        // all. Only deleting a body or resampling the document
+                        // coarser gives the pool anything back.
                         log::error!(
                             "mesh pool is full at {MAX_BUFFERS} buffers ({} vertices, {} \
-                             indices), so parts of the model are missing from the screen",
+                             indices), so parts of the model are missing from the screen. \
+                             Delete a body or resample coarser to free pool space; hiding a \
+                             body does not, because a hidden body keeps its slices.",
                             self.vertex_capacity * MAX_BUFFERS as u64,
                             self.index_capacity * MAX_BUFFERS as u64,
                         );
@@ -593,9 +634,19 @@ impl MeshPool {
     /// vertex. Bricks outside the frustum are skipped: at M2 scale a model is
     /// several thousand bricks and most of them are off screen at any moment, so
     /// not drawing those is the cheapest saving available.
+    ///
+    /// **Visibility is a draw-time skip and is never anything else.** A hidden
+    /// body keeps every voxel, every slot and every byte of pool space it had;
+    /// the only thing that changes is that this loop steps over its buckets.
+    /// The alternative -- dropping its bricks, or marking them dirty and
+    /// meshing them to nothing -- would make showing it again a whole-body
+    /// remesh, and would make the eye a thing that can lose geometry. It also
+    /// means hiding buys no pool headroom, which is why the overflow message
+    /// above says so.
     pub fn draw(&self, pass: &mut wgpu::RenderPass<'_>, frustum: &Frustum) {
         self.drawn.store(0, Ordering::Relaxed);
         self.culled.store(0, Ordering::Relaxed);
+        self.skipped_as_hidden.store(0, Ordering::Relaxed);
         if self.buckets.is_empty() {
             return;
         }
@@ -607,7 +658,15 @@ impl MeshPool {
         // documentation for what that cost.
         let mut drawn = 0;
         let mut culled = 0;
-        for (&(index, _body), bucket) in &self.buckets {
+        let mut hidden = 0;
+        for (&(index, body), bucket) in &self.buckets {
+            // Per bucket rather than per slot: a bucket is exactly one body, so
+            // the test runs at most `pairs x bodies` times a frame instead of
+            // once per brick.
+            if self.hidden.contains(&body) {
+                hidden += bucket.len();
+                continue;
+            }
             let pair = &self.buffers[index as usize];
             let mut bound = false;
             for slot in bucket.values() {
@@ -634,6 +693,120 @@ impl MeshPool {
         }
         self.drawn.store(drawn, Ordering::Relaxed);
         self.culled.store(culled, Ordering::Relaxed);
+        self.skipped_as_hidden.store(hidden, Ordering::Relaxed);
+    }
+
+    /// Replace the set of bodies that must not be drawn.
+    ///
+    /// **Wholesale, every time, and never mutated one body at a time.** The
+    /// set is a pure function of the document and the solo mode, and the one
+    /// place it is worked out is the application's visibility pass; recomputing
+    /// it here from an add or a remove would make two owners of one answer, and
+    /// two owners is how the eye and the viewport come to disagree after an
+    /// undo -- a body invisible on screen that still raycasts and still carves.
+    ///
+    /// Copies rather than takes the caller's buffer so that the caller can keep
+    /// its own allocation, and never allocates: the vector is built with room
+    /// for `MAX_BODIES` and a document cannot hold more than that.
+    pub fn set_hidden(&mut self, hidden: &[NodeId]) {
+        debug_assert!(
+            hidden.len() <= brokkr_core::MAX_BODIES,
+            "{} hidden bodies, which is more than a document can hold",
+            hidden.len()
+        );
+        self.hidden.clear();
+        self.hidden.extend_from_slice(hidden);
+    }
+
+    /// Drop every slot one body owns, and give its space back.
+    ///
+    /// Returns how many slots went, which is what a caller has to look at to
+    /// tell "the body had no bricks in the pool" from "the body was not there".
+    ///
+    /// **The caller must mark the surviving bodies dirty and remesh after
+    /// this**, exactly as [`MeshPool::reset`] requires, and for a sharper
+    /// reason than that one. A brick the pool refused while it was full is
+    /// simply dropped -- `upload`'s overflow arm returns after counting it, and
+    /// the application has already drained that coordinate out of its dirty
+    /// set, so nothing will offer the brick again until something else dirties
+    /// it. Freeing space here does not bring those bricks back; only a remesh
+    /// does. Skip the remesh and the user gets the worst outcome this file can
+    /// produce: `overflowed` is cleared below, so the red MESH POOL FULL banner
+    /// disappears while the geometry it was warning about is still missing from
+    /// the screen, permanently and silently. That is strictly worse than the
+    /// stale banner the clear exists to avoid.
+    ///
+    /// **Two pieces of bookkeeping here are not obvious and both have a
+    /// symptom.** Any buffer pair this empties has its allocators reset, so the
+    /// pair's bump pointer goes back to zero rather than staying wherever the
+    /// deleted body left it -- without that, deleting a body frees its blocks
+    /// into granule classes nothing may ask for again and the pair keeps its
+    /// high-water mark, which is the number that actually decides whether the
+    /// next allocation fits. And `overflowed` is cleared, because it and
+    /// `warned_about_overflow` were previously cleared only by
+    /// [`MeshPool::reset`]: the red banner would otherwise stay up, with a
+    /// stale count, over a document that now fits comfortably. The clear is
+    /// only sound because of the remesh above -- the remesh re-offers every
+    /// brick, so any that still do not fit put the banner straight back with an
+    /// honest count, which is precisely how `reset` gets away with it inside
+    /// `rebuild_everything`.
+    pub fn forget_body(&mut self, body: NodeId) -> usize {
+        let mut forgotten = 0;
+        for pair in 0..self.buffers.len() as u16 {
+            let Some(bucket) = self.buckets.remove(&(pair, body)) else {
+                continue;
+            };
+            for slot in bucket.into_values() {
+                self.release(slot);
+                self.uncount(slot);
+                forgotten += 1;
+            }
+        }
+        if forgotten == 0 {
+            return 0;
+        }
+
+        // A pair with no buckets left has no live block in it, which is exactly
+        // the precondition `BlockAllocator::reset` asks for.
+        for (index, pair) in self.buffers.iter_mut().enumerate() {
+            if self.buckets.keys().any(|&(held, _)| held == index as u16) {
+                continue;
+            }
+            pair.vertex_allocator.reset();
+            pair.index_allocator.reset();
+        }
+
+        self.overflowed = 0;
+        self.warned_about_overflow = false;
+        forgotten
+    }
+
+    /// How many of one body's bricks the pool is holding.
+    ///
+    /// The question "is this body really gone" has no other answer from
+    /// outside: `PoolStats` counts the whole pool, so a body whose slots
+    /// survived a delete would be invisible in it the moment a second body
+    /// exists.
+    pub fn body_bricks(&self, body: NodeId) -> usize {
+        (0..self.buffers.len() as u16)
+            .filter_map(|pair| self.buckets.get(&(pair, body)))
+            .map(FxHashMap::len)
+            .sum()
+    }
+
+    /// What the pool was last told not to draw.
+    ///
+    /// The same justification as [`MeshPool::body_bricks`]: the question has no
+    /// other answer from outside. Hiding is a draw-time skip, so it moves no
+    /// counter a caller can see -- `bricks`, `body_bricks` and every reserved
+    /// and watermark number are invariant across it by design, and `hidden` in
+    /// [`PoolStats`] is written by `draw`, so it stays zero until a frame is
+    /// actually drawn. Without this, a test asserting that the hidden set
+    /// reached the pool can only assert on the thing that SENT it, which is
+    /// not the same claim: deleting the delivering call entirely left the
+    /// whole workspace suite green when it was tried.
+    pub fn hidden_bodies(&self) -> &[NodeId] {
+        &self.hidden
     }
 
     /// Draw every brick of ONE body, with no culling at all.
@@ -662,6 +835,11 @@ impl MeshPool {
     /// No caller yet: increment 15 is the thumbnail pass. What exists today is
     /// the pool half of it, which is the half that had to land with the
     /// bucketing rather than after it.
+    ///
+    /// It also ignores [`MeshPool::set_hidden`], deliberately: the panel draws
+    /// a muted row for a hidden body and still shows its picture, so a
+    /// thumbnail pass that skipped hidden bodies would leave a blank square
+    /// where the muting is the cue.
     pub fn draw_body(&self, pass: &mut wgpu::RenderPass<'_>, body: NodeId) {
         for index in 0..self.buffers.len() as u16 {
             let Some(bucket) = self.buckets.get(&(index, body)) else {
@@ -724,6 +902,7 @@ impl MeshPool {
             overflowed: self.overflowed,
             drawn: self.drawn.load(Ordering::Relaxed),
             culled: self.culled.load(Ordering::Relaxed),
+            hidden: self.skipped_as_hidden.load(Ordering::Relaxed),
         }
     }
 }
@@ -1062,5 +1241,186 @@ mod tests {
         pool.upload(&device, &queue, key(1, 0), &small);
         assert_eq!(pool.stats().bricks, filled);
         assert_eq!(pool.stats().overflowed, 1, "the count of refusals is cumulative");
+    }
+
+    /// Deleting a body must put the pool back exactly where it was before that
+    /// body arrived.
+    ///
+    /// "Unchanged" is the wrong assertion here and it is wrong in exactly the
+    /// direction a leak hides in: a pool that kept the deleted body's slots
+    /// would also report an unchanged count. So the count is taken BEFORE the
+    /// second body is published and compared against the count after it is
+    /// forgotten, and the surviving body is checked slice by slice.
+    #[test]
+    fn forgetting_a_body_returns_the_pool_to_what_it_held_before_that_body() {
+        let Some((device, queue)) = device_or_skip("mesh pool forget body") else {
+            return;
+        };
+
+        let mut pool = MeshPool::with_capacities(&device, GRANULARITY * 16, GRANULARITY * 16);
+        let mesh = mesh_of(GRANULARITY as usize, GRANULARITY as usize - 1);
+        for brick in 0..3 {
+            pool.upload(&device, &queue, key(1, brick), &mesh);
+        }
+        let before = pool.stats();
+        let (_, kept) = pool.find(key(1, 0)).expect("body 1 has brick zero");
+
+        for brick in 0..4 {
+            pool.upload(&device, &queue, key(2, brick), &mesh);
+        }
+        assert_eq!(pool.stats().bricks, before.bricks + 4, "the fixture published nothing");
+
+        assert_eq!(pool.forget_body(NodeId(2)), 4, "every one of body 2's slots should have gone");
+        let after = pool.stats();
+        assert_eq!(after.bricks, before.bricks, "body 2 kept slots after it was forgotten");
+        assert_eq!(after.triangles, before.triangles);
+        assert_eq!(after.vertices, before.vertices);
+        assert_eq!(after.vertices_reserved, before.vertices_reserved, "its space was not returned");
+        assert_eq!(after.indices_reserved, before.indices_reserved);
+        assert_eq!(pool.body_bricks(NodeId(2)), 0);
+
+        // And the body that stayed is untouched, down to the slice it draws
+        // from -- forgetting one body must not disturb another's bookkeeping.
+        assert_eq!(pool.body_bricks(NodeId(1)), 3);
+        let (_, still_there) = pool.find(key(1, 0)).expect("body 1 still has brick zero");
+        assert_eq!(still_there.vertices.offset, kept.vertices.offset);
+        assert_eq!(still_there.index_count, kept.index_count);
+
+        // Forgetting a body that has nothing here is not an error and reports
+        // honestly, which is how a caller tells it apart from a real delete.
+        assert_eq!(pool.forget_body(NodeId(2)), 0);
+        assert_eq!(pool.forget_body(NodeId(77)), 0);
+    }
+
+    /// A delete that empties the pool has to take the high-water mark down
+    /// with it, and take the MESH POOL FULL banner down too.
+    ///
+    /// `overflowed` and `warned_about_overflow` used to clear only in
+    /// [`MeshPool::reset`], so the red banner stayed up with a stale count over
+    /// a document that now fits. And the watermark -- not `live` -- is the
+    /// number that decides whether the next allocation fits, so a pair left at
+    /// its old bump pointer after the body that pushed it there has gone is a
+    /// pool that refuses work it has room for.
+    #[test]
+    fn forgetting_the_body_that_filled_the_pool_clears_the_banner_and_the_watermark() {
+        let Some((device, queue)) = device_or_skip("mesh pool forget clears overflow") else {
+            return;
+        };
+
+        let mut pool = MeshPool::with_capacities(&device, GRANULARITY * 2, GRANULARITY * 2);
+        let small = mesh_of(GRANULARITY as usize, GRANULARITY as usize - 1);
+        for brick in 0..2 * MAX_BUFFERS {
+            pool.upload(&device, &queue, key(1, brick as i32), &small);
+        }
+        // One more than it can hold, so the overflow counter is really set.
+        pool.upload(&device, &queue, key(1, 900), &small);
+        assert!(pool.stats().overflowed > 0, "the fixture never filled the pool");
+        assert!(pool.stats().vertices_watermark > 0);
+
+        pool.forget_body(NodeId(1));
+        let after = pool.stats();
+        assert_eq!(after.bricks, 0);
+        assert_eq!(after.overflowed, 0, "the banner would have stayed up over an empty pool");
+        assert_eq!(
+            after.vertices_watermark, 0,
+            "every pair is empty, so every bump pointer should have gone back to zero"
+        );
+        assert_eq!(after.indices_watermark, 0);
+
+        // And the emptied pool is usable again to its full depth, which is the
+        // point of resetting the pairs rather than merely freeing the blocks.
+        for brick in 0..2 * MAX_BUFFERS {
+            pool.upload(&device, &queue, key(3, brick as i32), &small);
+        }
+        assert_eq!(pool.stats().bricks, 2 * MAX_BUFFERS);
+        assert_eq!(pool.stats().overflowed, 0, "the pool did not really recover its space");
+    }
+
+    /// **Freeing space does not un-refuse a brick, and the banner going down
+    /// does not mean the model is whole.** This is the precondition on
+    /// [`MeshPool::forget_body`] written as an assertion, because the doc
+    /// comment on its own is not something a future change can trip over.
+    ///
+    /// A brick refused while the pool was full is dropped -- `upload`'s
+    /// overflow arm returns after counting it -- and the application drained
+    /// that coordinate out of its dirty set on the way in, so nothing offers it
+    /// again. Deleting some other body clears `overflowed`, which takes the red
+    /// MESH POOL FULL banner down over a document that is still missing
+    /// geometry. The only thing that brings the brick back is a remesh, which
+    /// is why the delete gesture owes one.
+    #[test]
+    fn a_brick_refused_while_the_pool_was_full_stays_missing_after_a_delete() {
+        let Some((device, queue)) = device_or_skip("mesh pool refused brick after delete") else {
+            return;
+        };
+
+        let mut pool = MeshPool::with_capacities(&device, GRANULARITY * 2, GRANULARITY * 2);
+        let small = mesh_of(GRANULARITY as usize, GRANULARITY as usize - 1);
+        for brick in 0..2 * MAX_BUFFERS {
+            pool.upload(&device, &queue, key(1, brick as i32), &small);
+        }
+        // Body 2's one brick arrives at a pool with nothing left, and is
+        // refused. Body 2 is NOT deleted below -- it is the survivor, and this
+        // brick is a piece of the model the user can still see the rest of.
+        pool.upload(&device, &queue, key(2, 0), &small);
+        assert_eq!(pool.stats().overflowed, 1, "the fixture never filled the pool");
+        assert_eq!(pool.body_bricks(NodeId(2)), 0);
+
+        pool.forget_body(NodeId(1));
+
+        assert_eq!(pool.stats().overflowed, 0, "the banner is down...");
+        assert_eq!(
+            pool.body_bricks(NodeId(2)),
+            0,
+            "...and the brick it was warning about is still missing, which is the whole \
+             hazard: without the remesh the caller owes, this state is permanent and silent"
+        );
+
+        // And the remesh is what fixes it. One re-offer of the same brick, into
+        // the space the delete freed, and the model is whole again.
+        pool.upload(&device, &queue, key(2, 0), &small);
+        assert_eq!(pool.body_bricks(NodeId(2)), 1);
+        assert_eq!(pool.stats().overflowed, 0);
+    }
+
+    /// **Hiding is a draw-time skip and nothing else**, and this is the
+    /// assertion that says so: not one byte of pool space moves, no slot is
+    /// dropped, and no mesh is touched.
+    ///
+    /// The alternative -- dropping a hidden body's bricks, or marking them
+    /// dirty and meshing them to nothing -- would make showing it again a
+    /// whole-body remesh and would make the eye a thing that loses geometry.
+    /// It is also the half of the rule that cannot be seen from the
+    /// application: `vertices_reserved` and `vertices_watermark` only exist
+    /// here.
+    #[test]
+    fn hiding_a_body_moves_no_pool_space_at_all() {
+        let Some((device, queue)) = device_or_skip("mesh pool hidden set") else {
+            return;
+        };
+
+        let mut pool = MeshPool::with_capacities(&device, GRANULARITY * 16, GRANULARITY * 16);
+        let mesh = mesh_of(GRANULARITY as usize, GRANULARITY as usize - 1);
+        for body in 1..=2 {
+            for brick in 0..3 {
+                pool.upload(&device, &queue, key(body, brick), &mesh);
+            }
+        }
+        let before = pool.stats();
+
+        pool.set_hidden(&[NodeId(2)]);
+        let after = pool.stats();
+        assert_eq!(after.bricks, before.bricks, "hiding a body dropped its slots");
+        assert_eq!(after.vertices_reserved, before.vertices_reserved, "hiding freed pool space");
+        assert_eq!(after.indices_reserved, before.indices_reserved);
+        assert_eq!(after.vertices_watermark, before.vertices_watermark);
+        assert_eq!(after.indices_watermark, before.indices_watermark);
+        assert_eq!(after.triangles, before.triangles);
+        assert_eq!(pool.body_bricks(NodeId(2)), 3, "the hidden body must keep every brick");
+
+        // Showing it again is a set with the body left out, and costs nothing.
+        pool.set_hidden(&[]);
+        assert_eq!(pool.stats().bricks, before.bricks);
+        assert_eq!(pool.stats().vertices_watermark, before.vertices_watermark);
     }
 }

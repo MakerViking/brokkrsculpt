@@ -10,8 +10,8 @@ use std::time::Instant;
 
 use brokkr_core::{
     BrickCoord, BrickMesh, Brush, BrushDirection, BrushKind, BrushScratch, Document, Entry,
-    History, HistoryStats, MirrorAxis, MoveStroke, NodeId, Stamp, Stroke, Symmetry, UndoOutcome,
-    Volume, VolumeStats, lean_normal, raycast,
+    History, HistoryStats, MAX_VOLUME_BYTES, MirrorAxis, MoveStroke, NodeId, Stamp, Stroke,
+    Symmetry, UndoOutcome, Volume, VolumeStats, lean_normal, raycast,
 };
 use glam::{Vec2, Vec3};
 use iced::{Subscription, Task};
@@ -113,17 +113,6 @@ const STRENGTH_PER_PIXEL: f32 = 0.002;
 /// intermediate sizes continuously; the buttons only halve.
 const FINEST_VOXEL_MM: f32 = 0.03;
 const COARSEST_VOXEL_MM: f32 = 2.0;
-
-/// How much system memory one volume may occupy.
-///
-/// The mesh pool grows itself buffers now, so it is no longer the first thing
-/// a fine resample runs out of: the dragon at 0.0565 mm sits at 48% of the
-/// pool and 4.15 GB of RAM. Without this the detail buttons would walk a
-/// machine into swap.
-///
-/// Matches `voxelise`'s own import ceiling, and carries the same caveat: it is
-/// a guess at what a machine can spare, made without asking the machine.
-const MAX_VOLUME_BYTES: f64 = 6.0 * 1024.0 * 1024.0 * 1024.0;
 
 /// Roughly what a consumer resin printer resolves in XY, in millimetres.
 ///
@@ -299,6 +288,11 @@ pub struct Brokkr {
     /// [`Document::mesh_dirty`] has to make the serial-or-parallel decision
     /// once over the real total -- see its documentation.
     dirty: Vec<(NodeId, BrickCoord)>,
+    /// What is drawn, indexed by node position, and the bodies among it that
+    /// are not. Both are kept rather than rebuilt because
+    /// [`Brokkr::publish_visibility`] runs on the frame tick.
+    shown: Vec<bool>,
+    hidden_bodies: Vec<NodeId>,
     drag: Option<Drag>,
     /// Last pointer position in widget pixels, for drag deltas.
     cursor: Option<Vec2>,
@@ -650,6 +644,60 @@ pub enum SizingTarget {
     Strength,
 }
 
+/// Turn a window event the widget tree did not want into a message.
+///
+/// This is the callback `Brokkr::subscription` hands to
+/// `iced::event::listen_with`, lifted out of it and named so that it can be
+/// tested. It costs nothing to lift: `listen_with` takes a bare `fn` pointer
+/// (`iced_futures-0.14.0/src/event.rs:26`), so the inline version was already
+/// a non-capturing closure and this is the same value with a name on it.
+///
+/// It was NOT tested while it was inline, and that was the gap: every keyboard
+/// guard test synthesises `Message::KeyPressed` directly, which is downstream
+/// of here. Deleting the `KeyPressed` arm would have killed the entire
+/// keyboard -- no undo, no brush digits, no mirror keys -- with all of those
+/// tests still green, reporting a guard working perfectly on a message the
+/// application could no longer produce.
+///
+/// The two things it decides, and neither belongs anywhere else:
+///
+/// * Captured events are dropped. That is what makes the shortcuts
+///   focus-aware -- a focused text input consumes its own keystrokes -- and
+///   inverting it is how `1`-`7`, `s`, `u`, `x`, `y` and `z` were stolen from
+///   every text field for a year.
+/// * A press forwards the raw key; it does not decide what the key MEANS.
+///   There is no `self` here and no way to get one, so whether a modal is up
+///   is invisible from inside. `Brokkr::on_key` decides, and holds the guard.
+fn key_event(
+    event: iced::Event,
+    status: iced::event::Status,
+    _window: iced::window::Id,
+) -> Option<Message> {
+    if status == iced::event::Status::Captured {
+        return None;
+    }
+    match event {
+        iced::Event::Keyboard(iced::keyboard::Event::KeyPressed { key, modifiers, .. }) => {
+            Some(Message::KeyPressed { key, modifiers })
+        }
+        // Releasing a sizing key ends the gesture. Without this the pointer
+        // would keep resizing the brush instead of going back to sculpting.
+        //
+        // Not routed through `on_key` and deliberately not guarded by the
+        // modal check: a modal that opened mid-gesture must still let the
+        // gesture end, and ending one that never started is already a no-op.
+        iced::Event::Keyboard(iced::keyboard::Event::KeyReleased { key, .. }) => match key {
+            iced::keyboard::Key::Character(character)
+                if matches!(character.to_ascii_lowercase().as_str(), "s" | "u") =>
+            {
+                Some(Message::SizingEnded)
+            }
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
 impl Brokkr {
     pub fn new() -> Self {
         Self::with_devices(Tablet::start(), SpaceMouse::start())
@@ -714,6 +762,8 @@ impl Brokkr {
             move_stroke: MoveStroke::new(),
             stamp_centres: Vec::new(),
             dirty: Vec::new(),
+            shown: Vec::new(),
+            hidden_bodies: Vec::new(),
             drag: None,
             cursor: None,
             viewport_size: Vec2::new(1280.0, 720.0),
@@ -765,6 +815,9 @@ impl Brokkr {
         app.publish_camera();
         app.refresh_detail_advice();
         app.refresh_overlay();
+        // Before the first message, so the renderer is never acting on an empty
+        // hidden set it was never given.
+        app.publish_visibility();
         // A crash net left by a previous session is worth nothing if nobody
         // knows it is there, and the File menu is not somewhere you look
         // unprompted.
@@ -815,42 +868,19 @@ impl Brokkr {
             // Filtering on Ignored is what makes them focus-aware: a focused
             // text input consumes its keystrokes, and a shortcut fires only
             // when nothing else wanted the key.
-            iced::event::listen_with(|event, status, _window| {
-                if status == iced::event::Status::Captured {
-                    return None;
-                }
-                match event {
-                    iced::Event::Keyboard(iced::keyboard::Event::KeyPressed {
-                        key,
-                        modifiers,
-                        ..
-                    }) => match key {
-                        iced::keyboard::Key::Named(iced::keyboard::key::Named::Escape) => {
-                            Some(Message::MenuClosed)
-                        }
-                        iced::keyboard::Key::Character(character) => crate::viewport::shortcut(
-                            character.as_str(),
-                            modifiers.command(),
-                            modifiers.shift(),
-                        ),
-                        _ => None,
-                    },
-                    // Releasing a sizing key ends the gesture. Without this
-                    // the pointer would keep resizing the brush instead of
-                    // going back to sculpting.
-                    iced::Event::Keyboard(iced::keyboard::Event::KeyReleased { key, .. }) => {
-                        match key {
-                            iced::keyboard::Key::Character(character)
-                                if matches!(character.to_ascii_lowercase().as_str(), "s" | "u") =>
-                            {
-                                Some(Message::SizingEnded)
-                            }
-                            _ => None,
-                        }
-                    }
-                    _ => None,
-                }
-            }),
+            //
+            // What that callback must NOT do is decide what a key means.
+            // `listen_with` takes a bare `fn` pointer, not a closure, so there
+            // is no `self` there and no way to get one: whether a modal is up,
+            // whether a gesture is in flight, whether the document can even
+            // take the change are all invisible from inside it. It forwards
+            // the key and `on_key` decides. Reaching for a static or a global
+            // to dodge that is how the two halves drift apart.
+            //
+            // It is `key_event`, a named function rather than an inline
+            // closure, purely so the tests can call it -- see the tests on it
+            // for what silently breaks when it is wrong.
+            iced::event::listen_with(key_event),
         ])
     }
 
@@ -989,10 +1019,36 @@ impl Brokkr {
     ///
     /// The reset is only sound paired with marking everything dirty, so the
     /// two live in one function and neither is callable by accident.
+    ///
+    /// # This is also why no swap site marks the OUTGOING model's bricks
+    ///
+    /// `reset_sculpt`, `open_project`, `adopt_import` and `orient` each used to
+    /// collect the departing volume's brick coordinates and mark them dirty in
+    /// the incoming one, so that they would mesh to nothing and release their
+    /// pool slices. All four of those loops were dead, and had been since
+    /// before the pool learned about bodies: all four call this function, and
+    /// `MeshPool::reset` clears its slot map wholesale regardless of what any
+    /// key says. The loops cost a walk of the outgoing model plus a remesh of
+    /// however many coordinates it had, to release slices that had already
+    /// been released.
+    ///
+    /// The reason to say so here rather than to leave four comments behind is
+    /// that the trick reads as necessary, and it is the thing a fifth swap site
+    /// would copy. **The rule is: call this, and the outgoing model is gone.**
+    /// Anything that removes ONE body while the others stay is a different
+    /// problem and has a different answer -- `SharedFrame::forget_body`.
     fn rebuild_everything(&mut self) {
         self.shared.request_pool_reset();
         self.doc.mark_everything_dirty();
         self.remesh_dirty();
+        // Three of the four callers replace the whole document, and the new one
+        // starts numbering its nodes from 1 again -- so an id the outgoing
+        // document had hidden could name a perfectly visible body in the
+        // incoming one. `update` would put that right on the next message, and
+        // the next message is at worst one frame away, but "at worst one frame"
+        // is how long a body would be missing from the screen with nothing in
+        // the panel saying why.
+        self.publish_visibility();
     }
 
     fn remesh_dirty(&mut self) {
@@ -1594,10 +1650,11 @@ impl Brokkr {
         let pool = self.shared.stats();
         let _ = writeln!(
             out,
-            "view: {} triangles, {} drawn / {} culled, {:.1} fps",
+            "view: {} triangles, {} drawn / {} culled / {} hidden, {:.1} fps",
             pool.triangles,
             pool.drawn,
             pool.culled,
+            pool.hidden,
             if self.perf.average_frame_ms() > 0.0 {
                 1000.0 / self.perf.average_frame_ms()
             } else {
@@ -1627,12 +1684,6 @@ impl Brokkr {
         let mut volume = Volume::new(self.doc.voxel_size());
         volume.seed_sphere(Vec3::ZERO, MODEL_RADIUS_MM);
         volume.mark_everything_dirty();
-        // The old bricks have to be cleared from the pool too, or their
-        // triangles stay on screen. Marking them dirty meshes them to nothing,
-        // which releases their slices.
-        for coord in self.doc.active_volume().brick_coords() {
-            volume.mark_dirty(coord);
-        }
         self.doc = Document::from_volume(volume);
         // History refers to bricks of the volume that just went away, so keeping
         // it would let undo splice pieces of the discarded model into this one.
@@ -1892,15 +1943,7 @@ impl Brokkr {
             }
         };
 
-        // Clear the outgoing model from the mesh pool before swapping, exactly
-        // as a reset does.
-        let stale: Vec<BrickCoord> = self.doc.active_volume().brick_coords().collect();
         self.doc = doc;
-        let volume = self.doc.active_volume_mut();
-        for coord in stale {
-            volume.mark_dirty(coord);
-        }
-
         self.apply_view(&state.view);
         self.timeline.adopt(state.keys);
 
@@ -1919,16 +1962,12 @@ impl Brokkr {
 
     /// Swap an imported model in, modelled on `open_project`.
     ///
-    /// Four things here are individually silent when wrong.
+    /// Three things here are individually silent when wrong.
     ///
     /// `project_path` is cleared, where `open_project` sets it. An import must
     /// not adopt the mesh's path, or the next plain Save would write a `.brokkr`
     /// container straight over the user's `.stl` with no dialog and no warning.
     /// This is the most damaging mistake available in this function.
-    ///
-    /// The stale brick loop clears the outgoing model from the renderer's mesh
-    /// pool. Skipping it compiles and leaves the previous model's triangles
-    /// drawn on top of the new one.
     ///
     /// `mark_everything_dirty` is done by `voxelise` itself, exactly as
     /// `project::read` does it, which is why neither this nor `open_project`
@@ -1939,13 +1978,7 @@ impl Brokkr {
     /// bricks, so for a centred model it over-reports by up to about 1.7 times
     /// plus padding and the camera sits visibly too far back.
     fn adopt_import(&mut self, imported: crate::message::Imported) {
-        let stale: Vec<BrickCoord> = self.doc.active_volume().brick_coords().collect();
         self.doc = Document::from_volume(imported.volume);
-        let volume = self.doc.active_volume_mut();
-        for coord in stale {
-            volume.mark_dirty(coord);
-        }
-
         self.camera = OrbitCamera::framing(Vec3::ZERO, MODEL_RADIUS_MM);
         self.history.clear();
         self.history_stats = self.history.stats();
@@ -2059,6 +2092,14 @@ impl Brokkr {
     /// as a different document. That is not hypothetical -- the format grew a
     /// node table this release, and the first thing to exercise it in the wild
     /// is the autosave, unwatched, every two minutes.
+    ///
+    /// The check itself is pinned by
+    /// `the_save_verification_notices_a_file_that_is_not_this_document`, and
+    /// the *gate* in `save_project` that calls it -- a separate thing, and the
+    /// one that can be refactored away without a test noticing -- by
+    /// `a_save_that_cannot_read_its_own_output_back_keeps_the_previous_file`.
+    /// If you change the shape of the failure here, that second test is the one
+    /// to look at: it drives this through a temporary that reads back empty.
     fn verify_written(&self, path: &std::path::Path) -> Result<(), String> {
         let file = std::fs::File::open(path).map_err(|error| error.to_string())?;
         let mut reader = std::io::BufReader::new(file);
@@ -2088,32 +2129,61 @@ impl Brokkr {
         home.unwrap_or_else(std::env::temp_dir).join("brokkrsculpt")
     }
 
-    /// Weld the sculpt into one mesh and write it out.
+    /// Weld every visible body and write them all out to a chosen path.
     ///
     /// Refuses to write anything that would not print. A slicer given a mesh
     /// with holes either rejects it or fills it wrong, and finding that out
     /// after a failed print is worse than being told here.
-    /// Write the sculpt out to a chosen path.
     ///
-    /// The path now comes from a dialog rather than a fixed directory, so there
-    /// is nothing to create and nothing to guess.
+    /// **The refusal happens before `File::create`, and that ordering is the
+    /// point.** `File::create` truncates, so a verdict taken after it would
+    /// leave the user with a zero-byte file where their last good export was.
+    /// Everything is welded and validated into memory, the verdict is taken,
+    /// and only then is a file opened.
+    ///
+    /// **The status line names how many bodies were omitted, unconditionally
+    /// -- including when the answer is none.** The eye is one bit in a
+    /// forty-byte node record with no integrity check of any kind, and it is
+    /// the bit that decides whether a part reaches the printer: a single
+    /// flipped bit is a perfectly legal value that loads without error. The
+    /// brick stream is defended by a checked distance decode and the node table
+    /// is defended by nothing, so this line is the whole of that defence and it
+    /// costs one format string. Making it conditional -- "only say it when
+    /// something was hidden" -- would mean silence is ambiguous between
+    /// "nothing was hidden" and "the count was never computed", which is
+    /// exactly the reading it exists to prevent.
+    ///
+    /// `saved_visibility` and never `display_visibility`: a view mode must not
+    /// decide what reaches a print.
     fn export(&mut self, format: ExportFormat, path: &std::path::Path) {
         let started = Instant::now();
-        let (mesh, report) = self.doc.active_volume().export_mesh();
+        let mut visible = Vec::new();
+        self.doc.saved_visibility(&mut visible);
+        let bodies = self.doc.export_bodies(&visible);
+        let omitted = self.doc.body_count().saturating_sub(bodies.len());
 
-        if !report.is_printable() {
-            self.status = format!("not exported, {}", report.summary());
-            log::error!("refusing to export: {}", report.summary());
+        // Per body, never over the union: a document whose second body is
+        // empty sums to a printable report while half the print is missing.
+        if let Err(why) = brokkr_core::export::document_verdict(&bodies) {
+            self.status = format!("not exported, {why}");
+            log::error!("refusing to export: {why}");
             return;
         }
+
+        let summary =
+            brokkr_core::MeshReport::summed(bodies.iter().map(|(_, _, report)| *report)).summary();
+        let parts: Vec<(&str, &brokkr_core::ExportMesh)> =
+            bodies.iter().map(|(meta, mesh, _)| (meta.name.as_str(), mesh)).collect();
 
         let write = || -> std::io::Result<()> {
             let file = std::fs::File::create(path)?;
             let mut file = std::io::BufWriter::new(file);
             match format {
-                ExportFormat::Stl => brokkr_core::export::stl::write(&mesh, &mut file)?,
-                ExportFormat::Obj => brokkr_core::export::obj::write(&mesh, &mut file)?,
-                ExportFormat::ThreeMf => brokkr_core::export::threemf::write(&mesh, &mut file)?,
+                ExportFormat::Stl => brokkr_core::export::stl::write_all(&parts, &mut file)?,
+                ExportFormat::Obj => brokkr_core::export::obj::write_all(&parts, &mut file)?,
+                ExportFormat::ThreeMf => {
+                    brokkr_core::export::threemf::write_all(&parts, &mut file)?
+                }
             }
             std::io::Write::flush(&mut file)
         };
@@ -2121,9 +2191,16 @@ impl Brokkr {
         match write() {
             Ok(()) => {
                 let bytes = std::fs::metadata(path).map(|data| data.len()).unwrap_or(0);
+                // STL has nowhere to put an object boundary, so several bodies
+                // arrive in a slicer as one part. Said here rather than
+                // discovered after slicing.
+                let fused = matches!(format, ExportFormat::Stl) && parts.len() > 1;
                 self.status = format!(
-                    "{} to {} ({:.1} MB, {:.0} ms)",
-                    report.summary(),
+                    "exported {} of {} bodies; {omitted} hidden{} -- {summary} to {} \
+                     ({:.1} MB, {:.0} ms)",
+                    parts.len(),
+                    self.doc.body_count(),
+                    if fused { " (STL fuses them into one part)" } else { "" },
                     path.display(),
                     bytes as f64 / (1024.0 * 1024.0),
                     started.elapsed().as_secs_f64() * 1000.0
@@ -2425,15 +2502,7 @@ impl Brokkr {
         }
 
         let started = Instant::now();
-        let mut turned = self.doc.active_volume().rotated(rotation);
-        // The old bricks have to be cleared out of the renderer's pool. After a
-        // turn their coordinates hold something else, or nothing at all, and a
-        // brick nobody marks is one the pool keeps drawing -- the previous pose
-        // would stay on screen underneath the new one.
-        for coord in self.doc.active_volume().brick_coords() {
-            turned.mark_dirty(coord);
-        }
-
+        let turned = self.doc.active_volume().rotated(rotation);
         self.doc.replace_active_volume(turned);
         self.unsaved = true;
         // Every entry names a brick of a volume that no longer exists, exactly
@@ -2632,16 +2701,51 @@ impl Brokkr {
 
     /// Which rows are drawn, indexed by node position.
     ///
-    /// A stand-in for the visibility resolver, which combines three inputs -- a
-    /// row's own eye, every ancestor folder's, and solo -- and arrives with the
-    /// second body there is to hide. With one row and no folders the answer IS
-    /// that row's own eye, and writing the stand-in as a map over `nodes` keeps
-    /// the call sites the shape the resolver wants.
+    /// [`Document::display_visibility`] is the resolver, and this is the
+    /// allocating wrapper the keystroke paths want: undo and redo are the two
+    /// callers, and both are gestures rather than frames. The resolver fills a
+    /// buffer the application keeps, which is what increment 6's GPU mask
+    /// needs and what this must not become.
     ///
-    /// It allocates, which is right for a keystroke and would be wrong per
-    /// frame; the resolver fills a buffer the application keeps.
+    /// `None` for solo until there is a solo to pass; the parameter is on the
+    /// resolver from its first caller precisely so that this call site is
+    /// edited once rather than discovered later.
     fn shown_nodes(&self) -> Vec<bool> {
-        self.doc.nodes().iter().map(|node| node.visible).collect()
+        let mut shown = Vec::new();
+        self.doc.display_visibility(None, &mut shown);
+        shown
+    }
+
+    /// Work out what is drawn and tell the renderer, wholesale.
+    ///
+    /// **This is the second caller of the one visibility rule**, and the reason
+    /// the rule is one function: the eye in the panel, the pick gate, the plane
+    /// cut and this all have to agree, and they agree by asking rather than by
+    /// each remembering. The answer is recomputed in full every time and never
+    /// patched -- an incremental version would be a second owner of it, and two
+    /// owners is how the eye and the viewport come to disagree after an undo,
+    /// leaving a body invisible on screen that still raycasts and still carves.
+    ///
+    /// Called from [`Brokkr::update`] after every message rather than from the
+    /// handful of places that change an eye, because "the handful of places" is
+    /// a list that goes out of date silently. It runs on the frame tick too,
+    /// so it allocates nothing: both buffers are kept and refilled.
+    ///
+    /// `None` for solo until solo exists. The parameter is on the resolver from
+    /// its first caller precisely so this line is edited once rather than
+    /// discovered later.
+    ///
+    /// **Bodies only.** Folder rows have no geometry in the pool, and passing
+    /// one to the renderer would be a name it can never match.
+    fn publish_visibility(&mut self) {
+        self.doc.display_visibility(None, &mut self.shown);
+        self.hidden_bodies.clear();
+        for (node, shown) in self.doc.nodes().iter().zip(&self.shown) {
+            if !shown && node.is_body() {
+                self.hidden_bodies.push(node.id);
+            }
+        }
+        self.shared.set_hidden(&self.hidden_bodies);
     }
 
     /// What undo and redo both do once something has actually moved.
@@ -2671,14 +2775,83 @@ impl Brokkr {
         self.refresh_overlay();
     }
 
+    /// Whether a modal card is up, and therefore owns the input.
+    ///
+    /// One list, read by both halves of the guard: `on_key` for the keyboard
+    /// and `on_pointer` for the pointer. Before this existed the pointer had
+    /// its own inline pair of checks and the keyboard had none at all, so
+    /// `ctrl+Z` under the unsaved-work prompt changed the very volume the
+    /// prompt was asking about, `x` flipped a mirror plane behind the card,
+    /// and `1`-`6` swapped the brush. The bug-report dialog was in neither
+    /// list, so a press beside its card sculpted.
+    ///
+    /// # Adding to this list is not automatically right
+    ///
+    /// It answers "is the document unreachable right now", and every card here
+    /// is a question the user must answer before anything else happens. **A
+    /// modeless overlay that takes the pointer — the split preview, whose
+    /// whole gesture is dragging a plane across the model — belongs in the
+    /// keyboard guard and NOT in the pointer one.** Split this function in two
+    /// at that point rather than widening it and quietly killing the drag.
+    fn modal_open(&self) -> bool {
+        self.confirm.is_some() || self.orient_prompt.is_some() || self.bug_report.is_some()
+    }
+
+    /// What a key press means, now that nothing in the widget tree wanted it.
+    ///
+    /// The decode itself is `viewport::shortcut`, which is a pure function of
+    /// the key and its modifiers so that it can be tested without a window —
+    /// this is the half that needs the application, and it exists so that
+    /// there is exactly one place where a key turns into a change.
+    fn on_key(
+        &mut self,
+        key: iced::keyboard::Key,
+        modifiers: iced::keyboard::Modifiers,
+    ) -> Task<Message> {
+        match key {
+            // Escape is the one key a modal must still see, so it sits above
+            // the guard: it is how the unsaved-work prompt is cancelled and
+            // the orientation prompt declined. It does NOT dismiss the bug
+            // report, and that is on purpose -- the card holds a description
+            // the user typed, and throwing it away on a stray Escape is the
+            // same class of loss the confirm prompt exists to prevent.
+            iced::keyboard::Key::Named(iced::keyboard::key::Named::Escape) => {
+                self.update(Message::MenuClosed)
+            }
+            iced::keyboard::Key::Character(character) => {
+                // THE keyboard modal guard. Everything a shortcut can reach --
+                // undo, the mirror planes, the brush numbers -- edits the
+                // document or the tool behind a card that is asking about it.
+                if self.modal_open() {
+                    return Task::none();
+                }
+                let Some(message) = crate::viewport::shortcut(
+                    character.as_str(),
+                    modifiers.command(),
+                    modifiers.shift(),
+                    modifiers.alt(),
+                ) else {
+                    return Task::none();
+                };
+                // One level of recursion and never more: `shortcut` returns
+                // ordinary messages and cannot return another `KeyPressed`.
+                self.update(message)
+            }
+            iced::keyboard::Key::Named(_) | iced::keyboard::Key::Unidentified => Task::none(),
+        }
+    }
+
     fn on_pointer(&mut self, event: PointerEvent) {
-        // While a modal prompt is up, the pointer belongs to it. The capture
-        // layer in `view` already swallows presses, but the viewport is a
-        // shader widget that sees events wherever the cursor is, so this is the
-        // guarantee rather than the belt: without it a press behind the card
-        // would sculpt into a document the user is about to discard, or into a
-        // model they are about to turn.
-        if self.confirm.is_some() || self.orient_prompt.is_some() {
+        // While a modal prompt is up, the pointer belongs to it. The scrim in
+        // `view` now genuinely swallows presses -- it is wrapped in
+        // `iced::widget::opaque`, which captures them, where the bare styled
+        // container it used to be forwarded every one -- and this is the other
+        // half of that guarantee, because the viewport is a shader widget that
+        // sees events wherever the cursor is. Both halves or neither: without
+        // this a press behind the card would sculpt into a document the user
+        // is about to discard, into a model they are about to turn, or into
+        // the very state a bug report is describing.
+        if self.modal_open() {
             return;
         }
         self.last_activity = Instant::now();
@@ -2860,7 +3033,23 @@ impl Brokkr {
     /// dialog, a save, an export -- must not run here. The event loop is the
     /// same thread that draws, so a blocking call freezes the window, which is
     /// exactly the export freeze this replaces.
+    ///
+    /// **The visibility pass is here rather than inside the arms that change
+    /// an eye, and that placement is the guarantee.** `dispatch` returns early
+    /// from several arms, and the set of messages that can change what is drawn
+    /// is not a list anyone can keep correct -- open, reset, import, undo, redo,
+    /// a delete and a solo all belong to it, and increments 9 to 13 add more.
+    /// Recomputing it once, after whatever the message did, cannot go out of
+    /// date. It costs a walk of at most `MAX_NODES` rows and no allocation.
     pub fn update(&mut self, message: Message) -> Task<Message> {
+        let task = self.dispatch(message);
+        self.publish_visibility();
+        task
+    }
+
+    /// What one message actually does. See [`Brokkr::update`], which is the
+    /// only caller and which is where the visibility pass lives.
+    fn dispatch(&mut self, message: Message) -> Task<Message> {
         match message {
             Message::Pointer(event) => self.on_pointer(event),
             Message::Frame => {
@@ -3024,11 +3213,13 @@ impl Brokkr {
                     Err(why) => format!("could not send the report: {why}"),
                 };
             }
+            Message::KeyPressed { key, modifiers } => return self.on_key(key, modifiers),
             Message::MenuClosed => {
-                // Escape is the only sender. Against an open prompt it means
-                // Cancel, which is the harmless answer -- an explicit arm
-                // rather than letting the clears below reach `confirm`, since
-                // dismissing the prompt by accident is how work gets lost.
+                // Escape is the only sender, by way of `on_key`. Against an
+                // open prompt it means Cancel, which is the harmless answer --
+                // an explicit arm rather than letting the clears below reach
+                // `confirm`, since dismissing the prompt by accident is how
+                // work gets lost.
                 if self.confirm.is_some() {
                     return self.answer_confirm(ConfirmChoice::Cancel);
                 }
@@ -3239,6 +3430,16 @@ impl Brokkr {
                             // has been centred on the origin -- which destroys
                             // the one tell there is.
                             let resting_up = brokkr_core::resting_up(&mesh.positions);
+                            // `already_reserved` stays at zero, which is what
+                            // `at` gives and what a REPLACING import needs:
+                            // `adopt_import` swaps the whole document and
+                            // `rebuild_everything` empties the pool, so the
+                            // model on screen while this runs is not competing
+                            // with the one being built. An import that JOINS a
+                            // document -- "Import as a new body", deferred out
+                            // of this arc -- has to pass the pool's watermark
+                            // here instead, or the two will overflow it
+                            // between them with nothing reporting it.
                             let options = brokkr_core::voxelise::VoxeliseOptions::at(voxel_size);
                             brokkr_core::voxelise::voxelise(&mesh, &options).map(
                                 |(volume, report)| crate::message::Imported {
@@ -4150,6 +4351,256 @@ mod tests {
         assert!(app.history.can_undo(), "escape reset the sculpt");
     }
 
+    // --- the subscription's key decode ---------------------------------------
+    //
+    // Everything in the section below this one synthesises `Message::KeyPressed`
+    // directly, which is downstream of `key_event` and cannot see it. These
+    // four cases are the only thing standing between a wrong `key_event` and a
+    // green suite: with the press arm deleted the whole keyboard is dead and
+    // every guard test still passes, guarding a message nothing can produce.
+
+    /// A window event carrying `character`, pressed or released.
+    ///
+    /// The fields beyond `key` and `modifiers` are what a real winit press
+    /// fills in and `key_event` ignores; they are here because the literal
+    /// does not compile without them.
+    fn key_window_event(character: &str, modifiers: iced::keyboard::Modifiers) -> iced::Event {
+        iced::Event::Keyboard(iced::keyboard::Event::KeyPressed {
+            key: iced::keyboard::Key::Character(character.into()),
+            modified_key: iced::keyboard::Key::Character(character.into()),
+            physical_key: iced::keyboard::key::Physical::Unidentified(
+                iced::keyboard::key::NativeCode::Unidentified,
+            ),
+            location: iced::keyboard::Location::Standard,
+            modifiers,
+            text: None,
+            repeat: false,
+        })
+    }
+
+    fn key_release_event(character: &str) -> iced::Event {
+        iced::Event::Keyboard(iced::keyboard::Event::KeyReleased {
+            key: iced::keyboard::Key::Character(character.into()),
+            modified_key: iced::keyboard::Key::Character(character.into()),
+            physical_key: iced::keyboard::key::Physical::Unidentified(
+                iced::keyboard::key::NativeCode::Unidentified,
+            ),
+            location: iced::keyboard::Location::Standard,
+            modifiers: iced::keyboard::Modifiers::empty(),
+        })
+    }
+
+    /// `listen_with` hands every event to `key_event` regardless of who wanted
+    /// it, so dropping the captured ones is the whole of the focus awareness.
+    /// Inverting this check is verbatim the bug that shipped for a year:
+    /// `1`-`7`, `s`, `u`, `x`, `y` and `z` stolen from every text field,
+    /// because a focused input reports its keystrokes captured and the
+    /// shortcut fired anyway.
+    #[test]
+    fn a_key_a_widget_already_consumed_never_reaches_the_application() {
+        let typed = key_window_event("z", ctrl());
+
+        let message = key_event(typed, iced::event::Status::Captured, iced::window::Id::unique());
+
+        assert!(
+            message.is_none(),
+            "a captured key press was forwarded, so shortcuts fire while typing"
+        );
+    }
+
+    /// The other half: an event nobody claimed becomes a `KeyPressed` carrying
+    /// exactly the key and modifiers that arrived. `on_key` decodes from those
+    /// two fields alone, so anything lost here is a shortcut that cannot fire
+    /// -- dropping the modifiers would turn every `ctrl+z` into a bare `z`.
+    #[test]
+    fn an_ignored_key_press_is_forwarded_with_its_key_and_modifiers_intact() {
+        let mut modifiers = ctrl();
+        modifiers.insert(iced::keyboard::Modifiers::SHIFT);
+        let pressed = key_window_event("z", modifiers);
+
+        let message = key_event(pressed, iced::event::Status::Ignored, iced::window::Id::unique());
+
+        let Some(Message::KeyPressed { key, modifiers: forwarded }) = message else {
+            panic!("an ignored key press produced {message:?} rather than a KeyPressed");
+        };
+        assert_eq!(key, iced::keyboard::Key::Character("z".into()));
+        assert!(forwarded.command(), "the command modifier was dropped");
+        assert!(forwarded.shift(), "the shift modifier was dropped");
+    }
+
+    /// Releases are the one thing `key_event` decodes itself, because ending a
+    /// gesture must not go through the modal guard. Only the two sizing keys
+    /// mean anything on release; every other release is somebody else's.
+    #[test]
+    fn releasing_a_sizing_key_ends_the_gesture_and_no_other_release_means_anything() {
+        for sizing in ["s", "u"] {
+            let message = key_event(
+                key_release_event(sizing),
+                iced::event::Status::Ignored,
+                iced::window::Id::unique(),
+            );
+            assert!(
+                matches!(message, Some(Message::SizingEnded)),
+                "releasing {sizing} produced {message:?} rather than ending the sizing drag"
+            );
+        }
+
+        let message = key_event(
+            key_release_event("x"),
+            iced::event::Status::Ignored,
+            iced::window::Id::unique(),
+        );
+        assert!(
+            message.is_none(),
+            "releasing x produced {message:?}; only presses carry meaning for the mirror keys"
+        );
+    }
+
+    // --- the modal keyboard and pointer guard --------------------------------
+
+    /// Press a character key the way the subscription does, on an event the
+    /// widget tree ignored.
+    ///
+    /// Note what this does NOT do: call `viewport::shortcut` and feed the
+    /// result in. That would test the decode and skip the guard, which is the
+    /// only thing these tests are about.
+    fn key(app: &mut Brokkr, character: &str, modifiers: iced::keyboard::Modifiers) {
+        update(
+            app,
+            Message::KeyPressed {
+                key: iced::keyboard::Key::Character(character.into()),
+                modifiers,
+            },
+        );
+    }
+
+    fn bare() -> iced::keyboard::Modifiers {
+        iced::keyboard::Modifiers::empty()
+    }
+
+    /// `command()` is control on this platform, and the shortcut table reads
+    /// `command()` rather than the raw bit, so the tests must set what it
+    /// reads or they prove nothing.
+    fn ctrl() -> iced::keyboard::Modifiers {
+        iced::keyboard::Modifiers::CTRL
+    }
+
+    /// The undo that used to reach through the card.
+    ///
+    /// `Message::Undo` had no guard of any kind, so ctrl+Z with the
+    /// unsaved-work prompt up rolled back the very stroke the prompt was
+    /// asking whether to keep -- and answering Save then wrote out a document
+    /// the user had not agreed to.
+    #[test]
+    fn control_z_under_a_modal_leaves_the_document_alone() {
+        let mut app = app_with_unsaved_work();
+        let front = app.camera.eye().normalize() * MODEL_RADIUS_MM;
+        update(&mut app, Message::NewSculpt);
+        assert!(app.confirm.is_some(), "the fixture never raised a prompt");
+
+        let before = app.doc.active_volume().sample_world(front);
+        key(&mut app, "z", ctrl());
+
+        assert_eq!(
+            app.doc.active_volume().sample_world(front),
+            before,
+            "ctrl+Z undid a stroke behind the prompt"
+        );
+        assert!(app.history.can_undo(), "the stroke left the undo stack");
+        assert!(app.confirm.is_some(), "the prompt went away on its own");
+    }
+
+    /// Every other shortcut, on every modal. The brush and the mirror planes
+    /// are not the document, but changing them behind a card the user is
+    /// reading is the same surprise, and `1`-`6` did exactly that.
+    #[test]
+    fn no_shortcut_fires_while_any_modal_card_is_up() {
+        fn check(what: &str, raise: impl FnOnce(&mut Brokkr)) {
+            let mut app = app_with_unsaved_work();
+            let brush = app.brush.kind;
+            raise(&mut app);
+            assert!(app.modal_open(), "{what} did not count as a modal");
+
+            key(&mut app, "x", bare());
+            key(&mut app, "2", bare());
+
+            assert!(!app.symmetry.axis(MirrorAxis::X), "x flipped a mirror plane behind {what}");
+            assert_eq!(app.brush.kind, brush, "a digit swapped the brush behind {what}");
+        }
+
+        check("the unsaved-work prompt", |app| update(app, Message::NewSculpt));
+        check("the bug report", |app| update(app, Message::BugReportOpened));
+        check("the orientation prompt", |app| {
+            app.adopt_import(imported_with(Some(brokkr_core::Facing::Back)));
+        });
+    }
+
+    /// The control for both tests above: with nothing modal up, the same three
+    /// keystrokes all land. Without this they would pass against a build where
+    /// the keyboard was simply dead.
+    #[test]
+    fn the_same_keys_all_land_with_no_modal_up() {
+        let mut app = app_with_unsaved_work();
+        let front = app.camera.eye().normalize() * MODEL_RADIUS_MM;
+        let sculpted = app.doc.active_volume().sample_world(front);
+        assert!(!app.modal_open(), "the fixture is not a fair control");
+
+        key(&mut app, "x", bare());
+        assert!(app.symmetry.axis(MirrorAxis::X), "x did not reach the mirror planes");
+
+        key(&mut app, "2", bare());
+        assert_eq!(app.brush.kind, BrushKind::ALL[1], "the digit did not reach the brush");
+
+        key(&mut app, "z", ctrl());
+        assert_ne!(
+            app.doc.active_volume().sample_world(front),
+            sculpted,
+            "ctrl+Z did not undo the stroke"
+        );
+    }
+
+    /// Escape is the exception, and has to stay one: it is how the card is
+    /// answered, so it is the one key that must pass the guard.
+    #[test]
+    fn escape_still_reaches_a_modal_through_the_key_path() {
+        let mut app = app_with_unsaved_work();
+        update(&mut app, Message::NewSculpt);
+
+        update(
+            &mut app,
+            Message::KeyPressed {
+                key: iced::keyboard::Key::Named(iced::keyboard::key::Named::Escape),
+                modifiers: bare(),
+            },
+        );
+
+        assert!(app.confirm.is_none(), "escape was swallowed by the modal guard");
+        assert!(app.unsaved, "escape discarded the work it was asking about");
+    }
+
+    /// The bug-report card was in neither guard: the pointer early return
+    /// named `confirm` and `orient_prompt` only, so a press beside the card
+    /// carved the model the report was about while the user described it.
+    #[test]
+    fn a_press_beside_the_bug_report_card_does_not_sculpt() {
+        let mut app = app();
+        update(&mut app, Message::BugReportOpened);
+        assert!(app.bug_report.is_some(), "the dialog never opened");
+
+        let front = app.camera.eye().normalize() * MODEL_RADIUS_MM;
+        let before = app.doc.active_volume().sample_world(front);
+        press(&mut app, centre_of_viewport());
+        release(&mut app);
+
+        assert_eq!(
+            app.doc.active_volume().sample_world(front),
+            before,
+            "a press reached the model behind the card"
+        );
+        assert!(app.drag.is_none(), "it started a stroke behind the card");
+        assert!(!app.unsaved, "it dirtied a document nobody had touched");
+    }
+
     #[test]
     fn discard_runs_the_pending_action() {
         let mut app = app_with_unsaved_work();
@@ -4434,6 +4885,118 @@ mod tests {
         app.doc.add_body("Body 2", brokkr_core::Volume::new(app.doc.voxel_size()));
         let problem = app.verify_written(&path).expect_err("a stale file passed the check");
         assert!(problem.contains("2"), "the mismatch did not say what it found: {problem}");
+
+        std::fs::remove_dir_all(&directory).ok();
+    }
+
+    /// **`save_project` really returns on that verification** -- the test above
+    /// proves the check works, not that anything calls it.
+    ///
+    /// That distinction was measured, not assumed: deleting the whole
+    /// `if let Err(problem) = self.verify_written(&temporary)` gate from
+    /// `save_project` left all 279 tests in this crate green. A repair that is
+    /// real, correct, unit-tested and never called is a shape this project has
+    /// shipped before, and the gate is the one standing between an unreadable
+    /// file and `clear_autosave`.
+    ///
+    /// Driving it needs a temporary that swallows every write and hands back
+    /// something else on the read, and `/dev/null` is exactly that: the save
+    /// opens the symlink, `project::write` reports success at every step, and
+    /// the read-back finds an empty file. Nothing is written through the link
+    /// that survives, and the cleanup unlinks the LINK -- `remove_file` does
+    /// not follow one -- so `/dev/null` itself is never touched.
+    ///
+    /// Rejected first: making the document disagree with the file, the trick
+    /// the test above uses. It cannot work here, because `save_project` writes
+    /// and verifies against the same `self.doc` within one call, so the two can
+    /// never disagree without an injection point that does not exist.
+    #[test]
+    fn a_save_that_cannot_read_its_own_output_back_keeps_the_previous_file() {
+        let directory = scratch("save-unreadable");
+        let path = directory.join("sculpt.brokkr");
+        std::fs::write(&path, b"the previous save, which must survive").unwrap();
+
+        let mut app = app_with_unsaved_work();
+        app.autosave_file = Some(directory.join("autosave.brokkr"));
+        app.recent = crate::recent::Recent::load_from(Some(directory.join("recent")));
+        app.write_autosave();
+        assert!(app.has_autosave(), "the fixture needs a crash net to protect");
+
+        // Where `save_project` will put its temporary, pointed somewhere that
+        // accepts the write and gives nothing back.
+        let temporary = path.with_extension("brokkr.tmp");
+        std::os::unix::fs::symlink("/dev/null", &temporary).unwrap();
+
+        app.save_project(&path);
+
+        assert!(
+            app.status.contains("could not write"),
+            "a file that read back empty reported: {}",
+            app.status
+        );
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            b"the previous save, which must survive",
+            "an unverifiable save replaced the file it could not prove it had written"
+        );
+        assert!(app.unsaved, "an unverifiable save cleared the unsaved marker");
+        assert!(app.project_path.is_none(), "an unverifiable save adopted the path anyway");
+        assert!(
+            app.has_autosave(),
+            "an unverifiable save deleted the crash net, which is the whole failure the \
+             verification exists to stop"
+        );
+        assert!(
+            std::fs::symlink_metadata(&temporary).is_err(),
+            "the temporary was left on disk after the verification refused it"
+        );
+        assert!(
+            std::path::Path::new("/dev/null").exists(),
+            "the cleanup followed the symlink instead of unlinking it"
+        );
+
+        std::fs::remove_dir_all(&directory).ok();
+    }
+
+    /// The last failure arm, and the only one reached with a good file in hand:
+    /// the write worked, the read-back agreed, and the rename still failed.
+    ///
+    /// It is here for two reasons. It is the one arm that runs *after* the
+    /// verification, so reaching it at all proves execution got past that gate
+    /// rather than around it. And it is the arm where the temporary holds the
+    /// user's only new copy, so leaving it behind, or clearing `unsaved`
+    /// because the bytes did reach a disk somewhere, would both be wrong.
+    ///
+    /// The failure is forced by putting a DIRECTORY at the TARGET, which makes
+    /// `rename` fail with `EISDIR` while leaving every step before it -- create,
+    /// write, verify -- entirely successful.
+    #[test]
+    fn a_save_that_cannot_replace_the_target_keeps_the_crash_net() {
+        let directory = scratch("save-rename");
+        let path = directory.join("sculpt.brokkr");
+        std::fs::create_dir_all(&path).unwrap();
+
+        let mut app = app_with_unsaved_work();
+        app.autosave_file = Some(directory.join("autosave.brokkr"));
+        app.recent = crate::recent::Recent::load_from(Some(directory.join("recent")));
+        app.write_autosave();
+        assert!(app.has_autosave(), "the fixture needs a crash net to protect");
+
+        app.save_project(&path);
+
+        assert!(
+            app.status.contains("could not replace"),
+            "a failed rename reported: {}",
+            app.status
+        );
+        assert!(app.unsaved, "a failed rename cleared the unsaved marker");
+        assert!(app.project_path.is_none(), "a failed rename adopted the path anyway");
+        assert!(app.has_autosave(), "a failed rename deleted the crash net");
+        assert!(
+            !path.with_extension("brokkr.tmp").exists(),
+            "a failed rename left the temporary behind, where the user would find a file \
+             holding work the application says is unsaved"
+        );
 
         std::fs::remove_dir_all(&directory).ok();
     }
@@ -5857,6 +6420,24 @@ mod tests {
         );
     }
 
+    /// The same import, with its sphere where the camera is looking.
+    ///
+    /// `adopt_import` frames the ORIGIN at `MODEL_RADIUS_MM`, and
+    /// `imported_with`'s sphere is a 6 mm ball twenty millimetres above it: a
+    /// ray through the centre of the viewport misses it completely. A test
+    /// that presses there to prove the press was STOPPED therefore proves
+    /// nothing, which is exactly what
+    /// `a_press_behind_the_orientation_prompt_does_not_sculpt` was doing --
+    /// verified by removing the guard and watching it pass.
+    fn imported_under_the_cursor(
+        resting_up: Option<brokkr_core::Facing>,
+    ) -> crate::message::Imported {
+        let mut volume = brokkr_core::Volume::new(0.5);
+        volume.seed_sphere(Vec3::ZERO, MODEL_RADIUS_MM);
+        volume.mark_everything_dirty();
+        crate::message::Imported { volume, ..imported_with(resting_up) }
+    }
+
     /// Build what a finished import delivers, with a chosen guess about which
     /// way the mesh's own up pointed.
     fn imported_with(resting_up: Option<brokkr_core::Facing>) -> crate::message::Imported {
@@ -5945,11 +6526,12 @@ mod tests {
         // is the guarantee behind it. Without both, a click behind the card
         // carves the model the user is being asked about.
         let mut app = app();
-        app.adopt_import(imported_with(Some(brokkr_core::Facing::Back)));
+        app.adopt_import(imported_under_the_cursor(Some(brokkr_core::Facing::Back)));
         assert!(app.orient_prompt.is_some());
 
         let probe = app.camera.eye().normalize() * MODEL_RADIUS_MM;
         let before = app.doc.active_volume().sample_world(probe);
+        let entries = app.history_stats.undo_entries;
         press(&mut app, centre_of_viewport());
         release(&mut app);
 
@@ -5957,6 +6539,14 @@ mod tests {
             app.doc.active_volume().sample_world(probe),
             before,
             "a press reached the model behind it"
+        );
+        // The probe above is a fixed point on the ORIGINAL sphere, and an
+        // imported model need not have surface there -- with the guard removed
+        // by hand this assertion still passed, so it is not the one doing the
+        // work. A stroke that lands anywhere at all records an undo entry.
+        assert_eq!(
+            app.history_stats.undo_entries, entries,
+            "it recorded a stroke behind the prompt"
         );
         assert!(app.drag.is_none());
     }
@@ -6406,6 +6996,231 @@ mod export_tests {
         assert_eq!(app.doc.active_volume().brick_count(), before);
         assert!(app.status.is_empty(), "nothing happened, so nothing should be reported");
     }
+
+    // --- the N-body export -------------------------------------------------
+
+    fn scratch(name: &str) -> std::path::PathBuf {
+        let directory = std::env::temp_dir().join(format!("brokkr-{name}-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).unwrap();
+        directory
+    }
+
+    /// An application holding `count` small spheres, laid out along X so they
+    /// do not touch.
+    ///
+    /// A coarse lattice and a small radius on purpose: this is about how many
+    /// bodies reach a file, and twelve default spheres at 0.25 mm would spend
+    /// the whole test welding.
+    fn app_with_bodies(count: usize) -> Brokkr {
+        let mut app = app();
+        let mut first = Volume::new(1.0);
+        first.seed_sphere(Vec3::ZERO, 8.0);
+        let mut doc = Document::from_volume(first);
+        for index in 1..count {
+            let mut volume = Volume::new(1.0);
+            volume.seed_sphere(Vec3::new(index as f32 * 48.0, 0.0, 0.0), 8.0);
+            doc.add_body(format!("Body {}", index + 1), volume);
+        }
+        app.doc = doc;
+        app.rebuild_everything();
+        app
+    }
+
+    /// Turn one row's eye off through the document's own snapshot path, which
+    /// is what the panel will do.
+    fn hide(app: &mut Brokkr, at: usize) {
+        let id = app.doc.nodes()[at].id;
+        let mut meta = app.doc.meta(id).expect("the row is in the document");
+        meta.visible = false;
+        app.doc.set_meta(&meta);
+    }
+
+    /// **Twelve bodies with one hidden export eleven, and the status says so in
+    /// those words.**
+    ///
+    /// Decisions 4 and 10 both rest on this string. The eye is one bit in a
+    /// forty-byte node record with no checksum over it, and it is the bit that
+    /// decides whether a part reaches the printer -- a flipped bit is a legal
+    /// value that loads without any error at all. The brick stream has a
+    /// checked distance decode defending it; the node table has nothing. Naming
+    /// the count is the whole of that defence, which is why it is asserted
+    /// rather than assumed.
+    #[test]
+    fn a_hidden_body_is_omitted_and_the_status_names_how_many() {
+        let directory = scratch("export-hidden");
+        let path = directory.join("twelve.obj");
+        let mut app = app_with_bodies(12);
+        hide(&mut app, 4);
+
+        app.export(ExportFormat::Obj, &path);
+
+        assert!(
+            app.status.contains("exported 11 of 12 bodies; 1 hidden"),
+            "the omitted count is not in the status: {}",
+            app.status
+        );
+        let written = std::fs::read_to_string(&path).expect("the file should be there");
+        let objects: Vec<&str> = written.lines().filter(|line| line.starts_with("o ")).collect();
+        assert_eq!(objects.len(), 11, "eleven bodies should have reached the file: {objects:?}");
+        assert!(
+            !objects.contains(&"o Body 5"),
+            "the hidden body reached the file anyway: {objects:?}"
+        );
+
+        std::fs::remove_dir_all(&directory).ok();
+    }
+
+    /// **And a document with nothing hidden still names the count.**
+    ///
+    /// Split out from the test above because it is the case a conditional
+    /// message would get wrong, and a conditional message is the obvious
+    /// "improvement" somebody makes later: if the line only appears when
+    /// something was hidden, silence means either "nothing was hidden" or "the
+    /// count was never worked out", and those are the two readings the count
+    /// exists to keep apart.
+    #[test]
+    fn a_document_with_nothing_hidden_still_names_the_count() {
+        let directory = scratch("export-none-hidden");
+        let path = directory.join("one.stl");
+        let mut app = app();
+
+        app.export(ExportFormat::Stl, &path);
+
+        assert!(
+            app.status.contains("exported 1 of 1 bodies; 0 hidden"),
+            "the count is missing from a plain single-body export: {}",
+            app.status
+        );
+        std::fs::remove_dir_all(&directory).ok();
+    }
+
+    /// A single body's STL is byte for byte what the single-mesh writer
+    /// produces, end to end through the application.
+    ///
+    /// **What this proves on its own is narrower than its name suggests**, and
+    /// worth stating so nobody reads it as the byte pin it is not. Both sides
+    /// end in `stl::write_all`, so a change to the writer moves them together
+    /// and this test cannot see it. What it does see is everything the
+    /// application wraps around the writer -- `export_bodies`, the per-body
+    /// weld, `document_verdict`, the file creation -- adding nothing to a
+    /// one-body file. The bytes themselves are pinned in `brokkr-core` by
+    /// `export::stl::tests::a_known_mesh_writes_the_bytes_committed_in_the_golden`
+    /// against a committed fixture. The two together are what pins the file a
+    /// user receives; neither one does it alone.
+    ///
+    /// The shipped, verified property: an STL out of this build has been opened
+    /// in a slicer and printed. STL carries no object names, so it is the one
+    /// format where the N-body path can be identical rather than merely
+    /// equivalent -- OBJ and 3MF now carry the body's name where they used to
+    /// carry the literal `BrokkrSculpt`, which is the only byte that moves.
+    #[test]
+    fn a_single_body_export_is_byte_identical_to_the_single_mesh_writer() {
+        let directory = scratch("export-identical");
+        let path = directory.join("one.stl");
+        let mut app = app();
+
+        app.export(ExportFormat::Stl, &path);
+        let written = std::fs::read(&path).expect("the file should be there");
+
+        let (mesh, report) = app.doc.active_volume().export_mesh();
+        assert!(report.is_printable());
+        let mut expected = Vec::new();
+        brokkr_core::export::stl::write(&mesh, &mut expected).unwrap();
+        assert_eq!(written, expected, "the N-body path changed a one-body STL");
+
+        std::fs::remove_dir_all(&directory).ok();
+    }
+
+    /// Several bodies in one STL are named as fused, because the format has
+    /// nowhere to put an object boundary and a slicer will load them as one
+    /// part. Better said here than discovered after slicing.
+    #[test]
+    fn an_stl_of_several_bodies_says_they_arrive_as_one_part() {
+        let directory = scratch("export-stl-fused");
+        let path = directory.join("three.stl");
+        let mut app = app_with_bodies(3);
+
+        app.export(ExportFormat::Stl, &path);
+        assert!(app.status.contains("exported 3 of 3 bodies"), "{}", app.status);
+        assert!(
+            app.status.contains("STL fuses them into one part"),
+            "an STL of three bodies did not say what it did with them: {}",
+            app.status
+        );
+        std::fs::remove_dir_all(&directory).ok();
+    }
+
+    /// **A body that would not print refuses the whole export, and refuses it
+    /// before the file is opened.**
+    ///
+    /// `File::create` truncates, so a verdict taken after it destroys the file
+    /// the user was about to print -- and the natural per-body refactor is
+    /// exactly the one that moves the check down past the open. The previous
+    /// export was left in place here, unread and unchanged.
+    #[test]
+    fn an_unprintable_body_refuses_before_the_file_is_opened() {
+        let directory = scratch("export-refusal");
+        let path = directory.join("keepme.obj");
+        std::fs::write(&path, b"the previous export, which must survive").unwrap();
+
+        let mut app = app_with_bodies(2);
+        // An empty body prints nothing, and the sum over the document would
+        // still read as watertight -- see `document_verdict`.
+        let empty = app.doc.nodes()[1].id;
+        *app.doc.volume_mut(empty).expect("a body") = Volume::new(1.0);
+
+        app.export(ExportFormat::Obj, &path);
+
+        assert!(app.status.starts_with("not exported"), "reported: {}", app.status);
+        assert!(app.status.contains("Body 2"), "the refusal must name the body: {}", app.status);
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            b"the previous export, which must survive",
+            "the refusal opened and truncated the file before deciding"
+        );
+
+        std::fs::remove_dir_all(&directory).ok();
+    }
+
+    /// **The detail guard measures the whole document, not the active body.**
+    ///
+    /// It never did: `too_fine_for_the_pool` reads `doc_stats`, which is a sum
+    /// over every body, and the numbers below are what makes the difference
+    /// visible. Two bodies of 0.8 GiB each is 1.6 GiB, and one halving of the
+    /// voxel quadruples a shell -- 6.4 GiB, past the ceiling. Either body ALONE
+    /// would come to 3.2 GiB and be admitted. A guard that asked the active
+    /// body would step straight past the ceiling with the second body's bricks
+    /// unaccounted for, and the first thing to report it would be the machine
+    /// swapping.
+    #[test]
+    fn a_two_body_document_over_the_ceiling_refuses_the_finer_step() {
+        let mut app = app_with_bodies(2);
+        assert_eq!(app.doc.body_count(), 2);
+
+        // `doc_stats` really is the sum, measured rather than assumed.
+        let per_body: usize =
+            app.doc.bodies().map(|(_, volume)| volume.stats().resident_bytes).sum();
+        assert_eq!(app.doc_stats.resident_bytes, per_body);
+        assert!(
+            app.doc_stats.resident_bytes > app.doc.active_volume().stats().resident_bytes,
+            "the fixture's two bodies must not cost the same as one"
+        );
+
+        let each = 0.8 * 1024.0 * 1024.0 * 1024.0;
+        assert!(each * 4.0 < MAX_VOLUME_BYTES, "either body alone has to be admitted");
+        assert!(each * 2.0 * 4.0 > MAX_VOLUME_BYTES, "the pair has to be refused");
+        app.doc_stats.resident_bytes = (each * 2.0) as usize;
+
+        let before = app.doc.voxel_size();
+        update(&mut app, Message::Resample(before / 2.0));
+
+        assert!(app.doc.voxel_size() > before / 2.0, "the halving should not have been allowed");
+        assert!(
+            app.status.contains("finest the mesh pool holds"),
+            "the cap should be reported: {}",
+            app.status
+        );
+    }
 }
 
 #[cfg(test)]
@@ -6662,6 +7477,289 @@ mod timeline_tests {
         app.open_project(&without);
         assert!(app.timeline.keys.is_empty(), "the previous model's keys are still on the strip");
         assert!(!app.timeline.playing);
+
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+}
+
+/// The one rule about what is drawn, checked from both ends.
+///
+/// Visibility has three inputs -- a body's own eye, every ancestor folder's
+/// eye, and solo -- resolved in one function in `brokkr-core` and read by the
+/// panel, the pick gate, the plane cut and the renderer. These tests are about
+/// the last of those: that what the renderer has been told never disagrees
+/// with what the document says. When those two drift, a body is missing from
+/// the viewport while its row still reads "visible", and it still raycasts and
+/// still carves -- which is not a failure anyone can reproduce from a
+/// description.
+#[cfg(test)]
+mod visibility_tests {
+    use super::*;
+    use brokkr_core::NodeMeta;
+    use iced::Vector;
+
+    fn update(app: &mut Brokkr, message: Message) {
+        drop(app.update(message));
+    }
+
+    fn app() -> Brokkr {
+        Brokkr::with_tablet(crate::tablet::Tablet::inert())
+    }
+
+    /// A second body with something in it, so that hiding it is a question
+    /// about geometry rather than about an empty row.
+    fn add_body(app: &mut Brokkr, name: &str) -> NodeId {
+        let mut volume = Volume::new(app.doc.voxel_size());
+        volume.seed_sphere(Vec3::new(60.0, 0.0, 0.0), 10.0);
+        volume.mark_everything_dirty();
+        app.doc.add_body(name, volume)
+    }
+
+    fn set_eye(app: &mut Brokkr, id: NodeId, visible: bool) {
+        let meta = NodeMeta { visible, ..app.doc.meta(id).expect("the body is in the document") };
+        app.doc.set_meta(&meta);
+    }
+
+    /// What the document says is hidden, worked out from the resolver rather
+    /// than from `publish_visibility`'s own fold.
+    fn hidden_by_the_document(doc: &brokkr_core::Document) -> Vec<NodeId> {
+        let mut shown = Vec::new();
+        doc.display_visibility(None, &mut shown);
+        doc.nodes()
+            .iter()
+            .zip(&shown)
+            .filter(|(node, shown)| !**shown && node.is_body())
+            .map(|(node, _)| node.id)
+            .collect()
+    }
+
+    fn assert_agrees(app: &Brokkr, after: &str) {
+        assert_eq!(
+            app.shared.hidden_snapshot(),
+            hidden_by_the_document(&app.doc),
+            "the renderer and the document disagree about what is drawn, after {after}"
+        );
+    }
+
+    /// **After every message**, which is why the check is written as a loop
+    /// over messages rather than as one assertion per feature.
+    ///
+    /// The pass runs in `update` rather than in the arms that change an eye,
+    /// precisely because "the arms that change an eye" is a list that goes out
+    /// of date silently -- open, reset, import, undo, redo, delete and solo all
+    /// belong to it, and increments 9 to 13 add more. If someone moves the pass
+    /// back into the arms, this test is what fails.
+    #[test]
+    fn the_renderers_hidden_set_agrees_with_the_document_after_every_message() {
+        let mut app = app();
+        let second = add_body(&mut app, "Body 2");
+        set_eye(&mut app, second, false);
+
+        // Nothing has been dispatched yet, so this is also the check that the
+        // constructor published something rather than leaving the renderer to
+        // find out on the first frame.
+        update(&mut app, Message::Frame);
+        assert_eq!(
+            app.shared.hidden_snapshot(),
+            vec![second],
+            "a hidden body never reached the renderer at all"
+        );
+
+        // A stroke, so undo and redo have something to move.
+        app.on_pointer(PointerEvent::Moved {
+            position: Vector::new(640.0, 360.0),
+            size: Vector::new(1280.0, 720.0),
+        });
+        app.on_pointer(PointerEvent::Pressed {
+            button: PointerButton::Left,
+            position: Vector::new(640.0, 360.0),
+            size: Vector::new(1280.0, 720.0),
+        });
+        app.on_pointer(PointerEvent::Released { button: PointerButton::Left });
+
+        let messages = [
+            Message::Frame,
+            Message::BrushKindChanged(BrushKind::Draw),
+            Message::SymmetryAxisToggled(MirrorAxis::X),
+            Message::StatsToggled,
+            Message::Undo,
+            Message::Redo,
+            Message::Undo,
+            Message::Frame,
+        ];
+        for message in messages {
+            let named = format!("{message:?}");
+            update(&mut app, message);
+            assert_agrees(&app, &named);
+        }
+
+        // Showing it again has to travel the same way, or the eye turns things
+        // off and never back on.
+        set_eye(&mut app, second, true);
+        update(&mut app, Message::Frame);
+        assert!(app.shared.hidden_snapshot().is_empty(), "the body never came back");
+        assert_agrees(&app, "showing the body again");
+    }
+
+    /// A whole-document swap must not leave the renderer holding the previous
+    /// document's ids.
+    ///
+    /// Ids restart from 1 in every new document, so a stale hidden set does not
+    /// merely name something absent -- it names a real body in the new
+    /// document, and hides it.
+    #[test]
+    fn opening_and_resetting_do_not_leave_the_previous_documents_ids_hidden() {
+        let directory =
+            std::env::temp_dir().join(format!("brokkr-visibility-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("two-bodies.brokkr");
+
+        let mut app = app();
+        let second = add_body(&mut app, "Body 2");
+        set_eye(&mut app, second, false);
+        update(&mut app, Message::Frame);
+        assert_eq!(app.shared.hidden_snapshot(), vec![second]);
+        app.save_project(&path);
+
+        // Reset first: one body, nothing hidden, and the id the old second body
+        // used is now free for something else to be given.
+        update(&mut app, Message::ResetSphere);
+        assert!(app.confirm.is_none(), "the fixture had unsaved work and never reset");
+        assert!(
+            app.shared.hidden_snapshot().is_empty(),
+            "the reset document is still hiding an id from the document before it"
+        );
+        assert_agrees(&app, "a reset");
+
+        // ...and opening the saved file brings the hidden body back, because
+        // the eye is persisted state and a reopen is not a view mode.
+        app.open_project(&path);
+        assert!(!app.status.contains("could not"), "open reported: {}", app.status);
+        assert_eq!(
+            app.shared.hidden_snapshot().len(),
+            1,
+            "the saved eye did not reach the renderer after the open"
+        );
+        assert_agrees(&app, "an open");
+
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    /// **Hiding is a draw-time skip**, so it must not dirty a single brick.
+    ///
+    /// The other half of this rule -- that no pool space moves either -- is in
+    /// `brokkr-gpu`, because `vertices_reserved` and `vertices_watermark` do
+    /// not exist outside it. This is the half that can be seen from here, and
+    /// it is the one that would be broken by the obvious wrong implementation:
+    /// marking the hidden body's bricks dirty so they mesh to nothing.
+    #[test]
+    fn hiding_and_showing_a_body_marks_no_brick_dirty() {
+        let mut app = app();
+        let second = add_body(&mut app, "Body 2");
+        update(&mut app, Message::Frame);
+
+        // Settle: whatever the new body brought with it is meshed, so anything
+        // dirty after this point was dirtied by the eye. The second call is
+        // what makes the fixture honest -- `perf.dirty_bricks` is written by
+        // `remesh_dirty` and by nothing else, so a stale one from the first
+        // call would make every assertion below pass or fail for the wrong
+        // reason.
+        app.remesh_dirty();
+        app.remesh_dirty();
+        assert_eq!(app.perf.dirty_bricks, 0, "the fixture did not settle");
+
+        for visible in [false, true, false] {
+            set_eye(&mut app, second, visible);
+            update(&mut app, Message::Frame);
+            app.remesh_dirty();
+            assert_eq!(
+                app.perf.dirty_bricks,
+                0,
+                "turning the eye {} marked bricks for a remesh",
+                if visible { "on" } else { "off" }
+            );
+        }
+    }
+}
+
+/// What the four whole-document swap sites owe the renderer.
+///
+/// Increment 6 deleted eleven lines of stale-coordinate marking from
+/// `reset_sculpt`, `open_project`, `adopt_import` and `orient` -- loops that
+/// collected the outgoing model's brick coordinates and marked them dirty in
+/// the incoming volume so they would mesh to nothing and release their pool
+/// slices. All four were already dead, and the reason is entirely in this
+/// module: all four call `rebuild_everything`, and that asks the renderer to
+/// empty the pool, which drops every slot regardless of what key it was under.
+///
+/// **The reasoning is only as durable as the reset**, and nothing asserted the
+/// reset before this. If `rebuild_everything` ever stops asking for one, all
+/// four of these functions start leaving the previous model drawn underneath
+/// the new one -- and with the loops gone there is nothing else that would
+/// have cleared it.
+#[cfg(test)]
+mod swap_site_tests {
+    use super::*;
+
+    /// One whole-document swap, so the four can be driven by one loop and none
+    /// of them can be left out of it by accident.
+    type Swap = Box<dyn Fn(&mut Brokkr)>;
+
+    fn app() -> Brokkr {
+        Brokkr::with_tablet(crate::tablet::Tablet::inert())
+    }
+
+    /// Every whole-document swap empties the pool, and the swap itself is
+    /// enough -- no caller has to remember anything extra.
+    #[test]
+    fn every_whole_document_swap_asks_the_renderer_to_empty_the_pool() {
+        let directory = std::env::temp_dir().join(format!("brokkr-swaps-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("saved.brokkr");
+
+        let mut app = app();
+        app.save_project(&path);
+
+        // Each case: clear whatever is pending by standing in for the frame
+        // that would consume it, do the swap, and assert the request is back.
+        let cases: [(&str, Swap); 4] = [
+            ("reset", Box::new(|app: &mut Brokkr| app.reset_sculpt())),
+            ("open", Box::new(move |app: &mut Brokkr| app.open_project(&path))),
+            (
+                "import",
+                Box::new(|app: &mut Brokkr| {
+                    let mut volume = Volume::new(app.doc.voxel_size());
+                    volume.seed_sphere(Vec3::ZERO, 12.0);
+                    volume.mark_everything_dirty();
+                    app.adopt_import(crate::message::Imported {
+                        volume,
+                        source: std::path::PathBuf::from("fixture.stl"),
+                        report: brokkr_core::voxelise::VoxeliseReport::default(),
+                        elapsed_ms: 0.0,
+                        resting_up: None,
+                    });
+                }),
+            ),
+            (
+                "orient",
+                Box::new(|app: &mut Brokkr| {
+                    app.orient(brokkr_core::AxisRotation::taking(
+                        brokkr_core::Facing::Front,
+                        brokkr_core::Facing::Up,
+                    ));
+                }),
+            ),
+        ];
+
+        for (name, swap) in cases {
+            app.shared.take_pool_reset_for_tests();
+            swap(&mut app);
+            assert!(
+                app.shared.take_pool_reset_for_tests(),
+                "a {name} left the outgoing model's slots in the pool, so its triangles stay on \
+                 screen underneath the new document"
+            );
+        }
 
         let _ = std::fs::remove_dir_all(&directory);
     }

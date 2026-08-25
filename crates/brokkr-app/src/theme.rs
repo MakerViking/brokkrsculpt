@@ -240,9 +240,12 @@ pub fn danger_button(
 /// The dimming layer behind a modal prompt.
 ///
 /// Dark but translucent: the question is about the sculpt, so the sculpt has to
-/// stay visible behind it. Its real job is not decoration -- it is the widget
-/// that swallows presses, because the `stack!` layers this interface already
-/// uses do not block the widgets underneath them.
+/// stay visible behind it.
+///
+/// **Decoration only.** This used to say its real job was swallowing presses,
+/// and that was simply false — a styled `container` forwards every event it is
+/// given. The widget that swallows them is `panel::modal_layer`'s `opaque`
+/// wrapper; this only makes the dead area look dead.
 pub fn scrim(_theme: &iced::Theme) -> iced::widget::container::Style {
     iced::widget::container::Style {
         background: Some(rgba(0x00, 0x00, 0x00, 0.55).into()),

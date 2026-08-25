@@ -631,6 +631,7 @@ mod tests {
             repair_broken_scan_lines: true,
             coarsen_to_fit: false,
             refine_to_resolve: false,
+            already_reserved: 0.0,
         }
     }
 

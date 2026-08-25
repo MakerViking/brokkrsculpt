@@ -14,8 +14,8 @@ use std::sync::Arc;
 
 use brokkr_core::{BrushKind, FalloffCurve, MirrorAxis, PatternKind};
 use iced::widget::{
-    button, checkbox, column, container, mouse_area, pick_list, rich_text, row, scrollable, sensor,
-    slider, space, span, stack, text, text_editor, text_input,
+    button, checkbox, column, container, mouse_area, opaque, pick_list, rich_text, row, scrollable,
+    sensor, slider, space, span, stack, text, text_editor, text_input,
 };
 use iced::{Alignment, Element, Length, Padding};
 
@@ -273,7 +273,7 @@ impl Brokkr {
 
     /// The modal prompt shown when an action would discard unsaved work.
     ///
-    /// Two layers, and both are load bearing. The scrim is full size and
+    /// Two layers, and both are load bearing. `modal_layer` is full size and
     /// swallows presses, because iced 0.14 has no modal and a bare `stack!`
     /// layer lets clicks through to the sliders and the Reset button
     /// underneath. The card sits on it, centred, using `menu_card` rather than
@@ -321,13 +321,7 @@ impl Brokkr {
         .padding(theme::S5)
         .style(theme::menu_card);
 
-        container(card)
-            .width(Length::Fill)
-            .height(Length::Fill)
-            .align_x(Alignment::Center)
-            .align_y(Alignment::Center)
-            .style(theme::scrim)
-            .into()
+        modal_layer(card)
     }
 
     /// The bug report dialog.
@@ -415,13 +409,7 @@ impl Brokkr {
         .padding(theme::S5)
         .style(theme::menu_card);
 
-        container(card)
-            .width(Length::Fill)
-            .height(Length::Fill)
-            .align_x(Alignment::Center)
-            .align_y(Alignment::Center)
-            .style(theme::scrim)
-            .into()
+        modal_layer(card)
     }
 
     /// The panel that drops from an open top bar menu.
@@ -562,8 +550,9 @@ impl Brokkr {
     /// in both states.** It does not report a statistic, it reports that part
     /// of the model is not on the screen — and this project has already shipped
     /// that failure twice as something the user had to go looking for. It is
-    /// also not a flicker: `overflowed` only clears on a whole-model rebuild,
-    /// so once it is up it stays up until the condition is actually gone.
+    /// also not a flicker: `overflowed` clears only when the pool actually gets
+    /// space back -- a whole-model rebuild, or a body being deleted -- so once
+    /// it is up it stays up until the condition is really gone.
     fn overlay(&self) -> Element<'_, Message> {
         let pool = self.shared.stats();
 
@@ -585,8 +574,15 @@ impl Brokkr {
         }
 
         if pool.overflowed > 0 {
-            let warning =
-                format!("MESH POOL FULL: {} bricks missing from the view", pool.overflowed);
+            // What frees space is named, because the obvious remedy does not
+            // work: hiding a body is a draw-time skip and it keeps every slice
+            // it holds. A user reading "the pool is full" and reaching for the
+            // eye would see the count stay exactly where it is.
+            let warning = format!(
+                "MESH POOL FULL: {} bricks missing from the view\ndelete a body or resample \
+                 coarser -- hiding one frees nothing",
+                pool.overflowed
+            );
             stacked = stacked.push(
                 container(
                     text(warning)
@@ -627,8 +623,8 @@ impl Brokkr {
                 self.perf.load_ms
             ),
             format!(
-                "{} triangles   {} drawn / {} culled bricks",
-                pool.triangles, pool.drawn, pool.culled
+                "{} triangles   {} drawn / {} culled / {} hidden bricks",
+                pool.triangles, pool.drawn, pool.culled, pool.hidden
             ),
             format!(
                 "brush {}   mirror {}   radius {:.2} mm",
@@ -734,9 +730,9 @@ impl Brokkr {
 
     /// Offer to stand an imported model up.
     ///
-    /// Modal, and on the same scrim as the unsaved-work prompt, for the reason
-    /// documented there: a bare `stack!` layer in iced 0.14 lets clicks through
-    /// to the sliders underneath.
+    /// Modal, and on the same `modal_layer` as the unsaved-work prompt, for
+    /// the reason documented there: a bare `stack!` layer in iced 0.14 lets
+    /// clicks through to the sliders underneath.
     fn orient_prompt_card(&self, up: brokkr_core::Facing) -> Element<'_, Message> {
         type ButtonStyle = fn(&iced::Theme, button::Status) -> button::Style;
         let answer = |label: &'static str, accept: bool, style: ButtonStyle| {
@@ -779,13 +775,7 @@ impl Brokkr {
         .width(Length::Fixed(420.0))
         .style(theme::menu_card);
 
-        container(card)
-            .width(Length::Fill)
-            .height(Length::Fill)
-            .align_x(Alignment::Center)
-            .align_y(Alignment::Center)
-            .style(theme::scrim)
-            .into()
+        modal_layer(card)
     }
 
     /// The current tool's own controls, at the cursor.
@@ -1706,4 +1696,39 @@ impl Brokkr {
         .spacing(theme::S2)
         .into()
     }
+}
+
+/// Centre a modal card on a layer that dims the application and swallows the
+/// presses that would otherwise reach it.
+///
+/// # The dimming was never the part that made it modal
+///
+/// Every one of the three cards used to build this shape itself, with a
+/// comment saying the scrim "swallows presses". It did not. `theme::scrim` is
+/// a `container` *style*, and `container::update`
+/// (`iced_widget-0.14.2/src/container.rs:298`) forwards the event to its child
+/// and returns — it never calls `shell.capture_event`, so a press over the
+/// dimmed area travelled straight on to the shader widget underneath and
+/// sculpted the model the card was asking about. `iced::widget::opaque` is the
+/// piece that was missing: it captures mouse presses inside its bounds
+/// (`helpers.rs:577`), and `Stack::update` walks its children topmost-first and
+/// stops at the first capture (`stack.rs:249-264`), so the layers below never
+/// see it.
+///
+/// This is a legal capture under the rule the viewport is written to: **only
+/// bounds-checked events may capture**. `opaque` captures presses only, only
+/// when the cursor is over it — never a move and never a release, so a drag
+/// that started before the card appeared still ends properly.
+///
+/// The window's resize strips are stacked *above* the card in `view`, so they
+/// keep working: reverse traversal reaches them first.
+fn modal_layer<'a>(card: impl Into<Element<'a, Message>>) -> Element<'a, Message> {
+    opaque(
+        container(card)
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .align_x(Alignment::Center)
+            .align_y(Alignment::Center)
+            .style(theme::scrim),
+    )
 }

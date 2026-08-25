@@ -8,7 +8,7 @@
 //! given. The Iced glue that satisfies the `shader` widget's traits lives in
 //! `brokkr-app`.
 
-use brokkr_core::{BrickMesh, Vertex};
+use brokkr_core::{BrickMesh, NodeId, Vertex};
 use bytemuck::{Pod, Zeroable};
 
 use crate::frustum::Frustum;
@@ -326,6 +326,42 @@ impl SculptRenderer {
         mesh: &BrickMesh,
     ) {
         self.pool.upload(device, queue, key, mesh);
+    }
+
+    /// Drop every brick one body owns and give its pool space back.
+    ///
+    /// For a body that has left the document. The caller must have made sure
+    /// no upload for that body is still queued -- see `SharedFrame::apply` in
+    /// the application, which drains the forget list before the uploads and
+    /// throws away any pending upload that names a forgotten body. Applying
+    /// them in the other order re-uploads the meshes that were just released,
+    /// which draws a sliver of a deleted body forever with no counter moving.
+    ///
+    /// See [`MeshPool::forget_body`] for what it does to the allocator and to
+    /// the overflow banner, and for the remesh the caller owes it afterwards.
+    pub fn forget_body(&mut self, body: NodeId) -> usize {
+        self.pool.forget_body(body)
+    }
+
+    /// Replace the set of bodies the sculpt pass must not draw.
+    ///
+    /// Wholesale, from the application's one visibility pass. See
+    /// [`MeshPool::set_hidden`].
+    pub fn set_hidden(&mut self, hidden: &[NodeId]) {
+        self.pool.set_hidden(hidden);
+    }
+
+    /// How many of one body's bricks the pool holds, for tests that have to
+    /// tell "gone" from "still there but not drawn".
+    pub fn body_bricks(&self, body: NodeId) -> usize {
+        self.pool.body_bricks(body)
+    }
+
+    /// What the renderer was last told not to draw, for tests that have to
+    /// tell "the hidden set arrived" from "the hidden set was published".
+    /// See [`MeshPool::hidden_bodies`].
+    pub fn hidden_bodies(&self) -> &[NodeId] {
+        self.pool.hidden_bodies()
     }
 
     pub fn write_uniforms(&self, queue: &wgpu::Queue, uniforms: &Uniforms) {

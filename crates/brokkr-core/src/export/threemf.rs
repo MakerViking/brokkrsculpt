@@ -15,11 +15,12 @@
 //! there is nothing here to keep up with.
 //!
 //! What this writer produces is a deliberately degenerate subset of the format:
-//! stored entries only, one namespace, always millimetres, one object and no
-//! transforms. [`crate::import::threemf`] reads it back in the tests, which is
-//! what stops this module being checked only against its own assumptions -- but
-//! that reader is not tested against this writer alone, precisely because
-//! agreeing with it would prove nothing about a real file.
+//! stored entries only, one namespace, always millimetres, and no transforms --
+//! a body's position IS its brick occupancy, so there is nothing for a
+//! transform to say. [`crate::import::threemf`] reads it back in the tests,
+//! which is what stops this module being checked only against its own
+//! assumptions -- but that reader is not tested against this writer alone,
+//! precisely because agreeing with it would prove nothing about a real file.
 //!
 //! # Colour is not in the specification's terms
 //!
@@ -114,49 +115,72 @@ impl Default for Filaments {
     }
 }
 
-/// Build the model XML for a mesh.
+/// Build the model XML for a document's bodies.
 ///
 /// Coordinates are written with enough digits to round trip an `f32` exactly,
 /// because a 3MF is often the archival copy of a model.
-fn model_xml(mesh: &ExportMesh) -> String {
-    let mut xml = String::with_capacity(mesh.positions.len() * 48 + mesh.triangles.len() * 40);
+///
+/// **Each body is its own `<object>` with its own `<item>` in the build**, and
+/// the ids are 1-based positions in the list. That is the shape a slicer needs
+/// to keep them as separate parts on the plate: one object with several
+/// disjoint shells loads as a single part that cannot be moved, assigned a
+/// filament, or deleted independently. Indices stay per object -- 3MF numbers
+/// vertices within an object, unlike OBJ -- so there is no running offset here
+/// and adding one would be the bug.
+fn model_xml(bodies: &[(&str, &ExportMesh)]) -> String {
+    let capacity: usize =
+        bodies.iter().map(|(_, mesh)| mesh.positions.len() * 48 + mesh.triangles.len() * 40).sum();
+    let mut xml = String::with_capacity(capacity);
     xml.push_str("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n");
     xml.push_str(&format!(
         "<model unit=\"millimeter\" xml:lang=\"en-US\" xmlns=\"{CORE_NAMESPACE}\">\n"
     ));
     xml.push_str(" <metadata name=\"Application\">BrokkrSculpt</metadata>\n");
-    xml.push_str(" <resources>\n  <object id=\"1\" type=\"model\">\n   <mesh>\n");
+    xml.push_str(" <resources>\n");
 
-    xml.push_str("    <vertices>\n");
-    for position in &mesh.positions {
-        let position = to_print_space(*position);
-        xml.push_str(&format!(
-            "     <vertex x=\"{}\" y=\"{}\" z=\"{}\"/>\n",
-            position.x, position.y, position.z
-        ));
-    }
-    xml.push_str("    </vertices>\n");
+    for (index, (_, mesh)) in bodies.iter().enumerate() {
+        let id = index + 1;
+        xml.push_str(&format!("  <object id=\"{id}\" type=\"model\">\n   <mesh>\n"));
 
-    xml.push_str("    <triangles>\n");
-    for [a, b, c] in &mesh.triangles {
-        // The triangle's filament is the slot of its FIRST corner, which is the
-        // same rule the renderer's provoking vertex uses. Picking a different
-        // corner here would let the preview and the file disagree at every
-        // colour boundary, and nothing would catch it but the eye.
-        let slot = mesh.slots.get(*a as usize).copied().unwrap_or(0);
-        match paint_code(slot) {
-            Some(code) => xml.push_str(&format!(
-                "     <triangle v1=\"{a}\" v2=\"{b}\" v3=\"{c}\" paint_color=\"{code}\"/>\n"
-            )),
-            // Unassigned. The object's own `extruder` metadata decides, which is
-            // what an unpainted triangle means in a real file.
-            None => xml.push_str(&format!("     <triangle v1=\"{a}\" v2=\"{b}\" v3=\"{c}\"/>\n")),
+        xml.push_str("    <vertices>\n");
+        for position in &mesh.positions {
+            let position = to_print_space(*position);
+            xml.push_str(&format!(
+                "     <vertex x=\"{}\" y=\"{}\" z=\"{}\"/>\n",
+                position.x, position.y, position.z
+            ));
         }
-    }
-    xml.push_str("    </triangles>\n");
+        xml.push_str("    </vertices>\n");
 
-    xml.push_str("   </mesh>\n  </object>\n </resources>\n");
-    xml.push_str(" <build>\n  <item objectid=\"1\"/>\n </build>\n");
+        xml.push_str("    <triangles>\n");
+        for [a, b, c] in &mesh.triangles {
+            // The triangle's filament is the slot of its FIRST corner, which is
+            // the same rule the renderer's provoking vertex uses. Picking a
+            // different corner here would let the preview and the file disagree
+            // at every colour boundary, and nothing would catch it but the eye.
+            let slot = mesh.slots.get(*a as usize).copied().unwrap_or(0);
+            match paint_code(slot) {
+                Some(code) => xml.push_str(&format!(
+                    "     <triangle v1=\"{a}\" v2=\"{b}\" v3=\"{c}\" paint_color=\"{code}\"/>\n"
+                )),
+                // Unassigned. The object's own `extruder` metadata decides,
+                // which is what an unpainted triangle means in a real file.
+                None => {
+                    xml.push_str(&format!("     <triangle v1=\"{a}\" v2=\"{b}\" v3=\"{c}\"/>\n"))
+                }
+            }
+        }
+        xml.push_str("    </triangles>\n");
+
+        xml.push_str("   </mesh>\n  </object>\n");
+    }
+    xml.push_str(" </resources>\n");
+
+    xml.push_str(" <build>\n");
+    for index in 0..bodies.len() {
+        xml.push_str(&format!("  <item objectid=\"{}\"/>\n", index + 1));
+    }
+    xml.push_str(" </build>\n");
     xml.push_str("</model>\n");
     xml
 }
@@ -174,22 +198,56 @@ const RELATIONSHIPS: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
 </Relationships>
 "#;
 
-/// Which filament an object prints with when a triangle says nothing.
+/// Which filament each object prints with when a triangle says nothing, and
+/// what each one is called.
 ///
 /// Not part of the 3MF specification: it is the slicer's own sidecar, and the
 /// reference for its shape is a real project file rather than a document.
+///
+/// One `<object>` per body, ids matching [`model_xml`]'s, because the slicer's
+/// object list is what shows the names -- a document of eleven bodies all
+/// called BrokkrSculpt would be eleven rows nobody could tell apart.
 ///
 /// **`[Content_Types].xml` deliberately does not declare a `config`
 /// extension.** The real packages ship these parts undeclared and are read
 /// anyway, so declaring one would be inventing a rule the target does not
 /// follow.
-fn model_settings_xml(filaments: &Filaments) -> String {
-    format!(
-        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<config>\n  <object id=\"1\">\n    \
-         <metadata key=\"name\" value=\"BrokkrSculpt\"/>\n    \
-         <metadata key=\"extruder\" value=\"{}\"/>\n  </object>\n</config>\n",
-        filaments.base.max(1)
-    )
+fn model_settings_xml(bodies: &[(&str, &ExportMesh)], filaments: &Filaments) -> String {
+    let mut xml = String::from("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<config>\n");
+    for (index, (name, _)) in bodies.iter().enumerate() {
+        xml.push_str(&format!(
+            "  <object id=\"{}\">\n    <metadata key=\"name\" value=\"{}\"/>\n    \
+             <metadata key=\"extruder\" value=\"{}\"/>\n  </object>\n",
+            index + 1,
+            escape(name),
+            filaments.base.max(1)
+        ));
+    }
+    xml.push_str("</config>\n");
+    xml
+}
+
+/// The five characters XML cannot carry raw, in an attribute value.
+///
+/// A body's name is user text: it reaches this writer from a rename box and,
+/// through a project file, from whoever made that file. `<` alone would produce
+/// a package that no slicer opens, and `"` would end the attribute and let the
+/// rest of the name be read as markup -- which is an injection into a document
+/// somebody else's parser trusts. The name field is capped at 32 bytes and the
+/// reader repairs bad UTF-8, so nothing else about it needs defending here.
+fn escape(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for character in text.chars() {
+        match character {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&apos;"),
+            _ => out.push(character),
+        }
+    }
+    out
 }
 
 /// The slot colours, so the slicer shows what the sculpt was painted with.
@@ -228,8 +286,27 @@ pub fn write_with(
     filaments: &Filaments,
     out: &mut impl Write,
 ) -> io::Result<()> {
-    let model = model_xml(mesh);
-    let model_settings = model_settings_xml(filaments);
+    write_with_all(&[("BrokkrSculpt", mesh)], filaments, out)
+}
+
+/// Write a document's bodies as one 3MF package, with default filament slots.
+pub fn write_all(bodies: &[(&str, &ExportMesh)], out: &mut impl Write) -> io::Result<()> {
+    write_with_all(bodies, &Filaments::default(), out)
+}
+
+/// Write a document's bodies as one 3MF package, declaring `filaments` as the
+/// slot setup.
+///
+/// The extension point of this module: every other entry point here is a
+/// wrapper over it, so a caller with both several bodies and a filament setup
+/// to declare has one call rather than a combination that does not exist.
+pub fn write_with_all(
+    bodies: &[(&str, &ExportMesh)],
+    filaments: &Filaments,
+    out: &mut impl Write,
+) -> io::Result<()> {
+    let model = model_xml(bodies);
+    let model_settings = model_settings_xml(bodies, filaments);
     let project_settings = project_settings_json(filaments);
     let mut zip = ZipWriter::new();
     // Order matters to some readers: the content types part has to come first.
@@ -363,6 +440,15 @@ mod tests {
         mesh
     }
 
+    /// The one-body list, under the name the single-mesh entry points use.
+    ///
+    /// Every test below this line predates the N-body writer and is about what
+    /// one object's XML says, so they all go through here rather than each
+    /// spelling out a slice literal.
+    fn solo(mesh: &ExportMesh) -> Vec<(&str, &ExportMesh)> {
+        vec![("BrokkrSculpt", mesh)]
+    }
+
     #[test]
     fn crc32_matches_the_known_check_value() {
         // The value every CRC32 implementation is tested against.
@@ -380,7 +466,7 @@ mod tests {
     #[test]
     fn the_model_xml_declares_millimetres_and_references_its_object() {
         // The whole reason to prefer 3MF: the units are not a guess.
-        let xml = model_xml(&exported());
+        let xml = model_xml(&solo(&exported()));
         assert!(xml.contains("unit=\"millimeter\""), "{xml:.400}");
         assert!(xml.contains(CORE_NAMESPACE));
         assert!(xml.contains("<object id=\"1\""));
@@ -390,7 +476,7 @@ mod tests {
     #[test]
     fn every_vertex_and_triangle_reaches_the_xml() {
         let mesh = exported();
-        let xml = model_xml(&mesh);
+        let xml = model_xml(&solo(&mesh));
         assert_eq!(xml.matches("<vertex ").count(), mesh.positions.len());
         assert_eq!(xml.matches("<triangle ").count(), mesh.triangles.len());
     }
@@ -400,7 +486,7 @@ mod tests {
         // The file is Z-up while the sculpt is Y-up. 3MF is the archival copy,
         // so getting this wrong here is the version that outlives the others.
         let mesh = exported();
-        let xml = model_xml(&mesh);
+        let xml = model_xml(&solo(&mesh));
 
         let written: Vec<Vec3> = xml
             .lines()
@@ -434,7 +520,7 @@ mod tests {
         // 3MF counts from zero, unlike OBJ. Getting that backwards would shift
         // every face by one.
         let mesh = exported();
-        let xml = model_xml(&mesh);
+        let xml = model_xml(&solo(&mesh));
         let first = xml.lines().find(|line| line.contains("<triangle ")).expect("has a triangle");
         let [a, b, c] = mesh.triangles[0];
         assert!(first.contains(&format!("v1=\"{a}\"")), "{first}");
@@ -536,7 +622,7 @@ mod tests {
         mesh.slots[b as usize] = 4;
         mesh.slots[c as usize] = 4;
 
-        let xml = model_xml(&mesh);
+        let xml = model_xml(&solo(&mesh));
         let line = xml
             .lines()
             .find(|line| line.contains(&format!("v1=\"{a}\" v2=\"{b}\" v3=\"{c}\"")))
@@ -548,12 +634,12 @@ mod tests {
     fn an_unassigned_mesh_writes_exactly_what_it_used_to() {
         // The property that keeps every existing export byte-identical: a mesh
         // nobody painted must not gain a single attribute.
-        let xml = model_xml(&exported());
+        let xml = model_xml(&solo(&exported()));
         assert!(!xml.contains("paint_color"), "an unpainted mesh grew colour attributes");
 
         // And an all-zero slots vector is the same thing as an empty one.
         let zeroed = with_slots(|_| 0);
-        assert_eq!(model_xml(&zeroed), xml, "zeros are not the same as unassigned");
+        assert_eq!(model_xml(&solo(&zeroed)), xml, "zeros are not the same as unassigned");
     }
 
     #[test]
@@ -564,7 +650,7 @@ mod tests {
         // so omission is an optimisation nothing in the target relies on. Until
         // a round trip proves the slicer reads "absent" as "base", write it.
         let mesh = with_slots(|index| (index % 4 + 1) as u8);
-        let xml = model_xml(&mesh);
+        let xml = model_xml(&solo(&mesh));
         let painted = xml.matches("paint_color=").count();
         assert_eq!(painted, mesh.triangles.len(), "some assigned triangles came out unpainted");
     }
@@ -576,7 +662,7 @@ mod tests {
             materials: vec!["PETG".into()],
             base: 2,
         };
-        let model_settings = model_settings_xml(&filaments);
+        let model_settings = model_settings_xml(&solo(&exported()), &filaments);
         assert!(model_settings.contains("key=\"extruder\" value=\"2\""), "{model_settings}");
 
         let project = project_settings_json(&filaments);
@@ -608,5 +694,115 @@ mod tests {
         write(&mesh, &mut first).unwrap();
         write(&mesh, &mut second).unwrap();
         assert_eq!(first, second);
+    }
+
+    // --- several bodies ----------------------------------------------------
+
+    /// **The bytes a known mesh produces are what the committed golden holds.**
+    ///
+    /// This is the test that actually pins the package. Its neighbour below
+    /// compares `write` against `write_all`, which since the refactor is the
+    /// *same code* on both sides: `write` is a two-hop wrapper over
+    /// [`write_with_all`]. A committed file cannot move with the code.
+    ///
+    /// A golden is safe here only because the zip writer is the one in this
+    /// file: entries are stored rather than deflated and every timestamp is
+    /// zero, so there is no compressor version and no clock to make the bytes
+    /// drift. The golden covers the whole package --- content types, the
+    /// relationships part, the model XML and both slicer sidecars --- which is
+    /// the point, since a slicer refuses the package over any one of them.
+    ///
+    /// The golden's cube carries mixed filament slots, so the `paint_color`
+    /// route and the bare `<triangle>` are both in the pinned bytes. See
+    /// [`crate::export::golden`].
+    #[test]
+    fn a_known_mesh_writes_the_bytes_committed_in_the_golden() {
+        let mesh = crate::export::golden::cube();
+        let mut bytes = Vec::new();
+        write(&mesh, &mut bytes).unwrap();
+        crate::export::golden::assert_bytes("export-cube.3mf", &bytes);
+    }
+
+    /// **A single body writes byte for byte what the single-mesh writer always
+    /// has**, name included: [`write`] passes `BrokkrSculpt` through, so the
+    /// one-body package is unchanged by the N-body path. That makes the name the
+    /// only parameter reaching the one-body path --- and proves nothing more,
+    /// because `write` now *is* `write_with_all`. The bytes themselves are
+    /// pinned by [`a_known_mesh_writes_the_bytes_committed_in_the_golden`]; keep
+    /// both.
+    ///
+    /// The application now names the body instead, so a real one-body export
+    /// carries `value="Body 1"` in the slicer's sidecar where it used to say
+    /// `BrokkrSculpt`. The model part -- the geometry, the units, the ids -- is
+    /// identical, and the alternative was eleven objects in a slicer's list all
+    /// called the same thing.
+    #[test]
+    fn one_body_through_the_document_writer_is_byte_identical() {
+        let mesh = exported();
+        let mut alone = Vec::new();
+        let mut through = Vec::new();
+        write(&mesh, &mut alone).unwrap();
+        write_all(&[("BrokkrSculpt", &mesh)], &mut through).unwrap();
+        assert_eq!(alone, through, "the N-body path changed the one-body package");
+    }
+
+    /// Each body is its own `<object>` with its own `<item>`, and the indices
+    /// stay per object.
+    ///
+    /// The index rule is the opposite of OBJ's and that is exactly why it is
+    /// pinned: 3MF numbers vertices within an object, so a running offset
+    /// copied over from the OBJ writer would send every triangle of the second
+    /// body past the end of its own vertex list.
+    #[test]
+    fn each_body_is_its_own_object_and_its_own_build_item() {
+        let mesh = exported();
+        let xml = model_xml(&[("Left", &mesh), ("Right", &mesh)]);
+
+        assert_eq!(xml.matches("<object id=").count(), 2);
+        assert!(xml.contains("<object id=\"1\" type=\"model\">"), "{xml:.400}");
+        assert!(xml.contains("<object id=\"2\" type=\"model\">"));
+        assert!(xml.contains("<item objectid=\"1\"/>"));
+        assert!(xml.contains("<item objectid=\"2\"/>"));
+        assert_eq!(xml.matches("<vertex ").count(), mesh.positions.len() * 2);
+        assert_eq!(xml.matches("<triangle ").count(), mesh.triangles.len() * 2);
+
+        // Every index is inside ONE body's vertex list, which is what "per
+        // object" means and what an offset would break.
+        let highest = mesh.positions.len() - 1;
+        for line in xml.lines().filter(|line| line.contains("<triangle ")) {
+            for name in ["v1=\"", "v2=\"", "v3=\""] {
+                let at = line.find(name).expect("a triangle has three corners") + name.len();
+                let rest = &line[at..];
+                let index: usize = rest[..rest.find('"').unwrap()].parse().unwrap();
+                assert!(index <= highest, "index {index} is past the end of its own object");
+            }
+        }
+
+        // And the sidecar names them, so the slicer's object list is readable.
+        let settings =
+            model_settings_xml(&[("Left", &mesh), ("Right", &mesh)], &Filaments::default());
+        assert!(settings.contains("<object id=\"1\">"), "{settings}");
+        assert!(settings.contains("value=\"Left\""), "{settings}");
+        assert!(settings.contains("<object id=\"2\">"));
+        assert!(settings.contains("value=\"Right\""));
+    }
+
+    /// A body's name is user text and it lands inside an XML attribute.
+    ///
+    /// A rename box will take `<` and `"` without complaint, and the reader
+    /// repairs a name out of a file rather than refusing it, so this writer is
+    /// the last thing between somebody else's name and somebody else's parser.
+    /// Unescaped, a quote ends the attribute and the rest of the name is read
+    /// as markup.
+    #[test]
+    fn a_name_with_xml_in_it_is_escaped_rather_than_written_through() {
+        let mesh = exported();
+        let hostile = "a<b>c&d\"e'f";
+        let settings = model_settings_xml(&[(hostile, &mesh)], &Filaments::default());
+        assert!(
+            settings.contains("value=\"a&lt;b&gt;c&amp;d&quot;e&apos;f\""),
+            "a name went into the XML unescaped: {settings}"
+        );
+        assert!(!settings.contains("value=\"a<"), "{settings}");
     }
 }

@@ -847,6 +847,7 @@ fn an_imported_mesh_renders() {
             repair_broken_scan_lines: true,
             coarsen_to_fit: false,
             refine_to_resolve: false,
+            already_reserved: 0.0,
         },
     )
     .expect("the exported sphere should voxelise");
@@ -1002,4 +1003,88 @@ fn two_bodies_sharing_bricks_each_render_whole() {
          ({only_in_a} belong to the sphere alone, {only_in_b} to the cube alone)",
         mask_ab.len()
     );
+}
+
+/// **Hiding a body takes it out of the picture and does nothing else.**
+///
+/// This is the only test in the workspace that can see the actual consequence
+/// of the hidden set, and it is worth having because every cheaper way of
+/// implementing visibility passes a bookkeeping test and fails here: dropping
+/// the hidden body's slots would empty the pool as well as the picture, and
+/// meshing its bricks to nothing would do the same by a longer route. The
+/// assertion that says it is a DRAW-time skip is the pair "the picture lost
+/// exactly one body" and "the pool held on to every brick of it".
+///
+/// The two bodies are the same sphere and cube as the test above, for the same
+/// reason: they contest bricks near the origin, so a hidden body that took a
+/// visible one's slice with it would show up as a hole in what remains rather
+/// than as a clean removal.
+#[test]
+fn hiding_a_body_removes_exactly_that_body_from_the_picture() {
+    let Some(harness) = Harness::new() else {
+        eprintln!("no usable wgpu adapter, skipping the hidden body render test");
+        return;
+    };
+
+    const SPHERE_RADIUS: f32 = 20.0;
+    const CUBE_HALF: f32 = 14.0;
+    const BODY_A: NodeId = NodeId(1);
+    const BODY_B: NodeId = NodeId(2);
+
+    let distance = MODEL_RADIUS * 3.0;
+    let mut renderer = SculptRenderer::new(&harness.device, &harness.queue, TARGET_FORMAT);
+    renderer.resize(&harness.device, WIDTH, HEIGHT);
+    renderer.write_uniforms(&harness.queue, &uniforms(distance));
+
+    let mut sphere = Volume::new(VOXEL_SIZE);
+    sphere.seed_sphere(Vec3::ZERO, SPHERE_RADIUS);
+    let mut cube = Volume::new(VOXEL_SIZE);
+    seed_cube(&mut cube, CUBE_HALF);
+
+    // Body A alone first, in its own renderer, so there is something to
+    // compare the hidden frame against that was never near body B at all.
+    let mut alone = SculptRenderer::new(&harness.device, &harness.queue, TARGET_FORMAT);
+    alone.resize(&harness.device, WIDTH, HEIGHT);
+    alone.write_uniforms(&harness.queue, &uniforms(distance));
+    upload_body(&mut alone, &harness.device, &harness.queue, &mut sphere, BODY_A);
+    let mask_alone = mask(&harness.frame(&alone));
+
+    let slots_a = upload_body(&mut renderer, &harness.device, &harness.queue, &mut sphere, BODY_A);
+    let slots_b = upload_body(&mut renderer, &harness.device, &harness.queue, &mut cube, BODY_B);
+    let both = mask(&harness.frame(&renderer));
+    let full = renderer.stats();
+    assert_eq!(full.bricks, slots_a + slots_b);
+    // The fixture asserts nothing unless the cube is visible outside the
+    // sphere: hiding a body that draws no pixels of its own would pass anything.
+    let only_in_b = both.iter().zip(&mask_alone).filter(|(both, a)| **both && !**a).count();
+    assert!(only_in_b > 200, "the cube only reaches outside the sphere on {only_in_b} pixels");
+
+    renderer.set_hidden(&[BODY_B]);
+    let hidden_frame = harness.frame(&renderer);
+    dump("hidden-body", &hidden_frame);
+    let hidden = mask(&hidden_frame);
+    let wrong = hidden.iter().zip(&mask_alone).filter(|(one, other)| one != other).count();
+    assert_eq!(
+        wrong, 0,
+        "{wrong} pixels differ from body A drawn on its own, so hiding body B either left some \
+         of it on screen or took some of body A with it"
+    );
+
+    // ...and the pool did not give up a single byte for it, which is what makes
+    // this a draw-time skip and why the overflow message tells the user that
+    // hiding frees nothing.
+    let while_hidden = renderer.stats();
+    assert_eq!(while_hidden.bricks, full.bricks, "hiding dropped slots");
+    assert_eq!(while_hidden.vertices_reserved, full.vertices_reserved);
+    assert_eq!(while_hidden.vertices_watermark, full.vertices_watermark);
+    assert_eq!(renderer.body_bricks(BODY_B), slots_b, "the hidden body lost bricks");
+    assert_eq!(while_hidden.hidden, slots_b, "the skipped bricks were not counted as hidden");
+    assert_eq!(while_hidden.drawn + while_hidden.culled + while_hidden.hidden, full.bricks);
+
+    // Showing it again needs no remesh and no upload: the same frame comes
+    // back from the slices that were there all along.
+    renderer.set_hidden(&[]);
+    let shown = mask(&harness.frame(&renderer));
+    let wrong = shown.iter().zip(&both).filter(|(one, other)| one != other).count();
+    assert_eq!(wrong, 0, "{wrong} pixels did not come back when the body was shown again");
 }

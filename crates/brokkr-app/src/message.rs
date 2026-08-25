@@ -288,6 +288,22 @@ pub enum Message {
     /// Whether the radius tracks the model's size (ZBrush calls it Dynamic)
     /// rather than staying a fixed number of millimetres.
     DynamicRadiusToggled(bool),
+    /// A key was pressed and nothing in the widget tree wanted it.
+    ///
+    /// **Carries the key, not the message the key means.** The subscription
+    /// that raises it cannot decide that itself: `iced::event::listen_with`
+    /// takes a bare `fn` pointer (`iced_futures-0.14.0/src/event.rs:26`), so
+    /// its callback captures nothing and can never see whether a modal card is
+    /// up over the document. Decoding therefore happens in `Brokkr::on_key`,
+    /// which can — and that is the one place the modal guard has to live.
+    ///
+    /// A press that spells nothing is still sent, and dropped there. The
+    /// alternative, filtering in the subscription, would mean two places that
+    /// know which keys exist.
+    KeyPressed {
+        key: iced::keyboard::Key,
+        modifiers: iced::keyboard::Modifiers,
+    },
     /// Close the right-click menu.
     MenuClosed,
     /// Turn the model so the face the cube menu was opened on becomes this

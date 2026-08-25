@@ -55,3 +55,13 @@ wgpu.workspace = true
 # force field, and winit 0.30 only ever had it for touch.
 [target.'cfg(target_os = "linux")'.dependencies]
 evdev.workspace = true
+
+# Blocks on wgpu's adapter and device futures, and nothing else. Needed because
+# `SharedFrame::apply` orders a pool reset, a set of body deletions and a batch
+# of uploads against each other, and getting that order wrong draws a deleted
+# body forever with no counter moving -- so the test builds a real
+# `SculptRenderer` rather than asserting against a stand-in that could agree
+# with a wrong ordering. Costs zero new crates: `pollster` is already a
+# workspace dependency and already compiled for `brokkr-gpu`'s own tests.
+[dev-dependencies]
+pollster.workspace = true

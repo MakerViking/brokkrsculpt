@@ -37,6 +37,25 @@ pub struct PendingUpload {
     pub mesh: BrickMesh,
 }
 
+/// How many finished mesh buffers are kept for reuse.
+///
+/// **There is a cap because there was not one, and it retained gigabytes.**
+/// `BrickMesh::clear` keeps its allocations -- that is the whole point of the
+/// recycling -- and nothing ever trimmed the list, so one `rebuild_everything`
+/// over the 45,567-brick document this pool is built for handed back one buffer
+/// per brick and held every one of them. At an average brick (about 1100
+/// vertices, so 26 kB of vertices, 26 kB of indices and 13 kB of cells) that is
+/// roughly 66 kB each and about 3 GB retained, none of it counted by the
+/// document's own byte budget and none of it visible in any readout.
+///
+/// 1024 is chosen against what actually recurs: a stroke dirties tens of
+/// bricks, so steady-state sculpting never reaches the cap and never allocates,
+/// which is the property the recycling exists for. The case the cap bites is
+/// the whole-model rebuild, and that one is already proportional to the whole
+/// model -- paying for its buffers again is the cheaper half of that trade. At
+/// 66 kB a buffer this is about 68 MB held at rest.
+const MAX_SPARE_MESHES: usize = 1024;
+
 /// The hand off between the application and the render callbacks.
 #[derive(Debug, Default)]
 pub struct SharedFrame {
@@ -63,6 +82,11 @@ pub struct SharedFrame {
     /// pool starts from empty instead of fragmenting. See
     /// [`SharedFrame::request_pool_reset`].
     reset_pool: std::sync::atomic::AtomicBool,
+    /// Bodies that have left the document and whose pool slots must go with
+    /// them. See [`SharedFrame::forget_body`].
+    forget: Mutex<Vec<NodeId>>,
+    /// Bodies the renderer must not draw. See [`SharedFrame::set_hidden`].
+    hidden: Mutex<Vec<NodeId>>,
 }
 
 impl SharedFrame {
@@ -140,6 +164,157 @@ impl SharedFrame {
         self.reset_pool.store(true, std::sync::atomic::Ordering::Release);
     }
 
+    /// Take the pending pool reset, exactly as `apply` does, so a test can ask
+    /// whether one was requested.
+    ///
+    /// A take rather than a peek because the two uses always come in that
+    /// order: clear whatever is pending, do the thing, assert it is back.
+    ///
+    /// **This is what the four whole-document swap sites rest on.** Each of
+    /// them -- reset, open, import, re-orient -- used to mark the outgoing
+    /// model's brick coordinates dirty in the incoming volume so that they
+    /// would mesh to nothing and release their slices. All four of those loops
+    /// were dead, because all four call `Brokkr::rebuild_everything`, which
+    /// asks for this reset, and the reset drops every slot in the pool
+    /// regardless of what any key says. They were deleted in increment 6 on
+    /// exactly that reasoning -- so if the reset ever stops being asked for,
+    /// the reasoning goes with it and four functions quietly start leaving the
+    /// previous model on screen underneath the new one.
+    #[cfg(test)]
+    pub fn take_pool_reset_for_tests(&self) -> bool {
+        self.reset_pool.swap(false, std::sync::atomic::Ordering::AcqRel)
+    }
+
+    /// Ask the renderer to drop every brick one body owns, because that body
+    /// has left the document.
+    ///
+    /// # Why this is a queue rather than a call
+    ///
+    /// **`forget_body` cannot be called from where a delete happens.** The
+    /// application has no access to the [`brokkr_gpu::MeshPool`] at all: the
+    /// pool lives inside the pipeline that Iced owns and hands back only inside
+    /// `prepare`, and `publish` runs on the application thread. So a delete
+    /// that reached into the pool directly would release the body's slots while
+    /// that same body's meshes were still sitting in `pending` -- and `prepare`
+    /// would then upload them again, on the same frame, into fresh slices. What
+    /// the user would see is a sliver of a deleted body drawn forever, holding
+    /// pool space, with no counter moving and nothing in the log.
+    ///
+    /// [`SharedFrame::apply`] is where the ordering that avoids that is
+    /// written down, and it is the reason this is a list and not a method call.
+    ///
+    /// # What the caller owes afterwards
+    ///
+    /// **The delete gesture must pair this with `mark_everything_dirty()` +
+    /// `remesh_dirty()`**, the same pairing `rebuild_everything` makes around a
+    /// pool reset. `MeshPool::forget_body` clears the pool-full banner when it
+    /// frees space, and a brick the pool refused while it was full was dropped
+    /// on the floor -- its coordinate is long gone from the application's dirty
+    /// set, so nothing re-offers it. Freeing space without a remesh therefore
+    /// takes the warning down and leaves the missing geometry missing, which is
+    /// the silent-geometry-loss shape this project has shipped twice already.
+    ///
+    /// No caller outside the tests yet: increment 9 is the one that can delete
+    /// a body, and the pairing above is its job. The channel lands here rather
+    /// than there because the ordering above is the part that is easy to get
+    /// wrong and impossible to see, and it is worth having pinned by a test
+    /// before the gesture that needs it exists.
+    #[allow(dead_code)]
+    pub fn forget_body(&self, body: NodeId) {
+        self.forget.lock().expect("shared frame poisoned").push(body);
+    }
+
+    /// Replace the set of bodies the renderer must not draw.
+    ///
+    /// **Wholesale on every change, never mutated one body at a time.** The set
+    /// is a pure function of the document and the solo mode, worked out in one
+    /// place -- `Brokkr::publish_visibility`, over
+    /// [`brokkr_core::Document::display_visibility`] -- and pushed here whole.
+    /// An incremental version has a second owner of the same answer, and two
+    /// owners is how the eye and the viewport come to disagree after an undo:
+    /// a body invisible on screen that still raycasts and still carves.
+    ///
+    /// Copies rather than swaps so that the caller keeps its own buffer, and
+    /// allocates nothing after the first call.
+    pub fn set_hidden(&self, hidden: &[NodeId]) {
+        let mut held = self.hidden.lock().expect("shared frame poisoned");
+        held.clear();
+        held.extend_from_slice(hidden);
+    }
+
+    /// The bodies the renderer has been told not to draw.
+    ///
+    /// The only way to see what the viewport is actually acting on. The check
+    /// it exists for is `hidden_snapshot()` against
+    /// `doc.display_visibility(solo)` after every message: two computations of
+    /// one rule that must never disagree, and the failure when they do is a
+    /// body missing from the screen that the panel still shows as visible.
+    #[cfg(test)]
+    pub fn hidden_snapshot(&self) -> Vec<NodeId> {
+        self.hidden.lock().expect("shared frame poisoned").clone()
+    }
+
+    /// Make the renderer match everything the application has published, in the
+    /// one order that is correct.
+    ///
+    /// **The order is the whole content of this function**, and none of it is
+    /// arbitrary:
+    ///
+    /// 1. The pool reset comes first, because it drops every slot: a brick
+    ///    uploaded before it would be thrown away and never redrawn.
+    /// 2. The forget list comes next, and in the same step every queued upload
+    ///    naming a forgotten body is dropped. Applying the forgets after the
+    ///    uploads would re-upload a deleted body's meshes into fresh slices --
+    ///    a ghost sliver drawn forever with no counter moving. Dropping the
+    ///    queued uploads is the other half: forgetting the slots alone still
+    ///    leaves the meshes in `pending`, which is the same ghost by a longer
+    ///    route.
+    /// 3. The uploads, whose buffers all come back to `spare` whether they were
+    ///    uploaded or dropped -- a dropped upload's allocation is worth exactly
+    ///    as much as an uploaded one's.
+    /// 4. The hidden set last, so that a body published and hidden on the same
+    ///    frame is not drawn once before the skip arrives.
+    ///
+    /// Extracted out of `prepare` so that this ordering is testable at all;
+    /// nothing in the workspace tested this seam before increment 6.
+    pub fn apply(&self, renderer: &mut SculptRenderer, device: &wgpu::Device, queue: &wgpu::Queue) {
+        if self.reset_pool.swap(false, std::sync::atomic::Ordering::AcqRel) {
+            renderer.reset_pool();
+        }
+
+        let forgotten: Vec<NodeId> = {
+            let mut forget = self.forget.lock().expect("shared frame poisoned");
+            std::mem::take(&mut *forget)
+        };
+        for body in &forgotten {
+            renderer.forget_body(*body);
+        }
+
+        let drained: Vec<PendingUpload> = {
+            let mut pending = self.pending.lock().expect("shared frame poisoned");
+            std::mem::take(&mut *pending)
+        };
+        if !drained.is_empty() {
+            let mut spare = self.spare.lock().expect("shared frame poisoned");
+            for upload in drained {
+                if !forgotten.contains(&upload.key.body) {
+                    renderer.upload_brick(device, queue, upload.key, &upload.mesh);
+                }
+                // Capped rather than kept: see MAX_SPARE_MESHES. Over the cap
+                // the buffer is dropped here and its allocation returned to the
+                // system.
+                if spare.len() < MAX_SPARE_MESHES {
+                    spare.push(upload.mesh);
+                }
+            }
+        }
+
+        {
+            let hidden = self.hidden.lock().expect("shared frame poisoned");
+            renderer.set_hidden(&hidden);
+        }
+    }
+
     /// The pool counters as of the last frame, for the debug overlay.
     pub fn stats(&self) -> PoolStats {
         *self.stats.lock().expect("shared frame poisoned")
@@ -199,15 +374,32 @@ const RADIUS_STEP: f32 = 1.15;
 /// or a window, which on this machine is the only way to test input at all:
 /// it is a Wayland session, and XTEST pointer and key synthesis silently does
 /// nothing there.
-pub(crate) fn shortcut(character: &str, command: bool, shift: bool) -> Option<Message> {
-    if command {
-        // The only chorded shortcuts. Anything else with control held belongs
-        // to the toolkit or the window manager.
-        return character.eq_ignore_ascii_case("z").then_some(if shift {
-            Message::Redo
-        } else {
-            Message::Undo
-        });
+///
+/// # This is a pure decode, and deliberately not a guard
+///
+/// It answers "what does this key spell", never "may it fire now". Whether the
+/// application is in a state to accept a shortcut at all — a modal card up
+/// over the document, say — is `Brokkr::on_key`'s question, because it is the
+/// only one of the two that can see the document. Keep it that way: a state
+/// check in here cannot be tested without building the state, which is the
+/// whole reason this function is separate.
+///
+/// # Why `alt` is a parameter with no shortcut of its own yet
+///
+/// Alt is threaded through so that an unclaimed chord means *nothing* rather
+/// than meaning the bare key. Without it `alt+x` toggled X symmetry and
+/// `altgr+2` selected the second brush, which on a layout where AltGr composes
+/// characters is a keystroke the user meant for something else entirely. It
+/// also keeps `ctrl+alt+…` free for the chords the tool strip and the body
+/// panel are about to claim.
+pub(crate) fn shortcut(character: &str, command: bool, shift: bool, alt: bool) -> Option<Message> {
+    if command || alt {
+        // The only chorded shortcuts. Anything else with control or alt held
+        // belongs to the toolkit, to the window manager, or to a shortcut this
+        // application has not defined yet -- and must not fall through to the
+        // bare-key table below.
+        let undo_chord = command && !alt && character.eq_ignore_ascii_case("z");
+        return undo_chord.then_some(if shift { Message::Redo } else { Message::Undo });
     }
 
     // Brushes are numbered in the order the tool strip shows them, so the key
@@ -263,7 +455,10 @@ pub(crate) fn shortcut(character: &str, command: bool, shift: bool) -> Option<Me
 /// the application, because the shader traverses first. They now live in a
 /// subscription over events the widget tree IGNORED (`app.rs`), which is what
 /// makes them focus-aware: a focused text input consumes its keystrokes, and
-/// the shortcut only fires when nothing wanted the key.
+/// the shortcut only fires when nothing wanted the key. That subscription
+/// forwards the raw key to `Brokkr::on_key`, which is where a shortcut is
+/// allowed or refused: it cannot decide that itself, because `listen_with`
+/// takes a bare `fn` and can never see the application.
 fn route_pointer(
     event: &iced::Event,
     bounds: Rectangle,
@@ -404,23 +599,10 @@ impl shader::Primitive for SculptPrimitive {
         // vanish a frame before or after they should.
         pipeline.frustum = Frustum::from_view_projection(view_projection);
 
-        // Before the uploads, never after: the reset drops every slot, so a
-        // brick uploaded first would be thrown away and never redrawn.
-        if self.shared.reset_pool.swap(false, std::sync::atomic::Ordering::AcqRel) {
-            pipeline.renderer.reset_pool();
-        }
-
-        let drained: Vec<PendingUpload> = {
-            let mut pending = self.shared.pending.lock().expect("shared frame poisoned");
-            std::mem::take(&mut *pending)
-        };
-        if !drained.is_empty() {
-            let mut spare = self.shared.spare.lock().expect("shared frame poisoned");
-            for upload in drained {
-                pipeline.renderer.upload_brick(device, queue, upload.key, &upload.mesh);
-                spare.push(upload.mesh);
-            }
-        }
+        // Everything the application published since the last frame, in the one
+        // order that is correct: the reset, then the forgets, then the uploads,
+        // then the hidden set. See `SharedFrame::apply`.
+        self.shared.apply(&mut pipeline.renderer, device, queue);
 
         *self.shared.stats.lock().expect("shared frame poisoned") = pipeline.renderer.stats();
         self.shared.set_adapter(pipeline.renderer.adapter_summary());
@@ -629,6 +811,251 @@ mod tests {
     }
 }
 
+/// The ordering inside [`SharedFrame::apply`], against a real pool.
+///
+/// These need a `wgpu::Device`, because a pool slot is a slice of a real
+/// buffer and there is no way to reserve one without creating them. They are
+/// the first tests in this crate that do -- everything else here is headless --
+/// and that is deliberate: the failure they guard against is a deleted body's
+/// queued meshes being uploaded again after its slots were released, which
+/// leaves a sliver drawn forever with no counter moving, and no stand-in for
+/// the pool can tell you whether the real one kept the slot.
+#[cfg(test)]
+mod apply_tests {
+    use super::*;
+    use brokkr_core::Vertex;
+
+    /// A device, or `None` on a machine with no adapter -- but a FAILURE on CI,
+    /// where an adapter is always meant to be there.
+    ///
+    /// The same guard `brokkr-gpu`'s pool tests make, and for the same reason:
+    /// `cargo test --workspace` captures output, so a test that printed
+    /// "skipping" and returned would report `ok` having asserted nothing, and
+    /// someone could put the uploads back above the forgets and leave CI green.
+    /// `CI` is set to `true` by GitHub Actions for every step, and by every
+    /// other runner worth naming.
+    fn device_or_skip(what: &str) -> Option<(wgpu::Device, wgpu::Queue)> {
+        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
+        let opened =
+            pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default()))
+                .ok()
+                .and_then(|adapter| {
+                    pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default()))
+                        .ok()
+                });
+        if opened.is_some() {
+            return opened;
+        }
+        eprintln!("no usable wgpu adapter, skipping the {what} test");
+        assert!(
+            std::env::var_os("CI").is_none(),
+            "no usable wgpu adapter on CI, so the {what} test asserted nothing. The runner image \
+             is meant to provide one (Mesa's lavapipe); if it no longer does, fix the image \
+             rather than letting this pass."
+        );
+        None
+    }
+
+    fn renderer(device: &wgpu::Device, queue: &wgpu::Queue) -> SculptRenderer {
+        SculptRenderer::new(device, queue, wgpu::TextureFormat::Rgba8UnormSrgb)
+    }
+
+    /// A mesh with real geometry in it. The shape is meaningless: these tests
+    /// are about which slots exist, not about what is in them.
+    fn mesh() -> BrickMesh {
+        BrickMesh {
+            vertices: vec![Vertex { position: [0.0; 3], normal: [0.0, 1.0, 0.0] }; 64],
+            indices: (0..64).collect(),
+            cells: Vec::new(),
+        }
+    }
+
+    fn publish(shared: &SharedFrame, body: NodeId, bricks: i32) {
+        for brick in 0..bricks {
+            shared.publish(body, BrickCoord::new(brick, 0, 0), mesh());
+        }
+    }
+
+    /// A deleted body's queued meshes must never reach the pool, in either
+    /// order, and the pool must come back to the size it was BEFORE that body
+    /// was ever published.
+    ///
+    /// "Unchanged" is the wrong assertion and it is wrong in the direction the
+    /// leak hides in: a pool that uploaded the ghost and kept it would also
+    /// report a count that had not changed since the upload. So the count is
+    /// taken before body B exists at all.
+    #[test]
+    fn a_forgotten_bodys_queued_uploads_never_reach_the_pool() {
+        let Some((device, queue)) = device_or_skip("shared frame apply") else {
+            return;
+        };
+
+        const KEPT: NodeId = NodeId(1);
+        const GOING: NodeId = NodeId(2);
+
+        // Both orders, because the queue does not record when anything was
+        // pushed and the two are indistinguishable to `apply` by design.
+        for forget_first in [false, true] {
+            let mut renderer = renderer(&device, &queue);
+            let shared = SharedFrame::new();
+
+            publish(&shared, KEPT, 3);
+            shared.apply(&mut renderer, &device, &queue);
+            let before = renderer.stats();
+            assert_eq!(before.bricks, 3, "the fixture published nothing");
+
+            if forget_first {
+                shared.forget_body(GOING);
+                publish(&shared, GOING, 4);
+            } else {
+                publish(&shared, GOING, 4);
+                shared.forget_body(GOING);
+            }
+            shared.apply(&mut renderer, &device, &queue);
+
+            let after = renderer.stats();
+            assert_eq!(
+                renderer.body_bricks(GOING),
+                0,
+                "a body forgotten {} its meshes were published still has {} slots",
+                if forget_first { "before" } else { "after" },
+                renderer.body_bricks(GOING)
+            );
+            assert_eq!(after.bricks, before.bricks, "the pool grew for a body that was deleted");
+            assert_eq!(after.triangles, before.triangles);
+            assert_eq!(renderer.body_bricks(KEPT), 3, "the surviving body lost bricks");
+        }
+    }
+
+    /// The forget list is drained, not remembered: a body forgotten on one
+    /// frame must not swallow a body that is given the same id later.
+    ///
+    /// Ids are never reused inside one document, but a document is replaced
+    /// wholesale by every open, import and reset, and the new one starts
+    /// numbering from 1 again.
+    #[test]
+    fn the_forget_list_only_applies_to_the_frame_it_was_asked_on() {
+        let Some((device, queue)) = device_or_skip("shared frame forget drain") else {
+            return;
+        };
+
+        let mut renderer = renderer(&device, &queue);
+        let shared = SharedFrame::new();
+
+        shared.forget_body(NodeId(1));
+        publish(&shared, NodeId(1), 2);
+        shared.apply(&mut renderer, &device, &queue);
+        assert_eq!(renderer.stats().bricks, 0);
+
+        publish(&shared, NodeId(1), 2);
+        shared.apply(&mut renderer, &device, &queue);
+        assert_eq!(
+            renderer.stats().bricks,
+            2,
+            "the forget from the previous frame was still being applied"
+        );
+    }
+
+    /// A dropped upload's buffer is worth exactly as much as an uploaded one's,
+    /// and it has to come back for reuse rather than be freed.
+    #[test]
+    fn the_meshes_of_a_forgotten_body_come_back_for_reuse() {
+        let Some((device, queue)) = device_or_skip("shared frame recycling") else {
+            return;
+        };
+
+        let mut renderer = renderer(&device, &queue);
+        let shared = SharedFrame::new();
+        shared.forget_body(NodeId(9));
+        publish(&shared, NodeId(9), 5);
+        shared.apply(&mut renderer, &device, &queue);
+
+        assert_eq!(renderer.stats().bricks, 0, "the forgotten body was uploaded");
+        assert_eq!(
+            shared.spare.lock().expect("shared frame poisoned").len(),
+            5,
+            "the dropped uploads' buffers were thrown away instead of recycled"
+        );
+    }
+
+    /// The recycled list is capped, because it was not and that retained about
+    /// three gigabytes after one whole-model rebuild.
+    ///
+    /// `BrickMesh::clear` keeps its allocations -- which is the point of the
+    /// recycling -- and nothing ever trimmed the list, so a rebuild over a
+    /// 45,567-brick document handed back one buffer per brick and held every
+    /// one of them, uncounted by any budget and invisible in every readout.
+    #[test]
+    fn the_recycled_mesh_list_is_capped() {
+        let Some((device, queue)) = device_or_skip("shared frame spare cap") else {
+            return;
+        };
+
+        let mut renderer = renderer(&device, &queue);
+        let shared = SharedFrame::new();
+
+        let over = MAX_SPARE_MESHES as i32 + 64;
+        publish(&shared, NodeId(1), over);
+        shared.apply(&mut renderer, &device, &queue);
+
+        assert_eq!(
+            shared.spare.lock().expect("shared frame poisoned").len(),
+            MAX_SPARE_MESHES,
+            "the recycled list grew past its cap"
+        );
+        // And every brick still got uploaded: the cap throws buffers away, not
+        // geometry.
+        assert_eq!(renderer.stats().bricks, over as usize);
+    }
+
+    /// The hidden set has to arrive at the renderer, and the frame it arrives
+    /// on has to be one where the body it names is not drawn.
+    ///
+    /// `apply` sets it AFTER the uploads for that reason: a body published and
+    /// hidden on the same frame would otherwise be drawn once first.
+    ///
+    /// **Every assertion here is on the RENDERER, and the first version of
+    /// this test got that wrong.** It asserted `renderer.stats().bricks == 4`,
+    /// `renderer.body_bricks(NodeId(2)) == 2` and
+    /// `shared.hidden_snapshot() == vec![NodeId(2)]`. The first two hold
+    /// whether or not the set was delivered -- hiding is a draw-time skip, so
+    /// slot counts are invariant across it by design -- and the third reads the
+    /// `SharedFrame`'s own mutex, which is the SENDER. Replacing the
+    /// `renderer.set_hidden(&hidden)` line in `apply` with `let _ = &hidden;`
+    /// left the whole workspace suite green, with the eye muting the panel row
+    /// and the body still fully drawn on screen. `hidden_bodies()` exists so
+    /// this test can ask the receiver what it was told.
+    #[test]
+    fn the_hidden_set_reaches_the_renderer_on_the_frame_it_is_published() {
+        let Some((device, queue)) = device_or_skip("shared frame hidden set") else {
+            return;
+        };
+
+        let mut renderer = renderer(&device, &queue);
+        let shared = SharedFrame::new();
+
+        publish(&shared, NodeId(1), 2);
+        publish(&shared, NodeId(2), 2);
+        shared.set_hidden(&[NodeId(2)]);
+        shared.apply(&mut renderer, &device, &queue);
+
+        // Hidden is a draw-time skip, so the slots are all there...
+        assert_eq!(renderer.stats().bricks, 4);
+        assert_eq!(renderer.body_bricks(NodeId(2)), 2);
+        // ...and the renderer itself, not the channel that fed it, is what says
+        // the set arrived.
+        assert_eq!(renderer.hidden_bodies(), &[NodeId(2)]);
+
+        // Showing it again is the empty set, not the absence of a call.
+        shared.set_hidden(&[]);
+        shared.apply(&mut renderer, &device, &queue);
+        assert!(
+            renderer.hidden_bodies().is_empty(),
+            "showing a body again never reached the renderer"
+        );
+    }
+}
+
 #[cfg(test)]
 mod shortcut_tests {
     use super::*;
@@ -637,7 +1064,12 @@ mod shortcut_tests {
     /// a Wayland session, where XTEST key and pointer synthesis silently does
     /// nothing, so driving the real widget from a test is not an option.
     fn press(character: &str) -> Option<Message> {
-        shortcut(character, false, false)
+        shortcut(character, false, false, false)
+    }
+
+    /// The same key with control held, and nothing else.
+    fn control(character: &str) -> Option<Message> {
+        shortcut(character, true, false, false)
     }
 
     #[test]
@@ -664,7 +1096,10 @@ mod shortcut_tests {
                 axis.label()
             );
             // Shift alone must not change what a letter means.
-            assert!(matches!(shortcut(key, false, true), Some(Message::SymmetryAxisToggled(_))));
+            assert!(matches!(
+                shortcut(key, false, true, false),
+                Some(Message::SymmetryAxisToggled(_))
+            ));
         }
         // Capitals reach the same place.
         assert!(matches!(press("X"), Some(Message::SymmetryAxisToggled(MirrorAxis::X))));
@@ -674,9 +1109,9 @@ mod shortcut_tests {
     /// undoes, and the two must never be confused.
     #[test]
     fn control_z_still_undoes_rather_than_mirroring() {
-        assert!(matches!(shortcut("z", true, false), Some(Message::Undo)));
-        assert!(matches!(shortcut("z", true, true), Some(Message::Redo)));
-        assert!(matches!(shortcut("Z", true, false), Some(Message::Undo)));
+        assert!(matches!(control("z"), Some(Message::Undo)));
+        assert!(matches!(shortcut("z", true, true, false), Some(Message::Redo)));
+        assert!(matches!(control("Z"), Some(Message::Undo)));
         assert!(matches!(press("z"), Some(Message::SymmetryAxisToggled(MirrorAxis::Z))));
     }
 
@@ -700,8 +1135,28 @@ mod shortcut_tests {
         assert!(press("").is_none());
         // Every other control chord belongs to the toolkit or the window
         // manager, so claiming it here would steal it.
-        assert!(shortcut("s", true, false).is_none());
-        assert!(shortcut("x", true, false).is_none(), "ctrl x is not a mirror toggle");
-        assert!(shortcut("1", true, false).is_none());
+        assert!(control("s").is_none());
+        assert!(control("x").is_none(), "ctrl x is not a mirror toggle");
+        assert!(control("1").is_none());
+    }
+
+    /// Alt is the modifier that was silently ignored, and this is what the
+    /// fourth parameter buys. On a layout where AltGr composes characters,
+    /// `altgr+2` is the user typing something, not asking for the second
+    /// brush; and `ctrl+alt+z` has to stay free rather than being a second
+    /// spelling of undo.
+    #[test]
+    fn a_chord_this_application_has_not_claimed_means_nothing_at_all() {
+        let alt = |character: &str| shortcut(character, false, false, true);
+        for key in ["x", "y", "z", "1", "2", "s", "u", "[", "]"] {
+            assert!(alt(key).is_none(), "alt {key} fell through to the bare key");
+        }
+        assert!(shortcut("z", true, false, true).is_none(), "ctrl alt z is not undo");
+        assert!(shortcut("z", true, true, true).is_none(), "ctrl alt shift z is not redo");
+
+        // The control, without which every assertion above passes on a
+        // function that always returns None.
+        assert!(press("x").is_some());
+        assert!(control("z").is_some());
     }
 }

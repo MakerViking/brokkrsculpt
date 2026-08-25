@@ -180,6 +180,32 @@ fn lowest_field_version(doc: &Document) -> u16 {
 /// data, and a narrow band field clamped to ±3 is about as sparse as data gets.
 const MAX_BRICKS: u64 = 8 * 1024 * 1024 * 1024 / BRICK_BYTES as u64;
 
+/// How much system memory the whole DOCUMENT may occupy in voxel data.
+///
+/// The mesh pool grows itself buffers now, so it is no longer the first thing
+/// a fine resample runs out of: the dragon at 0.0565 mm sits at 48% of the
+/// pool and 4.15 GB of RAM. Without this the detail buttons would walk a
+/// machine into swap.
+///
+/// Matches [`crate::voxelise`]'s own import ceiling, and carries the same
+/// caveat: it is a guess at what a machine can spare, made without asking the
+/// machine. Reading the available memory and taking a fraction of it is the
+/// honest version and is not done.
+///
+/// **It lives here, beside [`MAX_BRICKS`], rather than in `brokkr-app` where
+/// it was written.** It was read by exactly one function -- the resample guard
+/// -- so `brokkr-core` could not reach it, and `brokkr-core` is where the two
+/// things that have to agree with it now are: [`Document::growth_guard`],
+/// which refuses a body the document has no room for, and the mask field,
+/// whose bytes ride beside the field they mask. CI fails the build if the
+/// dependency ever runs the other way, so a constant the engine needs cannot
+/// live in the shell.
+///
+/// An `f64` rather than a `u64` because every consumer multiplies it by a
+/// predicted growth factor; see [`crate::voxelise`]'s `MAX_IMPORT_BYTES`,
+/// which is the same number in the same shape for the same reason.
+pub const MAX_VOLUME_BYTES: f64 = 6.0 * 1024.0 * 1024.0 * 1024.0;
+
 /// How far from the origin a brick coordinate may sit.
 ///
 /// Derived rather than chosen: [`BrickCoord::origin`] multiplies the coordinate

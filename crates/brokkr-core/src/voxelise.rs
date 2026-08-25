@@ -227,6 +227,26 @@ pub struct VoxeliseOptions {
     /// size they asked for -- a test pinning field values at a known voxel, or
     /// a measurement comparing like with like.
     pub refine_to_resolve: bool,
+    /// Vertices of [`VERTEX_CAPACITY`] that are already spoken for, so this
+    /// import is judged against what the mesh pool has LEFT rather than against
+    /// an empty one.
+    ///
+    /// Zero is the right answer for an import that REPLACES the document,
+    /// which is every import there is today: the application rebuilds
+    /// everything afterwards, which empties the pool, so the model on screen
+    /// while the voxeliser runs is not competing with the one it is building.
+    /// Feeding the watermark there would refuse imports that fit perfectly.
+    ///
+    /// An import that joins an existing document -- "Import as a new body",
+    /// deferred out of the bodies plan and so not built here -- passes the
+    /// pool's watermark, and it is the call site that has to know which of the
+    /// two it is. See [`workable_voxel_for`] for what the number does and
+    /// [`crate::body::GrowthGuard`] for the same argument on the primitive
+    /// path.
+    ///
+    /// An `f64` because [`VERTEX_CAPACITY`] is one: every consumer of it
+    /// divides.
+    pub already_reserved: f64,
 }
 
 impl VoxeliseOptions {
@@ -239,6 +259,7 @@ impl VoxeliseOptions {
             repair_broken_scan_lines: true,
             coarsen_to_fit: true,
             refine_to_resolve: true,
+            already_reserved: 0.0,
         }
     }
 }
@@ -412,17 +433,20 @@ fn voxelise_once(
     // asked for exactness (`coarsen_to_fit: false`) and for the pathological
     // case where even the coarsened estimate does not settle.
     let mut voxel_size = voxel_size;
-    if let Err(refusal) = preflight(&corners, aabb_min, aabb_max, voxel_size) {
+    if let Err(refusal) =
+        preflight(&corners, aabb_min, aabb_max, voxel_size, options.already_reserved)
+    {
         if !options.coarsen_to_fit {
             return Err(refusal);
         }
-        let workable = workable_voxel_for(surface_area(&corners), voxel_size)
-            .expect("preflight refused, so a workable size exists");
+        let workable =
+            workable_voxel_for(surface_area(&corners), voxel_size, options.already_reserved)
+                .expect("preflight refused, so a workable size exists");
         // Five percent over the exact fit, because the estimate is an
         // estimate and landing at 100% of a ceiling helps nobody.
         report.coarsened_from_mm = voxel_size;
         voxel_size = workable * 1.05;
-        preflight(&corners, aabb_min, aabb_max, voxel_size)?;
+        preflight(&corners, aabb_min, aabb_max, voxel_size, options.already_reserved)?;
     }
     report.voxel_mm = voxel_size;
 
@@ -718,10 +742,30 @@ fn estimated_bytes(area: f64, voxel_size: f32) -> f64 {
 /// the number can be USED -- the coarsen-to-fit retry imports at it -- and so
 /// the arithmetic is testable without building a capacity-sized volume, which
 /// is by construction what any input that trips it produces.
-fn workable_voxel_for(area: f64, voxel_size: f32) -> Option<f32> {
+///
+/// **`already_reserved` is what stops this judging every import against an
+/// empty pool.** It used to divide by [`VERTEX_CAPACITY`] flat, which is right
+/// for the only import there has ever been -- one that replaces the whole
+/// document -- and wrong for an import that joins one. Two models that each
+/// come to 60% of the pool both pass on their own and together lose a fifth of
+/// the second one, silently, to the overflow path. It is fed from the pool's
+/// WATERMARK rather than its live reservation; see [`crate::body::GrowthGuard`]
+/// for why those two differ and why the difference is the whole bug.
+///
+/// The parameter is threaded rather than applied in [`preflight`] alone,
+/// because `preflight` only formats the refusal: the retry in
+/// [`voxelise_once`] calls this directly for the size it will actually import
+/// at, and a retry judging against an empty pool would coarsen to a size that
+/// still does not fit and then report success.
+fn workable_voxel_for(area: f64, voxel_size: f32, already_reserved: f64) -> Option<f32> {
     let vertices = area / (voxel_size as f64 * voxel_size as f64) * VERTEX_FACTOR;
-    let over =
-        (estimated_bytes(area, voxel_size) / MAX_IMPORT_BYTES).max(vertices / VERTEX_CAPACITY);
+    // Clamped to leave a thousandth of the pool, so that a caller which has
+    // already filled it names a very coarse size rather than dividing by zero
+    // and returning an infinity the retry would then import at. Nothing should
+    // reach the clamp: `GrowthGuard` refuses an add long before the pool is
+    // that full, and this is the backstop rather than the guard.
+    let headroom = (VERTEX_CAPACITY - already_reserved).max(VERTEX_CAPACITY / 1000.0);
+    let over = (estimated_bytes(area, voxel_size) / MAX_IMPORT_BYTES).max(vertices / headroom);
     (over > 1.0).then(|| (voxel_size as f64 * over.sqrt()) as f32)
 }
 
@@ -730,9 +774,10 @@ fn preflight(
     minimum: Vec3,
     maximum: Vec3,
     voxel_size: f32,
+    already_reserved: f64,
 ) -> Result<(), ImportError> {
     let area = surface_area(corners);
-    if let Some(workable) = workable_voxel_for(area, voxel_size) {
+    if let Some(workable) = workable_voxel_for(area, voxel_size, already_reserved) {
         let extent = maximum - minimum;
         return Err(ImportError::Malformed(format!(
             "it is {:.0} x {:.0} x {:.0} mm, which at {:.3} mm would need about {:.1} GB -- \
@@ -1562,20 +1607,118 @@ mod tests {
     #[test]
     fn the_workable_voxel_grows_with_the_square_root_of_the_overshoot() {
         // A modest surface at a sane voxel fits and asks for nothing.
-        assert_eq!(workable_voxel_for(600.0, 0.25), None, "a 10 mm cube at 0.25 mm fits");
+        assert_eq!(workable_voxel_for(600.0, 0.25, 0.0), None, "a 10 mm cube at 0.25 mm fits");
 
         // A surface big enough to blow the vertex ceiling names a size...
         let area = 500_000.0; // mm^2, a large scanned model
-        let workable = workable_voxel_for(area, 0.05).expect("this cannot fit at 0.05 mm");
+        let workable = workable_voxel_for(area, 0.05, 0.0).expect("this cannot fit at 0.05 mm");
         assert!(workable > 0.05, "workable must be coarser than the refused size");
 
         // ...and that size, with the retry's own five percent margin, fits --
         // the fixpoint the coarsen-to-fit path depends on.
         assert_eq!(
-            workable_voxel_for(area, workable * 1.05),
+            workable_voxel_for(area, workable * 1.05, 0.0),
             None,
             "the size the preflight names must itself pass the preflight"
         );
+    }
+
+    /// **An import that passes on its own is refused once the pool is already
+    /// carrying something**, which is the failure the `already_reserved`
+    /// parameter exists for and the one this function could not see when it
+    /// divided by the whole pool flat.
+    ///
+    /// The arithmetic is what makes it silent: each side passes its own check,
+    /// and together they ask for more than the pool has. The pool cannot say
+    /// no -- it logs a line to stderr and drops the bricks it could not fit --
+    /// so the model arrives on screen with pieces missing and nothing in the
+    /// interface reports it.
+    ///
+    /// **The plan's own wording for this check is "two imports that each pass
+    /// at 60% are refused as a pair", and that fixture cannot be built.**
+    /// Measured here rather than argued: the two ceilings are in a fixed ratio,
+    /// because `estimated_bytes` comes to `area / voxel^2 * 320` and the vertex
+    /// estimate to `area / voxel^2 * 2` -- exactly 160 bytes per vertex,
+    /// whatever the model and whatever the voxel size. So `MAX_IMPORT_BYTES`
+    /// caps ANY single import at `4 GiB / 160` = 26.8M vertices, which is 30%
+    /// of [`VERTEX_CAPACITY`], and a single import cannot reach 60% of the pool
+    /// by any route. Two of them still fit; it takes four. What the parameter
+    /// really defends is an import joining a pool that is already holding a
+    /// document, which is what this builds.
+    #[test]
+    fn an_import_that_fits_an_empty_pool_is_refused_when_the_pool_is_full() {
+        // The largest import the byte ceiling admits, less a little: 30% of the
+        // vertex pool, solved for rather than guessed, so the fixture states
+        // its own premise.
+        const SHARE: f64 = 0.30;
+        let voxel = 0.25_f32;
+        let area = SHARE * VERTEX_CAPACITY / VERTEX_FACTOR * (voxel as f64 * voxel as f64);
+
+        assert_eq!(
+            workable_voxel_for(area, voxel, 0.0),
+            None,
+            "the fixture must fit an empty pool, or it is testing the wrong thing"
+        );
+
+        // A document already on the GPU, leaving less room than the import
+        // needs. Below is the pair the plan asked for, as near as the ceilings
+        // allow it to be built.
+        let already = 0.8 * VERTEX_CAPACITY;
+        let workable = workable_voxel_for(area, voxel, already)
+            .expect("20% of the pool cannot hold a 30% import");
+        assert!(workable > voxel, "the import has to be told a COARSER size, not {workable}");
+        // And the size it names fits in what is left, with the retry's margin:
+        // the same fixpoint as above, now against a pool that is not empty.
+        assert_eq!(
+            workable_voxel_for(area, workable * 1.05, already),
+            None,
+            "the size named for a partly full pool must itself fit that pool"
+        );
+    }
+
+    /// The plan's pair, built as far as the ceilings permit: FOUR imports that
+    /// each pass alone, and the fourth refused.
+    ///
+    /// Here for the same reason the test above explains at length -- the byte
+    /// ceiling caps one import at 30% of the vertex pool, so three of them fit
+    /// and the overflow arrives on the fourth. Worth pinning as its own case
+    /// because it is the only one where every input is a real import rather
+    /// than a stand-in for a document, and because the number four is a
+    /// consequence of two constants that could move.
+    #[test]
+    fn the_fourth_import_of_a_size_that_three_hold_is_refused() {
+        const SHARE: f64 = 0.30;
+        let voxel = 0.25_f32;
+        let area = SHARE * VERTEX_CAPACITY / VERTEX_FACTOR * (voxel as f64 * voxel as f64);
+        let each = SHARE * VERTEX_CAPACITY;
+
+        for held in 0..3 {
+            assert_eq!(
+                workable_voxel_for(area, voxel, each * held as f64),
+                None,
+                "import {} of four should still fit",
+                held + 1
+            );
+        }
+        assert!(
+            workable_voxel_for(area, voxel, each * 3.0).is_some(),
+            "the fourth import must be refused rather than left to overflow the pool"
+        );
+    }
+
+    /// A pool with nothing left names a size rather than an infinity.
+    ///
+    /// The clamp inside [`workable_voxel_for`] is a backstop and should be
+    /// unreachable -- `GrowthGuard` refuses an add long before this -- but the
+    /// value it guards is fed straight to the coarsen-to-fit retry, which
+    /// imports at whatever it is handed. An infinite voxel size builds a
+    /// lattice of one brick, or panics, depending on the model.
+    #[test]
+    fn an_import_into_a_full_pool_is_refused_with_a_finite_size() {
+        let workable = workable_voxel_for(500_000.0, 0.25, VERTEX_CAPACITY)
+            .expect("a full pool cannot hold anything more");
+        assert!(workable.is_finite(), "a full pool named {workable} as a voxel size");
+        assert!(workable > 0.25);
     }
 
     /// Lay a one voxel thick run of material along X at a chosen depth.
@@ -2129,6 +2272,7 @@ mod tests {
                 repair_broken_scan_lines: true,
                 coarsen_to_fit: false,
                 refine_to_resolve: false,
+                already_reserved: 0.0,
             },
         )
         .expect("a sphere should voxelise");
@@ -2239,6 +2383,7 @@ mod tests {
                 repair_broken_scan_lines: true,
                 coarsen_to_fit: false,
                 refine_to_resolve: false,
+                already_reserved: 0.0,
             },
         );
         // `Volume` has no `Debug`, so the success case cannot be unwrapped into
@@ -2331,6 +2476,7 @@ mod preflight_calibration {
                     repair_broken_scan_lines: true,
                     coarsen_to_fit: false,
                     refine_to_resolve: false,
+                    already_reserved: 0.0,
                 },
             )
             .expect("the fixture should voxelise");

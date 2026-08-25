@@ -44,7 +44,10 @@ pub mod volume;
 pub mod voxelise;
 
 pub use apron::ApronBuffer;
-pub use body::{Document, MAX_BODIES, MAX_DEPTH, MAX_NODES, Node, NodeId, NodeMeta};
+pub use body::{
+    Document, GrowthGuard, MAX_BODIES, MAX_DEPTH, MAX_NODES, Node, NodeId, NodeMeta,
+    resolve_visibility,
+};
 pub use brick::{
     APRON_DIM, APRON_VOXELS, BRICK_DIM, BRICK_VOXELS, Brick, BrickCoord, INSIDE, NARROW_BAND,
     OUTSIDE,
@@ -54,12 +57,12 @@ pub use brush::{
     Symmetry, lean_normal,
 };
 pub use clip::ClipPlane;
-pub use export::{ExportMesh, MeshReport};
+pub use export::{ExportMesh, ExportedBody, MeshReport, document_verdict};
 pub use import::{ImportError, MESH_EXTENSIONS};
 pub use mesh::{BrickMesh, MeshScratch, Vertex};
 pub use orientation::{AxisRotation, Facing, from_print_space, resting_up, to_print_space};
 pub use pattern::{MAX_SCALE_MM, MIN_SCALE_VOXELS, Pattern, PatternKind};
-pub use project::{Keyframe, Outline, ProjectError, ProjectState, View};
+pub use project::{Keyframe, MAX_VOLUME_BYTES, Outline, ProjectError, ProjectState, View};
 pub use raycast::{Hit, raycast};
 pub use region::FieldRegion;
 pub use stroke::{MAX_STAMPS_PER_EVENT, Stroke};

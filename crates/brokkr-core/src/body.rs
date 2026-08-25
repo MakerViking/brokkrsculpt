@@ -39,8 +39,9 @@
 
 use rayon::prelude::*;
 
-use crate::brick::BrickCoord;
+use crate::brick::{BRICK_VOXELS, Brick, BrickCoord};
 use crate::mesh::{BrickMesh, MeshScratch};
+use crate::project::MAX_VOLUME_BYTES;
 use crate::volume::{PARALLEL_MESH_THRESHOLD, Volume, VolumeStats};
 
 /// Which node, for as long as the document lives.
@@ -604,6 +605,105 @@ impl Document {
         totals
     }
 
+    /// What this document will and will not make room for, right now.
+    ///
+    /// The one place an add path asks "does another body fit"; see
+    /// [`GrowthGuard`] for what it then answers with, and why nothing may work
+    /// this out for itself.
+    ///
+    /// **`pool_headroom` is `vertex_capacity - vertices_watermark` and never
+    /// `- vertices_reserved`.** The two differ by however much the allocator's
+    /// free lists hold in granule classes nothing is asking for, and what runs
+    /// the pool out of room is the bump pointer rather than the live count.
+    /// The resample guard in the application may use `reserved`, and its own
+    /// comment says that is honest *only because* a resample empties the pool
+    /// first. **Adding a body empties nothing**, so the same substitution here
+    /// would say a body fits and then watch the pool overflow -- which is the
+    /// failure `PoolStats` is documented against and the one this project has
+    /// shipped twice.
+    ///
+    /// Taken as a parameter rather than read, because the number lives in the
+    /// renderer and `brokkr-core` may not depend on a GPU crate. A `u64`
+    /// because that is what `PoolStats` carries.
+    pub fn growth_guard(&self, pool_headroom: u64) -> GrowthGuard {
+        GrowthGuard {
+            resident_bytes: self.totals().resident_bytes as f64,
+            pool_headroom: pool_headroom as f64,
+        }
+    }
+
+    /// Where two bodies claim the same voxels, and how many.
+    ///
+    /// One entry per pair that overlaps at all, in display order, with the
+    /// count of voxels **both** bodies read as solid. A pair that does not
+    /// overlap is absent rather than reported as zero, so an empty result means
+    /// "nothing interpenetrates" and the length is the number of collisions.
+    ///
+    /// **Nothing else in this codebase can see an interpenetration.**
+    /// [`crate::export::ExportMesh::validate`] counts edge incidence over
+    /// shared vertex *indices*, and two bodies welded separately share no
+    /// indices at all -- so two spheres passing through each other are two
+    /// closed surfaces, and both report watertight, and the slicer resolves the
+    /// union without complaint or reports it as a self-intersection depending
+    /// on which slicer it is. This is the only measurement that says so.
+    ///
+    /// Gated on the bodies' world AABBs, which is what makes the common case
+    /// -- bodies laid out side by side -- a handful of float comparisons. The
+    /// per-body cache the panel will keep is not here yet, so the boxes are
+    /// computed once up front rather than per pair: [`Volume::world_bounds`]
+    /// walks the brick keys, which is cheap, but doing it `n^2` times is not.
+    ///
+    /// Costs a walk of every shared brick's voxels for the pairs that do
+    /// overlap, so it is a user-action operation and must not run per frame.
+    pub fn overlaps(&self) -> Vec<(NodeId, NodeId, usize)> {
+        let bodies: Vec<(NodeId, &Volume, (glam::Vec3, glam::Vec3))> = self
+            .bodies()
+            .filter_map(|(id, volume)| volume.world_bounds().map(|box_| (id, volume, box_)))
+            .collect();
+
+        let mut found = Vec::new();
+        for (index, (one, here, one_box)) in bodies.iter().enumerate() {
+            for (other, there, other_box) in &bodies[index + 1..] {
+                if !boxes_meet(*one_box, *other_box) {
+                    continue;
+                }
+                let shared = here
+                    .brick_coords()
+                    .filter(|coord| there.brick(*coord).is_some())
+                    .collect::<Vec<_>>();
+                let voxels: usize =
+                    shared.par_iter().map(|coord| solid_in_both(here, there, *coord)).sum();
+                if voxels > 0 {
+                    found.push((*one, *other, voxels));
+                }
+            }
+        }
+        found
+    }
+
+    /// What is DRAWN: the pick gate, the panel's muted names, and every
+    /// direct-manipulation gesture (today: the plane cut). Indexed by NODE
+    /// position.
+    ///
+    /// Solo belongs here and nowhere else in the two named call sites, because
+    /// direct manipulation acts on what the user can see. See
+    /// [`resolve_visibility`].
+    pub fn display_visibility(&self, solo: Option<NodeId>, out: &mut Vec<bool>) {
+        resolve_visibility(&self.nodes, solo, out);
+    }
+
+    /// What is KEPT: the file, and the export. Indexed by NODE position.
+    ///
+    /// It is [`resolve_visibility`] with no solo, and the `None` is the whole
+    /// of the difference. **Export must never see solo** -- a view mode
+    /// silently dropping a part from a print is exactly the class of failure
+    /// the eye is being careful about, and it is why these two are named
+    /// functions rather than one function with a parameter everybody has to
+    /// remember the right value for.
+    pub fn saved_visibility(&self, out: &mut Vec<bool>) {
+        resolve_visibility(&self.nodes, None, out);
+    }
+
     /// Move every body's dirty set into `out`, tagged with the body it came
     /// from, keeping both allocations.
     ///
@@ -766,6 +866,205 @@ impl Document {
             debug_assert_eq!(node.depth, 0, "every node is at depth 0 in this build");
             debug_assert!(node.is_body(), "every node holds a body in this build");
         }
+    }
+}
+
+/// Whether two world space boxes share any volume at all.
+///
+/// Touching counts as meeting: the boxes come from brick extents, and two
+/// bodies whose bricks abut share the lattice plane between them, where a voxel
+/// of one is a voxel of the other.
+fn boxes_meet(
+    (one_low, one_high): (glam::Vec3, glam::Vec3),
+    (low, high): (glam::Vec3, glam::Vec3),
+) -> bool {
+    one_low.x <= high.x
+        && low.x <= one_high.x
+        && one_low.y <= high.y
+        && low.y <= one_high.y
+        && one_low.z <= high.z
+        && low.z <= one_high.z
+}
+
+/// Voxels of one brick coordinate that BOTH bodies read as solid.
+///
+/// Solid is `< 0.0` and not `<= 0.0`, which is the mesher's own rule: an exact
+/// zero is biased to the inside as `-0.0` by the voxeliser, and `-0.0 < 0.0` is
+/// false in Rust, so `fast-surface-nets` reads such a voxel as OUTSIDE.
+/// Counting it as an overlap here would report an interpenetration along every
+/// surface two bodies merely touch along.
+fn solid_in_both(here: &Volume, there: &Volume, coord: BrickCoord) -> usize {
+    match (here.brick(coord), there.brick(coord)) {
+        // A uniform tile is one value for all 32,768 of its voxels, so the two
+        // cheap cases are worth having: neither needs to be read at all.
+        (Some(Brick::Uniform(one)), Some(Brick::Uniform(other))) => {
+            usize::from(*one < 0.0 && *other < 0.0) * BRICK_VOXELS
+        }
+        (Some(Brick::Uniform(one)), Some(Brick::Dense(data)))
+        | (Some(Brick::Dense(data)), Some(Brick::Uniform(one)))
+            if *one < 0.0 =>
+        {
+            data.iter().filter(|value| **value < 0.0).count()
+        }
+        (Some(Brick::Dense(one)), Some(Brick::Dense(other))) => one
+            .iter()
+            .zip(other.iter())
+            .filter(|(here, there)| **here < 0.0 && **there < 0.0)
+            .count(),
+        // An absent brick reads as OUTSIDE, so it can overlap nothing.
+        _ => 0,
+    }
+}
+
+/// The ONE place the three inputs to visibility are combined: a node's own eye,
+/// every ancestor folder's eye, and solo. `out` is indexed by NODE position.
+///
+/// **All three are masks over a node's own bit and none of them writes it.**
+/// That is taken verbatim from two independent references that converge on the
+/// same wording -- Maxon on SubTool folders, "toggling the visibility state of
+/// the folder will not change that of the individual SubTools", and Photoshop,
+/// which draws the suppressed child with a grey eye. Both compose answers fall
+/// out of it: a hidden child in a shown folder stays hidden, and a shown child
+/// in a hidden folder is restored exactly on re-show, because nothing was
+/// mutated. Nomad ships the opposite and users filed it as unintuitive.
+///
+/// **Solo is a PARAMETER and never a field** -- not of [`Document`], not of
+/// `ProjectState`, and above all not of `View`. `project::write(out, doc,
+/// state)` takes exactly two data parameters and solo is a field of neither, so
+/// there is no expression that can pass solo to the writer. That is not
+/// discipline; the call does not typecheck. `View` is written to the file *and*
+/// is the payload of every timeline keyframe, so solo there would make jumping
+/// to a key change which bodies exist on screen.
+///
+/// Solo NARROWS and never widens, for the same reason the other two masks do:
+/// soloing a body whose own eye is off leaves it hidden here. Making that
+/// gesture show the body is the business of whatever handles the click -- it
+/// sets the eye -- and not of this function, which has no business rewriting a
+/// bit the user set.
+///
+/// One forward pass. Preorder guarantees every ancestor is already resolved,
+/// and the ancestor chain fits a fixed-size array, so this allocates nothing
+/// beyond `out`'s own growth and recurses nowhere -- a hostile file cannot make
+/// it recurse AT ALL. The depth index is clamped for the same reason
+/// [`Node::from_meta`] clamps: an index past [`MAX_DEPTH`] would be a panic in
+/// a function every frame calls.
+///
+/// **The signature is final from here, before folders and before solo exist**,
+/// with every caller passing `None` until they do. Three inputs are a decided
+/// requirement and the alternative is revisiting every call site later. With
+/// one node at depth 0 both the ancestor walk and the solo scope are no-ops,
+/// which is exactly why this is worth fixing once rather than in six places.
+pub fn resolve_visibility(nodes: &[Node], solo: Option<NodeId>, out: &mut Vec<bool>) {
+    out.clear();
+    out.reserve(nodes.len());
+
+    // Whether the node at each depth resolved as shown, so its children can
+    // read their own ancestor's answer out of the slot above them.
+    const DEPTHS: usize = MAX_DEPTH as usize;
+    let mut ancestors = [true; DEPTHS];
+    // The depth of the soloed node, for as long as we are inside its subtree.
+    // A subtree is a preorder run of everything deeper than its root, which is
+    // what makes the scope test one integer comparison rather than a search.
+    let mut soloed_at: Option<u8> = None;
+
+    for node in nodes {
+        let depth = usize::from(node.depth).min(DEPTHS - 1);
+        let ancestors_shown = depth == 0 || ancestors[depth - 1];
+        ancestors[depth] = ancestors_shown && node.visible;
+
+        if let Some(wanted) = solo {
+            soloed_at = match soloed_at {
+                Some(root) if node.depth > root => Some(root),
+                _ if node.id == wanted => Some(node.depth),
+                _ => None,
+            };
+        }
+        let in_scope = solo.is_none() || soloed_at.is_some();
+
+        out.push(ancestors_shown && node.visible && in_scope);
+    }
+}
+
+/// The ceilings a growing document is measured against, and the one place the
+/// arithmetic that predicts a refusal lives.
+///
+/// **This exists because there was no RAM or pool ceiling on the add-a-body
+/// path at all.** The application's resample guard consulted both, and it was
+/// the only thing that did: it returned early unless the request was *finer*
+/// than the current lattice, so nothing that GREW the document ever reached
+/// either ceiling. A second body was simply admitted, and the first thing to
+/// notice would have been the pool logging `MESH POOL FULL` to stderr while the
+/// model on screen quietly lost parts of itself. This project has shipped
+/// silent geometry loss twice and the whole point of this type is that it does
+/// not happen a third time.
+///
+/// Build one with [`Document::growth_guard`], which is what makes the byte
+/// figure a sum over every body rather than the active one's.
+#[derive(Debug, Clone, Copy)]
+pub struct GrowthGuard {
+    /// Voxel bytes the whole document already holds.
+    resident_bytes: f64,
+    /// Vertices the mesh pool can still hand out: capacity minus WATERMARK.
+    pool_headroom: f64,
+}
+
+impl GrowthGuard {
+    /// How much under an exact fit a suggested size lands.
+    ///
+    /// Three percent, matching the resample guard's own margin and for the same
+    /// reason: the estimate is an estimate, and a prediction that lands at
+    /// exactly 100% of a ceiling helps nobody.
+    const MARGIN: f64 = 0.97;
+
+    /// Why a body costing `bytes` of voxel data and `vertices` of mesh will not
+    /// fit, and the fraction of its linear size that would.
+    ///
+    /// `None` is the answer that means "go ahead". The `f32` in the refusal is
+    /// a **linear** scale factor, because both costs are a shell over a
+    /// surface: a body at half the size has a quarter of the surface, a quarter
+    /// of the bricks and a quarter of the vertices. That is the same square law
+    /// the resample guard runs against voxel size, transposed onto the only
+    /// lever an add path has. A caller may offer it, shrink to it, or simply
+    /// print the message -- but it must not have to work the number out for
+    /// itself, because the established pattern in this codebase is that a
+    /// refusal names the size that WOULD work.
+    ///
+    /// **Vertices and not indices.** The index buffer is provisioned at six
+    /// times the vertex buffer and a closed surface produces about six -- the
+    /// dragon reserves 51.9 million indices against 8.65 million vertices -- so
+    /// the vertex count is the binding one. [`crate::voxelise`]'s import
+    /// preflight makes the same call for the same reason, and a second
+    /// parameter every caller has to estimate would buy a ceiling nothing
+    /// reaches first.
+    pub fn no_room_for(&self, bytes: f64, vertices: f64) -> Option<(String, f32)> {
+        let byte_headroom = (MAX_VOLUME_BYTES - self.resident_bytes).max(0.0);
+        let byte_fit = if bytes > 0.0 { byte_headroom / bytes } else { f64::INFINITY };
+        let vertex_fit = if vertices > 0.0 { self.pool_headroom / vertices } else { f64::INFINITY };
+        let fit = byte_fit.min(vertex_fit);
+        if fit >= 1.0 {
+            return None;
+        }
+
+        // Which ceiling is the tighter one decides what the message says,
+        // because "it needs 3.4 GB" and "it needs 40M vertices" send a reader
+        // to completely different remedies.
+        let why = if byte_fit <= vertex_fit {
+            format!(
+                "it needs about {:.1} GB of memory and the document has {:.1} GB left of a \
+                 {:.0} GB ceiling",
+                bytes / (1024.0 * 1024.0 * 1024.0),
+                byte_headroom / (1024.0 * 1024.0 * 1024.0),
+                MAX_VOLUME_BYTES / (1024.0 * 1024.0 * 1024.0),
+            )
+        } else {
+            format!(
+                "it needs about {:.1}M vertices and the mesh pool has {:.1}M left",
+                vertices / 1.0e6,
+                self.pool_headroom / 1.0e6,
+            )
+        };
+        let workable = (fit.sqrt() * Self::MARGIN) as f32;
+        Some((format!("{why} -- {:.0}% of that size would fit", workable * 100.0), workable))
     }
 }
 
@@ -1039,5 +1338,329 @@ mod tests {
         assert_eq!(doc.active(), second, "there is nothing below, so the selection moves up");
         assert!(doc.volume(doc.active()).is_some(), "the active row must still hold a field");
         assert_eq!(doc.body_count(), 2);
+    }
+
+    // --- the visibility resolver ------------------------------------------
+
+    /// A row at a chosen depth with a chosen eye, built straight rather than
+    /// through a [`Document`].
+    ///
+    /// The document pins every node to depth 0 in this build and asserts it
+    /// after every mutation, so a tree deep enough to exercise the ancestor
+    /// walk cannot be built through one. [`resolve_visibility`] is a free
+    /// function over `&[Node]` precisely so it can be tested ahead of the
+    /// feature that produces such a list.
+    fn row(id: u32, depth: u8, visible: bool) -> Node {
+        Node::from_meta(
+            NodeMeta {
+                id: NodeId(id),
+                depth,
+                name: format!("row {id}"),
+                visible,
+                collapsed: false,
+            },
+            Volume::new(0.5),
+        )
+    }
+
+    #[test]
+    fn a_hidden_folder_hides_its_children_without_writing_their_eyes() {
+        // folder(hidden) > child(shown) > grandchild(shown), then a sibling of
+        // the folder that must be untouched by any of it.
+        let nodes = vec![row(1, 0, false), row(2, 1, true), row(3, 2, true), row(4, 0, true)];
+
+        let mut shown = Vec::new();
+        resolve_visibility(&nodes, None, &mut shown);
+        assert_eq!(shown, vec![false, false, false, true]);
+
+        // The eyes themselves are untouched, which is the whole composition
+        // rule: re-showing the folder restores the descendants exactly, because
+        // nothing was ever written to them.
+        assert!(nodes[1].visible, "the ancestor's eye was written into the child's");
+        assert!(nodes[2].visible);
+    }
+
+    /// The other half of the same rule: a hidden child inside a SHOWN folder
+    /// stays hidden. An ancestor's eye is an AND-mask and never an override.
+    #[test]
+    fn a_shown_folder_does_not_reveal_a_child_that_is_hidden() {
+        let nodes = vec![row(1, 0, true), row(2, 1, false), row(3, 2, true)];
+        let mut shown = Vec::new();
+        resolve_visibility(&nodes, None, &mut shown);
+        assert_eq!(
+            shown,
+            vec![true, false, false],
+            "a shown folder revealed a hidden child, and its grandchild with it"
+        );
+    }
+
+    /// Solo scopes to the soloed node's SUBTREE, which is the preorder run of
+    /// everything deeper than it, and stops at the first row that is not.
+    #[test]
+    fn solo_shows_the_soloed_node_and_its_subtree_and_nothing_else() {
+        let nodes = vec![
+            row(1, 0, true), // before
+            row(2, 0, true), // soloed folder
+            row(3, 1, true), // inside
+            row(4, 2, true), // inside, deeper
+            row(5, 0, true), // after, back at the soloed depth
+        ];
+
+        let mut shown = Vec::new();
+        resolve_visibility(&nodes, Some(NodeId(2)), &mut shown);
+        assert_eq!(shown, vec![false, true, true, true, false]);
+
+        // And with no solo the same list is all shown, so the test above is
+        // measuring solo rather than something else.
+        resolve_visibility(&nodes, None, &mut shown);
+        assert_eq!(shown, vec![true; 5]);
+    }
+
+    /// **Solo narrows and never widens.** Soloing a body whose own eye is off
+    /// leaves it hidden here, because solo is a mask over that bit like the
+    /// other two and not a rewrite of it.
+    ///
+    /// The gesture "solo a hidden body and see it" is a decided requirement,
+    /// and it is met by the click handler turning the eye on -- which is
+    /// undoable and visible in the panel -- rather than by this function
+    /// quietly disagreeing with the eye the user is looking at.
+    #[test]
+    fn soloing_a_hidden_node_does_not_reveal_it() {
+        let nodes = vec![row(1, 0, true), row(2, 0, false)];
+        let mut shown = Vec::new();
+        resolve_visibility(&nodes, Some(NodeId(2)), &mut shown);
+        assert_eq!(shown, vec![false, false], "solo overrode an eye instead of masking it");
+    }
+
+    /// Soloing something that is not in the list hides everything rather than
+    /// showing everything. A stale id is a bug either way, and the failure that
+    /// is visible immediately is better than the one that looks like solo did
+    /// not fire.
+    #[test]
+    fn soloing_an_id_that_is_not_here_shows_nothing() {
+        let nodes = vec![row(1, 0, true), row(2, 0, true)];
+        let mut shown = Vec::new();
+        resolve_visibility(&nodes, Some(NodeId(99)), &mut shown);
+        assert_eq!(shown, vec![false, false]);
+    }
+
+    /// Every combination of the three inputs, at the full depth the panel
+    /// allows, against the rule stated independently of the implementation.
+    ///
+    /// The tests above are the cases worth reading; this is the one that says
+    /// there is no *other* case. The tree is a straight chain of
+    /// [`MAX_DEPTH`] rows, which is the shape that exercises the ancestor walk
+    /// to its last slot. Every assignment of eyes down that chain is tried (256
+    /// of them), against no solo and against solo on each row in turn -- 2,304
+    /// resolutions, which is what "every combination" costs at this depth.
+    ///
+    /// The expectation is recomputed from the rule -- "shown if every eye from
+    /// the root down to and including its own is on, AND it is inside the solo
+    /// scope" -- rather than read from a table, so this cannot be made to agree
+    /// with a wrong implementation by pasting its output into a fixture.
+    #[test]
+    fn the_resolver_matches_the_rule_at_every_depth_for_every_eye_and_every_solo() {
+        const DEPTH: usize = MAX_DEPTH as usize;
+        assert_eq!(DEPTH, 8, "the ancestor array is fixed size, so its length is part of this");
+
+        let mut shown = Vec::new();
+        for eyes in 0_u32..(1 << DEPTH) {
+            // Row n is at depth n, so row n's ancestors are rows 0..n.
+            let nodes: Vec<Node> =
+                (0..DEPTH).map(|d| row(d as u32 + 1, d as u8, eyes >> d & 1 == 1)).collect();
+
+            let solos = std::iter::once(None).chain((0..DEPTH).map(|d| Some(NodeId(d as u32 + 1))));
+            for solo in solos {
+                resolve_visibility(&nodes, solo, &mut shown);
+                assert_eq!(shown.len(), DEPTH);
+
+                for (index, &resolved) in shown.iter().enumerate() {
+                    let eyes_on = (0..=index).all(|above| eyes >> above & 1 == 1);
+                    // In a chain, one row's subtree is that row and everything
+                    // after it, because everything after it is deeper.
+                    let in_scope = solo.is_none_or(|wanted| index + 1 >= wanted.0 as usize);
+                    assert_eq!(
+                        resolved,
+                        eyes_on && in_scope,
+                        "row {index} of the chain with eyes {eyes:08b} and solo {solo:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The buffer is reused, so it has to be emptied rather than appended to.
+    #[test]
+    fn resolving_twice_into_one_buffer_does_not_accumulate() {
+        let doc = Document::new(0.5);
+        let mut shown = vec![true; 17];
+        doc.saved_visibility(&mut shown);
+        assert_eq!(shown.len(), doc.node_count());
+    }
+
+    /// The two named call sites differ in exactly one thing, and that one thing
+    /// is what keeps a view mode out of a print.
+    #[test]
+    fn the_saved_visibility_ignores_solo_and_the_displayed_one_does_not() {
+        let mut doc = Document::new(0.5);
+        let second = doc.add_body("Body 2", Volume::new(0.5));
+
+        let mut displayed = Vec::new();
+        doc.display_visibility(Some(second), &mut displayed);
+        assert_eq!(displayed, vec![false, true], "solo did not narrow what is drawn");
+
+        let mut saved = Vec::new();
+        doc.saved_visibility(&mut saved);
+        assert_eq!(saved, vec![true, true], "solo reached the file and the export");
+    }
+
+    // --- interpenetration --------------------------------------------------
+
+    /// Two bodies that pass through each other, and two that do not.
+    ///
+    /// This is the only measurement in the codebase that can tell them apart:
+    /// each body welds separately, so `MeshReport::validate` counts edges over
+    /// disjoint index spaces and both report watertight however deeply they
+    /// interpenetrate.
+    #[test]
+    fn overlapping_bodies_are_counted_and_disjoint_ones_are_not() {
+        let mut doc = Document::new(0.5);
+        let first = doc.active();
+        doc.active_volume_mut().seed_sphere(Vec3::ZERO, 8.0);
+
+        let mut through = Volume::new(0.5);
+        through.seed_sphere(Vec3::new(4.0, 0.0, 0.0), 8.0);
+        let second = doc.add_body("Body 2", through);
+
+        let found = doc.overlaps();
+        assert_eq!(found.len(), 1, "expected exactly one colliding pair: {found:?}");
+        assert_eq!((found[0].0, found[0].1), (first, second));
+        assert!(found[0].2 > 0, "the pair was reported with no overlapping voxels");
+
+        // Both still export as closed surfaces, which is what makes the count
+        // above the only thing that would ever say so.
+        for (_, volume) in doc.bodies() {
+            let (_, report) = volume.export_mesh();
+            assert!(report.is_printable(), "the fixture should be two clean solids");
+        }
+    }
+
+    #[test]
+    fn bodies_that_do_not_touch_report_no_overlap_at_all() {
+        let mut doc = Document::new(0.5);
+        doc.active_volume_mut().seed_sphere(Vec3::ZERO, 8.0);
+        let mut apart = Volume::new(0.5);
+        apart.seed_sphere(Vec3::new(80.0, 0.0, 0.0), 8.0);
+        doc.add_body("Body 2", apart);
+
+        assert!(doc.overlaps().is_empty(), "two bodies 80 mm apart were reported as colliding");
+    }
+
+    /// Bodies whose bricks meet but whose material does not are NOT an overlap.
+    ///
+    /// The AABB gate would pass them -- brick extents round out to whole 32
+    /// voxel bricks, so two spheres several millimetres apart share bricks --
+    /// and reporting them would make the count useless on any laid-out
+    /// document. The voxel comparison is what earns it.
+    #[test]
+    fn bodies_whose_bricks_meet_but_whose_material_does_not_are_not_an_overlap() {
+        let mut doc = Document::new(0.5);
+        doc.active_volume_mut().seed_sphere(Vec3::ZERO, 8.0);
+        let mut beside = Volume::new(0.5);
+        // Just clear of the first sphere, and well inside the brick rounding.
+        beside.seed_sphere(Vec3::new(18.0, 0.0, 0.0), 8.0);
+        doc.add_body("Body 2", beside);
+
+        let one = doc.active_volume().world_bounds().expect("the first body has bricks");
+        let other = doc
+            .bodies()
+            .nth(1)
+            .and_then(|(_, volume)| volume.world_bounds())
+            .expect("the second body has bricks");
+        assert!(
+            boxes_meet(one, other),
+            "the fixture must share bricks or it is not testing the voxel comparison"
+        );
+        assert!(doc.overlaps().is_empty(), "touching bricks were reported as touching material");
+    }
+
+    // --- the growth guard --------------------------------------------------
+
+    /// A body the document has room for is admitted, and the guard says so by
+    /// answering nothing at all.
+    #[test]
+    fn a_body_that_fits_is_not_refused() {
+        let doc = Document::new(0.5);
+        let guard = doc.growth_guard(80_000_000);
+        assert!(guard.no_room_for(100.0 * 1024.0 * 1024.0, 1_000_000.0).is_none());
+    }
+
+    /// The RAM ceiling, which is the one that fires first on a real document.
+    ///
+    /// The message has to name the ceiling as well as the shortfall, because
+    /// "it needs 4 GB" without "there is 1.5 GB left" is not something a user
+    /// can act on -- and the fraction has to be one that actually fits, or the
+    /// refusal has sent them somewhere that will refuse them again.
+    #[test]
+    fn a_body_too_big_for_the_memory_ceiling_is_refused_with_a_size_that_fits() {
+        let mut doc = Document::new(0.5);
+        doc.active_volume_mut().seed_sphere(Vec3::ZERO, 6.0);
+        let held = doc.totals().resident_bytes as f64;
+        // Everything but a gigabyte of the ceiling is already spoken for.
+        let guard = GrowthGuard {
+            resident_bytes: MAX_VOLUME_BYTES - 1024.0 * 1024.0 * 1024.0,
+            pool_headroom: 80_000_000.0,
+        };
+        assert!(held > 0.0, "the fixture body must cost something");
+
+        let wanted = 4.0 * 1024.0 * 1024.0 * 1024.0;
+        let (why, workable) =
+            guard.no_room_for(wanted, 1_000_000.0).expect("4 GB does not fit in 1 GB");
+        assert!(why.contains("GB of memory"), "the memory ceiling should be named: {why}");
+        assert!(why.contains("6 GB ceiling"), "the ceiling itself is not in the message: {why}");
+        assert!(why.contains('%'), "the message has to name a size that would work: {why}");
+
+        // A shell scales with the square of its linear size, so the suggested
+        // fraction has to be applied that way -- and once applied it must
+        // itself be admitted, which is the fixpoint the whole refusal rests on.
+        let shrunk = wanted * (workable * workable) as f64;
+        assert!(
+            guard.no_room_for(shrunk, 1_000_000.0).is_none(),
+            "the size the guard named does not itself fit: {workable}"
+        );
+    }
+
+    /// The pool ceiling, and the one place the WATERMARK is the number that
+    /// matters.
+    ///
+    /// `Document::growth_guard` takes headroom rather than capacity precisely
+    /// so this cannot be computed from `vertices_reserved` by mistake: adding a
+    /// body resets nothing, so the space behind a fragmented bump pointer is
+    /// not space at all.
+    #[test]
+    fn a_body_the_pool_cannot_hold_is_refused_in_vertices() {
+        let doc = Document::new(0.5);
+        // Plenty of RAM, almost no pool.
+        let guard = doc.growth_guard(2_000_000);
+        let (why, workable) =
+            guard.no_room_for(1024.0 * 1024.0, 8_000_000.0).expect("8M vertices do not fit in 2M");
+        assert!(why.contains("vertices"), "the pool ceiling should be named: {why}");
+        assert!(workable > 0.0 && workable < 1.0, "a fraction was expected, got {workable}");
+
+        let shrunk = 8_000_000.0 * (workable * workable) as f64;
+        assert!(
+            guard.no_room_for(1024.0 * 1024.0, shrunk).is_none(),
+            "the size the guard named does not itself fit: {workable}"
+        );
+    }
+
+    /// A document already past the ceiling has no room for anything, and must
+    /// still answer with a finite fraction rather than a negative or a NaN.
+    #[test]
+    fn a_document_already_over_the_ceiling_refuses_without_arithmetic_nonsense() {
+        let guard = GrowthGuard { resident_bytes: MAX_VOLUME_BYTES * 2.0, pool_headroom: 0.0 };
+        let (_, workable) = guard.no_room_for(1024.0, 1024.0).expect("there is no room at all");
+        assert!(workable.is_finite(), "the refusal named {workable} as a size");
+        assert_eq!(workable, 0.0, "nothing fits, so no fraction of it fits either");
     }
 }
