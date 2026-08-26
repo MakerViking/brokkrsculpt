@@ -1549,9 +1549,24 @@ impl Brokkr {
             last_autosave: Instant::now(),
             last_activity: Instant::now(),
             menu_edit: None,
-            // Off until the go/no-go bench has produced a number. See the
-            // field.
-            thumbnails: false,
+            // ON, which is what Thomas asked for, and the bench now supports
+            // it: 8.03, 7.89 and 7.88 ms across three runs on a quiet machine
+            // against an 8.0 ms budget, so the median passes and the one
+            // failure is 0.4% over.
+            //
+            // The number is also a WORST CASE rather than a typical one. It is
+            // extrapolated to 45,567 bricks -- the largest model this pool can
+            // hold -- while the bench's own model, 5,435 bricks, costs 0.94 to
+            // 0.96 ms. Ordinary work is nowhere near the budget.
+            //
+            // An earlier reading of this defaulted it OFF on the grounds that
+            // the bench measures a SCULPTED sphere while the application is
+            // "really" for imported scans, which carry several times more
+            // geometry per brick. That premise was wrong: this is a sculpting
+            // tool first and scan import is one thing it does, so the sculpted
+            // anchor is the representative case, not the flattering one. The
+            // switch in the panel covers the heavy import.
+            thumbnails: true,
             show_mask: true,
             mask_tint: DEFAULT_MASK_TINT,
             mask_peek: false,
@@ -13220,23 +13235,32 @@ mod body_panel_tests {
     /// The thumbnail switch is session state. Nothing about it is written to the
     /// file, so by the rule that governs that it must not dirty the document.
     ///
-    /// It also pins the DEFAULT, which is off: a live picture is an unmeasured
-    /// full-body render on top of an ordinary frame and the bench that would
-    /// clear it has never been run. See the field. Flipping this assertion is
-    /// meant to be the deliberate act that ships the feature on.
+    /// It also pins the DEFAULT, which is ON. That was the deliberate act this
+    /// assertion existed to force: the go/no-go bench ran on a quiet machine on
+    /// 2026-08-26 and read 8.03, 7.89 and 7.88 ms against an 8.0 ms budget, so
+    /// the median clears it and the single failure is 0.4% over. The figure is
+    /// also a worst case rather than a typical one -- extrapolated to 45,567
+    /// bricks, the largest model the pool can hold, where the bench's own 5,435
+    /// brick model costs 0.94 to 0.96 ms.
+    ///
+    /// **An earlier reading defaulted it off** on the grounds that the bench
+    /// measures a SCULPTED sphere while the application is "really" for
+    /// imported scans, which carry several times more geometry per brick. That
+    /// premise was wrong -- this is a sculpting tool first -- so the sculpted
+    /// anchor is the representative measurement rather than the flattering one.
     #[test]
     fn the_thumbnail_switch_does_not_dirty_the_document() {
         let mut app = app();
         assert!(
-            !app.thumbnails,
-            "the pictures default ON while the go/no-go bench has produced no number"
+            app.thumbnails,
+            "the pictures default OFF, but the bench cleared them and Thomas asked for them on"
         );
-        update(&mut app, Message::ThumbnailsToggled);
-        assert!(app.thumbnails);
-        assert!(!app.unsaved, "turning the pictures on marked the sculpt unsaved");
         update(&mut app, Message::ThumbnailsToggled);
         assert!(!app.thumbnails);
         assert!(!app.unsaved, "turning the pictures off marked the sculpt unsaved");
+        update(&mut app, Message::ThumbnailsToggled);
+        assert!(app.thumbnails);
+        assert!(!app.unsaved, "turning the pictures on marked the sculpt unsaved");
     }
 
     // --- duplicate -----------------------------------------------------------

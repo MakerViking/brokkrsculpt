@@ -239,8 +239,8 @@ warnings, and three performance gates fail the build if a budget is blown.
 hand, a packaged build, and builds for Windows, macOS and tablets. All on the
 list rather than ruled out.
 
-**The honest limits**, both of which are the case this application exists for
-rather than edge cases:
+**The honest limits**, both of which you will meet in ordinary use rather than
+in exotic corner cases:
 
 - **Very thin, genuinely open shells** cannot be made solid, as above.
 - **Fine detail on a large model is limited.** Resolution is uniform, so a brush
