@@ -14,11 +14,11 @@
 use std::time::{Duration, Instant};
 
 use brokkr_core::{
-    BrickCoord, BrickMesh, Brush, BrushDirection, BrushKind, BrushScratch, Document, Entry,
-    FalloffCurve, History, MeshScratch, Pattern, PatternKind, Stamp, Stroke, Symmetry, UndoOutcome,
-    Volume,
+    BRICK_DIM, BrickCoord, BrickMesh, Brush, BrushDirection, BrushKind, BrushScratch, Document,
+    Entry, FalloffCurve, History, MaskField, MeshScratch, Pattern, PatternKind, Stamp, Stroke,
+    Symmetry, UndoOutcome, Volume,
 };
-use glam::Vec3;
+use glam::{IVec3, Vec3};
 
 /// Total frame budget at 60 fps.
 const FRAME_BUDGET: Duration = Duration::from_micros(16_000);
@@ -41,6 +41,30 @@ const EDIT_BUDGET: Duration = Duration::from_micros(4_000);
 /// version, which was not enough on its own. The remaining lever, if this ever
 /// needs one, is evaluating the pattern per brick row rather than per voxel.
 const PATTERN_EDIT_BUDGET: Duration = Duration::from_micros(6_000);
+
+/// Edit budget for a stroke over a body that carries a mask.
+///
+/// Derived, and **not measured** -- the session that added it was not allowed
+/// to run the harness, so this is arithmetic and the first real run is what
+/// confirms or moves it. A dense mask brick adds one `u8` per voxel to the
+/// traffic of a loop that already moves eight bytes of field, so +12.5% on the
+/// 4 ms [`EDIT_BUDGET`], rounded up to leave room for the one map lookup per
+/// brick and the hoisted branch that resolves the slab.
+///
+/// It has its own constant rather than widening [`EDIT_BUDGET`] for everyone,
+/// on the same grounds as [`PATTERN_EDIT_BUDGET`]: a user who never masks must
+/// not pay for masking, and the unmasked rows keep the original 4 ms.
+///
+/// The remesh is deliberately NOT relaxed, and since the mask became a vertex
+/// attribute that is a claim rather than a tautology. A masked stroke dirties
+/// exactly the bricks an unmasked one does -- a mask changes what the edit
+/// writes, not what it moves -- and the meshing itself is unchanged; what is
+/// added is one stored byte per VERTEX, taken through a slab that is resolved
+/// once per brick, against a mesher that already writes 24 bytes per vertex and
+/// runs surface nets over 39,304 samples to find them. If that shows up against
+/// the 8 ms remesh budget it is worth knowing, which is the point of leaving
+/// the number where it is.
+const MASKED_EDIT_BUDGET: Duration = Duration::from_micros(5_000);
 /// Edit budget at the largest radius on the tool strip.
 ///
 /// The 4 ms edit budget is not met at a 20 mm radius and, on this
@@ -160,6 +184,64 @@ fn report(label: &str, samples: &mut Samples, budget: Duration) -> bool {
     ok
 }
 
+/// Paint a dense, feathered mask over the shell of the seeded sphere.
+///
+/// Three properties, and each one is what makes the row measure the thing it is
+/// for.
+///
+/// **Dense.** A collapsed mask brick resolves once and hoists out of the voxel
+/// loop, so a tile would measure the hoist and not the per voxel read. The
+/// value varies smoothly in world space, so no brick is uniform and none of
+/// them collapses at end of stroke.
+///
+/// **Never fully protected.** A brick at a resolved protection of 255 is
+/// skipped outright by the planner, which is faster than not masking at all --
+/// so a fully masked row would report a saving and measure nothing.
+///
+/// **Feathered.** The rule every path that writes a mask keeps: a step in the
+/// mask is a fold in the geometry under Move, and a bench that painted one
+/// would be encoding a shape the application must never produce.
+///
+/// Only the shell is painted. The interior tiles are nowhere near the stroke,
+/// and a mask over them would be tens of megabytes charged to `resident_bytes`
+/// for no measurement at all.
+fn paint_a_mask(volume: &mut Volume, centre: Vec3, radius: f32) {
+    let voxel_size = volume.voxel_size();
+    let half_brick = (BRICK_DIM as f32 - 1.0) * 0.5;
+    let coords: Vec<BrickCoord> = volume
+        .brick_coords()
+        .filter(|coord| {
+            let middle = (coord.origin().as_vec3() + Vec3::splat(half_brick)) * voxel_size;
+            (middle.distance(centre) - radius).abs() <= BRICK_DIM as f32 * voxel_size
+        })
+        .collect();
+
+    for coord in coords {
+        let origin = coord.origin();
+        for z in 0..BRICK_DIM as i32 {
+            for y in 0..BRICK_DIM as i32 {
+                for x in 0..BRICK_DIM as i32 {
+                    let cell = origin + IVec3::new(x, y, z);
+                    // A smooth swell across the model rather than a per brick
+                    // ramp: a ramp that restarts at every brick boundary is a
+                    // step, which is exactly what the mask must never carry.
+                    let across = (cell.as_vec3() * voxel_size - centre).dot(Vec3::ONE) * 0.02;
+                    let protection = (0.5 + 0.45 * across.sin()) * u8::MAX as f32;
+                    volume.mask_mut().write(cell, protection as u8);
+                }
+            }
+        }
+    }
+
+    let stats = volume.stats();
+    println!(
+        "  masked: {} mask bricks, {} of them dense, {:.1} MB of mask",
+        stats.mask_bricks,
+        stats.mask_dense_bricks,
+        stats.mask_bytes as f64 / (1024.0 * 1024.0)
+    );
+}
+
 fn main() {
     let voxel_size = 1.0_f32;
     let centre = Vec3::splat(EFFECTIVE_RESOLUTION * voxel_size * 0.5);
@@ -244,15 +326,27 @@ fn main() {
     // Slow and fast drags over the same path. The fast one is the case the
     // per event budget really has to survive: fewer pointer samples means more
     // interpolated stamps per event.
-    for (label, events, pattern, edit_budget) in [
-        ("slow drag", STEPS, PatternKind::None, EDIT_BUDGET),
-        ("fast drag", STEPS / 5, PatternKind::None, EDIT_BUDGET),
+    for (label, events, pattern, masked, edit_budget) in [
+        ("slow drag", STEPS, PatternKind::None, false, EDIT_BUDGET),
+        ("fast drag", STEPS / 5, PatternKind::None, false, EDIT_BUDGET),
         // Hair measured as the worst of the six in the per pattern table
         // below. A pattern multiplies into the hottest loop in the project, so
         // the case that has to hold is the fast drag with one switched on --
         // not a single stamp in isolation.
-        ("fast drag, hair pattern", STEPS / 5, PatternKind::Hair, PATTERN_EDIT_BUDGET),
+        ("fast drag, hair pattern", STEPS / 5, PatternKind::Hair, false, PATTERN_EDIT_BUDGET),
+        // LAST, and the mask it paints is torn off again at the bottom of this
+        // loop -- see the comment there, which is the load-bearing half. A mask
+        // is a second multiply into the same loop the pattern is, so the case
+        // that has to hold is the same fast drag with one painted -- and
+        // without this row the gate only ever measures unmasked strokes and
+        // would stay green through a regression from one slab lookup per brick
+        // to one per voxel, which is three and a half million map probes on a
+        // large stamp.
+        ("fast drag, masked", STEPS / 5, PatternKind::None, true, MASKED_EDIT_BUDGET),
     ] {
+        if masked {
+            paint_a_mask(volume, centre, radius);
+        }
         let brush =
             Brush { pattern: Pattern { kind: pattern, scale_mm: 2.0, depth: 1.0 }, ..brush };
         let mut edit_samples = Samples::new();
@@ -324,6 +418,28 @@ fn main() {
         passed &= report("  dirty remesh", &mut remesh_samples, REMESH_BUDGET);
         passed &= report("  edit plus remesh", &mut combined_samples, FRAME_BUDGET);
         println!();
+
+        // Tear the mask off again the moment the row that needs it is reported.
+        //
+        // Every block in this file after the loop shares this one body -- the
+        // undo timing, the per brush table and the per pattern table all reach
+        // it through `doc.active_volume_mut()` -- and nothing puts a mask back
+        // the way `end_stroke` puts bricks back, because the mask is
+        // deliberately not part of an undo entry (see `mask`'s module
+        // documentation). A mask left here would therefore be on the body for
+        // the rest of `main`, with two consequences and neither of them
+        // announced in the printed output. Both tables below would measure
+        // masked strokes -- an extra `u8` per voxel plus a slab resolve per
+        // brick -- against [`EDIT_BUDGET`], which was deliberately NOT widened
+        // for masking, so a row marked OVER there would be reporting a
+        // regression that is not one. And the Move row of the brush table would
+        // silently get half the drag cap, because `MoveStroke::begin` halves it
+        // on any body carrying a mask, so that row would warp half as far as it
+        // did in every previous run and stop being comparable across commits
+        // without ever failing.
+        if masked {
+            *volume.mask_mut() = MaskField::default();
+        }
     }
 
     // Undo and redo are not per frame work, so they carry no budget, but a

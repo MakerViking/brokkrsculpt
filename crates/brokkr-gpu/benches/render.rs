@@ -13,12 +13,21 @@
 use std::time::{Duration, Instant};
 
 use brokkr_core::{BrickCoord, BrickMesh, Volume};
-use brokkr_gpu::{Frustum, PixelRect, SculptRenderer, SlotKey, THE_ONLY_BODY, Uniforms};
+use brokkr_gpu::{
+    Frustum, PixelRect, SculptRenderer, SlotKey, THE_ONLY_BODY, THUMBNAIL_SIZE, Uniforms,
+};
 use glam::{Mat4, Vec3};
 
 const WIDTH: u32 = 1920;
 const HEIGHT: u32 = 1080;
 const TARGET_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8UnormSrgb;
+
+/// What one thumbnail of the largest possible body is allowed to cost.
+///
+/// 8 rather than 15, because a thumbnail render rides on top of an ordinary
+/// frame inside a 16 ms budget, and a 15 ms threshold would permit a picture
+/// that consumed the whole frame on its own.
+const THUMBNAIL_BUDGET_MS: f64 = 8.0;
 
 /// The model, in millimetres.
 const MODEL_RADIUS: f32 = 30.0;
@@ -142,7 +151,13 @@ fn main() {
             view_projection: matrix.to_cols_array_2d(),
             view: Mat4::IDENTITY.to_cols_array_2d(),
             srgb_target: 1,
-            padding: [0; 3],
+            // Tinted, at full strength, because the whole point of the row is
+            // what a frame costs in the state the application ships in -- and
+            // the tint is on by default. A bench that switched it off would be
+            // measuring the branch it is meant to be measuring the cost of.
+            mask_inverted: 0,
+            mask_tint: 1.0,
+            padding: [0; 1],
         };
         renderer.write_uniforms(&queue, &uniforms);
 
@@ -186,9 +201,81 @@ fn main() {
          draw call count, because nothing is off screen to skip."
     );
 
+    all_passed &= thumbnail_row(&device, &queue, &renderer, &volume, stats.bricks);
+
     if !all_passed {
         eprintln!("\nRENDER BUDGET EXCEEDED");
         std::process::exit(1);
     }
     println!("\nall render budgets met");
+}
+
+/// Bricks in the model this application is built for. See `handoff.md`.
+const DRAGON_BRICKS: usize = 45_567;
+
+/// What one live thumbnail costs, and whether the feature is affordable at all.
+///
+/// **This is a go/no-go, not a regression check, and it is deliberately a
+/// comparison rather than an absolute.** The threshold is 8 ms rather than the
+/// frame's 16, because a thumbnail render rides ON TOP of an ordinary frame: a
+/// 15 ms threshold would permit a picture that consumed the whole budget on its
+/// own and still called itself a pass.
+///
+/// The extrapolation is the number that decides it. The bench model is a
+/// sculpted sphere of a few thousand bricks; the model the mesh pool is sized
+/// for is 45,567, which is 8.4x the draw calls at the same 84 x 84 target.
+/// **Two things that number does NOT cover, and they belong beside it:** an
+/// imported scan carries several times more geometry per brick than a sculpted
+/// sphere does, and this machine's GPU is not the slowest one the application
+/// will run on. If the extrapolated figure is over 8 ms, the answer is the
+/// panel's `Thumbnails` switch, which exists for exactly this.
+fn thumbnail_row(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    renderer: &SculptRenderer,
+    volume: &Volume,
+    bricks: usize,
+) -> bool {
+    let Some(bounds) = volume.world_bounds() else {
+        eprintln!("  the bench model has no bricks, so there is no thumbnail to time");
+        return false;
+    };
+
+    let mut samples: Vec<Duration> = Vec::with_capacity(FRAMES);
+    for frame in 0..FRAMES {
+        let started = Instant::now();
+        renderer.render_thumbnail(device, queue, 0, THE_ONLY_BODY, bounds);
+        device.poll(wgpu::PollType::wait_indefinitely()).expect("device poll failed");
+        if frame > 0 {
+            samples.push(started.elapsed());
+        }
+    }
+    samples.sort_unstable();
+
+    let median = millis(samples[samples.len() / 2]);
+    let worst = millis(*samples.last().expect("at least one frame"));
+    let scaled = median * DRAGON_BRICKS as f64 / bricks.max(1) as f64;
+    let passed = scaled <= THUMBNAIL_BUDGET_MS;
+
+    println!(
+        "\n  thumbnail {THUMBNAIL_SIZE} x {THUMBNAIL_SIZE}   median {median:>6.2} ms   \
+         worst {worst:>6.2} ms   over {bricks} bricks"
+    );
+    println!(
+        "  extrapolated to {DRAGON_BRICKS} bricks: {scaled:>6.2} ms   budget \
+         {THUMBNAIL_BUDGET_MS:.1} ms  {}",
+        if passed { "pass" } else { "OVER" }
+    );
+    if !passed {
+        eprintln!(
+            "\n  A thumbnail of the largest model this pool is sized for would cost {scaled:.1} ms \
+             on top of an ordinary frame. Live pictures are not affordable here: leave the \
+             placeholder, or default the panel's Thumbnails switch to off."
+        );
+    }
+    println!(
+        "  Sculpted geometry on this machine's GPU. An imported scan carries several times more\n\
+         geometry per brick, and this is not the slowest GPU the application runs on."
+    );
+    passed
 }

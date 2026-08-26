@@ -49,10 +49,14 @@
 //! erases it. Colour adds a slot write inside those branches and does not have
 //! to revisit the classifier.
 //!
-//! A mask, when that lands, is the other way round: **`max` of the two masks,
-//! never the argmin's mask.** Protection is a veto and vetoes union; the argmin
-//! rule that is right for a filament slot would let an unmasked source strip
-//! protection along the exact seam the merge just created.
+//! The mask is the other way round: **`max` of the two masks, never the
+//! argmin's mask.** Protection is a veto and vetoes union; the argmin rule that
+//! is right for a filament slot would let an unmasked source strip protection
+//! along the exact seam the merge just created. That half is live -- see the
+//! end of [`Volume::union_from`] -- and unlike the field half it is not in the
+//! undo entry yet. `StrokeEdit` gained a mask list in increment 21, so the
+//! shape now exists; what is missing is `union_max_from` handing back the
+//! bricks it overwrote. Revisit when a merge's undo is next touched.
 
 use crate::body::{Document, NodeId};
 use crate::brick::{BRICK_VOXELS, Brick, INSIDE, OUTSIDE};
@@ -254,6 +258,20 @@ impl Volume {
             // aprons read into the brick that just changed. See the module doc.
             self.mark_dirty_voxel_range(coord.origin(), coord.max_voxel());
         }
+
+        // The masks union by `max`, and the two rules do not contradict each
+        // other: the union of two solids is the LOWER distance and the union of
+        // two protections is the HIGHER one, because a merge must not be a way
+        // to unprotect what either body protected.
+        //
+        // Not in the undo entry yet. `StrokeEdit` can carry mask bricks as of
+        // increment 21, but `union_max_from` does not hand back the ones it
+        // overwrote, so undoing a merge restores the field and leaves the merged
+        // mask in place. Named here because it is the one thing about this call
+        // that a reader would otherwise assume was covered.
+        let mask = other.mask();
+        self.mask_mut().union_max_from(mask, other.brick_coords());
+
         written
     }
 }
@@ -604,6 +622,104 @@ mod tests {
         let written = into.union_from(&from);
         assert_eq!(written, 0, "a tie was written as though the source had won");
         assert!(into.end_stroke().is_none(), "a tie was recorded for undo");
+    }
+
+    /// A merge takes the GREATER protection, so a source that wins the distance
+    /// everywhere still cannot unprotect what the target protected.
+    ///
+    /// The two rules do not contradict each other: the union of two solids is
+    /// the lower distance and the union of two protections is the higher one.
+    #[test]
+    fn merging_an_unmasked_source_that_wins_everywhere_leaves_the_target_fully_masked() {
+        use crate::{PROTECTED, UNMASKED};
+
+        let coord = BrickCoord::new(0, 0, 0);
+        let mut into = Volume::new(VOXEL);
+        into.insert_brick(coord, Brick::Uniform(0.5));
+        for voxel in voxels(coord.origin(), coord.max_voxel()) {
+            into.mask_mut().write(voxel, PROTECTED);
+        }
+        into.mask_mut().collapse();
+
+        // A solid tile beats 0.5 at every voxel of the brick.
+        let mut from = Volume::new(VOXEL);
+        from.insert_brick(coord, Brick::Uniform(INSIDE));
+        assert_eq!(from.mask().at(coord.origin()), UNMASKED, "the source must carry no mask");
+
+        into.begin_stroke();
+        let written = into.union_from(&from);
+        into.end_stroke();
+
+        assert_eq!(written, 1, "the source has to have won the field, or this proves nothing");
+        assert_eq!(into.sample_voxel(coord.origin()), INSIDE);
+        for voxel in voxels(coord.origin(), coord.max_voxel()) {
+            assert_eq!(into.mask().at(voxel), PROTECTED, "the merge unprotected {voxel}");
+        }
+        assert_eq!(
+            into.stats().mask_bytes,
+            0,
+            "a fully protected brick has to stay a tile through a merge"
+        );
+    }
+
+    /// The same rule read the other way round, and this is the direction that
+    /// depends on the call: the protection has to ARRIVE in a target that had
+    /// none, so deleting the `union_max_from` at the end of
+    /// [`Volume::union_from`] fails here.
+    ///
+    /// The test above cannot see that deletion. It masks the TARGET and asserts
+    /// the target is still masked, which is true of a merge that never touches
+    /// the mask at all -- it is the argmin guard, not the coverage.
+    ///
+    /// Both source polarities, because they reach the target by different
+    /// routes. A normal mask is carried by the source's own mask BRICKS; Mask
+    /// All is an empty brick map with the polarity bit set, so the only thing
+    /// that tells the merge where to write is the source's FIELD bricks -- the
+    /// `also` iterator. Get the second one wrong and Mask All silently does not
+    /// survive a merge down.
+    #[test]
+    fn a_masked_source_protects_the_target_it_is_merged_into() {
+        use crate::{PROTECTED, UNMASKED};
+
+        let coord = BrickCoord::new(0, 0, 0);
+        for inverted in [false, true] {
+            let mut into = Volume::new(VOXEL);
+            into.insert_brick(coord, Brick::Uniform(0.5));
+            assert_eq!(into.mask().at(coord.origin()), UNMASKED, "the target must carry no mask");
+
+            let mut from = Volume::new(VOXEL);
+            from.insert_brick(coord, Brick::Uniform(INSIDE));
+            if inverted {
+                // Mask All: the polarity flips and the brick map stays empty,
+                // so the bit is the entire mask.
+                from.mask_mut().set_inverted(true);
+            } else {
+                for voxel in voxels(coord.origin(), coord.max_voxel()) {
+                    from.mask_mut().write(voxel, PROTECTED);
+                }
+                from.mask_mut().collapse();
+            }
+            assert_eq!(from.mask().at(coord.origin()), PROTECTED, "the fixture is not masked");
+
+            into.begin_stroke();
+            let written = into.union_from(&from);
+            into.end_stroke();
+
+            assert_eq!(written, 1, "the source has to have won the field, or this proves nothing");
+            for voxel in voxels(coord.origin(), coord.max_voxel()) {
+                assert_eq!(
+                    into.mask().at(voxel),
+                    PROTECTED,
+                    "an inverted={inverted} source did not protect {voxel}"
+                );
+            }
+            assert!(!into.mask().inverted(), "the target's polarity is not the source's to change");
+            assert_eq!(
+                into.stats().mask_bytes,
+                0,
+                "a fully protected brick has to arrive as a tile rather than 32 KiB"
+            );
+        }
     }
 
     /// Two dense bricks whose `min` comes out saturated everywhere release

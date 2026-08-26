@@ -78,6 +78,29 @@ pub const ERROR: Color = rgb(0xff, 0x5c, 0x5c);
 /// `icon.rs`'s header.
 pub const ERROR_TINT: Color = rgba(0xff, 0x5c, 0x5c, 0.22);
 
+/// The mask's cool blue: the brush ring while protection is being painted, and
+/// the hue the viewport tint shifts toward.
+///
+/// **Not in SindriCAD's token set, and not derivable from one.** Every colour
+/// above is warm or neutral, deliberately — the clay matcap is warm and
+/// `--accent` already means "a press adds". This has to be a hue the matcap
+/// cannot produce, or a masked surface reads as a slightly different shade of
+/// clay. Generated from the matcap's own values: its whole luminance swing is
+/// 102 levels and its coolest pixel is a fill-lit cavity at `b - r = +17`,
+/// where this sits at `b - r = +100`. That is the measurement the choice rests
+/// on, and it is why a "gentle cool desaturation" was refused — at full
+/// strength it moves a lit pixel by 36 levels against the matcap's own 102, so
+/// a fully masked lit pixel would be brighter than an unmasked shadowed one.
+pub const MASK: Color = rgb(0x58, 0x87, 0xf0);
+
+/// The same hue, pale, for the ring that says a drag is REMOVING protection.
+///
+/// Deliberately not [`ERROR`]. Red means "this removes material" everywhere
+/// else in the application and unmasking removes none at all; masking and
+/// unmasking are one thing and its inverse, so they are one hue and two
+/// lightnesses rather than two hues.
+pub const MASK_PALE: Color = rgb(0xa8, 0xc4, 0xf8);
+
 // Radii, from `--r-sm` through `--r-lg`.
 pub const RADIUS_SM: f32 = 6.0;
 pub const RADIUS_MD: f32 = 8.0;
@@ -93,10 +116,12 @@ pub const ICON_CHROME: f32 = 14.0;
 /// The tool strip, above the tool's name.
 ///
 /// Eighteen rather than the twenty-four the grid is drawn on, because the strip
-/// has a vertical budget and seven brushes plus three mirror toggles plus the
-/// cut have to fit a 768-high window without scrolling. A properties panel
+/// has a vertical budget: seven brushes, three mirror toggles, the cut and the
+/// mask have to fit a 768-high window without scrolling. A properties panel
 /// taller than its window has already happened here once and put every
-/// SpaceMouse binding out of reach.
+/// SpaceMouse binding out of reach. Adding the mask as the eleventh button was
+/// paid for by two subtractions rather than by shrinking this — see
+/// `panel.rs`'s `tool_strip`.
 pub const ICON_TOOL: f32 = 18.0;
 /// Inline with a line of text: a section's collapse marker.
 pub const ICON_INLINE: f32 = 11.0;
@@ -459,12 +484,48 @@ pub fn body_row_marker(_theme: &iced::Theme) -> iced::widget::container::Style {
     }
 }
 
-/// The placeholder where a body's picture will go.
+/// The two-pixel accent line that says where a dragged row would land.
 ///
-/// A flat 28 px well, which is the shape the rendered thumbnail needs anyway --
-/// so nothing here is thrown away when increment 15 puts a picture in it. A type
-/// glyph instead would be three icons that have to pass two icon tests and then
-/// be deleted.
+/// The same [`ACCENT`] as the selection marker, and the same 1 px radius, so
+/// the two read as one vocabulary: orange means "this row" and an orange line
+/// means "this gap". It is drawn INDENTED to the depth the block would take,
+/// which is how a line between two rows says which of them it would become a
+/// sibling of.
+pub fn drop_line(_theme: &iced::Theme) -> iced::widget::container::Style {
+    iced::widget::container::Style {
+        background: Some(ACCENT.into()),
+        border: iced::Border { radius: 1.0.into(), ..Default::default() },
+        ..Default::default()
+    }
+}
+
+/// A closed folder the drop would go INSIDE.
+///
+/// The tint alone would be the active row's style exactly, and the active row
+/// is very often the row being dragged -- so this adds the accent outline. The
+/// filled row rather than a line is the third indicator every shipped tree drag
+/// gets wrong: without it, "into this folder" and "after this folder" draw the
+/// same thing and the user finds out which on release.
+pub fn body_row_drop_into(_theme: &iced::Theme) -> iced::widget::container::Style {
+    iced::widget::container::Style {
+        background: Some(ACCENT_TINT.into()),
+        border: iced::Border { color: ACCENT, width: 1.0, radius: RADIUS_SM.into() },
+        ..Default::default()
+    }
+}
+
+/// The well a body's picture sits in.
+///
+/// A flat 28 px inset with a hairline border. The picture is a `shader` widget
+/// inside it with a pixel of padding, so the border still frames the cell -- and
+/// a body with no cell to draw falls back to the bare well, which is what this
+/// was before there were pictures.
+///
+/// **`BG_DEEP` here and `THUMBNAIL_BACKGROUND` in `brokkr-gpu` are the same
+/// colour and have to stay that way.** An unrendered cell is filled with that
+/// constant, so a mismatch shows as a picture sitting in a slightly different
+/// hole from the rows either side of it. `brokkr-gpu` must not depend on the
+/// application, which is why there are two of them.
 pub fn body_thumbnail(_theme: &iced::Theme) -> iced::widget::container::Style {
     iced::widget::container::Style {
         background: Some(BG_DEEP.into()),

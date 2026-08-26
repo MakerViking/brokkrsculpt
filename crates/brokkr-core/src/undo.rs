@@ -44,11 +44,12 @@
 //!
 //! **A body leaves the document ONLY through a [`Change::NodeRemoved`], or
 //! through a whole-document replacement that clears the history.** The stack is
-//! chronological and [`History::trim`] evicts oldest-first, so a removal always
-//! sits ABOVE every brick edit to the body it removed, and a `Change::Bricks`
+//! chronological and [`History::trim`] evicts from the two FAR ENDS of it --
+//! the oldest undo, then the furthest-future redo -- so a removal always sits
+//! ABOVE every brick edit to the body it removed, and a `Change::Bricks`
 //! is therefore always applicable. That is why there is no liveness check here,
 //! no `forget_body`, and no pruning in the middle of the stack. It also
-//! constrains the byte policy: **eviction must stay a prefix drop.**
+//! constrains the byte policy: **eviction must stay a prefix or a suffix drop.**
 //!
 //! # Two counters, one deque
 //!
@@ -74,6 +75,7 @@ use rustc_hash::FxHashMap;
 
 use crate::body::{Document, Node, NodeId, NodeMeta};
 use crate::brick::{Brick, BrickCoord};
+use crate::mask::{MaskBrick, MaskField};
 
 /// Default ceiling on the brick snapshots undo history holds.
 ///
@@ -98,27 +100,75 @@ pub const DEFAULT_RECLAIM_BUDGET: usize = 512 * 1024 * 1024;
 /// A `None` brick means it did not exist before the stroke, which undo has to
 /// restore just as faithfully as any content: leaving an empty brick behind
 /// would leave its triangles on screen.
+///
+/// # Three lists, not one, and the mask's is usually the empty one
+///
+/// A gesture can change the field, the mask, or the mask's polarity, and one
+/// entry has to put back whatever it changed. They are kept apart rather than
+/// folded into a single "brick" list because they cost two orders of magnitude
+/// differently: a field brick is 131,104 B against a mask brick's 32,800, and
+/// **a sculpt stroke through a mask records ZERO mask bytes** -- the mask is
+/// read-only for the whole of one, so there is nothing of it to put back. That
+/// is the property the storage decision in [`crate::mask`] was made for, and
+/// `a_sculpt_stroke_through_a_mask_records_no_mask_bytes` is what holds it.
+///
+/// `polarity` is the value the mask's Invert bit held BEFORE the gesture, and
+/// `None` means the gesture did not touch it. One bool rather than a rewritten
+/// map is the whole reason Mask All and Invert are O(1) in undo as well as in
+/// time and memory.
 #[derive(Debug, Default)]
 pub struct StrokeEdit {
-    bricks: Vec<(BrickCoord, Option<Brick>)>,
+    bricks: PriorBricks,
+    masks: PriorMasks,
+    polarity: Option<bool>,
     bytes: usize,
 }
 
+/// The prior contents of a set of field bricks. `None` is a brick that did not
+/// exist, which undo puts back by removing it again.
+type PriorBricks = Vec<(BrickCoord, Option<Brick>)>;
+
+/// The same for mask bricks. Named alongside [`PriorBricks`] rather than
+/// written out: the two differ by one word deep inside a nested generic, and
+/// swapping them is a mistake the type system would catch and a reader would
+/// not.
+type PriorMasks = Vec<(BrickCoord, Option<MaskBrick>)>;
+
 impl StrokeEdit {
-    pub(crate) fn from_recording(recording: FxHashMap<BrickCoord, Option<Brick>>) -> Option<Self> {
-        if recording.is_empty() {
+    pub(crate) fn from_recording(
+        bricks: FxHashMap<BrickCoord, Option<Brick>>,
+        masks: FxHashMap<BrickCoord, Option<MaskBrick>>,
+        polarity: Option<bool>,
+    ) -> Option<Self> {
+        if bricks.is_empty() && masks.is_empty() && polarity.is_none() {
             return None;
         }
-        Some(Self::from_bricks(recording.into_iter().collect()))
+        Some(Self::from_parts(bricks.into_iter().collect(), masks.into_iter().collect(), polarity))
     }
 
-    pub(crate) fn from_bricks(bricks: Vec<(BrickCoord, Option<Brick>)>) -> Self {
-        let bytes = bricks.iter().map(|(_, brick)| prior_bytes(brick.as_ref())).sum();
-        Self { bricks, bytes }
+    /// An entry that puts back field bricks and nothing else.
+    ///
+    /// `#[cfg(test)]` because nothing in the shipping paths builds one any more:
+    /// `end_stroke` and `apply_edit` both go through [`StrokeEdit::from_parts`]
+    /// with all three lists, and a constructor that quietly drops the mask half
+    /// is exactly the shape a future caller should not reach for.
+    #[cfg(test)]
+    pub(crate) fn from_bricks(bricks: PriorBricks) -> Self {
+        Self::from_parts(bricks, Vec::new(), None)
     }
 
-    pub(crate) fn into_bricks(self) -> Vec<(BrickCoord, Option<Brick>)> {
-        self.bricks
+    pub(crate) fn from_parts(
+        bricks: PriorBricks,
+        masks: PriorMasks,
+        polarity: Option<bool>,
+    ) -> Self {
+        let bytes = bricks.iter().map(|(_, brick)| prior_bytes(brick.as_ref())).sum::<usize>()
+            + masks.iter().map(|(_, brick)| mask_prior_bytes(brick.as_ref())).sum::<usize>();
+        Self { bricks, masks, polarity, bytes }
+    }
+
+    pub(crate) fn into_parts(self) -> (PriorBricks, PriorMasks, Option<bool>) {
+        (self.bricks, self.masks, self.polarity)
     }
 
     /// Bricks this entry restores.
@@ -127,9 +177,15 @@ impl StrokeEdit {
         self.bricks.len()
     }
 
+    /// Mask bricks this entry restores.
+    #[inline]
+    pub fn mask_len(&self) -> usize {
+        self.masks.len()
+    }
+
     #[inline]
     pub fn is_empty(&self) -> bool {
-        self.bricks.is_empty()
+        self.bricks.is_empty() && self.masks.is_empty() && self.polarity.is_none()
     }
 
     /// Memory this entry holds, which is what the budget counts.
@@ -152,6 +208,20 @@ impl StrokeEdit {
 #[inline]
 pub(crate) fn prior_bytes(prior: Option<&Brick>) -> usize {
     size_of::<(BrickCoord, Option<Brick>)>() + prior.map_or(0, Brick::heap_bytes)
+}
+
+/// What one mask brick's prior contents cost the stroke budget.
+///
+/// The mask twin of [`prior_bytes`], and the numbers are the whole point of
+/// keeping the two lists apart: 32 + 32,768 = **32,800 B** for a dense mask
+/// brick against a field brick's 32 + 131,072 = 131,104. A mask stroke is a
+/// quarter the undo weight of a sculpt stroke over the same bricks, and
+/// `a_mask_entry_is_a_quarter_the_weight_of_a_sculpt_entry` pins both figures
+/// rather than the ratio -- a ratio would pass on a mask brick that collapsed
+/// to a tile, which costs nothing at all.
+#[inline]
+pub(crate) fn mask_prior_bytes(prior: Option<&MaskBrick>) -> usize {
+    size_of::<(BrickCoord, Option<MaskBrick>)>() + prior.map_or(0, MaskBrick::heap_bytes)
 }
 
 /// What removing one node costs the reclaim allowance.
@@ -184,6 +254,23 @@ pub enum Change {
     /// implement `Clone` at all, so a delete costs no allocation and peak
     /// memory does not rise -- it merely does not fall.
     NodeRemoved { at: usize, node: Box<Node> },
+    /// A body's WHOLE mask was replaced. Applying puts the previous one back.
+    ///
+    /// Clear, Mask All and every absolute filter, and one variant for all of
+    /// them because the thing they have in common is the thing that matters:
+    /// the mask that came off is the ONLY copy of itself. It is MOVED in and
+    /// never cloned, exactly as [`Change::NodeRemoved`] moves a node, so Clear
+    /// allocates nothing however large the mask was.
+    ///
+    /// **Its bytes are charged to the reclaim allowance and never to the
+    /// stroke budget**, for the reason the module doc gives about deleted
+    /// bodies: this entry IS the storage, its size is known before the
+    /// operation runs, and putting a gigabyte of protection against the 256 MB
+    /// stroke budget would evict every stroke behind it.
+    ///
+    /// Polarity rides inside the field rather than beside it, which is what
+    /// makes Mask All one change and not two.
+    WholeMask { body: NodeId, mask: Box<MaskField> },
     /// A row's name, eye, collapse or depth changed. Applying writes `before`.
     ///
     /// **The whole outline, both sides, over a FIXED id set.** That is what
@@ -225,6 +312,16 @@ impl Change {
                 doc.insert(at, *node);
                 Change::NodeAdded { at, id }
             }
+            Change::WholeMask { body, mask } => {
+                // Always applicable, by the same invariant `Change::Bricks`
+                // rests on: a removal sits above every edit to the body it
+                // removed, and eviction is a prefix or a suffix drop.
+                let volume = doc
+                    .volume_mut(body)
+                    .expect("a mask change names a body that is still in the document");
+                let previous = volume.replace_mask(*mask);
+                Change::WholeMask { body, mask: Box::new(previous) }
+            }
             Change::Outline { before, after } => {
                 debug_assert!(
                     same_ids(&before, &after),
@@ -248,6 +345,7 @@ impl Change {
             Change::Bricks { body, .. } => *body,
             Change::NodeAdded { id, .. } => *id,
             Change::NodeRemoved { node, .. } => node.id,
+            Change::WholeMask { body, .. } => *body,
             Change::Outline { before, after } => {
                 before.iter().zip(after).find(|(was, now)| was != now).map_or_else(
                     || before.first().map_or(NodeId(0), |meta| meta.id),
@@ -261,7 +359,9 @@ impl Change {
     fn stroke_bytes(&self) -> usize {
         match self {
             Change::Bricks { edit, .. } => edit.bytes(),
-            Change::NodeRemoved { .. } => 0,
+            // Both hold a whole thing that was moved out of the document
+            // rather than copied out of it. See `reclaim_bytes`.
+            Change::NodeRemoved { .. } | Change::WholeMask { .. } => 0,
             Change::NodeAdded { .. } => size_of::<Self>(),
             Change::Outline { before, after } => {
                 before.iter().chain(after).map(NodeMeta::bytes).sum()
@@ -276,6 +376,7 @@ impl Change {
     fn reclaim_bytes(&self) -> usize {
         match self {
             Change::NodeRemoved { node, .. } => removed_node_bytes(node),
+            Change::WholeMask { mask, .. } => size_of::<MaskField>() + mask.bytes(),
             _ => 0,
         }
     }
@@ -324,6 +425,18 @@ impl Entry {
         self.changes.is_empty()
     }
 
+    /// How many changes one gesture turned out to be.
+    ///
+    /// The number a caller checks when the whole promise of an operation is
+    /// that it is ONE entry however many rows it touched -- a split into forty
+    /// parts is forty `NodeAdded` and one `NodeRemoved`, and an assertion on
+    /// the body count alone would pass just as well for forty entries.
+    #[inline]
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.changes.len()
+    }
+
     /// Brick snapshots, against [`DEFAULT_HISTORY_BUDGET`].
     #[inline]
     pub fn stroke_bytes(&self) -> usize {
@@ -353,7 +466,7 @@ impl Entry {
     /// The first body this entry would change that the user cannot see, if
     /// there is one.
     ///
-    /// **Two of the four changes are deliberately NOT gated, and both reasons
+    /// **Two of the five changes are deliberately NOT gated, and both reasons
     /// were arrived at by trying it the other way.**
     ///
     /// `NodeRemoved` restores a node that is not in the document, so there is
@@ -371,6 +484,7 @@ impl Entry {
         self.changes.iter().find_map(|change| {
             let id = match change {
                 Change::Bricks { body, .. } => *body,
+                Change::WholeMask { body, .. } => *body,
                 Change::NodeAdded { id, .. } => *id,
                 Change::NodeRemoved { .. } | Change::Outline { .. } => return None,
             };
@@ -440,7 +554,12 @@ pub struct HistoryStats {
 /// A bounded stack of gestures.
 pub struct History {
     undo: VecDeque<Entry>,
-    redo: Vec<Entry>,
+    /// The gestures that have been undone, oldest-undone FIRST.
+    ///
+    /// A `VecDeque` and not a `Vec` because both ends are used: the back is the
+    /// next entry to redo, and the front is the one furthest into the future,
+    /// which is the end [`History::trim`] evicts from.
+    redo: VecDeque<Entry>,
     budget: usize,
     reclaim_budget: usize,
     bytes: usize,
@@ -459,7 +578,7 @@ impl History {
     pub fn with_budgets(budget_bytes: usize, reclaim_budget_bytes: usize) -> Self {
         Self {
             undo: VecDeque::new(),
-            redo: Vec::new(),
+            redo: VecDeque::new(),
             budget: budget_bytes,
             reclaim_budget: reclaim_budget_bytes,
             bytes: 0,
@@ -485,21 +604,56 @@ impl History {
         self.trim();
     }
 
-    /// Drop the oldest entries while EITHER allowance is over.
+    /// Drop the entries furthest from where the user is standing, while EITHER
+    /// allowance is over.
     ///
-    /// A single entry larger than the whole budget is kept anyway: dropping it
-    /// would mean the user's last action could not be undone at all, which is
-    /// worse than briefly exceeding a soft ceiling.
+    /// **The entry at each end of the cursor is kept whatever it costs**, and
+    /// the two protections are the same rule rather than two: dropping
+    /// `undo.back()` means the user's last action cannot be undone, dropping
+    /// `redo.back()` means the undo they just pressed cannot be taken back.
+    /// Both are a silent loss of the gesture they are standing on, and both are
+    /// worse than briefly exceeding a soft ceiling. Hence the guard is "while
+    /// EITHER stack holds more than one entry" rather than a count of the two
+    /// together: an over-budget pair of one undo and one redo is a state this
+    /// deliberately settles in.
     ///
-    /// Oldest-first and nothing else, ever. The module doc's invariant -- that
-    /// a `Bricks` change is always applicable -- holds only because eviction is
-    /// a prefix drop; taking the largest entry out of the middle instead would
-    /// leave brick edits above a removal that is no longer there.
+    /// **The undo stack is evicted oldest-first and nothing else, ever.** The
+    /// module doc's invariant -- that a `Bricks` change is always applicable --
+    /// holds only because eviction is a prefix drop; taking the largest entry
+    /// out of the middle instead would leave brick edits above a removal that
+    /// is no longer there.
+    ///
+    /// # Why it also pops the redo stack, and from the FRONT
+    ///
+    /// Read the two stacks as one timeline with a cursor between them: the undo
+    /// stack is the past in order, and the redo stack is the future with its
+    /// BACK nearest the cursor. So `redo.front()` is the entry furthest into
+    /// the future, and dropping it is the exact mirror of dropping the oldest
+    /// undo entry -- a suffix drop, which keeps every entry that remains
+    /// applicable in order for the same reason the prefix drop does.
+    ///
+    /// Nothing evicted the redo stack before this, and it is not a hypothetical
+    /// leak. Any entry whose INVERSE is larger than itself grows the history
+    /// permanently: a stroke into empty space records `None` per brick, 32
+    /// bytes, and hands back the 128 KB bricks it created. Masking makes that
+    /// the normal case rather than the odd one, and two hundred such strokes
+    /// undone is a redo stack of roughly a gigabyte that nothing would ever
+    /// reclaim.
     fn trim(&mut self) {
         while (self.bytes > self.budget || self.reclaim_bytes > self.reclaim_budget)
-            && self.undo.len() > 1
+            && (self.undo.len() > 1 || self.redo.len() > 1)
         {
-            let Some(dropped) = self.undo.pop_front() else {
+            // The oldest past first, and only then the furthest future: the
+            // user is more likely to reach for one more undo than for the redo
+            // at the far end of a run they have already walked away from.
+            //
+            // The loop guard is what makes the second arm safe: reaching it
+            // means the undo stack is down to its protected entry, so the redo
+            // stack is the one holding more than one and `pop_front` cannot be
+            // the entry nearest the cursor.
+            let dropped =
+                if self.undo.len() > 1 { self.undo.pop_front() } else { self.redo.pop_front() };
+            let Some(dropped) = dropped else {
                 break;
             };
             self.bytes -= dropped.stroke_bytes;
@@ -554,7 +708,7 @@ impl History {
             return UndoOutcome::Refused(hidden);
         }
         let entry = self.undo.pop_back().expect("checked just above");
-        self.apply(entry, doc, |history, inverse| history.redo.push(inverse))
+        self.apply(entry, doc, |history, inverse| history.redo.push_back(inverse))
     }
 
     /// Redo the most recently undone gesture, under the same refusal.
@@ -564,23 +718,26 @@ impl History {
             doc.node_count(),
             "the visibility mask is indexed by node position and must cover every node"
         );
-        let Some(entry) = self.redo.last() else {
+        let Some(entry) = self.redo.back() else {
             return UndoOutcome::Nothing;
         };
         if let Some(hidden) = entry.blocked_by(doc, visible) {
             return UndoOutcome::Refused(hidden);
         }
-        let entry = self.redo.pop().expect("checked just above");
+        let entry = self.redo.pop_back().expect("checked just above");
         self.apply(entry, doc, |history, inverse| history.undo.push_back(inverse))
     }
 
     /// The half undo and redo share: swap the entry into the document and put
     /// its inverse on the other stack, keeping both counters straight.
     ///
-    /// Neither direction trims. The two stacks together hold the same bytes
-    /// they held a moment ago -- an inverse is the same bricks -- so trimming
-    /// here could only evict an entry the user is in the middle of walking
-    /// past.
+    /// **Both directions trim, and the reason is that an inverse is NOT the
+    /// same bytes.** This used to say it was, and that was wrong in the one
+    /// direction that matters: a stroke that CREATES bricks records `None` for
+    /// each of them -- 32 bytes -- and its inverse holds the 128 KB bricks the
+    /// stroke made. Undoing such a stroke therefore grows the history rather
+    /// than moving it, and nothing was there to notice. See [`History::trim`]
+    /// for which end it evicts from and why that end is safe.
     fn apply(
         &mut self,
         entry: Entry,
@@ -598,6 +755,7 @@ impl History {
         self.bytes += inverse.stroke_bytes;
         self.reclaim_bytes += inverse.reclaim_bytes;
         keep(self, inverse);
+        self.trim();
         UndoOutcome::Applied(touched)
     }
 
@@ -650,6 +808,22 @@ mod tests {
         doc.active_volume_mut().seed_sphere(Vec3::ZERO, 24.0);
         let brush = Brush { kind: BrushKind::Draw, radius: 8.0, strength: 0.4, ..Brush::default() };
         (doc, brush, BrushScratch::new())
+    }
+
+    /// One MASK stroke on the active body, as one entry.
+    fn mask_stroke(
+        doc: &mut Document,
+        brush: &Brush,
+        scratch: &mut BrushScratch,
+        at: Vec3,
+        op: crate::MaskOp,
+    ) -> Entry {
+        let body = doc.active();
+        let volume = doc.volume_mut(body).expect("a body to mask");
+        volume.begin_stroke();
+        let normal = volume.gradient_world(at);
+        brush.apply_mask(volume, &Stamp::new(at, normal, BrushDirection::Add), op, scratch);
+        Entry::stroke(body, volume.end_stroke().expect("the stroke changed something"))
     }
 
     /// One stroke on the active body, as one entry.
@@ -894,6 +1068,145 @@ mod tests {
         assert_eq!(stats.dropped_bodies, 0, "no body was deleted, so none was lost");
         // The most recent action stays undoable even though it is over budget.
         assert!(history.can_undo());
+    }
+
+    /// **A long undo run must not grow history without bound.**
+    ///
+    /// A stroke that CREATES bricks records `None` for each of them -- 32 bytes
+    /// -- and its inverse holds the bricks it made, at 128 KB apiece. So undoing
+    /// one grows the history rather than moving it, and until `trim` learned to
+    /// pop the redo stack nothing ever reclaimed that: two hundred such strokes
+    /// undone is about a gigabyte no budget could see. A draw into empty space
+    /// has always had this shape; a mask stroke over previously-unmasked bricks
+    /// makes it the ordinary one.
+    ///
+    /// Constructed rather than sculpted, because the SHAPE of the entry is the
+    /// whole point: a brush that happened to pass over an existing brick would
+    /// record its 128 KB on the way in and prove nothing.
+    #[test]
+    fn undoing_a_run_of_brick_creating_strokes_stays_inside_the_budget() {
+        const STROKES: usize = 40;
+        const BUDGET: usize = 512 * 1024;
+
+        let mut doc = Document::new(1.0);
+        let body = doc.active();
+        let mut history = History::new(BUDGET);
+        for index in 0..STROKES {
+            let coord = BrickCoord::new(index as i32, 0, 0);
+            let volume = doc.volume_mut(body).expect("the starting body");
+            volume.insert_brick(coord, Brick::dense_filled(0.5));
+            history.push(Entry::stroke(body, StrokeEdit::from_bricks(vec![(coord, None)])));
+        }
+        assert_eq!(history.stats().undo_entries, STROKES, "a push evicted something");
+        assert!(
+            history.stats().bytes <= BUDGET,
+            "the pushes alone are {} bytes, so the fixture proves nothing",
+            history.stats().bytes
+        );
+
+        for _ in 0..STROKES {
+            undo(&mut history, &mut doc);
+        }
+
+        let stats = history.stats();
+        assert!(
+            stats.bytes <= BUDGET || stats.undo_entries + stats.redo_entries == 1,
+            "{} entries holding {} bytes against a {BUDGET} byte budget",
+            stats.undo_entries + stats.redo_entries,
+            stats.bytes
+        );
+        assert!(stats.dropped > 0, "nothing was evicted, so the budget was never reached");
+        assert!(history.can_redo(), "the redo nearest the user was evicted");
+    }
+
+    /// The end of the redo stack that gets evicted is the one furthest from the
+    /// user, so what survives a run of undos is the redo they would press next.
+    ///
+    /// Getting this backwards would be worse than not evicting at all: pressing
+    /// redo would replay a gesture from the middle of the run and skip the one
+    /// the user was standing on.
+    #[test]
+    fn eviction_takes_the_far_end_of_the_redo_stack_and_leaves_the_near_one() {
+        // Three brick-creating entries, and a budget that holds their `None`
+        // priors easily and two of their 128 KB inverses not at all.
+        const BUDGET: usize = 200 * 1024;
+
+        let mut doc = Document::new(1.0);
+        let body = doc.active();
+        let coords = [BrickCoord::new(0, 0, 0), BrickCoord::new(1, 0, 0), BrickCoord::new(2, 0, 0)];
+        let mut history = History::new(BUDGET);
+        for coord in coords {
+            let volume = doc.volume_mut(body).expect("the starting body");
+            volume.insert_brick(coord, Brick::dense_filled(0.5));
+            history.push(Entry::stroke(body, StrokeEdit::from_bricks(vec![(coord, None)])));
+        }
+        assert_eq!(history.stats().undo_entries, 3, "a push evicted something");
+
+        for _ in 0..coords.len() {
+            applied(undo(&mut history, &mut doc));
+        }
+        let volume = doc.volume(body).expect("the starting body");
+        for coord in coords {
+            assert!(volume.brick(coord).is_none(), "undo left {coord:?} behind");
+        }
+
+        let stats = history.stats();
+        assert_eq!(stats.redo_entries, 1, "the squeeze kept the wrong number of redos");
+        assert_eq!(stats.dropped, 2);
+
+        applied(redo(&mut history, &mut doc));
+        let volume = doc.volume(body).expect("the starting body");
+        assert!(
+            volume.brick(coords[0]).is_some(),
+            "the surviving redo was not the one nearest the user"
+        );
+        assert!(volume.brick(coords[1]).is_none(), "a later gesture was replayed out of order");
+        assert!(volume.brick(coords[2]).is_none());
+        assert!(!history.can_redo(), "only one redo should have survived");
+    }
+
+    /// **A single undo must never eat the redo it just created.** The gesture
+    /// the user is standing on is undoable and redoable at both ends of the
+    /// cursor, and no budget is worth taking either away silently.
+    ///
+    /// The shape that used to break it: history near the ceiling, holding one
+    /// small older entry and one brick-creating stroke. Undoing the stroke
+    /// hands back the 128 KB bricks it made, which puts the total over -- and
+    /// with only one undo entry left to protect, `trim` reached for the redo
+    /// stack and took the one entry on it. Ctrl+Y then did nothing, while the
+    /// smaller, older undo entry it could have dropped instead was kept.
+    ///
+    /// The two tests above cannot see this: both leave a run of several redos,
+    /// so the last-one rule never comes up.
+    #[test]
+    fn one_undo_of_an_over_budget_stroke_still_leaves_something_to_redo() {
+        // Well under one 128 KB inverse, so the undo is guaranteed to go over.
+        const BUDGET: usize = 100 * 1024;
+
+        let mut doc = Document::new(1.0);
+        let body = doc.active();
+        let older = BrickCoord::new(0, 0, 0);
+        let newest = BrickCoord::new(1, 0, 0);
+        let mut history = History::new(BUDGET);
+        for coord in [older, newest] {
+            let volume = doc.volume_mut(body).expect("the starting body");
+            volume.insert_brick(coord, Brick::dense_filled(0.5));
+            history.push(Entry::stroke(body, StrokeEdit::from_bricks(vec![(coord, None)])));
+        }
+        assert_eq!(history.stats().undo_entries, 2, "a push evicted something");
+
+        applied(undo(&mut history, &mut doc));
+
+        assert!(
+            history.can_redo(),
+            "the only redo was evicted by the undo that made it: {:?}",
+            history.stats()
+        );
+        // And it is the right one: redoing puts back exactly the brick the undo
+        // took away, rather than replaying something out of order.
+        applied(redo(&mut history, &mut doc));
+        let volume = doc.volume(body).expect("the starting body");
+        assert!(volume.brick(newest).is_some(), "the redo did not put the stroke back");
     }
 
     #[test]
@@ -1234,5 +1547,303 @@ mod tests {
         shown[doc.index_of(other).expect("the second body")] = false;
         assert_eq!(history.undo(&mut doc, &shown), UndoOutcome::Applied(other));
         assert!(doc.node(other).expect("the second body").visible, "the eye was not put back");
+    }
+
+    // --- the mask half of an entry -------------------------------------------
+
+    /// A mask entry weighs a quarter of a sculpt entry, **to the byte**.
+    ///
+    /// Both numbers rather than the ratio between them, and that is not
+    /// pedantry: a ratio passes on a mask brick that collapsed to a tile, which
+    /// costs no heap at all, and it passes on an entry that recorded no mask
+    /// bricks. 32 + 32,768 against 32 + 131,072 is the arithmetic the whole
+    /// "+25% storage" argument for eight bits rests on, and it is checked here
+    /// because this is where the undo budget reads it.
+    #[test]
+    fn a_mask_entry_is_a_quarter_the_weight_of_a_sculpt_entry() {
+        let dense = MaskBrick::dense_filled(200);
+        assert_eq!(mask_prior_bytes(Some(&dense)), 32_800);
+        assert_eq!(mask_prior_bytes(Some(&MaskBrick::Uniform(200))), 32);
+        assert_eq!(mask_prior_bytes(None), 32);
+
+        let field = Brick::Dense(Box::new([0.0; crate::BRICK_VOXELS]));
+        assert_eq!(prior_bytes(Some(&field)), 131_104);
+    }
+
+    /// **A sculpt stroke records ZERO mask bytes**, and that is what the whole
+    /// storage decision was made for.
+    ///
+    /// The mask is read-only for the length of a sculpt stroke, so there is
+    /// nothing of it to put back. Had the mask lived inside `Brick`, every
+    /// ordinary carve would have snapshotted 32 KB per brick of a mask it never
+    /// wrote -- and `record_for_undo` clones the whole brick, so nothing would
+    /// have said so.
+    #[test]
+    fn a_sculpt_stroke_through_a_mask_records_no_mask_bytes() {
+        let (mut doc, brush, mut scratch) = sculpted();
+        let at = Vec3::new(24.0, 0.0, 0.0);
+        let masking = mask_stroke(&mut doc, &brush, &mut scratch, at, crate::MaskOp::Raise);
+        let mask_bricks = match masking.changes.first() {
+            Some(Change::Bricks { edit, .. }) => edit.mask_len(),
+            _ => panic!("a mask stroke is one brick change"),
+        };
+        assert!(mask_bricks > 0, "the fixture recorded no mask at all");
+
+        // Somewhere else on the sphere, so the carve is not refused by the very
+        // mask that was just painted.
+        let carve = stroke(&mut doc, &brush, &mut scratch, Vec3::new(-24.0, 0.0, 0.0));
+        match carve.changes.first() {
+            Some(Change::Bricks { edit, .. }) => {
+                assert_ne!(edit.len(), 0, "the fixture carved nothing");
+                assert_eq!(edit.mask_len(), 0, "a sculpt stroke recorded mask bricks");
+            }
+            _ => panic!("a sculpt stroke is one brick change"),
+        }
+    }
+
+    /// Undoing a mask stroke puts the protection back bit for bit, and marks
+    /// bricks dirty so the picture follows.
+    ///
+    /// The second half is the one that would go unnoticed: the mask is baked
+    /// into a vertex attribute at mesh time, so an undo that restored the bytes
+    /// and marked nothing would leave the old tint on screen over the restored
+    /// mask -- a state where the model and the document disagree and nothing
+    /// says which is right.
+    #[test]
+    fn undoing_a_mask_stroke_restores_it_and_marks_bricks_dirty() {
+        let (mut doc, brush, mut scratch) = sculpted();
+        let at = Vec3::new(24.0, 0.0, 0.0);
+        let body = doc.active();
+        doc.volume_mut(body).expect("a body").take_dirty(&mut Vec::new());
+
+        let before = doc.volume(body).expect("a body").mask_fill();
+        let entry = mask_stroke(&mut doc, &brush, &mut scratch, at, crate::MaskOp::Raise);
+        let after = doc.volume(body).expect("a body").mask_fill();
+        assert!(after > before, "the fixture painted nothing: {before} then {after}");
+
+        let sampled: Vec<u8> = (0..40)
+            .map(|step| {
+                let cell = glam::IVec3::new(24 - step / 4, step % 4, 0);
+                doc.volume(body).expect("a body").mask().at(cell)
+            })
+            .collect();
+
+        doc.volume_mut(body).expect("a body").take_dirty(&mut Vec::new());
+        let mut history = History::new(DEFAULT_HISTORY_BUDGET);
+        history.push(entry);
+        let shown = all_shown(&doc);
+        history.undo(&mut doc, &shown);
+
+        let mut dirty = Vec::new();
+        doc.volume_mut(body).expect("a body").take_dirty(&mut dirty);
+        assert!(!dirty.is_empty(), "undoing a mask stroke marked nothing for a remesh");
+        assert_eq!(
+            doc.volume(body).expect("a body").mask_fill(),
+            before,
+            "undo did not put the mask back"
+        );
+
+        history.redo(&mut doc, &shown);
+        let again: Vec<u8> = (0..40)
+            .map(|step| {
+                let cell = glam::IVec3::new(24 - step / 4, step % 4, 0);
+                doc.volume(body).expect("a body").mask().at(cell)
+            })
+            .collect();
+        assert_eq!(again, sampled, "redo did not put the mask back bit for bit");
+    }
+
+    // --- the whole-mask verbs --------------------------------------------
+
+    /// A body with a real painted mask on it, and the mask's own byte count.
+    fn masked() -> (Document, usize) {
+        let (mut doc, brush, mut scratch) = sculpted();
+        let body = doc.active();
+        let volume = doc.volume_mut(body).expect("a body to mask");
+        for step in 0..6 {
+            let at = Vec3::new(24.0, step as f32 * 3.0 - 7.5, 0.0);
+            let normal = volume.gradient_world(at);
+            brush.apply_mask(
+                volume,
+                &Stamp::new(at, normal, BrushDirection::Add),
+                crate::MaskOp::Raise,
+                &mut scratch,
+            );
+        }
+        volume.mask_mut().collapse();
+        let bytes = volume.mask().bytes();
+        assert!(bytes > 0, "the fixture painted no mask");
+        (doc, bytes)
+    }
+
+    /// **Clear costs the reclaim allowance and not one byte of the stroke
+    /// budget**, because the map it holds was MOVED out of the document rather
+    /// than copied out of it. Charging it to the stroke budget would evict
+    /// every stroke behind it on a large mask.
+    #[test]
+    fn clearing_a_mask_charges_the_reclaim_allowance_and_not_the_stroke_budget() {
+        let (mut doc, bytes) = masked();
+        let body = doc.active();
+        let volume = doc.volume_mut(body).expect("a body");
+        let cleared = volume.mask().cleared(false);
+        let old = volume.replace_mask(cleared);
+
+        let entry = Entry::new(vec![Change::WholeMask { body, mask: Box::new(old) }]);
+        assert_eq!(entry.stroke_bytes(), 0, "a moved mask was charged to the stroke budget");
+        assert!(
+            entry.reclaim_bytes() >= bytes,
+            "the reclaim allowance is not counting the {bytes} bytes it is holding"
+        );
+    }
+
+    /// Clear gives the memory back, and undoing it puts the mask back bit for
+    /// bit -- the same field object, not a rebuilt one.
+    #[test]
+    fn clearing_a_mask_returns_resident_bytes_and_undoing_it_restores_it_bit_for_bit() {
+        let (mut doc, _) = masked();
+        let body = doc.active();
+        let masked_bytes = doc.totals().resident_bytes;
+
+        let sampled: Vec<u8> = (0..64)
+            .map(|step| {
+                let cell = glam::IVec3::new(24 - step / 8, step % 8 - 4, 0);
+                doc.volume(body).expect("a body").mask().at(cell)
+            })
+            .collect();
+        assert!(sampled.iter().any(|value| *value > 0), "the samples miss the mask entirely");
+
+        // What the document weighed before anything was painted: the same
+        // volume with an empty mask on it.
+        let bare = {
+            let volume = doc.volume_mut(body).expect("a body");
+            let cleared = volume.mask().cleared(false);
+            let old = volume.replace_mask(cleared);
+            let bare = doc.totals().resident_bytes;
+            let volume = doc.volume_mut(body).expect("a body");
+            volume.replace_mask(old);
+            bare
+        };
+        assert!(bare < masked_bytes, "the fixture's mask weighs nothing");
+
+        let volume = doc.volume_mut(body).expect("a body");
+        let cleared = volume.mask().cleared(false);
+        let old = volume.replace_mask(cleared);
+        assert_eq!(
+            doc.totals().resident_bytes,
+            bare,
+            "clearing the mask did not give its bytes back"
+        );
+
+        let mut history = History::new(DEFAULT_HISTORY_BUDGET);
+        history.push(Entry::new(vec![Change::WholeMask { body, mask: Box::new(old) }]));
+        undo(&mut history, &mut doc);
+
+        let restored: Vec<u8> = (0..64)
+            .map(|step| {
+                let cell = glam::IVec3::new(24 - step / 8, step % 8 - 4, 0);
+                doc.volume(body).expect("a body").mask().at(cell)
+            })
+            .collect();
+        assert_eq!(restored, sampled, "undoing a clear did not put the mask back bit for bit");
+        assert_eq!(doc.totals().resident_bytes, masked_bytes);
+    }
+
+    /// Mask All is clear-then-invert as ONE change, so undoing it puts the map
+    /// and the polarity back together -- the only state either is meaningful in.
+    #[test]
+    fn undoing_mask_all_puts_the_map_and_the_polarity_back_together() {
+        let (mut doc, _) = masked();
+        let body = doc.active();
+        let before = doc.volume(body).expect("a body").mask_fill();
+
+        let volume = doc.volume_mut(body).expect("a body");
+        let all = volume.mask().cleared(true);
+        let old = volume.replace_mask(all);
+        assert!(volume.mask().protects_everything());
+
+        let mut history = History::new(DEFAULT_HISTORY_BUDGET);
+        history.push(Entry::new(vec![Change::WholeMask { body, mask: Box::new(old) }]));
+        undo(&mut history, &mut doc);
+
+        let volume = doc.volume(body).expect("a body");
+        assert!(!volume.mask().inverted(), "undo left the polarity inverted");
+        assert!((volume.mask_fill() - before).abs() < 1.0e-9, "undo did not put the map back");
+
+        redo(&mut history, &mut doc);
+        assert!(
+            doc.volume(body).expect("a body").mask().protects_everything(),
+            "redo did not put Mask All back"
+        );
+    }
+
+    /// **Invert costs nothing at all, in either direction.** One bool in, one
+    /// bool out, no bricks marked and no bytes against either budget -- which
+    /// is what stops ctrl+I allocating 1.04 GiB on a lightly masked model.
+    #[test]
+    fn inverting_a_mask_costs_no_bytes_and_marks_no_bricks_in_either_direction() {
+        let (mut doc, _) = masked();
+        let body = doc.active();
+        doc.volume_mut(body).expect("a body").take_dirty(&mut Vec::new());
+
+        let edit = doc.volume_mut(body).expect("a body").flip_mask_polarity();
+        assert_eq!(edit.bytes(), 0, "a polarity flip recorded brick bytes");
+        assert!(doc.volume(body).expect("a body").mask().inverted());
+
+        let mut dirty = Vec::new();
+        doc.volume_mut(body).expect("a body").take_dirty(&mut dirty);
+        assert!(dirty.is_empty(), "a polarity flip marked {} bricks for a remesh", dirty.len());
+
+        let entry = Entry::stroke(body, edit);
+        assert_eq!(entry.stroke_bytes(), 0);
+        assert_eq!(entry.reclaim_bytes(), 0);
+
+        let mut history = History::new(DEFAULT_HISTORY_BUDGET);
+        history.push(entry);
+        undo(&mut history, &mut doc);
+        assert!(!doc.volume(body).expect("a body").mask().inverted(), "undo did not flip it back");
+
+        let mut dirty = Vec::new();
+        doc.volume_mut(body).expect("a body").take_dirty(&mut dirty);
+        assert!(
+            dirty.is_empty(),
+            "undoing a polarity flip marked {} bricks, which is a 475 ms remesh at the ceiling",
+            dirty.len()
+        );
+    }
+
+    /// Replacing a mask marks the bricks either side of the swap, or the tint
+    /// that was there stays on screen over a mask that is gone.
+    #[test]
+    fn replacing_a_mask_marks_the_bricks_either_side_of_the_swap() {
+        let (mut doc, _) = masked();
+        let body = doc.active();
+        doc.volume_mut(body).expect("a body").take_dirty(&mut Vec::new());
+
+        let volume = doc.volume_mut(body).expect("a body");
+        let cleared = volume.mask().cleared(false);
+        volume.replace_mask(cleared);
+
+        let mut dirty = Vec::new();
+        doc.volume_mut(body).expect("a body").take_dirty(&mut dirty);
+        assert!(!dirty.is_empty(), "clearing the mask marked nothing for a remesh");
+    }
+
+    /// A mask change on a hidden body is refused like any other edit to one.
+    #[test]
+    fn a_whole_mask_change_on_a_hidden_body_is_refused_rather_than_applied() {
+        let (mut doc, _) = masked();
+        let body = doc.active();
+        let volume = doc.volume_mut(body).expect("a body");
+        let cleared = volume.mask().cleared(false);
+        let old = volume.replace_mask(cleared);
+
+        let mut history = History::new(DEFAULT_HISTORY_BUDGET);
+        history.push(Entry::new(vec![Change::WholeMask { body, mask: Box::new(old) }]));
+        let hidden = vec![false; doc.node_count()];
+        assert_eq!(history.undo(&mut doc, &hidden), UndoOutcome::Refused(body));
+        assert!(
+            doc.volume(body).expect("a body").mask().is_free(),
+            "the refused undo put the mask back anyway"
+        );
     }
 }

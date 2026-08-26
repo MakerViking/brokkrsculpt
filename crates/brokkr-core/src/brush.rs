@@ -64,6 +64,7 @@
 use glam::{IVec3, Vec3};
 
 use crate::brick::{BRICK_DIM, BrickCoord, INSIDE, OUTSIDE};
+use crate::mask::{PROTECTED, UNMASKED};
 use crate::pattern::{Pattern, Prepared};
 use crate::region::FieldRegion;
 use crate::volume::{BrickPreview, BrickVerdict, Volume};
@@ -555,6 +556,28 @@ impl Symmetry {
     }
 }
 
+/// What a mask stroke does to the protection under the brush.
+///
+/// Three operations and no fourth, and the absence of one is worth naming: a
+/// destructive whole-mask operation is **never** the degenerate no-movement
+/// case of a local one. ZBrush's blur is the zero-drag case of its mask paint,
+/// which has been its top masking complaint since 2007 and which its vendor
+/// answers by telling people to set the blur strength to zero and leave the
+/// gesture firing. A mask stroke of zero length here is a zero-length stroke,
+/// full stop; Clear, Invert and the absolute Blur are buttons.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MaskOp {
+    /// Paint protection in. The plain left drag.
+    Raise,
+    /// Take it away. Control, alt, or the eraser end of the stylus -- the
+    /// direction is worked out by the caller and NOT by
+    /// [`BrushKind::is_directional`], which answers false for three of the seven
+    /// brushes and would silently invert this for them.
+    Lower,
+    /// Soften what is already there, locally, under the brush. Shift.
+    Blur,
+}
+
 /// One application of a brush at a point.
 #[derive(Debug, Clone, Copy)]
 pub struct Stamp {
@@ -691,6 +714,172 @@ impl Brush {
     /// read inside the locked box.
     pub fn max_drag(&self) -> f32 {
         self.radius * MOVE_DRAG_MARGIN / self.falloff.max_slope()
+    }
+
+    /// Paint the mask under one stamp, plus its mirrors when symmetry is on.
+    ///
+    /// Mirroring is not in the plan's list for this increment and is here on
+    /// purpose: the three mirror toggles stay lit in the tool strip while the
+    /// mask tool is live, and the mirror planes stay drawn in the viewport, so a
+    /// mask that ignored them would be the interface saying one thing and the
+    /// tool doing another. It costs the same twin loop the field already runs
+    /// and no new concept.
+    pub fn apply_mask_symmetric(
+        &self,
+        volume: &mut Volume,
+        stamp: &Stamp,
+        op: MaskOp,
+        symmetry: Symmetry,
+        centre: Vec3,
+        scratch: &mut BrushScratch,
+    ) {
+        self.apply_mask(volume, stamp, op, scratch);
+        if symmetry.is_off() {
+            return;
+        }
+        let mut twins = [*stamp; Symmetry::MAX_MIRRORS];
+        let count = symmetry.mirrors(stamp, centre, &mut twins);
+        for twin in &twins[..count] {
+            self.apply_mask(volume, twin, op, scratch);
+        }
+    }
+
+    /// Paint the mask under one stamp.
+    ///
+    /// # Why this is not a `BrushKind`
+    ///
+    /// Masking is a TOOL and never a brush: the digits index
+    /// [`BrushKind::ALL`], and a `BrushKind` that must never write the field
+    /// would need an arm in five exhaustive matches inside this crate for a
+    /// variant every one of them would have to refuse. It borrows the brush's
+    /// radius, falloff, pattern and pressure -- which is what makes `s`, `[`,
+    /// `]` and the falloff curves work on it with no new code, and which is
+    /// what ZBrush does -- and it has its own strength, held by the caller.
+    ///
+    /// # Blend toward the target, never add to the value
+    ///
+    /// `new = old + (target - old) * weight`, with `weight` in `0..=1` by
+    /// construction, exactly as Smooth, Flatten and Clay blend toward theirs.
+    /// The two properties that buys are the reason it is written this way:
+    /// repeated stamps converge on the target instead of overshooting it, and
+    /// the edge of every stroke is FEATHERED because the falloff is a factor of
+    /// the blend rather than an addition to it. The second is a rule and not a
+    /// preference -- [`crate::mask`] gives its three independent
+    /// justifications, of which the sharpest is that a step in the mask is a
+    /// fold in the geometry under Move.
+    ///
+    /// The pattern multiplies in here as it does on the field, and that is
+    /// deliberate: it is already pinned to `0..=1`, so masking through Scales or
+    /// Cracks cannot escape the range, and it is ZBrush's alpha masking arriving
+    /// for free. Turning it off would be code added to remove capability.
+    pub fn apply_mask(
+        &self,
+        volume: &mut Volume,
+        stamp: &Stamp,
+        op: MaskOp,
+        scratch: &mut BrushScratch,
+    ) {
+        if self.radius <= 0.0 || self.strength <= 0.0 || stamp.pressure <= 0.0 {
+            return;
+        }
+
+        let voxel_size = volume.voxel_size();
+        let inverse_radius = 1.0 / self.radius;
+        let gain = (self.strength * stamp.pressure).clamp(0.0, 1.0);
+        let extent = Vec3::splat(self.radius);
+        let (lo, hi) = volume.voxel_bounds(stamp.centre - extent, stamp.centre + extent);
+
+        // Blur is the one mask operation that is not a per voxel function, so
+        // it runs the same two-phase shape every field brush that reads its
+        // neighbours runs: copy the box out, then write back using only the
+        // copy. Without it a voxel would average a mixture of old and new
+        // values and the result would depend on visiting order.
+        if op == MaskOp::Blur {
+            volume.snapshot_mask(lo, hi, &mut scratch.region);
+        }
+        let region = &scratch.region;
+
+        let pattern = if self.pattern.is_off() {
+            Prepared::OFF
+        } else {
+            self.pattern.prepare(voxel_size, stamp.normal, stamp.tangent)
+        };
+
+        let falloff = self.falloff;
+        let centre = stamp.centre;
+        let radius_squared = self.radius * self.radius;
+
+        volume.edit_mask(lo, hi, |voxel, position, protection| {
+            let offset = position - centre;
+            if offset.length_squared() >= radius_squared {
+                return protection;
+            }
+            let distance = offset.length() * inverse_radius;
+            let weight = falloff.weight(distance) * gain * pattern.weight(position);
+            if weight <= 0.0 {
+                return protection;
+            }
+            let target = match op {
+                MaskOp::Raise => PROTECTED as f32,
+                MaskOp::Lower => UNMASKED as f32,
+                // The kernel Smooth already uses on the field, over a snapshot
+                // of the mask instead of a snapshot of the distances.
+                MaskOp::Blur => region.neighbour_average(voxel),
+            };
+            let held = protection as f32;
+            let next = held + (target - held) * weight;
+            // **Quantised toward the target only when the target is within
+            // reach**, and the asymmetry between the two directions is the
+            // whole of this.
+            //
+            // Eight bits cannot hold a proportional blend exactly, so the
+            // rounding has to go somewhere. To-nearest alone sends it the wrong
+            // way at the end: at a weight of 0.4 the blend reaches 254 and then
+            // stops -- `254 + (255 - 254) * 0.4` rounds back to 254 -- so "keep
+            // painting until it is protected" never arrives. That is not a
+            // cosmetic one level: the planner's skip and the plane cut's
+            // spared-brick test both compare against `PROTECTED` exactly, so a
+            // mask a user had painted solid would still let a cut through.
+            //
+            // Rounding TOWARD the target unconditionally fixes that and buys a
+            // worse bug, because a step of `(255 - held) * w` ceils to 1 however
+            // small `w` is: every voxel the brush touches at all then gains a
+            // level per stamp, the whole footprint ratchets to `PROTECTED` in a
+            // few hundred stamps, and the feathered rim `crate::mask` requires
+            // -- the rim `mask_drag_scale`'s half-margin rests on -- collapses
+            // into the single voxel at the radius. Measured at radius 8,
+            // strength 0.4: 300 stamps gave `[255 x 8, 0]` where one stamp gave
+            // `[102, 98, 87, 70, 51, 33, 16, 5, 0]`.
+            //
+            // So the snap is confined to the last level, where it is the only
+            // thing that can move the value at all, and everything before it
+            // rounds to nearest and settles at a plateau that varies smoothly
+            // with the weight. Exact arrival and a permanently graded rim are
+            // mutually exclusive for a memoryless 8-bit blend -- either the
+            // fixed point is the target for every non-zero weight, which is the
+            // ratchet, or it is weight-dependent, which cannot be the target
+            // everywhere -- so each direction takes the one that costs less.
+            //
+            // **Lower keeps the ratchet deliberately, because `UNMASKED` is not
+            // a value but the absent state.** [`crate::MaskField::collapse`]
+            // drops a brick only at exactly 0, so a residue of 2 left by a
+            // rounded erase is permanent: `is_free` stays false, the standing
+            // card goes on naming a body at 1%, Move's cap goes on being halved,
+            // and no amount of further erasing clears it. Falling short of 255
+            // has no equivalent -- it costs sparing at the rim of a cut and
+            // nothing else.
+            //
+            // Blur snaps at neither end, because it has no exact target:
+            // rounding its step away from the value would make a settled region
+            // dither one level either side of its own neighbourhood average
+            // forever.
+            let next = match op {
+                MaskOp::Raise if target - next < 1.0 => next.ceil(),
+                MaskOp::Lower => next.floor(),
+                _ => next.round(),
+            };
+            next.clamp(UNMASKED as f32, PROTECTED as f32) as u8
+        });
     }
 
     /// Apply one stamp, plus its mirrors when symmetry is on.
@@ -978,6 +1167,13 @@ impl Brush {
             if skipping == Skipping::Off {
                 return BrickVerdict::Whole;
             }
+            // Nothing here may be written at all, and unlike every other skip
+            // in this function that needs no reasoning about neighbours: the
+            // mask kills the write rather than the read. Resolved protection,
+            // so this fires on a Mask All rather than in spite of one.
+            if preview.mask == Some(PROTECTED) {
+                return BrickVerdict::Skip;
+            }
             // A voxel further from the centre than the radius gets its own
             // value back, so a brick the ball misses cannot change. Grown by a
             // voxel so this is a bound on the per voxel test rather than a race
@@ -1027,97 +1223,107 @@ impl Brush {
         // are actually going to be written.
         let radius_squared = self.radius * self.radius;
 
-        volume.edit_voxels_where(lo, hi, read_voxels, decide, |voxel, position, value| {
-            let offset = position - centre;
-            if offset.length_squared() >= radius_squared {
-                return value;
-            }
-            let distance = offset.length() * inverse_radius;
-            let shaped = falloff.weight(distance) * gain;
-            if shaped <= 0.0 {
-                return value;
-            }
-            // The pattern is one extra multiply, and it is evaluated only for
-            // voxels the falloff has not already zeroed. It stays in 0..=1, so
-            // the blending brushes below keep a legal lerp factor.
-            let weight = shaped * pattern.weight(position);
-            if weight <= 0.0 {
-                return value;
-            }
-
-            match kind {
-                BrushKind::Inflate => value + field_sign * weight * displacement,
-
-                BrushKind::Draw => {
-                    // Translate the field along the stroke normal, which slides
-                    // this patch of surface out from under the cursor.
-                    //
-                    // The tempting version, weighting an offset by how much the
-                    // local gradient faces the stroke, does not survive a
-                    // stroke: wherever the field is flat or saturated that
-                    // gradient is noise, and multiplying a displacement by it
-                    // turns the noise into geometry. A resample cannot
-                    // introduce detail that was not already there.
-                    let shift = stroke_normal
-                        * (weight * displacement * voxel_size * direction.outward_sign());
-                    region.sample((position - shift) / voxel_size)
+        volume.edit_voxels_where(
+            lo,
+            hi,
+            read_voxels,
+            true,
+            decide,
+            |voxel, position, value, free| {
+                let offset = position - centre;
+                if offset.length_squared() >= radius_squared {
+                    return value;
+                }
+                let distance = offset.length() * inverse_radius;
+                let shaped = falloff.weight(distance) * gain;
+                if shaped <= 0.0 {
+                    return value;
+                }
+                // The pattern is one extra multiply, and the mask a second, and
+                // both are evaluated only for voxels the falloff has not already
+                // zeroed. Both stay in 0..=1, so the product does too and the
+                // blending brushes below keep a legal lerp factor -- which is what
+                // makes smooth, flatten and clay converge on their target instead
+                // of extrapolating away from it.
+                let weight = shaped * pattern.weight(position) * free;
+                if weight <= 0.0 {
+                    return value;
                 }
 
-                BrushKind::Smooth => {
-                    let average = region.neighbour_average(voxel);
-                    value + (average - value) * weight
-                }
+                match kind {
+                    BrushKind::Inflate => value + field_sign * weight * displacement,
 
-                BrushKind::Pinch => {
-                    // Read the field from slightly closer to the brush axis,
-                    // which drags the surface sideways and squeezes whatever
-                    // ridge runs through the brush into a crease.
-                    //
-                    // The obvious alternative, an unsharp mask on the values,
-                    // looks the same for one stamp and then compounds: it is a
-                    // high pass filter with gain above 1, so across a stroke it
-                    // amplifies its own rounding error into a crust. Warping
-                    // the domain only ever resamples what is already there.
-                    let to_centre = centre - position;
-                    // Along the surface only. Pulling along the normal as well
-                    // would make pinch quietly double as inflate.
-                    let lateral = to_centre - stroke_normal * to_centre.dot(stroke_normal);
-                    let Some(direction_to_axis) = lateral.try_normalize() else {
-                        return value;
-                    };
-                    let spread = match direction {
-                        BrushDirection::Add => 1.0,
-                        BrushDirection::Subtract => -1.0,
-                    };
-                    let pull =
-                        direction_to_axis * (weight * PINCH_PULL_VOXELS * voxel_size * spread);
-                    region.sample((position + pull) / voxel_size)
-                }
+                    BrushKind::Draw => {
+                        // Translate the field along the stroke normal, which slides
+                        // this patch of surface out from under the cursor.
+                        //
+                        // The tempting version, weighting an offset by how much the
+                        // local gradient faces the stroke, does not survive a
+                        // stroke: wherever the field is flat or saturated that
+                        // gradient is noise, and multiplying a displacement by it
+                        // turns the noise into geometry. A resample cannot
+                        // introduce detail that was not already there.
+                        let shift = stroke_normal
+                            * (weight * displacement * voxel_size * direction.outward_sign());
+                        region.sample((position - shift) / voxel_size)
+                    }
 
-                BrushKind::Flatten => {
-                    let plane = (position - plane_point).dot(stroke_normal) / voxel_size;
-                    value + (plane - value) * weight
-                }
+                    BrushKind::Smooth => {
+                        let average = region.neighbour_average(voxel);
+                        value + (average - value) * weight
+                    }
 
-                BrushKind::Move => {
-                    // Unreachable: `apply` sends Move to `drag_once` before any
-                    // of this, because a gesture is not a stamp.
-                    value
-                }
+                    BrushKind::Pinch => {
+                        // Read the field from slightly closer to the brush axis,
+                        // which drags the surface sideways and squeezes whatever
+                        // ridge runs through the brush into a crease.
+                        //
+                        // The obvious alternative, an unsharp mask on the values,
+                        // looks the same for one stamp and then compounds: it is a
+                        // high pass filter with gain above 1, so across a stroke it
+                        // amplifies its own rounding error into a crust. Warping
+                        // the domain only ever resamples what is already there.
+                        let to_centre = centre - position;
+                        // Along the surface only. Pulling along the normal as well
+                        // would make pinch quietly double as inflate.
+                        let lateral = to_centre - stroke_normal * to_centre.dot(stroke_normal);
+                        let Some(direction_to_axis) = lateral.try_normalize() else {
+                            return value;
+                        };
+                        let spread = match direction {
+                            BrushDirection::Add => 1.0,
+                            BrushDirection::Subtract => -1.0,
+                        };
+                        let pull =
+                            direction_to_axis * (weight * PINCH_PULL_VOXELS * voxel_size * spread);
+                        region.sample((position + pull) / voxel_size)
+                    }
 
-                BrushKind::Clay => {
-                    let plane = (position - plane_point).dot(stroke_normal) / voxel_size;
-                    let blended = value + (plane - value) * weight;
-                    // Keep only the half of the operation that moves material
-                    // the way the user asked for. Without this, clay carves
-                    // away any bump standing above its plane.
-                    match direction {
-                        BrushDirection::Add => blended.min(value),
-                        BrushDirection::Subtract => blended.max(value),
+                    BrushKind::Flatten => {
+                        let plane = (position - plane_point).dot(stroke_normal) / voxel_size;
+                        value + (plane - value) * weight
+                    }
+
+                    BrushKind::Move => {
+                        // Unreachable: `apply` sends Move to `drag_once` before any
+                        // of this, because a gesture is not a stamp.
+                        value
+                    }
+
+                    BrushKind::Clay => {
+                        let plane = (position - plane_point).dot(stroke_normal) / voxel_size;
+                        let blended = value + (plane - value) * weight;
+                        // Keep only the half of the operation that moves material
+                        // the way the user asked for. Without this, clay carves
+                        // away any bump standing above its plane.
+                        match direction {
+                            BrushDirection::Add => blended.min(value),
+                            BrushDirection::Subtract => blended.max(value),
+                        }
                     }
                 }
-            }
-        });
+            },
+        );
     }
 }
 
@@ -1433,7 +1639,7 @@ impl MoveStroke {
         self.anchors.clear();
         self.applied = Vec3::ZERO;
         self.brush = *brush;
-        self.max_drag = brush.max_drag();
+        self.max_drag = brush.max_drag() * mask_drag_scale(volume);
         if brush.radius <= 0.0 || brush.strength <= 0.0 {
             return;
         }
@@ -1530,6 +1736,12 @@ impl MoveStroke {
                 if skipping == Skipping::Off {
                     return BrickVerdict::Whole;
                 }
+                // Nothing here may be written at all. See the same three lines
+                // in `Brush::stamp`: resolved protection, so it fires on a Mask
+                // All rather than in spite of one.
+                if preview.mask == Some(PROTECTED) {
+                    return BrickVerdict::Skip;
+                }
                 // Grown by a voxel so this bounds the per voxel test rather
                 // than racing the last bit of its rounding.
                 let slack = Vec3::splat(voxel_size);
@@ -1592,27 +1804,52 @@ impl MoveStroke {
             // Zero reach: this never answers `OnlyNearDifferentNeighbours`,
             // because what it has to prove is about the locked copy and not
             // about the brick's neighbours in the volume.
-            volume.edit_voxels_where(anchor.lo, anchor.hi, 0, decide, |_, position, value| {
-                let Some(displacement) =
-                    move_displacement(anchors, drag, position, inverse_radius, falloff, cap)
-                else {
-                    // Outside every falloff, so no drag this gesture could have
-                    // would move it and it still holds its locked value.
-                    // Resampling would be eight reads and seven interpolations
-                    // to arrive back at itself, over the near half of the box
-                    // that a ball does not fill.
+            volume.edit_voxels_where(
+                anchor.lo,
+                anchor.hi,
+                0,
+                true,
+                decide,
+                |_, position, value, free| {
+                    // Explicitly, and not by way of a zero displacement. A zero
+                    // displacement makes the warp resample the LOCKED COPY at
+                    // the voxel, which is the value at lock time rather than the
+                    // value now; within a gesture those coincide by induction,
+                    // but this is a different expression and it is exactly the
+                    // class of difference the On against Off equivalence test
+                    // exists to catch.
+                    if free <= 0.0 {
+                        return value;
+                    }
+                    let Some(displacement) =
+                        move_displacement(anchors, drag, position, inverse_radius, falloff, cap)
+                    else {
+                        // Outside every falloff, so no drag this gesture could
+                        // have would move it and it still holds its locked
+                        // value. Resampling would be eight reads and seven
+                        // interpolations to arrive back at itself, over the near
+                        // half of the box that a ball does not fill.
+                        //
+                        // The test is the falloff and NOT the displacement: a
+                        // displacement of zero is what a drag that has come back
+                        // to where it started produces, and those voxels are
+                        // exactly the ones that have to be written to put the
+                        // form back.
+                        return value;
+                    };
+                    // Inside, this reads from behind along the drag, which is
+                    // also what puts the field back where a previous, longer
+                    // drag had moved it from: nothing here accumulates.
                     //
-                    // The test is the falloff and NOT the displacement: a
-                    // displacement of zero is what a drag that has come back to
-                    // where it started produces, and those voxels are exactly
-                    // the ones that have to be written to put the form back.
-                    return value;
-                };
-                // Inside, this reads from behind along the drag, which is also
-                // what puts the field back where a previous, longer drag had
-                // moved it from: nothing here accumulates.
-                field.sample((position - displacement) / voxel_size)
-            });
+                    // The mask scales the DISPLACEMENT rather than blending the
+                    // warped value against the old one. A partly applied domain
+                    // warp is still a domain warp and still cannot invent
+                    // detail; a blend between two resamples is a comb filter,
+                    // and across the thirty overlapping stamps of a real stroke
+                    // that is a visible ghost.
+                    field.sample((position - displacement * free) / voxel_size)
+                },
+            );
         }
     }
 
@@ -1637,6 +1874,25 @@ impl MoveStroke {
     pub fn is_at_the_limit(&self) -> bool {
         self.max_drag > 0.0 && self.applied.length() >= self.max_drag * 0.98
     }
+}
+
+/// What [`Brush::max_drag`] is multiplied by while a body carries a mask.
+///
+/// One half, and it buys back a fold bound rather than being cautious for the
+/// sake of it. [`Brush::max_drag`] is derived from the condition that the warp
+/// stops being invertible once `drag * max_slope / radius` reaches 1; with a
+/// mask the gradient the warp actually applies is that of `w * free`, and
+/// `|grad(w * free)| <= |grad w| + |grad free|`. Halving the cap covers the
+/// second term exactly when the mask's own gradient is no steeper than the
+/// brush's falloff, which holds for any mask painted at a comparable radius
+/// and for any blurred one. It does not hold for a mask painted with a much
+/// smaller brush, which is why every path that writes the mask writes a
+/// FEATHERED edge and never a step -- see [`crate::mask`].
+///
+/// One bool probe per gesture, not per event: an unmasked body pays nothing and
+/// keeps the full cap.
+fn mask_drag_scale(volume: &Volume) -> f32 {
+    if volume.mask().is_free() { 1.0 } else { 0.5 }
 }
 
 /// How far the field under `position` is displaced, summed over every mirror,
@@ -2394,6 +2650,7 @@ mod snapshot_tests {
 mod skipping_tests {
     use super::*;
     use crate::brick::{BRICK_DIM, BRICK_VOXELS, Brick, BrickCoord, INSIDE, OUTSIDE, brick_index};
+    use crate::testing::assert_same_field;
 
     /// Every brush, both ways round the stroke, which is the grid the claims in
     /// [`Brush::leaves_constant_alone`] are made over.
@@ -2408,37 +2665,6 @@ mod skipping_tests {
     fn stamp_at(centre: Vec3, normal: Vec3, direction: BrushDirection) -> Stamp {
         Stamp::new(centre, normal, direction)
             .with_tangent(normal.cross(Vec3::Z).normalize_or(Vec3::Y))
-    }
-
-    /// Assert two volumes hold the same field, brick for brick.
-    ///
-    /// Compared through the storage rather than by sampling every voxel,
-    /// which makes it a memcmp per brick instead of a hash lookup per voxel.
-    /// The representation has to match too: a brick the unskipped path made
-    /// dense and then found it had not changed is rolled back to the tile it
-    /// was, so a difference there would mean one path is leaving 128 KB behind.
-    fn assert_same_field(a: &Volume, b: &Volume, what: &str) {
-        let mut left: Vec<BrickCoord> = a.brick_coords().collect();
-        let mut right: Vec<BrickCoord> = b.brick_coords().collect();
-        left.sort();
-        right.sort();
-        assert_eq!(left, right, "{what}: different bricks are stored");
-
-        for coord in left {
-            match (a.brick(coord), b.brick(coord)) {
-                (Some(Brick::Uniform(x)), Some(Brick::Uniform(y))) => {
-                    assert_eq!(x, y, "{what}: tile {coord:?} differs");
-                }
-                (Some(Brick::Dense(x)), Some(Brick::Dense(y))) => {
-                    assert!(x[..] == y[..], "{what}: brick {coord:?} differs");
-                }
-                (x, y) => panic!(
-                    "{what}: brick {coord:?} is stored differently: {:?} against {:?}",
-                    x.map(|brick| matches!(brick, Brick::Dense(_))),
-                    y.map(|brick| matches!(brick, Brick::Dense(_))),
-                ),
-            }
-        }
     }
 
     /// A solid half space, `x <= surface`, over a block of bricks wide enough
@@ -2739,6 +2965,516 @@ mod skipping_tests {
                  alone, and visit less than the same brush pushed the other way"
             );
         }
+    }
+
+    // ------------------------------------------------------- masked skipping
+
+    /// A sphere with enough curvature under the stamp that every one of the
+    /// seven brushes has something to do there.
+    ///
+    /// [`slab`] cannot serve: its field is linear, so smooth's neighbour
+    /// average, flatten's plane and a tangential Move warp all hand a voxel its
+    /// own value straight back, and a control that asks "did the unmasked stamp
+    /// change anything" would fail on three brushes for reasons that have
+    /// nothing to do with masking.
+    fn ball() -> Volume {
+        let mut volume = Volume::new(1.0);
+        volume.seed_sphere(Vec3::splat(48.0), 30.0);
+        volume.take_dirty(&mut Vec::new());
+        volume
+    }
+
+    /// A point on [`ball`]'s surface, chosen off the axes so the stamp box
+    /// straddles brick boundaries in two dimensions.
+    const ON_THE_BALL: Vec3 = Vec3::new(66.0, 72.0, 48.0);
+
+    /// Every voxel of every brick the inclusive box touches, set to whatever
+    /// `protection` says for that voxel.
+    ///
+    /// WHOLE bricks, and that is the point rather than convenience: a brick
+    /// protected only in part carries detail, so `MaskField::protection_fill`
+    /// answers `None` and the planner cannot see it at all. Painting whole
+    /// bricks is what lets one fixture put a mask the planner acts on and a
+    /// mask only the per voxel multiply can act on side by side.
+    fn paint_bricks(volume: &mut Volume, lo: IVec3, hi: IVec3, protection: impl Fn(IVec3) -> u8) {
+        let b_lo = BrickCoord::containing(lo).0;
+        let b_hi = BrickCoord::containing(hi).0;
+        for bz in b_lo.z..=b_hi.z {
+            for by in b_lo.y..=b_hi.y {
+                for bx in b_lo.x..=b_hi.x {
+                    let origin = BrickCoord::new(bx, by, bz).origin();
+                    for z in 0..BRICK_DIM as i32 {
+                        for y in 0..BRICK_DIM as i32 {
+                            for x in 0..BRICK_DIM as i32 {
+                                let cell = origin + IVec3::new(x, y, z);
+                                volume.mask_mut().write(cell, protection(cell));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// One protection value over whole bricks.
+    fn protect_bricks(volume: &mut Volume, lo: IVec3, hi: IVec3, value: u8) {
+        paint_bricks(volume, lo, hi, |_| value);
+    }
+
+    /// A smooth ramp of protection, never 0 and never 255.
+    ///
+    /// No brick collapses to a tile and none of them qualifies for the
+    /// planner's skip, which is what makes this the arm where the per voxel
+    /// multiply is the only thing doing any work. Smooth in WORLD space rather
+    /// than restarting per brick, because a ramp that restarts at a brick
+    /// boundary is a step, and a step is what the mask must never carry.
+    fn feathered(cell: IVec3) -> u8 {
+        let across = cell.as_vec3().dot(Vec3::ONE) * 0.05;
+        ((0.5 + 0.4 * across.sin()) * u8::MAX as f32) as u8
+    }
+
+    /// The largest difference between two fields over an inclusive voxel box.
+    ///
+    /// The counterpart to [`assert_same_field`], for the controls: a test that
+    /// only ever asserts "nothing changed" passes just as well when the stamp
+    /// was never applied at all.
+    fn worst_difference(a: &Volume, b: &Volume, lo: IVec3, hi: IVec3) -> f32 {
+        let mut worst = 0.0_f32;
+        for z in lo.z..=hi.z {
+            for y in lo.y..=hi.y {
+                for x in lo.x..=hi.x {
+                    let voxel = IVec3::new(x, y, z);
+                    worst = worst.max((a.sample_voxel(voxel) - b.sample_voxel(voxel)).abs());
+                }
+            }
+        }
+        worst
+    }
+
+    /// Skipping leaves the same field and the same undo entry THROUGH A MASK
+    /// too, and visits fewer bricks than the same stroke unmasked.
+    ///
+    /// This is the answer to the question the increment asks, put as a test
+    /// rather than as an argument: does a mask leave the uniform-brick skip
+    /// correct, merely conservative, or wrong?
+    ///
+    /// Correct, and the reasoning is that every proof in `decide` is quantified
+    /// over ALL weights in `0..=1` rather than over a particular one -- the
+    /// radius cull is position-only, [`Brush::leaves_constant_alone`] argues
+    /// from the constant value "whatever the weight and wherever inside it the
+    /// read lands", `blend_toward_plane_clamps_back` states its premise as
+    /// "`weight` is somewhere in `0..=1`", and Move's verdict spans the
+    /// displacement box from zero outwards. A mask factor in `0..=1` turns a
+    /// legal weight into another legal weight, so all four survive verbatim.
+    ///
+    /// It becomes conservative only in the sense that a fully protected brick
+    /// was already unchangeable and nothing told the planner, which is what the
+    /// new skip fixes. The third assertion is what pins that down: the masked
+    /// stroke visits STRICTLY FEWER bricks than the unmasked one. A stroke over
+    /// a masked region gets cheaper, not dearer.
+    ///
+    /// Three arms INTERLEAVED brick by brick, and every part of that sentence
+    /// was arrived at by watching a weaker fixture stay green under a
+    /// deliberately broken skip.
+    ///
+    /// The arms are fully protected tiles, which the planner skips outright;
+    /// HALF protected tiles, which it can see and must not skip; and a
+    /// feathered ramp, which it cannot see at all. Drop the middle one and a
+    /// skip written as "any uniform mask brick" or "any protection over half"
+    /// passes everything here, because a two-arm fixture holds no uniform brick
+    /// between the extremes for it to bite on. Interleaving them by brick
+    /// rather than laying them out in blocks is what puts a different arm in
+    /// every neighbouring brick, so a slab fetched for the wrong coordinate
+    /// lands on a different protection instead of the same one.
+    ///
+    /// The radius is large rather than the 9 the tests above use, and that is
+    /// load-bearing too: at radius 9 only two bricks of the box are inside the
+    /// ball at all, so the radius cull reaches the rest before the mask does
+    /// and two of the three arms are never exercised.
+    #[test]
+    fn skipping_through_a_mask_leaves_the_same_field_and_visits_fewer_bricks() {
+        let at = ON_THE_BALL;
+        let radius = 24.0;
+        let reach = Vec3::splat(radius + 2.0);
+        let (lo, hi) = ball().voxel_bounds(at - reach, at + reach);
+        let arm_of = |cell: IVec3| {
+            let brick = BrickCoord::containing(cell).0;
+            match (brick.x + brick.y + brick.z).rem_euclid(3) {
+                0 => PROTECTED,
+                1 => PROTECTED / 2,
+                _ => feathered(cell),
+            }
+        };
+
+        for (kind, direction) in every_brush() {
+            let brush = Brush { kind, radius, strength: 0.8, ..Brush::default() };
+            let normal = ball().gradient_world(at);
+            let stamp = stamp_at(at, normal, direction);
+
+            let run = |masked: bool, skipping: Skipping| {
+                let mut volume = ball();
+                if masked {
+                    paint_bricks(&mut volume, lo, hi, arm_of);
+                    // Only the two uniform arms collapse to tiles; the ramp
+                    // carries detail and stays dense, which is the point.
+                    volume.mask_mut().collapse();
+                }
+                volume.begin_stroke();
+                brush.stamp(&mut volume, &stamp, &mut BrushScratch::new(), skipping);
+                let visited = volume.last_visited_bricks();
+                (volume, visited)
+            };
+
+            let (mut skipped, visited_when_skipping) = run(true, Skipping::On);
+            let (mut whole, visited_when_not) = run(true, Skipping::Off);
+            let (_, visited_unmasked) = run(false, Skipping::On);
+
+            assert_same_field(&skipped, &whole, &format!("{kind} {direction:?} through a mask"));
+            match (skipped.end_stroke(), whole.end_stroke()) {
+                (Some(a), Some(b)) => {
+                    assert_eq!(
+                        (a.len(), a.bytes()),
+                        (b.len(), b.bytes()),
+                        "{kind} {direction:?} recorded a different undo entry through a mask"
+                    );
+                }
+                (None, None) => {}
+                (a, b) => panic!(
+                    "{kind} {direction:?} recorded an undo entry one way and not the other \
+                     through a mask: {} against {}",
+                    a.is_some(),
+                    b.is_some()
+                ),
+            }
+
+            assert!(
+                visited_when_skipping < visited_when_not,
+                "{kind} {direction:?} skipped nothing through a mask: \
+                 {visited_when_skipping} bricks either way"
+            );
+            assert!(
+                visited_when_skipping < visited_unmasked,
+                "{kind} {direction:?} did not get CHEAPER for being masked: \
+                 {visited_when_skipping} bricks masked against {visited_unmasked} unmasked"
+            );
+        }
+    }
+
+    /// What shape the protection under the stamp is in.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Protection {
+        /// Mask All: an empty map under inversion. O(1), the most-used masking
+        /// state there is, and the one an "absent means free" reading of the
+        /// mask sculpts straight through.
+        Everything,
+        /// Painted fully protected and then collapsed, the way end of stroke
+        /// leaves it. Uniform tiles, so the planner can see it.
+        Tiles,
+        /// Painted fully protected and left dense. The planner cannot see it,
+        /// so the per voxel multiply is the only thing standing between the
+        /// brush and the material.
+        Dense,
+    }
+
+    /// A fully masked block feels no brush at all, and a half masked one feels
+    /// half of it.
+    ///
+    /// **The four skipping tests above pass under every mask bug, which is why
+    /// this exists.** `skipping_leaves_the_same_field_and_the_same_undo_entry`
+    /// compares On against Off through the SAME per voxel closure over fixtures
+    /// carrying no mask, so an inverted sense, a slab fetched for the wrong
+    /// brick, an off-by-one index or the mask ignored entirely all give
+    /// identical results on both sides of it; and
+    /// `the_constant_skip_reaches_past_what_a_radius_cull_alone_would` asserts
+    /// only that fewer bricks were visited, never that the field is right.
+    ///
+    /// Three claims per brush and direction, and the third is the one that
+    /// keeps the first two honest.
+    ///
+    /// - Fully protected: the field is bit identical to not stamping at all,
+    ///   nothing was recorded for undo, and no brick was promoted to dense --
+    ///   which is what [`assert_same_field`] compares the representation for.
+    /// - Fully protected as tiles: nothing was even visited, so the new skip
+    ///   really is firing rather than the multiply quietly doing the work.
+    /// - Half protected: the field differs from BOTH the untouched fixture and
+    ///   the unmasked stamp. Without it, a mask that protected everything
+    ///   always would pass every assertion above.
+    #[test]
+    fn a_fully_masked_block_feels_no_brush_at_all() {
+        let at = ON_THE_BALL;
+        let radius = 9.0;
+        // Everything the stamp can write, plus slack, in whole bricks.
+        let reach = Vec3::splat(radius + 2.0);
+        let (lo, hi) = ball().voxel_bounds(at - reach, at + reach);
+
+        for (kind, direction) in every_brush() {
+            let brush = Brush { kind, radius, strength: 0.8, ..Brush::default() };
+            let untouched = ball();
+            let normal = untouched.gradient_world(at);
+            let stamp = stamp_at(at, normal, direction);
+
+            // The control the other three rest on: this stamp does something.
+            let mut plain = ball();
+            brush.apply(&mut plain, &stamp, &mut BrushScratch::new());
+            let moved = worst_difference(&plain, &untouched, lo, hi);
+            assert!(
+                moved > 1.0e-3,
+                "{kind} {direction:?} changed nothing without a mask, so this test cannot tell \
+                 a mistake from a pass"
+            );
+
+            for protection in [Protection::Everything, Protection::Tiles, Protection::Dense] {
+                let mut volume = ball();
+                match protection {
+                    Protection::Everything => volume.mask_mut().set_inverted(true),
+                    Protection::Tiles => {
+                        protect_bricks(&mut volume, lo, hi, PROTECTED);
+                        volume.mask_mut().collapse();
+                    }
+                    Protection::Dense => protect_bricks(&mut volume, lo, hi, PROTECTED),
+                }
+
+                volume.begin_stroke();
+                brush.apply(&mut volume, &stamp, &mut BrushScratch::new());
+                let visited = volume.last_visited_bricks();
+
+                assert_same_field(
+                    &volume,
+                    &untouched,
+                    &format!("{kind} {direction:?} through a {protection:?} mask"),
+                );
+                assert!(
+                    volume.end_stroke().is_none(),
+                    "{kind} {direction:?} recorded an undo entry for a stroke it was not \
+                     allowed to make, through a {protection:?} mask"
+                );
+
+                match protection {
+                    // The mask kills the write, so there is nothing to visit.
+                    Protection::Everything | Protection::Tiles => assert_eq!(
+                        visited, 0,
+                        "{kind} {direction:?} visited {visited} bricks through a {protection:?} \
+                         mask, so the skip is not firing"
+                    ),
+                    // The planner cannot see a dense mask, so the multiply is
+                    // the only thing protecting the material -- and this is the
+                    // arm that would catch it being dropped.
+                    Protection::Dense => assert!(
+                        visited > 0,
+                        "{kind} {direction:?} skipped a dense mask, so the multiply was never \
+                         exercised"
+                    ),
+                }
+            }
+
+            // Half protected differs from both, which is what stops a mask that
+            // protects everything from passing this whole test.
+            let mut half = ball();
+            protect_bricks(&mut half, lo, hi, PROTECTED / 2);
+            half.mask_mut().collapse();
+            brush.apply(&mut half, &stamp, &mut BrushScratch::new());
+            let from_untouched = worst_difference(&half, &untouched, lo, hi);
+            let from_plain = worst_difference(&half, &plain, lo, hi);
+            assert!(
+                from_untouched > 1.0e-3,
+                "{kind} {direction:?} did nothing at all through a half mask"
+            );
+            assert!(
+                from_plain > 1.0e-3,
+                "{kind} {direction:?} ignored a half mask: it did exactly what it does unmasked"
+            );
+        }
+    }
+
+    /// A ball small enough that one brush can empty whole bricks of it, sitting
+    /// on the brick lattice so that emptying it saturates bricks rather than
+    /// leaving every one of them straddling the surface.
+    fn small_ball() -> Volume {
+        let mut volume = Volume::new(1.0);
+        volume.seed_sphere(Vec3::splat(16.0), 20.0);
+        volume.take_dirty(&mut Vec::new());
+        volume
+    }
+
+    /// A solid half space `x <= 0`, as a real distance field.
+    ///
+    /// [`slab`] cannot serve here either, and for a second reason: it clones one
+    /// transition brick into every brick column that straddles the surface, so
+    /// its zero crossing is not where `surface` says it is. That is harmless to
+    /// the On-against-Off comparisons it was written for, which only ever ask
+    /// the two paths to agree, and fatal to anything that measures where the
+    /// surface actually ended up.
+    fn half_space() -> Volume {
+        let mut volume = Volume::new(1.0);
+        volume.edit_voxels(IVec3::new(-24, -40, -40), IVec3::new(32, 40, 40), |_, position, _| {
+            position.x
+        });
+        volume.take_dirty(&mut Vec::new());
+        volume
+    }
+
+    /// A masked carving stroke still saturates the bricks it is allowed to
+    /// carve, so they still qualify for the collapse that releases their
+    /// 128 KB.
+    ///
+    /// The failure this rules out is a slow one rather than a wrong picture:
+    /// masking that leaves bricks dense and part way through the band where an
+    /// unmasked carve would have emptied them, so the allocations pile up over
+    /// a session and nothing ever releases them.
+    #[test]
+    fn a_masked_carving_stroke_still_leaves_bricks_is_collapsible_accepts() {
+        let at = Vec3::splat(16.0);
+        // Wide enough that whole bricks sit well inside the falloff, which is
+        // what it takes to saturate one: a brick is 32 voxels across, so its
+        // corners are 27.7 from its centre and a brush that only just covers it
+        // leaves them at a weight that never fills the band.
+        let brush =
+            Brush { kind: BrushKind::Inflate, radius: 48.0, strength: 0.9, ..Brush::default() };
+
+        let carve = |masked: bool| {
+            let mut volume = small_ball();
+            if masked {
+                // The near half in X, so the stroke has both something it may
+                // carve and something it may not.
+                protect_bricks(
+                    &mut volume,
+                    IVec3::new(-8, -8, -8),
+                    IVec3::new(15, 40, 40),
+                    PROTECTED,
+                );
+                volume.mask_mut().collapse();
+            }
+            let mut scratch = BrushScratch::new();
+            for _ in 0..20 {
+                brush.apply(
+                    &mut volume,
+                    &stamp_at(at, Vec3::X, BrushDirection::Subtract),
+                    &mut scratch,
+                );
+            }
+            let collapsible = volume
+                .brick_coords()
+                .filter(|coord| match volume.brick(*coord) {
+                    Some(brick @ Brick::Dense(_)) => brick.is_collapsible().is_some(),
+                    _ => false,
+                })
+                .count();
+            (collapsible, volume.stats().dense_bricks)
+        };
+
+        let (plain_collapsible, plain_dense) = carve(false);
+        let (masked_collapsible, masked_dense) = carve(true);
+
+        assert!(
+            plain_collapsible > 0,
+            "the unmasked carve saturated nothing, so this test cannot tell a mistake from a pass"
+        );
+        assert!(
+            masked_collapsible > 0,
+            "a masked carve left no dense brick the collapse would accept, against \
+             {plain_collapsible} unmasked"
+        );
+        assert!(
+            masked_dense <= plain_dense,
+            "masking made MORE dense bricks than not masking at all: {masked_dense} against \
+             {plain_dense}"
+        );
+    }
+
+    /// Thirty overlapping stamps through a half mask move the surface about
+    /// half as far.
+    ///
+    /// A QUANTITATIVE claim, which is the whole of its value: "the masked
+    /// result lies between the old surface and the new one" is satisfied by a
+    /// mask read at the wrong strength, a mask applied on the first stamp and
+    /// then forgotten, or a mask resolved from a neighbouring brick over a
+    /// stroke that walks across brick boundaries. All three move the ratio well
+    /// outside the window below, and the last of them is the reason this is
+    /// thirty stamps rather than one.
+    ///
+    /// **It does NOT catch the comb-filter spelling of the multiply, and the
+    /// plan expected it to.** Measured this session: replacing the scaled
+    /// displacement with `value + (drawn - value) * free` leaves this ratio
+    /// unchanged to three figures, because a domain warp over a locally linear
+    /// field differs from a blend toward that same warp only to second order in
+    /// the shift, and Draw's shift is a fraction of a voxel. The blend IS
+    /// caught, by
+    /// `a_masked_move_gesture_ends_where_the_drag_ended_however_many_events_it_took`,
+    /// where a whole gesture's displacement compounds across events instead of
+    /// being recomputed from a locked copy -- also measured, at 0.33 against a
+    /// tolerance of 0.001.
+    #[test]
+    fn thirty_stamps_through_a_half_mask_move_the_surface_about_half_as_far() {
+        let at = Vec3::ZERO;
+        let radius = 12.0;
+        let reach = Vec3::splat(radius + 2.0);
+        let (lo, hi) = half_space().voxel_bounds(at - reach, at + reach);
+        let brush = Brush { kind: BrushKind::Draw, radius, strength: 0.08, ..Brush::default() };
+
+        // Where the surface sits along X at a point across the stamp, found by
+        // marching rather than assumed, because the whole question is where the
+        // surface ended up.
+        let surface_x = |volume: &Volume, y: f32| {
+            let mut last = -16.0_f32;
+            for step in 0..4000 {
+                let x = -16.0 + step as f32 * 0.01;
+                if volume.sample_world(Vec3::new(x, y, 0.0)) >= 0.0 {
+                    return last;
+                }
+                last = x;
+            }
+            last
+        };
+
+        // Peak to trough of the profile across the stamp: the crest under the
+        // brush against the untouched surface out past its rim.
+        let peak_to_trough = |volume: &Volume| {
+            let mut lowest = f32::MAX;
+            let mut highest = f32::MIN;
+            for step in -16..=16 {
+                let height = surface_x(volume, step as f32);
+                lowest = lowest.min(height);
+                highest = highest.max(height);
+            }
+            highest - lowest
+        };
+
+        let stroke = |protection: Option<u8>| {
+            let mut volume = half_space();
+            if let Some(value) = protection {
+                protect_bricks(&mut volume, lo, hi, value);
+                volume.mask_mut().collapse();
+            }
+            let mut scratch = BrushScratch::new();
+            for _ in 0..30 {
+                brush.apply(&mut volume, &stamp_at(at, Vec3::X, BrushDirection::Add), &mut scratch);
+            }
+            peak_to_trough(&volume)
+        };
+
+        // 128 and not 127.5: protection is an integer, so the closest a half
+        // mask gets to exactly half is one part in 255 away from it.
+        const HALF: u8 = 128;
+        let free = (u8::MAX - HALF) as f32 / u8::MAX as f32;
+
+        let whole = stroke(None);
+        let halved = stroke(Some(HALF));
+        assert!(whole > 0.5, "the unmasked stroke barely moved the surface: {whole} voxels");
+
+        // A few percent and not a rounding: measured at 0.520 against the 0.498
+        // the mask asks for. The residual is the warp saturating, not the mask
+        // being wrong -- the full strength stroke carries the surface far
+        // enough that the falloff where it now sits has fallen away, so it
+        // advances slightly less than linearly while the half strength one
+        // stays in the linear regime. The strength is deliberately low for that
+        // reason: at 0.3 the same measurement gives 0.61, which says more about
+        // saturation than about the mask.
+        let ratio = halved / whole;
+        assert!(
+            (ratio - free).abs() < 0.05,
+            "thirty stamps through a mask leaving {free} of the brush moved the surface \
+             {halved} voxels against {whole} unmasked, a ratio of {ratio}"
+        );
     }
 }
 
@@ -3237,6 +3973,155 @@ mod move_tests {
         );
     }
 
+    /// A masked body gets half the drag cap, and that is bought rather than
+    /// free.
+    ///
+    /// [`Brush::max_drag`] is derived from the condition that a domain warp
+    /// stops being invertible once `drag * max_slope / radius` reaches one. Under
+    /// a mask the gradient the warp applies is that of `weight * free`, and the
+    /// mask contributes a second term to it, so the cap has to come down or a
+    /// mask edge becomes a fold in the geometry. Halved on one bool probe, so
+    /// an unmasked body keeps the whole of its reach.
+    ///
+    /// The mask here is fully protected and nowhere near the brush, so the
+    /// per voxel multiply is 1.0 everywhere the gesture writes: what is being
+    /// measured is the cap and nothing else.
+    #[test]
+    fn a_masked_body_gives_a_move_gesture_half_the_drag_cap() {
+        let brush = Brush { kind: BrushKind::Move, radius: 9.0, strength: 0.8, ..Brush::default() };
+        let at = Vec3::new(24.0, 0.0, 0.0);
+        // Far past the cap, so both gestures clamp and it is the clamp being
+        // compared rather than the pointer.
+        let far = at + Vec3::Y * 200.0;
+
+        let reach = |mask: bool| {
+            let mut volume = sphere_with_a_bump();
+            if mask {
+                volume.mask_mut().write(IVec3::new(400, 400, 400), PROTECTED);
+            }
+            let mut stroke = MoveStroke::new();
+            stroke.begin(&volume, &brush, at, Symmetry::OFF, Vec3::ZERO);
+            stroke.drag_to(&mut volume, far, 1.0);
+            let applied = stroke.applied().length();
+            stroke.end();
+            applied
+        };
+
+        let unmasked = reach(false);
+        let masked = reach(true);
+        assert!(
+            (unmasked - brush.max_drag()).abs() < 1.0e-4,
+            "the unmasked gesture did not reach its own cap: {unmasked} against {}",
+            brush.max_drag()
+        );
+        assert!(
+            (masked - unmasked * 0.5).abs() < 1.0e-4,
+            "a masked body did not halve the drag cap: {masked} against {unmasked} unmasked"
+        );
+    }
+
+    /// A masked gesture ends where the drag ended, however many pointer events
+    /// it took to get there.
+    ///
+    /// **The suite has no analogue of this and cannot grow one by accident.**
+    /// `Skipping::Off` reaches Move only through `drag_once`, which locks,
+    /// drags and releases around a SINGLE event, so every equivalence test in
+    /// the file exercises the one-event path. The mask is read fresh on every
+    /// event while the copy is locked once, and that is precisely where a
+    /// per-event accumulation would hide.
+    ///
+    /// The failure it rules out is the tempting spelling of the multiply:
+    /// blending the warped value against the old one,
+    /// `value + (warped - value) * free`, instead of scaling the displacement.
+    /// Nothing about one event distinguishes the two -- both leave the surface
+    /// half way -- but the blend compounds over events, so thirty of them land
+    /// somewhere thirty times further on than three do, and the gesture drifts
+    /// on while the pointer stands still.
+    ///
+    /// Both runs end on the same waypoint, and the one before it is the
+    /// opposite end of the drag, so [`MOVE_SETTLE_VOXELS`] cannot swallow the
+    /// last event of either. Not bit exact for the same reason
+    /// `a_drag_out_and_back_returns_the_form` is not: a brick that one run
+    /// classified as uniform and the other did not is resampled rather than
+    /// left alone, and the two answers differ by the interpolation.
+    #[test]
+    fn a_masked_move_gesture_ends_where_the_drag_ended_however_many_events_it_took() {
+        let brush = Brush { kind: BrushKind::Move, radius: 9.0, strength: 0.8, ..Brush::default() };
+        let at = Vec3::new(24.0, 0.0, 0.0);
+        let out = |along: f32| at + Vec3::Y * along;
+
+        // A protection ramp across the brush, feathered rather than stepped --
+        // which is a rule and not a preference, because a step in the mask is a
+        // fold in the geometry once the combined gradient reaches one.
+        let build = || {
+            let mut volume = sphere_with_a_bump();
+            for z in -14..=14 {
+                for y in -14..=14 {
+                    for x in 10..=38 {
+                        let across = ((x - 24) as f32 / 28.0 + 0.5).clamp(0.0, 1.0);
+                        let protection = (across * u8::MAX as f32).round() as u8;
+                        volume.mask_mut().write(IVec3::new(x, y, z), protection);
+                    }
+                }
+            }
+            volume.mask_mut().collapse();
+            volume
+        };
+
+        let run = |waypoints: &[Vec3]| {
+            let mut volume = build();
+            gesture(&mut volume, &brush, at, waypoints);
+            volume
+        };
+
+        let mut many: Vec<Vec3> =
+            (0..28).map(|step| out((step as f32 * 0.7).sin() * 3.0)).collect();
+        many.extend([out(-3.0), out(3.0)]);
+        let few = run(&[out(3.0), out(-3.0), out(3.0)]);
+        let many = run(&many);
+
+        let mut worst = 0.0_f32;
+        for z in -12..=12 {
+            for y in -12..=12 {
+                for x in 12..=36 {
+                    let probe = IVec3::new(x, y, z);
+                    worst = worst.max((few.sample_voxel(probe) - many.sample_voxel(probe)).abs());
+                }
+            }
+        }
+        assert!(
+            worst < 1.0e-3,
+            "a masked gesture to the same waypoint landed somewhere else depending on how many \
+             events it took: worst difference {worst}"
+        );
+
+        // And the control, or the two could agree by both doing nothing: the
+        // gesture moved the surface, and moved it LESS than the same gesture
+        // without a mask.
+        let untouched = sphere_with_a_bump();
+        let mut unmasked = sphere_with_a_bump();
+        gesture(&mut unmasked, &brush, at, &[out(3.0), out(-3.0), out(3.0)]);
+
+        let mut masked_travel = 0.0_f32;
+        let mut plain_travel = 0.0_f32;
+        for z in -12..=12 {
+            for y in -12..=12 {
+                for x in 12..=36 {
+                    let probe = IVec3::new(x, y, z);
+                    let was = untouched.sample_voxel(probe);
+                    masked_travel = masked_travel.max((few.sample_voxel(probe) - was).abs());
+                    plain_travel = plain_travel.max((unmasked.sample_voxel(probe) - was).abs());
+                }
+            }
+        }
+        assert!(masked_travel > 1.0e-3, "the masked gesture moved nothing at all");
+        assert!(
+            masked_travel < plain_travel,
+            "the mask did not hold the gesture back at all: {masked_travel} against \
+             {plain_travel} unmasked"
+        );
+    }
+
     #[test]
     fn a_gesture_straddling_a_mirror_plane_still_reads_the_field() {
         // Two anchors close enough to overlap is the one case where a voxel's
@@ -3429,5 +4314,369 @@ mod tilt_tests {
             leaned_away > leaned_towards,
             "leaning the other way should not pile material in the same place"
         );
+    }
+}
+/// The mask brush: the tool that writes protection instead of distance.
+///
+/// Its own module, matching the shape of `move_tests` and `skipping_tests`
+/// above -- these all run against a masked fixture, and the assertions are
+/// about a different map from the one every test in `tests` is about.
+#[cfg(test)]
+mod mask_tests {
+    use super::*;
+    use crate::brick::{BRICK_DIM, BrickCoord};
+    use glam::IVec3;
+
+    fn sphere() -> Volume {
+        let mut volume = Volume::new(1.0);
+        volume.seed_sphere(Vec3::ZERO, 24.0);
+        volume
+    }
+
+    /// A point on the surface of the seeded sphere, and its outward normal.
+    fn surface(volume: &Volume) -> (Vec3, Vec3) {
+        let point = Vec3::new(24.0, 0.0, 0.0);
+        (point, volume.gradient_world(point))
+    }
+
+    fn brush(kind: BrushKind) -> Brush {
+        Brush { kind, radius: 8.0, strength: 0.4, ..Brush::default() }
+    }
+
+    /// The one property the whole mask design rests on at this layer: painting
+    /// protection changes protection and NOTHING about the field.
+    ///
+    /// A field that moved here would mean the mask tool had become a very quiet
+    /// sculpt brush, which is the failure a user would find days later in an
+    /// exported print rather than on screen.
+    #[test]
+    fn a_mask_stamp_changes_the_mask_and_not_one_field_value() {
+        let mut volume = sphere();
+        let (point, normal) = surface(&volume);
+        let before: Vec<(BrickCoord, Vec<f32>)> = volume
+            .brick_coords()
+            .map(|coord| {
+                let origin = coord.origin();
+                let values = (0..BRICK_DIM as i32)
+                    .flat_map(move |z| {
+                        (0..BRICK_DIM as i32).flat_map(move |y| {
+                            (0..BRICK_DIM as i32).map(move |x| origin + IVec3::new(x, y, z))
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                (coord, values)
+            })
+            .map(|(coord, cells)| {
+                (coord, cells.into_iter().map(|cell| volume.sample_voxel(cell)).collect())
+            })
+            .collect();
+
+        let mut scratch = BrushScratch::new();
+        brush(BrushKind::Draw).apply_mask(
+            &mut volume,
+            &Stamp::new(point, normal, BrushDirection::Add),
+            MaskOp::Raise,
+            &mut scratch,
+        );
+
+        assert!(volume.mask_fill() > 0.0, "the mask stamp painted nothing at all");
+        for (coord, values) in before {
+            let origin = coord.origin();
+            for (index, expected) in values.into_iter().enumerate() {
+                let x = index % BRICK_DIM;
+                let y = (index / BRICK_DIM) % BRICK_DIM;
+                let z = index / (BRICK_DIM * BRICK_DIM);
+                let cell = origin + IVec3::new(x as i32, y as i32, z as i32);
+                assert_eq!(
+                    volume.sample_voxel(cell),
+                    expected,
+                    "the mask stamp moved the field at {cell:?}"
+                );
+            }
+        }
+    }
+
+    /// Raise and Lower are each other's inverse in direction, whichever brush
+    /// happens to be selected.
+    ///
+    /// **Every brush, and that is the point.** The direction of a mask stroke is
+    /// worked out by the caller and must never consult
+    /// `BrushKind::is_directional`, which answers false for Smooth, Flatten and
+    /// Move -- so a mask painter that reused the field's own direction rule
+    /// would invert for three of the seven and there would be nothing on screen
+    /// to say which three. This pins the half that lives in this crate: the op
+    /// decides, and the brush kind does not enter into it.
+    #[test]
+    fn lowering_the_mask_undoes_raising_it_with_every_brush_selected() {
+        for kind in BrushKind::ALL {
+            let mut volume = sphere();
+            let (point, normal) = surface(&volume);
+            let mut scratch = BrushScratch::new();
+            let stamp = Stamp::new(point, normal, BrushDirection::Add);
+
+            brush(kind).apply_mask(&mut volume, &stamp, MaskOp::Raise, &mut scratch);
+            let raised = volume.mask_fill();
+            assert!(raised > 0.0, "{kind}: raising painted nothing");
+
+            for _ in 0..12 {
+                brush(kind).apply_mask(&mut volume, &stamp, MaskOp::Lower, &mut scratch);
+            }
+            assert!(
+                volume.mask_fill() < raised * 0.1,
+                "{kind}: lowering left {} of {raised}",
+                volume.mask_fill()
+            );
+        }
+    }
+
+    /// Erasing a mask reaches the FREE state, not merely a small number.
+    ///
+    /// This is the half of the quantiser's asymmetry that a fill percentage
+    /// cannot see. [`crate::MaskField::collapse`] drops a brick only when it is
+    /// uniformly `UNMASKED`, so a residue of two levels left behind by a rounded
+    /// erase is permanent in every way the user meets it: the body reads as
+    /// masked forever, the standing card goes on naming it, Move's cap goes on
+    /// being halved, and erasing again cannot help because the residue is
+    /// exactly where the blend has stopped moving. That is why `Lower` floors
+    /// unconditionally where `Raise` snaps only within a level of its target --
+    /// see the note in `apply_mask`.
+    #[test]
+    fn erasing_a_mask_clears_it_to_the_free_state_and_not_to_a_residue() {
+        let mut volume = sphere();
+        let (point, normal) = surface(&volume);
+        let mut scratch = BrushScratch::new();
+        let stamp = Stamp::new(point, normal, BrushDirection::Add);
+
+        brush(BrushKind::Draw).apply_mask(&mut volume, &stamp, MaskOp::Raise, &mut scratch);
+        assert!(!volume.mask().is_free(), "raising left the mask free");
+
+        // The same brush, at the same place, held until it has nothing left to
+        // take: a weak stamp removes a level at a time by design.
+        for _ in 0..64 {
+            brush(BrushKind::Draw).apply_mask(&mut volume, &stamp, MaskOp::Lower, &mut scratch);
+        }
+        volume.mask_mut().collapse();
+        assert!(volume.mask().is_free(), "erasing left {} behind", volume.mask_fill());
+    }
+
+    /// Repeated stamps converge on the target rather than overshooting it.
+    ///
+    /// This is what "blend toward a legal target with a weight in 0..=1" buys,
+    /// and it is the same argument Smooth, Flatten and Clay rest on. A mask
+    /// painter written as `value += weight * 255` would pass a one-stamp test
+    /// and then saturate a whole brush footprint to a hard edge over a stroke,
+    /// which is the step the storage design forbids.
+    #[test]
+    fn repeated_mask_stamps_converge_on_full_protection_and_never_pass_it() {
+        let mut volume = sphere();
+        let (point, normal) = surface(&volume);
+        let mut scratch = BrushScratch::new();
+        let stamp = Stamp::new(point, normal, BrushDirection::Add);
+        let cell = (point / volume.voxel_size()).round().as_ivec3();
+
+        let mut previous = 0u8;
+        for pass in 0..30 {
+            brush(BrushKind::Draw).apply_mask(&mut volume, &stamp, MaskOp::Raise, &mut scratch);
+            let now = volume.mask().at(cell);
+            assert!(now >= previous, "pass {pass} went backwards: {previous} then {now}");
+            previous = now;
+        }
+        assert_eq!(previous, PROTECTED, "thirty stamps did not reach the target");
+    }
+
+    /// The rim of a mask stroke is feathered, not a step.
+    ///
+    /// A rule rather than a preference, with three independent justifications in
+    /// `crate::mask`. The sharpest of them is that a step in the mask is a fold
+    /// in the geometry under Move, which no amount of narrow-band clamping
+    /// catches.
+    #[test]
+    fn a_mask_stroke_leaves_a_feathered_rim_rather_than_a_step() {
+        let mut volume = sphere();
+        let (point, normal) = surface(&volume);
+        let mut scratch = BrushScratch::new();
+        brush(BrushKind::Draw).apply_mask(
+            &mut volume,
+            &Stamp::new(point, normal, BrushDirection::Add),
+            MaskOp::Raise,
+            &mut scratch,
+        );
+
+        // Sampled along the surface away from the centre, out past the radius.
+        let mut seen = Vec::new();
+        for step in 0..=8 {
+            let along = point + Vec3::new(0.0, step as f32, 0.0);
+            let cell = (along / volume.voxel_size()).round().as_ivec3();
+            seen.push(volume.mask().at(cell));
+        }
+        assert!(seen[0] > 0, "the centre of the stroke was not masked");
+        assert_eq!(*seen.last().expect("eight samples"), UNMASKED, "the mask leaked past the rim");
+        let between = seen.iter().filter(|value| (1..PROTECTED).contains(value)).count();
+        assert!(between >= 3, "only {between} intermediate values: this is a step, not a feather");
+    }
+
+    /// And it still has a rim after a scrub, which the one-stamp test above
+    /// cannot see.
+    ///
+    /// The one-stamp profile is feathered whatever the arithmetic does, because
+    /// the falloff supplies the shape. What eats a feather is repetition: a
+    /// quantiser that moves every touched voxel by a level per stamp drives the
+    /// whole footprint to `PROTECTED` however small its weight was, and a few
+    /// seconds of scrubbing is a few hundred stamps. Measured on this fixture
+    /// before the fix, 300 stamps gave `[255 x 8, 0]` -- not one intermediate
+    /// value left, and a full 255 step against the untouched voxel outside the
+    /// radius, which is exactly the mask gradient [`mask_drag_scale`]'s
+    /// half-margin assumes cannot happen.
+    ///
+    /// **What is asserted is what the arithmetic can actually promise**: the
+    /// centre still arrives at `PROTECTED`, and the grade in between survives.
+    /// The last voxel inside the radius against the first one outside is NOT
+    /// bounded here and cannot be -- that discontinuity belongs to the falloff's
+    /// support, not to the quantiser, and closing it needs a stroke-wide
+    /// accumulation buffer rather than a rounding rule.
+    #[test]
+    fn three_hundred_stamps_still_leave_a_grade_between_the_centre_and_the_rim() {
+        let mut volume = sphere();
+        let (point, normal) = surface(&volume);
+        let mut scratch = BrushScratch::new();
+        let stamp = Stamp::new(point, normal, BrushDirection::Add);
+        for _ in 0..300 {
+            brush(BrushKind::Draw).apply_mask(&mut volume, &stamp, MaskOp::Raise, &mut scratch);
+        }
+
+        let mut seen = Vec::new();
+        for step in 0..=8 {
+            let along = point + Vec3::new(0.0, step as f32, 0.0);
+            let cell = (along / volume.voxel_size()).round().as_ivec3();
+            seen.push(volume.mask().at(cell));
+        }
+        assert_eq!(seen[0], PROTECTED, "scrubbing no longer reaches full protection: {seen:?}");
+        let between = seen.iter().filter(|value| (1..PROTECTED).contains(value)).count();
+        assert!(between >= 3, "{seen:?} has {between} intermediate values: the rim ratcheted flat");
+    }
+
+    /// Blur softens what is there and reads a SNAPSHOT rather than the values it
+    /// is writing.
+    ///
+    /// The two-phase shape is the whole of the correctness here. Reading the
+    /// live mask would make each voxel average a mixture of old and new values
+    /// and the answer would depend on which voxel was visited first -- the same
+    /// hazard `crate::region` exists for on the field side, which is why blur
+    /// borrows that machinery rather than inventing a second copy of it.
+    #[test]
+    fn blurring_pulls_a_hard_mask_edge_toward_its_neighbours() {
+        let mut volume = sphere();
+        let (point, normal) = surface(&volume);
+        let mut scratch = BrushScratch::new();
+        let stamp = Stamp::new(point, normal, BrushDirection::Add);
+
+        // A deliberately hard edge: a block of full protection with nothing
+        // feathering it, written straight into the mask.
+        for z in -3..=3 {
+            for y in -3..=3 {
+                for x in -3..=3 {
+                    let cell =
+                        (point / volume.voxel_size()).round().as_ivec3() + IVec3::new(x, y, z);
+                    volume.mask_mut().write(cell, PROTECTED);
+                }
+            }
+        }
+        let edge = (point / volume.voxel_size()).round().as_ivec3() + IVec3::new(0, 3, 0);
+        assert_eq!(volume.mask().at(edge), PROTECTED, "the fixture did not build an edge");
+
+        for _ in 0..4 {
+            brush(BrushKind::Draw).apply_mask(&mut volume, &stamp, MaskOp::Blur, &mut scratch);
+        }
+        let softened = volume.mask().at(edge);
+        assert!(softened < PROTECTED, "the edge stayed hard at {softened}");
+        assert!(softened > UNMASKED, "the blur erased the mask instead of softening it");
+    }
+
+    /// A mask stroke on a masked body is still just protection: the field the
+    /// mask itself protects is never consulted, and a fully protected voxel is
+    /// not immune to being UNMASKED.
+    ///
+    /// Worth pinning because the obvious mistake -- running the mask painter
+    /// through the same `use_mask` multiply the field edits use -- makes the
+    /// mask self-protecting, and a fully masked body can then never be unmasked
+    /// by the tool that masked it.
+    #[test]
+    fn the_mask_does_not_protect_itself_from_being_edited() {
+        let mut volume = sphere();
+        let (point, normal) = surface(&volume);
+        let mut scratch = BrushScratch::new();
+        let stamp = Stamp::new(point, normal, BrushDirection::Add);
+        let cell = (point / volume.voxel_size()).round().as_ivec3();
+
+        for _ in 0..30 {
+            brush(BrushKind::Draw).apply_mask(&mut volume, &stamp, MaskOp::Raise, &mut scratch);
+        }
+        assert_eq!(volume.mask().at(cell), PROTECTED, "the fixture did not fully protect it");
+
+        for _ in 0..30 {
+            brush(BrushKind::Draw).apply_mask(&mut volume, &stamp, MaskOp::Lower, &mut scratch);
+        }
+        assert_eq!(volume.mask().at(cell), UNMASKED, "a full mask could not be taken off again");
+    }
+
+    /// Painting protection under an inverted mask paints PROTECTION.
+    ///
+    /// `MaskField::write` applies polarity on both sides, and so does
+    /// `edit_brick`; the trap is a painter that writes the stored byte and
+    /// leaves the user painting holes in their own Mask All.
+    #[test]
+    fn painting_under_an_inverted_mask_still_paints_protection() {
+        let mut volume = sphere();
+        let (point, normal) = surface(&volume);
+        volume.mask_mut().set_inverted(true);
+        let cell = (point / volume.voxel_size()).round().as_ivec3();
+        assert_eq!(volume.mask().at(cell), PROTECTED, "inversion did not protect everything");
+
+        let mut scratch = BrushScratch::new();
+        let stamp = Stamp::new(point, normal, BrushDirection::Add);
+        for _ in 0..30 {
+            brush(BrushKind::Draw).apply_mask(&mut volume, &stamp, MaskOp::Lower, &mut scratch);
+        }
+        assert_eq!(volume.mask().at(cell), UNMASKED, "unmasking under inversion did not free it");
+        for _ in 0..30 {
+            brush(BrushKind::Draw).apply_mask(&mut volume, &stamp, MaskOp::Raise, &mut scratch);
+        }
+        assert_eq!(volume.mask().at(cell), PROTECTED, "masking under inversion did not protect it");
+    }
+
+    /// A masked stroke over a mask is a stroke that does nothing to the field.
+    ///
+    /// The end-to-end claim, on the two halves together: paint protection, then
+    /// sculpt through it, and the field comes back bit-identical to not having
+    /// sculpted at all.
+    #[test]
+    fn sculpting_through_a_mask_this_brush_painted_leaves_the_field_alone() {
+        let mut volume = sphere();
+        let (point, normal) = surface(&volume);
+        let mut scratch = BrushScratch::new();
+        let stamp = Stamp::new(point, normal, BrushDirection::Add);
+
+        // A wide mask, so the whole of the narrower sculpt brush lands inside
+        // it: the rim of a feathered mask is deliberately not full protection.
+        let painter = Brush { radius: 20.0, strength: 1.0, ..brush(BrushKind::Draw) };
+        for _ in 0..40 {
+            painter.apply_mask(&mut volume, &stamp, MaskOp::Raise, &mut scratch);
+        }
+
+        let before: Vec<f32> = (-6..=6)
+            .map(|step| volume.sample_world(point + Vec3::new(0.0, step as f32, 0.0)))
+            .collect();
+        let carver = Brush { radius: 5.0, strength: 0.6, ..brush(BrushKind::Draw) };
+        for _ in 0..5 {
+            carver.apply(&mut volume, &stamp, &mut scratch);
+        }
+        for (index, expected) in before.into_iter().enumerate() {
+            let step = index as i32 - 6;
+            assert_eq!(
+                volume.sample_world(point + Vec3::new(0.0, step as f32, 0.0)),
+                expected,
+                "a fully masked stroke moved the field at step {step}"
+            );
+        }
     }
 }

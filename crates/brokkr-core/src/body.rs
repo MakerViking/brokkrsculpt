@@ -1005,39 +1005,62 @@ impl Document {
 
     /// Move one row's subtree into a folder, or out to the top level.
     ///
-    /// The whole of the legality question is a range comparison: **you cannot
-    /// drop a folder into its own subtree**, which is `range.contains(&target)`
-    /// and not a graph search. That is the property the depth encoding buys --
-    /// a cycle is not rejected here, it is unrepresentable.
+    /// A destination named by *what it is* rather than by where the pointer is,
+    /// which is the form every caller outside the panel wants: the tests below,
+    /// and anything that has a folder id in its hand rather than a gap. It is a
+    /// two-line translation into a [`DropTarget`] and then
+    /// [`Document::reparent`], and it is written that way ON PURPOSE -- a
+    /// second copy of the splice is a second copy of the vacated-slot
+    /// arithmetic, which is exactly the line the property test caught a bug in.
     ///
-    /// `None` when the move is illegal, when the target is a body, or when the
-    /// subtree would end up deeper than the panel goes. A move that changes
-    /// nothing also returns `None`, so a no-op never costs an undo press.
-    ///
-    /// A folder the departure leaves empty is dissolved in the same list of
-    /// changes, after the reorder, so one ctrl+Z puts both back.
+    /// `None` for everything `reparent` returns `None` for, plus a target that
+    /// is a body row: a body is never a parent.
     pub fn move_to_folder(&mut self, id: NodeId, into: Option<NodeId>) -> Option<Vec<Change>> {
-        let at = self.index_of(id)?;
-        let range = subtree(&self.nodes, at);
-
-        let (insert_at, depth) = match into {
+        let target = match into {
             Some(folder) => {
                 let folder_at = self.index_of(folder)?;
-                if self.nodes[folder_at].is_body() || range.contains(&folder_at) {
+                if self.nodes[folder_at].is_body() {
                     return None;
                 }
-                (subtree(&self.nodes, folder_at).end, self.nodes[folder_at].depth() + 1)
+                DropTarget {
+                    at: subtree(&self.nodes, folder_at).end,
+                    depth: self.nodes[folder_at].depth() + 1,
+                }
             }
             // Out to the end of the top level, which is where a row with no
             // parent belongs and the only unambiguous place to put it.
-            None => (self.nodes.len(), 0),
+            None => DropTarget { at: self.nodes.len(), depth: 0 },
         };
+        self.reparent(id, target)
+    }
 
-        let by = i16::from(depth) - i16::from(self.nodes[at].depth());
-        let deepest = self.nodes[range.clone()].iter().map(Node::depth).max()?;
-        if i16::from(deepest) + by >= i16::from(MAX_DEPTH) {
+    /// Splice one row's subtree into a gap in the list, at a chosen depth.
+    ///
+    /// **The subtree moves as a block**, which is what flat preorder buys: the
+    /// rows under a folder are a contiguous run, so re-parenting twelve of them
+    /// is one `drain` and one `splice` rather than a walk. Nothing here can
+    /// build a cycle, because there is nothing in this encoding to point at an
+    /// ancestor with -- the refusal below is about a block landing *inside its
+    /// own run*, which would lose rows rather than loop.
+    ///
+    /// `None` when [`drop_refusal`] refuses the pair, and `None` when the move
+    /// would change nothing -- so a drag that puts a row back where it was
+    /// costs no undo press and no unsaved flag. Those two are deliberately not
+    /// distinguished in the return: the panel has already asked
+    /// [`drop_refusal`] itself, to draw the indicator, and a caller that has
+    /// not is not entitled to a reason.
+    ///
+    /// A folder the departure leaves empty is dissolved in the same list of
+    /// changes, after the reorder, so one ctrl+Z puts both back.
+    pub fn reparent(&mut self, id: NodeId, target: DropTarget) -> Option<Vec<Change>> {
+        let at = self.index_of(id)?;
+        let range = subtree(&self.nodes, at);
+        if drop_refusal(&self.nodes, range.clone(), target).is_some() {
             return None;
         }
+
+        let DropTarget { at: insert_at, depth } = target;
+        let by = i16::from(depth) - i16::from(self.nodes[at].depth());
         // Already exactly where it is being sent: the rows would come out in
         // the same order at the same depths.
         if by == 0 && (insert_at == range.start || insert_at == range.end) {
@@ -1047,9 +1070,9 @@ impl Document {
         let before = self.outline();
         let moved: Vec<Node> = self.nodes.drain(range.clone()).collect();
         // The drain shifted everything after the subtree down by its length.
-        let target = if insert_at > range.start { insert_at - moved.len() } else { insert_at };
-        self.nodes.splice(target..target, moved);
-        for node in &mut self.nodes[target..target + range.len()] {
+        let landed = if insert_at > range.start { insert_at - moved.len() } else { insert_at };
+        self.nodes.splice(landed..landed, moved);
+        for node in &mut self.nodes[landed..landed + range.len()] {
             node.shift_depth(by);
         }
         let after = self.outline();
@@ -1060,7 +1083,7 @@ impl Document {
         // this wrong dissolves nothing and leaves an empty folder behind --
         // caught by the property test rather than by reasoning, on a move of a
         // folder's only child into a folder ABOVE it.
-        let vacated = if target < range.start { range.start + range.len() } else { range.start };
+        let vacated = if landed < range.start { range.start + range.len() } else { range.start };
         let mut changes = vec![Change::Outline { before, after }];
         changes.extend(self.dissolve_empty_folders_above(vacated));
         self.assert_invariants();
@@ -1178,6 +1201,9 @@ impl Document {
             let stats = volume.stats();
             totals.dense_bricks += stats.dense_bricks;
             totals.uniform_bricks += stats.uniform_bricks;
+            totals.mask_bricks += stats.mask_bricks;
+            totals.mask_dense_bricks += stats.mask_dense_bricks;
+            totals.mask_bytes += stats.mask_bytes;
             totals.resident_bytes += stats.resident_bytes;
         }
         totals
@@ -1657,6 +1683,222 @@ pub fn subtree(nodes: &[Node], at: usize) -> Range<usize> {
     at..end
 }
 
+/// Where a drop would land: a gap in the preorder list, and the depth the
+/// dragged subtree's root takes in it.
+///
+/// **The same value drives the indicator and the commit**, which is what stops
+/// the two disagreeing -- the panel draws whatever [`drop_target`] returned and
+/// then hands that exact value to [`Document::reparent`], rather than each of
+/// them working the answer out from the pointer. Every shipped tree drag that
+/// puts a line in one place and the row in another has two copies of this
+/// arithmetic.
+///
+/// `at` is an insertion index into the list AS IT STANDS, so `at == range.end`
+/// of the dragged block means "immediately after myself" and not "at the end of
+/// whatever is left once I have gone". [`Document::reparent`] does the shift.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DropTarget {
+    pub at: usize,
+    pub depth: u8,
+}
+
+/// Why a drop cannot happen, in the words the status line uses.
+///
+/// Three reasons and not a bare `None`, because "nothing happened" is the
+/// failure this panel is written against: the drop indicator vanishes at the
+/// exact moment the user most needs to be told why.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DropRefusal {
+    /// The block would land inside its own run, which would lose the rows it
+    /// was dragged by. **This is the "a folder into its own child" case**, and
+    /// it is a range comparison rather than a graph search -- the depth
+    /// encoding has nothing to point at an ancestor with, so a cycle is not
+    /// detected here, it is unrepresentable.
+    IntoItself,
+    /// The deepest row of the block would sit past [`MAX_DEPTH`].
+    ///
+    /// **Refused with the reason and never clamped.** A clamp would flatten a
+    /// three-level subtree into a two-level one on a gesture whose whole
+    /// meaning was "keep this shape, move it there".
+    TooDeep,
+    /// There is no such gap, or nothing in front of it could be the block's
+    /// parent. Not reachable from the panel; it is what a stale message or a
+    /// hand-built [`DropTarget`] gets.
+    Nowhere,
+}
+
+impl DropRefusal {
+    /// The clause the status line puts a row's name in front of.
+    #[inline]
+    pub fn reason(self) -> &'static str {
+        match self {
+            Self::IntoItself => "cannot go inside itself",
+            Self::TooDeep => "would sit past the eighth level, which is as deep as the panel goes",
+            Self::Nowhere => "cannot go there",
+        }
+    }
+}
+
+/// The band of a row, as a fraction of its height, that means "before it" --
+/// and, mirrored, "after it".
+///
+/// A third rather than a half wherever there are three answers, so the middle
+/// band is as big as the two edges and dropping INTO a folder is not a
+/// pixel-hunt. Rows are 22 or 32 px tall, so a third is 7 px at worst.
+const DROP_EDGE: f32 = 1.0 / 3.0;
+
+/// The drag state machine: where the pointer is, reduced to where the block
+/// would go.
+///
+/// A pure function of the list and three numbers -- the row that was pressed,
+/// the row the pointer is over, and how far down that row it is -- so the whole
+/// gesture is testable without a window, a pointer or a frame.
+///
+/// # Which gap a row means
+///
+/// | the row under the pointer | top band | middle | bottom band |
+/// |---|---|---|---|
+/// | a body | before it | -- | after it |
+/// | an OPEN folder | before it | -- | its first child |
+/// | a CLOSED folder | before it | inside it, last | after all of it |
+///
+/// An open folder has no "inside" band, and it needs none: the row directly
+/// below it already IS inside it, so the gap under its own row is its first
+/// child. That is also what makes a closed folder the only row that draws the
+/// filled indicator, which is what section 3 of the plan asks for.
+///
+/// # Getting back OUT of a folder
+///
+/// The last child of a folder and the row after the folder are adjacent on
+/// screen, and the two of them name the same gap at two different depths --
+/// the bottom of the child keeps the block in the folder, the top of the row
+/// below takes it out. That is the whole mechanism, and it is why the depth is
+/// read off the row the pointer is over rather than off the gap.
+///
+/// When the folder is the last thing in the document there is no row below it,
+/// and the way out is then the top band of the folder's own outermost
+/// ancestor -- which is always on screen, because a row is only visible when
+/// every folder above it is open.
+pub fn drop_target(
+    nodes: &[Node],
+    dragged: usize,
+    over: usize,
+    fraction: f32,
+) -> Result<DropTarget, DropRefusal> {
+    let Some(target) = drop_gap(nodes, dragged, over, fraction) else {
+        return Err(DropRefusal::Nowhere);
+    };
+    match drop_refusal(nodes, subtree(nodes, dragged), target) {
+        Some(refusal) => Err(refusal),
+        None => Ok(target),
+    }
+}
+
+/// The gap the pointer names, before any question of whether the block may go
+/// there. `None` only when one of the indices is not a row.
+///
+/// Split out of [`drop_target`] so that **the refused target is still a value**.
+/// `drop_target` throws it away on the way to an `Err`, which is fine for the
+/// panel -- it draws nothing for a refusal -- but it left the property test
+/// unable to hand [`Document::reparent`] the very target the indicator had just
+/// turned down, and therefore unable to measure the one thing it claims:
+/// that the two ends of the gesture cannot disagree. It stays private because
+/// a gap nobody has checked is not something a caller should be able to reach
+/// for by accident; the band table lives on `drop_target`.
+fn drop_gap(nodes: &[Node], dragged: usize, over: usize, fraction: f32) -> Option<DropTarget> {
+    if dragged >= nodes.len() || over >= nodes.len() {
+        return None;
+    }
+    let depth = nodes[over].depth();
+    let end = subtree(nodes, over).end;
+
+    // **The dragged block is folded away for the duration of the drag**, so its
+    // own row answers to the closed-folder rules whatever its `collapsed` bit
+    // says. Without that line, dropping a folder into itself is a state nobody
+    // can produce with the pointer and the refusal is untested theatre.
+    let closed = !nodes[over].is_body() && (nodes[over].collapsed || over == dragged);
+    Some(if closed {
+        if fraction < DROP_EDGE {
+            DropTarget { at: over, depth }
+        } else if fraction > 1.0 - DROP_EDGE {
+            DropTarget { at: end, depth }
+        } else {
+            DropTarget { at: end, depth: depth + 1 }
+        }
+    } else if nodes[over].is_body() {
+        if fraction < 0.5 { DropTarget { at: over, depth } } else { DropTarget { at: end, depth } }
+    } else if fraction < 0.5 {
+        DropTarget { at: over, depth }
+    } else {
+        // A folder is never empty, so `over + 1` is always its first child and
+        // the depth below always exists.
+        DropTarget { at: over + 1, depth: depth + 1 }
+    })
+}
+
+/// Whether a block may land in a gap, and why not.
+///
+/// **The one legality predicate**, asked by [`drop_target`] to draw the
+/// indicator and again by [`Document::reparent`] to perform the move, so the
+/// two cannot admit different things. `range` is the dragged block's own
+/// preorder run.
+///
+/// The three questions, in the order a reader wants the answer in:
+///
+/// 1. would the block land inside itself;
+/// 2. would its deepest row go past the panel's cap;
+/// 3. is the gap a gap at all -- something in front of it has to be able to be
+///    the block's parent, and nothing after it may end up swallowed by it.
+pub fn drop_refusal(
+    nodes: &[Node],
+    range: Range<usize>,
+    target: DropTarget,
+) -> Option<DropRefusal> {
+    let DropTarget { at, depth } = target;
+    if at > nodes.len() || range.start >= nodes.len() {
+        return Some(DropRefusal::Nowhere);
+    }
+    // Strictly inside the block's own run: the splice would cut the block in
+    // half with itself.
+    if range.start < at && at < range.end {
+        return Some(DropRefusal::IntoItself);
+    }
+
+    // The row that would become the block's parent: the nearest one before the
+    // gap that is shallower than the depth being asked for. Read off the list
+    // AS IT STANDS, which is the whole of why `at == range.end` at a deeper
+    // depth is self-nesting -- the row in front of that gap is the block's own
+    // last row.
+    let anchor =
+        (depth > 0).then(|| (0..at).rev().find(|index| nodes[*index].depth() < depth)).flatten();
+    if anchor.is_some_and(|index| range.contains(&index)) {
+        return Some(DropRefusal::IntoItself);
+    }
+
+    let Some(deepest) =
+        nodes.get(range.clone()).and_then(|block| block.iter().map(Node::depth).max())
+    else {
+        // An empty or out-of-bounds run, which is not a block at all.
+        return Some(DropRefusal::Nowhere);
+    };
+    let by = i16::from(depth) - i16::from(nodes[range.start].depth());
+    if i16::from(deepest) + by >= i16::from(MAX_DEPTH) {
+        return Some(DropRefusal::TooDeep);
+    }
+
+    // A depth with no parent to hang off, or a row after the gap that the block
+    // would swallow as a descendant. Neither is reachable from the panel; both
+    // are what stops a hand-built target from producing a list that is not a
+    // forest.
+    if depth > 0 && anchor.is_none_or(|index| nodes[index].depth() + 1 != depth) {
+        return Some(DropRefusal::Nowhere);
+    }
+    if nodes.get(at).is_some_and(|node| node.depth() > depth) && at != range.start {
+        return Some(DropRefusal::Nowhere);
+    }
+    None
+}
+
 /// Where a ray enters a world space box, or `None` when it never does inside
 /// `far`.
 ///
@@ -1837,6 +2079,18 @@ pub struct GrowthGuard {
 }
 
 impl GrowthGuard {
+    /// A guard over two numbers stated outright.
+    ///
+    /// **Test-only, and it exists because the ceilings cannot be reached by
+    /// building a document.** Six gigabytes of resident bricks is six gigabytes
+    /// of real allocation, so the refusals in this file construct the struct
+    /// directly -- and a refusal that lives in another module, such as
+    /// [`crate::split::SplitPlan`]'s, has no way to do that without this.
+    #[cfg(test)]
+    pub(crate) fn of(resident_bytes: f64, pool_headroom: f64) -> Self {
+        Self { resident_bytes, pool_headroom }
+    }
+
     /// How much under an exact fit a suggested size lands.
     ///
     /// Three percent, matching the resample guard's own margin and for the same
@@ -2601,6 +2855,345 @@ mod tests {
         assert!(doc.node(source).is_none(), "the folder its only child left is still here");
         assert!(doc.node(target).is_some());
         assert_eq!(depths(&doc), vec![0, 1, 1, 0]);
+    }
+
+    // --- the drag ------------------------------------------------------------
+
+    /// A depth-3 tree with one of everything a drop can land on: an open
+    /// folder, a CLOSED folder with a row hidden inside it, a nested body, two
+    /// top-level rows and a folder holding one child.
+    ///
+    /// ```text
+    /// 0 Outer            depth 0, open
+    /// 1   Inner          depth 1, open
+    /// 2     Deep         depth 2, CLOSED
+    /// 3       Body 1     depth 3
+    /// 4     Nested       depth 2
+    /// 5 Loose            depth 0
+    /// 6 Shelf            depth 0, open
+    /// 7   Shelved        depth 1
+    /// ```
+    fn depth_three() -> Document {
+        let mut doc = Document::new(0.5);
+        let buried = doc.active();
+        let nested = doc.add_body("Nested", Volume::new(0.5));
+        doc.add_body("Loose", Volume::new(0.5));
+        let shelved = doc.add_body("Shelved", Volume::new(0.5));
+
+        let (deep, _) = doc.group(buried, "Deep").expect("Deep");
+        let (inner, _) = doc.group(deep, "Inner").expect("Inner");
+        doc.move_to_folder(nested, Some(inner)).expect("Nested into Inner");
+        doc.group(inner, "Outer").expect("Outer");
+        doc.group(shelved, "Shelf").expect("Shelf");
+        doc.set_collapsed(deep, true).expect("Deep closed");
+
+        assert_eq!(depths(&doc), vec![0, 1, 2, 3, 2, 0, 0, 1], "the fixture is the wrong shape");
+        assert_eq!(
+            doc.nodes().iter().map(|node| node.name.as_str()).collect::<Vec<_>>(),
+            vec!["Outer", "Inner", "Deep", "Body 1", "Nested", "Loose", "Shelf", "Shelved"],
+            "the fixture's rows are in the wrong order"
+        );
+        doc
+    }
+
+    /// Every band of every row kind, written out as a table, because the whole
+    /// of the gesture is this mapping and a reader should be able to check it
+    /// against the doc comment's table without running anything.
+    ///
+    /// Read the fixture in [`depth_three`] alongside it.
+    #[test]
+    fn where_a_drop_lands_is_a_table_over_the_row_under_the_pointer() {
+        let doc = depth_three();
+        let nodes = doc.nodes();
+        // Dragging Loose, which is a top-level body and therefore the source
+        // that makes every destination legal that can be legal.
+        const LOOSE: usize = 5;
+
+        type Case = (&'static str, usize, f32, Result<DropTarget, DropRefusal>);
+        let cases: [Case; 14] = [
+            // A body: two bands, because a body has no inside.
+            ("above Body 1", 3, 0.1, Ok(DropTarget { at: 3, depth: 3 })),
+            ("below Body 1", 3, 0.9, Ok(DropTarget { at: 4, depth: 3 })),
+            ("just above Body 1's middle", 3, 0.49, Ok(DropTarget { at: 3, depth: 3 })),
+            ("just below it", 3, 0.51, Ok(DropTarget { at: 4, depth: 3 })),
+            // An OPEN folder: the gap under its row is its first child.
+            ("above Outer", 0, 0.1, Ok(DropTarget { at: 0, depth: 0 })),
+            ("below Outer", 0, 0.9, Ok(DropTarget { at: 1, depth: 1 })),
+            ("below Shelf", 6, 0.9, Ok(DropTarget { at: 7, depth: 1 })),
+            // A CLOSED folder: three bands, and the middle one is inside it.
+            ("above Deep", 2, 0.1, Ok(DropTarget { at: 2, depth: 2 })),
+            ("into Deep", 2, 0.5, Ok(DropTarget { at: 4, depth: 3 })),
+            ("below Deep, past its hidden child", 2, 0.9, Ok(DropTarget { at: 4, depth: 2 })),
+            // The two ways to name one gap, which is how a row gets OUT.
+            ("below Shelved, which keeps it in Shelf", 7, 0.9, Ok(DropTarget { at: 8, depth: 1 })),
+            ("above Loose, which is the top level", 5, 0.1, Ok(DropTarget { at: 5, depth: 0 })),
+            // Nested sits at depth 2 and Loose is one row.
+            ("into Deep from Loose is fine", 2, 0.5, Ok(DropTarget { at: 4, depth: 3 })),
+            ("a row that is not here", 99, 0.5, Err(DropRefusal::Nowhere)),
+        ];
+
+        for (what, over, fraction, want) in cases {
+            assert_eq!(drop_target(nodes, LOOSE, over, fraction), want, "{what}");
+        }
+    }
+
+    /// The three illegal cases, each from the gesture that produces it, because
+    /// a refusal nobody can reach with the pointer is untested theatre.
+    #[test]
+    fn a_folder_dropped_into_itself_a_block_too_deep_and_a_gap_that_is_not_one_are_refused() {
+        let doc = depth_three();
+        let nodes = doc.nodes();
+
+        // Outer is folded away for the duration of its own drag, so its row
+        // answers to the closed-folder rules and its middle band is "inside
+        // me". That is the cycle, and it is the one the depth encoding makes
+        // unrepresentable rather than merely detectable.
+        assert_eq!(drop_target(nodes, 0, 0, 0.5), Err(DropRefusal::IntoItself), "Outer into Outer");
+        // And the same folder over a row of its own, which is only reachable
+        // through a stale message -- the rows are not drawn during the drag.
+        assert_eq!(drop_target(nodes, 0, 2, 0.5), Err(DropRefusal::IntoItself), "Outer into Deep");
+
+        // The cap. It takes a tall block AND a deep destination to reach, which
+        // a depth-3 tree on its own cannot do: eight levels is a lot of room.
+        let deep = a_tower_and_a_tall_block();
+        assert_eq!(
+            depths(&deep),
+            vec![0, 1, 2, 3, 4, 5, 6, 0, 1, 2],
+            "the tower is the wrong shape"
+        );
+        assert_eq!(
+            drop_target(deep.nodes(), 7, 6, 0.9),
+            Err(DropRefusal::TooDeep),
+            "a three-level block under a depth-6 row would put its deepest row at 8"
+        );
+        // One level shallower and the same block fits, so the refusal above is
+        // the cap talking and not the gesture failing.
+        assert!(drop_target(deep.nodes(), 7, 4, 0.9).is_ok(), "the block does not fit anywhere");
+
+        // A gap with nothing in front of it that could be a parent. Not
+        // reachable from the panel; this is what a hand-built target gets.
+        assert_eq!(
+            drop_refusal(nodes, 5..6, DropTarget { at: 0, depth: 3 }),
+            Some(DropRefusal::Nowhere),
+            "a depth-3 row at the very top of the list has no parent"
+        );
+        assert!(!DropRefusal::IntoItself.reason().is_empty());
+        assert!(!DropRefusal::TooDeep.reason().is_empty());
+        assert!(!DropRefusal::Nowhere.reason().is_empty());
+    }
+
+    /// A chain six folders deep with a body at the bottom, and beside it a
+    /// three-level block. The only shape in which the eighth-level cap can
+    /// actually bite.
+    ///
+    /// ```text
+    /// 0 L0 .. 5 L5      folders, depths 0 to 5
+    /// 6   Pit           a body at depth 6
+    /// 7 Block           depth 0
+    /// 8   B1            depth 1
+    /// 9     Leaf        depth 2
+    /// ```
+    fn a_tower_and_a_tall_block() -> Document {
+        let mut doc = Document::new(0.5);
+        let pit = doc.active();
+        let leaf = doc.add_body("Leaf", Volume::new(0.5));
+
+        let mut outermost = pit;
+        for level in (0..6).rev() {
+            let (folder, _) = doc.group(outermost, format!("L{level}")).expect("a level");
+            outermost = folder;
+        }
+        let (b1, _) = doc.group(leaf, "B1").expect("B1");
+        doc.group(b1, "Block").expect("Block");
+        doc
+    }
+
+    /// **Every (source, destination) pair over a depth-3 tree**, at every band
+    /// of every row: each one either produces a legal forest or is refused with
+    /// a reason, and the predicate that drew the indicator is the predicate the
+    /// commit obeyed.
+    ///
+    /// Run over the tower as well, because a depth-3 tree has too much headroom
+    /// under the eighth level for the cap to ever bite -- and a refusal no case
+    /// reaches is a refusal nothing tests.
+    ///
+    /// The counted control at the bottom matters as much as the property: a
+    /// version of this that refused everything would pass it perfectly.
+    #[test]
+    fn every_drop_over_a_depth_three_tree_is_a_legal_forest_or_a_named_refusal() {
+        type Fixture = (&'static str, fn() -> Document);
+        let fixtures: [Fixture; 2] =
+            [("the depth-3 tree", depth_three), ("the tower", a_tower_and_a_tall_block)];
+        let mut landed = 0usize;
+        let mut refused = [0usize; 3];
+        let mut moved_something = 0usize;
+
+        for (fixture, build) in fixtures {
+            let rows = build().node_count();
+            let bodies = build().body_count();
+            for source in 0..rows {
+                for over in 0..rows {
+                    for band in [0.1_f32, 0.5, 0.9] {
+                        // Rebuilt per case: `Volume` has no `Clone` at all, so
+                        // there is no snapshot to restore and no shared state
+                        // to leak between cases.
+                        let mut doc = build();
+                        let id = doc.nodes()[source].id;
+                        let block: Vec<NodeId> = doc.nodes()[subtree(doc.nodes(), source)]
+                            .iter()
+                            .map(|node| node.id)
+                            .collect();
+                        let was = depths(&doc);
+
+                        let outcome = drop_target(doc.nodes(), source, over, band);
+                        let what = format!("{fixture}: {source} over {over} at {band}");
+                        let Ok(target) = outcome else {
+                            match outcome.expect_err("checked above") {
+                                DropRefusal::IntoItself => refused[0] += 1,
+                                DropRefusal::TooDeep => refused[1] += 1,
+                                DropRefusal::Nowhere => refused[2] += 1,
+                            }
+                            // **The indicator and the commit cannot disagree**:
+                            // the gap the panel refused to draw a line in is a
+                            // gap the document also refuses to splice into.
+                            // THE SAME TARGET, which is why this reaches past
+                            // `drop_target` for it -- an assertion over a
+                            // target built here by hand would be a constant,
+                            // and one was: `DropTarget { at: 0, depth:
+                            // MAX_DEPTH }` is `TooDeep` for every block in
+                            // every document, so it passed whatever refusal was
+                            // under test.
+                            let refused_target = drop_gap(doc.nodes(), source, over, band)
+                                .expect("both indices are rows");
+                            assert!(
+                                doc.reparent(id, refused_target).is_none(),
+                                "{what}: the commit performed a move the indicator refused"
+                            );
+                            assert_eq!(
+                                depths(&doc),
+                                was,
+                                "{what}: a refused move still moved rows"
+                            );
+                            continue;
+                        };
+                        landed += 1;
+
+                        if doc.reparent(id, target).is_none() {
+                            assert_eq!(
+                                depths(&doc),
+                                was,
+                                "{what}: a refused move still moved rows"
+                            );
+                            continue;
+                        }
+                        moved_something += 1;
+
+                        // A legal forest: the fold over one integer that IS the
+                        // whole tree check.
+                        let after = depths(&doc);
+                        assert_eq!(after[0], 0, "{what}: the first row is not at the top level");
+                        for (index, pair) in after.windows(2).enumerate() {
+                            assert!(
+                                pair[1] <= pair[0] + 1,
+                                "{what}: row {} skipped a level in {after:?}",
+                                index + 1
+                            );
+                        }
+                        assert!(after.iter().all(|depth| *depth < MAX_DEPTH), "{what}: {after:?}");
+                        // Nothing was lost. Rows CAN go -- a folder its last
+                        // child left is dissolved into the same entry -- but a
+                        // body never can, and neither can any row of the block
+                        // that was dragged.
+                        assert_eq!(doc.body_count(), bodies, "{what}: a body went missing");
+                        for id in &block {
+                            assert!(doc.node(*id).is_some(), "{what}: a dragged row went missing");
+                        }
+                        // The block stayed a block, in its own order: the rows
+                        // are still contiguous and still the same shape.
+                        let landed_at =
+                            doc.index_of(block[0]).expect("the block's root is still here");
+                        let arrived: Vec<NodeId> = doc.nodes()[landed_at..landed_at + block.len()]
+                            .iter()
+                            .map(|node| node.id)
+                            .collect();
+                        assert_eq!(arrived, block, "{what}: the block did not move as a block");
+
+                        // **A folder is never empty**, which is a rule between
+                        // gestures rather than a document invariant.
+                        for (index, node) in doc.nodes().iter().enumerate() {
+                            assert!(
+                                node.is_body()
+                                    || doc
+                                        .nodes()
+                                        .get(index + 1)
+                                        .is_some_and(|next| next.depth() > node.depth()),
+                                "{what}: {} was left empty in {after:?}",
+                                node.name
+                            );
+                        }
+                        assert!(
+                            doc.volume(doc.active()).is_some(),
+                            "{what}: the active row lost its field"
+                        );
+                    }
+                }
+            }
+        }
+
+        assert!(landed > 100, "too few drops were legal for this to prove anything: {landed}");
+        assert!(moved_something > 50, "almost every legal drop was a no-op: {moved_something}");
+        assert!(refused[0] > 0, "no drop was ever refused for landing inside itself");
+        assert!(refused[1] > 0, "no drop was ever refused for being too deep");
+        // **Zero, and asserted as zero.** `Nowhere` is the refusal for a gap
+        // that is not one, and `drop_target` cannot produce one: every band of
+        // the table lands on an index the list has, at a depth the row in front
+        // of it can parent. It is reachable only by a hand-built target or a
+        // stale message, which is what
+        // `a_folder_dropped_into_itself_a_block_too_deep_and_a_gap_that_is_not_one_are_refused`
+        // covers. If this ever counts one, the band table has grown a gap the
+        // panel could point at and nothing else here would have said so.
+        assert_eq!(refused[2], 0, "the pointer produced a gap that is not a gap");
+    }
+
+    /// The gap under a folder's last child and the gap above the row after the
+    /// folder are the SAME index at two depths, and that is the whole of how a
+    /// row gets back out of a folder.
+    #[test]
+    fn one_gap_at_two_depths_is_what_takes_a_row_out_of_a_folder() {
+        let mut doc = depth_three();
+        let shelved = doc.nodes()[7].id;
+        // Nothing below Shelf, so the way out is the top band of a top-level
+        // row -- here, Loose, which sits above it.
+        let out = drop_target(doc.nodes(), 7, 5, 0.1).expect("above Loose");
+        assert_eq!(out, DropTarget { at: 5, depth: 0 });
+
+        doc.reparent(shelved, out).expect("the move out");
+        assert_eq!(depths(&doc), vec![0, 1, 2, 3, 2, 0, 0], "Shelved did not come out");
+        assert_eq!(doc.nodes()[5].id, shelved, "it did not land above Loose");
+        assert_eq!(
+            doc.nodes().iter().filter(|node| node.name == "Shelf").count(),
+            0,
+            "the folder its only child left is still here"
+        );
+    }
+
+    /// A drag that puts a row back where it already was is not a change, and a
+    /// change is what an undo entry costs. Both bands of both neighbours.
+    #[test]
+    fn a_drop_that_changes_nothing_is_not_a_move() {
+        let mut doc = depth_three();
+        let nested = doc.nodes()[4].id;
+        let was = doc.outline();
+
+        for (what, over, band) in [
+            ("its own top band", 4, 0.1),
+            ("its own bottom band", 4, 0.9),
+            ("above itself", 4, 0.4),
+        ] {
+            let target = drop_target(doc.nodes(), 4, over, band).expect(what);
+            assert!(doc.reparent(nested, target).is_none(), "{what} counted as a move");
+            assert_eq!(doc.outline(), was, "{what} changed the document");
+        }
     }
 
     /// The outline is a permutation plus field edits, so putting one back has

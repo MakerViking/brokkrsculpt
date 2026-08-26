@@ -23,7 +23,7 @@ use iced::mouse;
 use iced::widget::shader;
 use iced::{Rectangle, Vector};
 
-use crate::app::SizingTarget;
+use crate::app::{SizingTarget, Tool};
 use crate::camera::OrbitCamera;
 use crate::message::{Message, PointerButton, PointerEvent};
 use crate::navcube;
@@ -44,17 +44,81 @@ pub struct PendingUpload {
 /// recycling -- and nothing ever trimmed the list, so one `rebuild_everything`
 /// over the 45,567-brick document this pool is built for handed back one buffer
 /// per brick and held every one of them. At an average brick (about 1100
-/// vertices, so 26 kB of vertices, 26 kB of indices and 13 kB of cells) that is
-/// roughly 66 kB each and about 3 GB retained, none of it counted by the
-/// document's own byte budget and none of it visible in any readout.
+/// vertices, so 26 kB of vertices, 26 kB of indices, 13 kB of cells and 1 kB of
+/// mask) that is roughly 67 kB each and about 3 GB retained, none of it counted
+/// by the document's own byte budget and none of it visible in any readout.
 ///
 /// 1024 is chosen against what actually recurs: a stroke dirties tens of
 /// bricks, so steady-state sculpting never reaches the cap and never allocates,
 /// which is the property the recycling exists for. The case the cap bites is
 /// the whole-model rebuild, and that one is already proportional to the whole
 /// model -- paying for its buffers again is the cheaper half of that trade. At
-/// 66 kB a buffer this is about 68 MB held at rest.
+/// 67 kB a buffer this is about 69 MB held at rest.
 const MAX_SPARE_MESHES: usize = 1024;
+
+/// One body's picture, asked for by the application and drawn by the render
+/// callback.
+///
+/// The render thread has no `Document`, so the request carries everything the
+/// framing needs. `bounds` is the body's world box, and the framing is worked
+/// out from it inside `brokkr-gpu`.
+///
+/// # Why the box travels with the request rather than being measured here
+///
+/// **The plan asked for `Volume::surface_bounds` and the code refuses it, in
+/// so many words.** `refuse_mirrors_the_body_does_not_straddle` in `app.rs`
+/// says "re-measuring per stroke would put a full-model scan on every button
+/// release, which is the thing the cache in `brokkr-core` refuses to hold for
+/// exactly this reason", and `BodyCache`'s own doc comment refuses to cache the
+/// surface box on the same grounds. A thumbnail is requested 200 ms after the
+/// geometry stops changing, which for a sculpting session IS every button
+/// release, so `surface_bounds` here would be that scan under a different name.
+///
+/// `Volume::world_bounds` is a walk of the brick map's keys -- tens of
+/// microseconds where the surface scan is tens of milliseconds -- and it
+/// over-reports by up to one brick a side, so a body fills a little less of its
+/// cell than it could. **Revisit when split by loose parts lands** (plan
+/// increment 16): a `"<name> fragments"` body holds specks scattered across the
+/// whole source model's extent, and brick framing renders those into a blank
+/// square. The answer then is a cached surface box on the body, refreshed where
+/// split writes it, not a scan per request.
+#[derive(Debug, Clone, Copy)]
+pub struct ThumbRequest {
+    pub body: NodeId,
+    pub cell: u32,
+    pub bounds: (glam::Vec3, glam::Vec3),
+}
+
+/// What the sculpt shader is told about the mask this frame.
+///
+/// Both halves are VIEW state and neither is document state: the polarity is
+/// read out of the body being drawn rather than owned here, and the tint is a
+/// preference the `show mask` toggle and its slider set. Nothing here can
+/// change what a stroke does -- see [`brokkr_gpu::Uniforms::mask_tint`], which
+/// is where the 3D-Coat confusion this avoids is written down.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct MaskView {
+    /// The active body's polarity, applied to the vertex attribute by the
+    /// shader rather than baked into the mesh.
+    ///
+    /// **The active body's, and every OTHER body is reconciled against it by
+    /// [`SharedFrame::set_opposite_polarity`]** -- a mask is per body and this
+    /// is one word, so on its own it cannot describe a document where Invert
+    /// has been used on one body and not another.
+    pub inverted: bool,
+    /// How strongly protection is tinted, 0..1. Zero is the toggle switched
+    /// off, and draws every body exactly as an unmasked one.
+    pub tint: f32,
+}
+
+impl Default for MaskView {
+    /// Tinted at full strength, because that is the state the application
+    /// starts in and because the default has to fail in the direction where a
+    /// mask that exists is visible.
+    fn default() -> Self {
+        Self { inverted: false, tint: 1.0 }
+    }
+}
 
 /// The hand off between the application and the render callbacks.
 #[derive(Debug, Default)]
@@ -87,6 +151,25 @@ pub struct SharedFrame {
     forget: Mutex<Vec<NodeId>>,
     /// Bodies the renderer must not draw. See [`SharedFrame::set_hidden`].
     hidden: Mutex<Vec<NodeId>>,
+    /// Bodies drawn with the opposite of [`MaskView::inverted`]. See
+    /// [`SharedFrame::set_opposite_polarity`].
+    opposite_polarity: Mutex<Vec<NodeId>>,
+    /// How the mask is to be drawn. See [`MaskView`] and
+    /// [`SharedFrame::set_mask_view`].
+    mask: Mutex<MaskView>,
+    /// The one thumbnail waiting to be drawn.
+    ///
+    /// **Capacity one, so the per-frame cap IS the type.** "At most one body
+    /// per frame" is the property the whole feature's cost argument rests on --
+    /// the largest body this application is built for is planned against about
+    /// 8 ms, which fits inside a 16 ms frame exactly once -- and a queue with a
+    /// counter beside it is a rule someone can get wrong. An `Option` is a rule
+    /// nobody can get wrong.
+    ///
+    /// The application only ever fills this when it is empty, so a request that
+    /// waits several frames (see [`SharedFrame::apply`]) delays the next one
+    /// rather than being overwritten by it.
+    thumb: Mutex<Option<ThumbRequest>>,
 }
 
 impl SharedFrame {
@@ -253,6 +336,57 @@ impl SharedFrame {
         self.hidden.lock().expect("shared frame poisoned").clone()
     }
 
+    /// Say how the mask is to be drawn on the next frame.
+    ///
+    /// **Published from the one visibility pass, after every message, rather
+    /// than from the handful of places that change it** -- the same argument
+    /// [`SharedFrame::set_hidden`] makes. The handful is bigger than it looks:
+    /// the toggle, the tint slider, the held peek key, choosing another body,
+    /// and any undo that puts a polarity back. A list of those is a list that
+    /// goes silently out of date, and what it goes out of date INTO is a mask
+    /// drawn with the wrong polarity, which is the picture at its most
+    /// misleading -- protected material shown as free.
+    ///
+    /// Costs one lock and two word writes, so it is affordable on the frame
+    /// tick, which is what lets it be unconditional.
+    pub fn set_mask_view(&self, view: MaskView) {
+        *self.mask.lock().expect("shared frame poisoned") = view;
+    }
+
+    /// Replace the set of bodies drawn with the opposite of
+    /// [`MaskView::inverted`].
+    ///
+    /// **The other half of `set_mask_view`, and it is published from the same
+    /// place in the same pass** -- they are one answer in two pieces, and a
+    /// polarity word that arrived without the set it is relative to would draw
+    /// protected material as free for one frame. Copies rather than swaps, and
+    /// allocates nothing after the first call, exactly as
+    /// [`SharedFrame::set_hidden`] does.
+    pub fn set_opposite_polarity(&self, opposite: &[NodeId]) {
+        let mut held = self.opposite_polarity.lock().expect("shared frame poisoned");
+        held.clear();
+        held.extend_from_slice(opposite);
+    }
+
+    /// The bodies the renderer has been told draw with the opposite polarity.
+    ///
+    /// The same justification as [`SharedFrame::hidden_snapshot`].
+    #[cfg(test)]
+    pub fn opposite_polarity_snapshot(&self) -> Vec<NodeId> {
+        self.opposite_polarity.lock().expect("shared frame poisoned").clone()
+    }
+
+    /// What the renderer has been told about the mask.
+    ///
+    /// The same justification as [`SharedFrame::hidden_snapshot`]: a test that
+    /// asserted on the application's own fields would be asserting on the thing
+    /// that SENDS the answer rather than on the answer that arrived, and
+    /// deleting the send would leave it green.
+    #[cfg(test)]
+    pub fn mask_view(&self) -> MaskView {
+        *self.mask.lock().expect("shared frame poisoned")
+    }
+
     /// The bodies queued to be dropped from the pool, taken.
     ///
     /// Taken rather than read for the same reason
@@ -262,6 +396,37 @@ impl SharedFrame {
     #[cfg(test)]
     pub fn take_forgotten_for_tests(&self) -> Vec<NodeId> {
         std::mem::take(&mut *self.forget.lock().expect("shared frame poisoned"))
+    }
+
+    /// Ask for one body's picture to be redrawn on the next frame the pool is
+    /// quiet.
+    ///
+    /// The caller must check [`SharedFrame::thumbnail_pending`] first: this
+    /// replaces whatever is here, and the application's stale set is what
+    /// remembers the request, so a silent overwrite would lose a picture until
+    /// that body's geometry changed again.
+    pub fn request_thumbnail(&self, request: ThumbRequest) {
+        *self.thumb.lock().expect("shared frame poisoned") = Some(request);
+    }
+
+    /// Whether a thumbnail is already waiting. The application's "at most one
+    /// in flight" gate.
+    pub fn thumbnail_pending(&self) -> bool {
+        self.thumb.lock().expect("shared frame poisoned").is_some()
+    }
+
+    /// Take the queued thumbnail, exactly as `apply` does, so a headless test
+    /// can stand in for the render callback.
+    ///
+    /// A take rather than a peek for the same reason
+    /// [`SharedFrame::take_pool_reset_for_tests`] swaps: what the refresh rule
+    /// owes is that a request is there afterwards, and a test that could see a
+    /// previous gesture's request would pass on the wrong evidence. It is also
+    /// the only way to reach the "exactly one" assertions at all -- there is no
+    /// `prepare` in a headless test to empty the mailbox.
+    #[cfg(test)]
+    pub fn take_thumbnail_for_tests(&self) -> Option<ThumbRequest> {
+        self.thumb.lock().expect("shared frame poisoned").take()
     }
 
     /// Make the renderer match everything the application has published, in the
@@ -285,10 +450,20 @@ impl SharedFrame {
     /// 4. The hidden set last, so that a body published and hidden on the same
     ///    frame is not drawn once before the skip arrives.
     ///
+    /// 5. The thumbnail LAST of all, and only on a frame that did none of the
+    ///    above. Two reasons, and both of them are pictures the user would have
+    ///    to work out for themselves. After a pool reset the slots are gone
+    ///    until the re-upload lands, so a thumbnail drawn in that window is a
+    ///    correctly cleared empty cell -- which the application would then mark
+    ///    clean, leaving a blank square that never refreshes. And a frame
+    ///    carrying uploads is a frame where the pool is already busy, which is
+    ///    the one place an extra full-body draw would be felt.
+    ///
     /// Extracted out of `prepare` so that this ordering is testable at all;
     /// nothing in the workspace tested this seam before increment 6.
     pub fn apply(&self, renderer: &mut SculptRenderer, device: &wgpu::Device, queue: &wgpu::Queue) {
-        if self.reset_pool.swap(false, std::sync::atomic::Ordering::AcqRel) {
+        let reset_happened = self.reset_pool.swap(false, std::sync::atomic::Ordering::AcqRel);
+        if reset_happened {
             renderer.reset_pool();
         }
 
@@ -304,6 +479,7 @@ impl SharedFrame {
             let mut pending = self.pending.lock().expect("shared frame poisoned");
             std::mem::take(&mut *pending)
         };
+        let pool_was_quiet = drained.is_empty();
         if !drained.is_empty() {
             let mut spare = self.spare.lock().expect("shared frame poisoned");
             for upload in drained {
@@ -322,6 +498,31 @@ impl SharedFrame {
         {
             let hidden = self.hidden.lock().expect("shared frame poisoned");
             renderer.set_hidden(&hidden);
+        }
+
+        {
+            let opposite = self.opposite_polarity.lock().expect("shared frame poisoned");
+            renderer.set_opposite_polarity(&opposite);
+        }
+
+        if reset_happened || !pool_was_quiet {
+            return;
+        }
+        let request = { self.thumb.lock().expect("shared frame poisoned").take() };
+        if let Some(request) = request {
+            // A request for a body that left the document on this very frame is
+            // dropped, exactly as that body's queued uploads are and for the
+            // same reason: its cell has already gone back to the application's
+            // free list and may belong to somebody else by now.
+            if !forgotten.contains(&request.body) {
+                renderer.render_thumbnail(
+                    device,
+                    queue,
+                    request.cell,
+                    request.body,
+                    request.bounds,
+                );
+            }
         }
     }
 
@@ -447,6 +648,19 @@ pub(crate) fn shortcut(character: &str, command: bool, shift: bool, alt: bool) -
         // muscle memory carries over: S is Draw Size, U is Z Intensity.
         "s" => Some(Message::SizingStarted(SizingTarget::Radius)),
         "u" => Some(Message::SizingStarted(SizingTarget::Strength)),
+        // Mask, and `m` rather than `8`. The digits index `BrushKind::ALL`, and
+        // making the mask a `BrushKind` would force an arm in five exhaustive
+        // matches inside `brokkr-core` for a variant that must never write the
+        // field. Pressed while masking it goes back to sculpting, which
+        // `Message::ToolChanged` does for every tool.
+        "m" => Some(Message::ToolChanged(Tool::Mask)),
+        // Hold to see the mask, whatever the `show mask` toggle says. ZBrush's
+        // own mask-visibility key is H, taken rather than invented so muscle
+        // memory carries over, and held rather than latched because that is the
+        // gesture a latched toggle cannot do: look, and be back where you were
+        // without a second press. The release is decoded in `key_event`
+        // alongside the sizing keys -- this function only ever sees presses.
+        "h" => Some(Message::MaskPeekStarted),
         "x" => Some(Message::SymmetryAxisToggled(MirrorAxis::X)),
         "y" => Some(Message::SymmetryAxisToggled(MirrorAxis::Y)),
         "z" => Some(Message::SymmetryAxisToggled(MirrorAxis::Z)),
@@ -543,7 +757,7 @@ impl shader::Program<Message> for Viewport {
     type Primitive = SculptPrimitive;
 
     fn draw(&self, _state: &(), _cursor: mouse::Cursor, _bounds: Rectangle) -> SculptPrimitive {
-        SculptPrimitive { shared: Arc::clone(&self.shared) }
+        SculptPrimitive::Viewport { shared: Arc::clone(&self.shared) }
     }
 
     fn update(
@@ -572,11 +786,57 @@ impl shader::Program<Message> for Viewport {
     }
 }
 
-/// What the widget draws this frame. Holding only a handle keeps `draw` free of
-/// per frame copying.
+/// One row of the body panel, showing one cell of the thumbnail atlas.
+///
+/// **Inert, and that is the mechanism doing the work rather than an option
+/// somewhere.** `Program::update` is left at its default, which returns `None`
+/// (`iced_widget-0.14.2/src/shader/program.rs:26-34`), so this widget captures
+/// nothing and the press falls through to the row's `mouse_area` behind it. It
+/// must not become a `Button`: the thumbnail is the largest target in the row,
+/// and Photoshop puts a completely different action on a ctrl-clicked layer
+/// thumbnail, which users hit constantly.
 #[derive(Debug)]
-pub struct SculptPrimitive {
-    shared: Arc<SharedFrame>,
+pub struct ThumbnailCell {
+    cell: u32,
+}
+
+impl ThumbnailCell {
+    pub fn new(cell: u32) -> Self {
+        Self { cell }
+    }
+}
+
+impl shader::Program<Message> for ThumbnailCell {
+    type State = ();
+    type Primitive = SculptPrimitive;
+
+    fn draw(&self, _state: &(), _cursor: mouse::Cursor, _bounds: Rectangle) -> SculptPrimitive {
+        SculptPrimitive::Thumbnail { cell: self.cell }
+    }
+}
+
+/// What a `shader` widget draws this frame.
+///
+/// # One type with two arms, and the alternative is a second half-gigabyte pool
+///
+/// A separate `ThumbnailPrimitive` looks obviously tidier and is the refactor a
+/// future reader attempts. It does not work. `iced_wgpu` stores pipelines in a
+/// map keyed on `TypeId::of::<T>()` where **T is the PRIMITIVE type**
+/// (`iced_wgpu-0.14.0/src/primitive.rs:133`, `:218`), so a second primitive
+/// type -- even one declaring `type Pipeline = SculptPipeline` -- gets its own
+/// [`SculptPipeline`]: a second [`SculptRenderer`], a second
+/// [`brokkr_gpu::MeshPool`], and `MeshPool::new` eagerly creates buffer pair 0.
+/// That is half a gigabyte of VRAM reserved for a pool nothing ever uploads to,
+/// rendering blank thumbnails, with no error anywhere.
+///
+/// The [`SculptPrimitive::Thumbnail`] arm holds no `Arc` and touches no mutex:
+/// a row's primitive is four bytes and its `prepare` does nothing. That matters
+/// because `prepare` is NOT culled per instance
+/// (`iced_wgpu-0.14.0/src/lib.rs:366-375`); only `draw` is (`:544-552`).
+#[derive(Debug)]
+pub enum SculptPrimitive {
+    Viewport { shared: Arc<SharedFrame> },
+    Thumbnail { cell: u32 },
 }
 
 impl shader::Primitive for SculptPrimitive {
@@ -590,12 +850,20 @@ impl shader::Primitive for SculptPrimitive {
         bounds: &Rectangle,
         viewport: &shader::Viewport,
     ) {
+        let Self::Viewport { shared } = self else {
+            // A row does nothing here. See the type's doc comment: `prepare` runs
+            // for every instance whether or not it is on screen, so this arm has
+            // to stay free.
+            return;
+        };
+
         // The depth attachment has to match the colour attachment, which is the
         // whole window rather than just this widget.
         let size = viewport.physical_size();
         pipeline.renderer.resize(device, size.width, size.height);
 
-        let camera = *self.shared.camera.lock().expect("shared frame poisoned");
+        let camera = *shared.camera.lock().expect("shared frame poisoned");
+        let mask = *shared.mask.lock().expect("shared frame poisoned");
         let aspect = bounds.width / bounds.height.max(1.0);
         let view = camera.view();
         let view_projection = camera.projection(aspect) * view;
@@ -603,15 +871,17 @@ impl shader::Primitive for SculptPrimitive {
             view_projection: view_projection.to_cols_array_2d(),
             view: view.to_cols_array_2d(),
             srgb_target: u32::from(pipeline.renderer.target_is_srgb()),
-            padding: [0; 3],
+            mask_inverted: u32::from(mask.inverted),
+            mask_tint: mask.tint,
+            padding: [0; 1],
         };
         pipeline.renderer.write_uniforms(queue, &uniforms);
         {
-            let overlay = self.shared.overlay.lock().expect("shared frame poisoned");
+            let overlay = shared.overlay.lock().expect("shared frame poisoned");
             pipeline.renderer.write_overlay(device, queue, &overlay, view_projection);
         }
         {
-            let cube = self.shared.cube.lock().expect("shared frame poisoned");
+            let cube = shared.cube.lock().expect("shared frame poisoned");
             pipeline.renderer.write_cube(device, queue, &cube, navcube::view_projection(&camera));
         }
         // The cube's corner box is defined in logical pixels so it stays the
@@ -632,11 +902,35 @@ impl shader::Primitive for SculptPrimitive {
 
         // Everything the application published since the last frame, in the one
         // order that is correct: the reset, then the forgets, then the uploads,
-        // then the hidden set. See `SharedFrame::apply`.
-        self.shared.apply(&mut pipeline.renderer, device, queue);
+        // then the hidden set, then at most one thumbnail. See
+        // `SharedFrame::apply`.
+        //
+        // The thumbnail is drained HERE, in the viewport's arm, and never in a
+        // row's. A row's `prepare` runs whether or not the row is on screen and
+        // there may be sixty-four of them; the viewport's runs exactly once a
+        // frame, which is what makes "at most one body per frame" true of the
+        // schedule as well as of the mailbox.
+        shared.apply(&mut pipeline.renderer, device, queue);
 
-        *self.shared.stats.lock().expect("shared frame poisoned") = pipeline.renderer.stats();
-        self.shared.set_adapter(pipeline.renderer.adapter_summary());
+        *shared.stats.lock().expect("shared frame poisoned") = pipeline.renderer.stats();
+        shared.set_adapter(pipeline.renderer.adapter_summary());
+    }
+
+    /// A row is a flat blit inside iced's own pass; the viewport is not.
+    ///
+    /// iced's render pass has `depth_stencil_attachment: None`
+    /// (`iced_wgpu-0.14.0/src/lib.rs:452`), so depth-tested 3D can never ride
+    /// it -- which is why the viewport returns `false` here and takes a pass of
+    /// its own in [`Self::render`], and why the thumbnail's 3D happened
+    /// offscreen during `prepare` and all that is left for this call is a
+    /// textured quad. iced has already set the pass's viewport and scissor to
+    /// this row's bounds (`lib.rs:551`, `:560`), so the blit needs no rectangle
+    /// of its own.
+    fn draw(&self, pipeline: &SculptPipeline, pass: &mut wgpu::RenderPass<'_>) -> bool {
+        match self {
+            Self::Viewport { .. } => false,
+            Self::Thumbnail { cell } => pipeline.renderer.blit_thumbnail(pass, *cell),
+        }
     }
 
     fn render(
@@ -646,6 +940,10 @@ impl shader::Primitive for SculptPrimitive {
         target: &wgpu::TextureView,
         clip_bounds: &Rectangle<u32>,
     ) {
+        if !matches!(self, Self::Viewport { .. }) {
+            return;
+        }
+
         pipeline.renderer.render(
             encoder,
             target,
@@ -898,6 +1196,7 @@ mod apply_tests {
             vertices: vec![Vertex { position: [0.0; 3], normal: [0.0, 1.0, 0.0] }; 64],
             indices: (0..64).collect(),
             cells: Vec::new(),
+            mask: vec![0; 64],
         }
     }
 
@@ -905,6 +1204,90 @@ mod apply_tests {
         for brick in 0..bricks {
             shared.publish(body, BrickCoord::new(brick, 0, 0), mesh());
         }
+    }
+
+    /// A mesh that actually covers pixels, for the one test whose claim is
+    /// about what is in a cell rather than about which slots exist.
+    ///
+    /// [`mesh`] cannot serve: its sixty-four vertices are all at the origin, so
+    /// every triangle it makes is degenerate and rasterizes to nothing. This is
+    /// one quad across the middle of the box those thumbnail tests frame. The
+    /// sculpt pipeline is built with `cull_mode: None`, so the winding does not
+    /// matter; the normal faces the camera so the matcap lookup lands on the
+    /// lit part of the clay rather than on the dark rim.
+    fn visible_mesh() -> BrickMesh {
+        let corner = |x: f32, y: f32| Vertex { position: [x, y, 0.0], normal: [0.0, 0.0, 1.0] };
+        BrickMesh {
+            vertices: vec![
+                corner(-8.0, -8.0),
+                corner(8.0, -8.0),
+                corner(8.0, 8.0),
+                corner(-8.0, 8.0),
+            ],
+            indices: vec![0, 1, 2, 0, 2, 3],
+            cells: Vec::new(),
+            mask: vec![0; 4],
+        }
+    }
+
+    /// One cell of the thumbnail atlas, tightly packed, in the texture's own
+    /// channel order.
+    ///
+    /// A near copy of the same helper in `brokkr-gpu`'s `offscreen.rs`, which
+    /// is an integration test and so cannot be reached from here. There is no
+    /// other way to see a thumbnail, and "the picture in this cell survived"
+    /// is the only assertion that can tell the forget guard's two designs
+    /// apart.
+    fn cell_bytes(
+        renderer: &SculptRenderer,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        cell: u32,
+    ) -> Vec<u8> {
+        let size = brokkr_gpu::THUMBNAIL_SIZE;
+        let padded = (size * 4).div_ceil(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT)
+            * wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
+        let readback = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("thumbnail readback"),
+            size: u64::from(padded * size),
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+
+        let mut encoder = device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("thumbnail") });
+        encoder.copy_texture_to_buffer(
+            wgpu::TexelCopyTextureInfo {
+                texture: renderer.thumbnails().texture(),
+                mip_level: 0,
+                origin: wgpu::Origin3d { x: 0, y: 0, z: cell },
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyBufferInfo {
+                buffer: &readback,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(padded),
+                    rows_per_image: Some(size),
+                },
+            },
+            wgpu::Extent3d { width: size, height: size, depth_or_array_layers: 1 },
+        );
+        queue.submit([encoder.finish()]);
+
+        let slice = readback.slice(..);
+        slice.map_async(wgpu::MapMode::Read, |result| result.expect("readback map failed"));
+        device.poll(wgpu::PollType::wait_indefinitely()).expect("device poll failed");
+
+        let mapped = slice.get_mapped_range();
+        let mut pixels = Vec::with_capacity((size * size * 4) as usize);
+        for row in 0..size {
+            let start = (row * padded) as usize;
+            pixels.extend_from_slice(&mapped[start..start + (size * 4) as usize]);
+        }
+        drop(mapped);
+        readback.unmap();
+        pixels
     }
 
     /// A deleted body's queued meshes must never reach the pool, in either
@@ -1039,6 +1422,166 @@ mod apply_tests {
         assert_eq!(renderer.stats().bricks, over as usize);
     }
 
+    /// **A thumbnail must never write the viewport's camera**, and nothing
+    /// else in the workspace can see it if it does.
+    ///
+    /// `SculptRenderer` has exactly one 144-byte viewport uniform buffer, and
+    /// iced runs `prepare` for EVERY primitive before `render` for any of them
+    /// (`iced_wgpu-0.14.0/src/lib.rs:146-147`). So a thumbnail that wrote its
+    /// matrix into that buffer would leave the main viewport drawing the whole
+    /// model at an 84 pixel thumbnail's camera for that frame -- no panic, no
+    /// validation error, no wrong pixel in any headless harness, just a model
+    /// that jumps every time a picture refreshes. That is why the atlas carries
+    /// a second buffer and a second bind group over the same layout rather than
+    /// two slots in one, and this is the only assertion that can tell the two
+    /// designs apart.
+    #[test]
+    fn a_thumbnail_leaves_the_viewports_own_matrix_alone() {
+        let Some((device, queue)) = device_or_skip("thumbnail uniform isolation") else {
+            return;
+        };
+
+        let mut renderer = renderer(&device, &queue);
+        let shared = SharedFrame::new();
+
+        // A matrix nothing could produce by accident, so a value that survives
+        // really is this one and not a default or a thumbnail's.
+        let mut wanted = Uniforms::default();
+        wanted.view_projection[0][0] = 1234.5;
+        wanted.view[3][2] = -67.5;
+        renderer.write_uniforms(&queue, &wanted);
+
+        publish(&shared, NodeId(1), 2);
+        shared.apply(&mut renderer, &device, &queue);
+
+        shared.request_thumbnail(ThumbRequest {
+            body: NodeId(1),
+            cell: 0,
+            bounds: (glam::Vec3::splat(-10.0), glam::Vec3::splat(10.0)),
+        });
+        shared.apply(&mut renderer, &device, &queue);
+        assert!(!shared.thumbnail_pending(), "the fixture never drained, so it asserts nothing");
+
+        let held = renderer.read_viewport_uniforms(&device, &queue);
+        assert_eq!(
+            held.view_projection, wanted.view_projection,
+            "a thumbnail overwrote the viewport's projection: the model would be drawn at the \
+             thumbnail's camera for a frame"
+        );
+        assert_eq!(held.view, wanted.view, "a thumbnail overwrote the viewport's view matrix");
+    }
+
+    /// The thumbnail is drained LAST, at most one a frame, and never on a frame
+    /// where the pool is catching up.
+    ///
+    /// After a reset the slots are gone until the re-upload lands, so a
+    /// thumbnail drawn in that window is a correctly cleared EMPTY cell -- and
+    /// the application would then mark it clean, leaving a blank square that
+    /// never refreshes. A frame carrying uploads is a frame where the pool is
+    /// already busy, which is the one place an extra full-body draw is felt.
+    #[test]
+    fn a_thumbnail_waits_for_a_frame_where_the_pool_has_caught_up() {
+        let Some((device, queue)) = device_or_skip("thumbnail scheduling") else {
+            return;
+        };
+
+        let mut renderer = renderer(&device, &queue);
+        let shared = SharedFrame::new();
+        let request = ThumbRequest {
+            body: NodeId(1),
+            cell: 2,
+            bounds: (glam::Vec3::splat(-10.0), glam::Vec3::splat(10.0)),
+        };
+
+        // A frame carrying uploads leaves it where it is.
+        shared.request_thumbnail(request);
+        publish(&shared, NodeId(1), 3);
+        shared.apply(&mut renderer, &device, &queue);
+        assert!(shared.thumbnail_pending(), "a thumbnail was drawn on a frame carrying uploads");
+
+        // So does a frame that resets the pool, even a quiet one: the slots are
+        // gone until the re-upload lands.
+        shared.request_pool_reset();
+        shared.apply(&mut renderer, &device, &queue);
+        assert!(shared.thumbnail_pending(), "a thumbnail was drawn on the frame of a pool reset");
+
+        // And the next quiet frame takes it, exactly once.
+        shared.apply(&mut renderer, &device, &queue);
+        assert!(!shared.thumbnail_pending(), "the quiet frame did not take the request");
+        shared.apply(&mut renderer, &device, &queue);
+        assert!(!shared.thumbnail_pending(), "a drained request came back");
+    }
+
+    /// A request for a body that left the document on the same frame is
+    /// dropped, exactly as that body's queued uploads are.
+    ///
+    /// **The damage is a BLANKED cell, not a wrong picture**, and the first
+    /// version of this comment named the wrong one. By the time the drain runs
+    /// the forgotten body's slots are already gone from the pool, so
+    /// `render_thumbnail` would draw nothing into the cell -- and the pass
+    /// CLEARS before it draws, so what lands is the placeholder. The cell has
+    /// meanwhile gone back to the application's free list and may already
+    /// belong to another body, so the row that goes blank is that body's, and
+    /// it stays blank until its own geometry next changes.
+    ///
+    /// **The assertion has to see the cell, and the first version of this test
+    /// did not.** It asserted `!shared.thumbnail_pending()` and
+    /// `body_bricks(GONE) == 0`, and both of those hold whether or not the
+    /// guard exists: the mailbox is drained either way and a forgotten body has
+    /// no slots either way. Replacing the `if !forgotten.contains(...)` guard
+    /// in `apply` with `if true` left every test in this file green. So the
+    /// heir's picture is rendered into the cell FIRST and the cell is read back
+    /// and compared byte for byte -- which is also why the fixture asserts that
+    /// its own render put something other than the background there.
+    #[test]
+    fn a_thumbnail_for_a_body_forgotten_on_the_same_frame_is_dropped() {
+        let Some((device, queue)) = device_or_skip("thumbnail forget") else {
+            return;
+        };
+
+        /// The body that is deleted on the same frame its picture was asked for.
+        const GONE: NodeId = NodeId(1);
+        /// The body that inherits its cell.
+        const HEIR: NodeId = NodeId(2);
+        /// The layer they both point at, which is the whole hazard.
+        const SHARED_CELL: u32 = 4;
+        const BOUNDS: (glam::Vec3, glam::Vec3) =
+            (glam::Vec3::new(-10.0, -10.0, -10.0), glam::Vec3::new(10.0, 10.0, 10.0));
+
+        let mut renderer = renderer(&device, &queue);
+        let shared = SharedFrame::new();
+
+        publish(&shared, GONE, 2);
+        shared.publish(HEIR, BrickCoord::new(0, 0, 0), visible_mesh());
+        shared.apply(&mut renderer, &device, &queue);
+
+        // The heir's picture goes in first, so there is a real one to lose.
+        shared.request_thumbnail(ThumbRequest { body: HEIR, cell: SHARED_CELL, bounds: BOUNDS });
+        shared.apply(&mut renderer, &device, &queue);
+        let painted = cell_bytes(&renderer, &device, &queue, SHARED_CELL);
+        let background = brokkr_gpu::background_texel(wgpu::TextureFormat::Rgba8UnormSrgb);
+        assert!(
+            painted.chunks_exact(4).any(|texel| texel != background),
+            "the fixture drew nothing into the cell, so the comparison below would pass for a \
+             cleared cell too"
+        );
+
+        shared.forget_body(GONE);
+        shared.request_thumbnail(ThumbRequest { body: GONE, cell: SHARED_CELL, bounds: BOUNDS });
+        shared.apply(&mut renderer, &device, &queue);
+
+        // Taken from the mailbox either way -- a request nobody drains would
+        // block every later one -- and the body's slots really are gone.
+        assert!(!shared.thumbnail_pending(), "the request for a deleted body was left queued");
+        assert_eq!(renderer.body_bricks(GONE), 0);
+        // ...and the heir's row still has its picture.
+        assert!(
+            cell_bytes(&renderer, &device, &queue, SHARED_CELL) == painted,
+            "the dropped request was drawn anyway: it cleared the cell, so the body that \
+             inherited that layer shows an empty well until its own geometry next changes"
+        );
+    }
+
     /// The hidden set has to arrive at the renderer, and the frame it arrives
     /// on has to be one where the body it names is not drawn.
     ///
@@ -1083,6 +1626,40 @@ mod apply_tests {
         assert!(
             renderer.hidden_bodies().is_empty(),
             "showing a body again never reached the renderer"
+        );
+    }
+
+    /// The opposite-polarity set has to arrive at the renderer too, and for
+    /// the same reason, asserted the same way.
+    ///
+    /// Polarity is a bind-group choice at draw time, so like hiding it moves no
+    /// slot count a test could look at, and like hiding it is delivered through
+    /// `apply`. Every assertion is on the RECEIVER: `opposite_polarity_snapshot`
+    /// would read the sender's own mutex and stay green if the delivering line
+    /// were deleted.
+    #[test]
+    fn the_opposite_polarity_set_reaches_the_renderer_on_the_frame_it_is_published() {
+        let Some((device, queue)) = device_or_skip("shared frame polarity set") else {
+            return;
+        };
+
+        let mut renderer = renderer(&device, &queue);
+        let shared = SharedFrame::new();
+
+        publish(&shared, NodeId(1), 2);
+        publish(&shared, NodeId(2), 2);
+        shared.set_opposite_polarity(&[NodeId(2)]);
+        shared.apply(&mut renderer, &device, &queue);
+
+        assert_eq!(renderer.stats().bricks, 4, "polarity is not a slot count");
+        assert_eq!(renderer.opposite_polarity_bodies(), &[NodeId(2)]);
+
+        // Agreeing again is the empty set, not the absence of a call.
+        shared.set_opposite_polarity(&[]);
+        shared.apply(&mut renderer, &device, &queue);
+        assert!(
+            renderer.opposite_polarity_bodies().is_empty(),
+            "the body agreeing again never reached the renderer"
         );
     }
 }

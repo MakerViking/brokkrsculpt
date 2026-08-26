@@ -20,13 +20,29 @@ use brokkr_core::{
     NARROW_BAND, OUTSIDE, Pattern, PatternKind, Stamp, Volume,
 };
 use brokkr_gpu::{
-    Frustum, NodeId, OverlayBatch, PixelRect, SculptRenderer, SlotKey, THE_ONLY_BODY, Uniforms,
+    Frustum, NodeId, OverlayBatch, PixelRect, SculptRenderer, SlotKey, THE_ONLY_BODY,
+    THUMBNAIL_BACKGROUND, THUMBNAIL_SIZE, Uniforms, background_texel,
 };
 use glam::{IVec3, Vec3};
 
 const WIDTH: u32 = 480;
 const HEIGHT: u32 = 360;
+
+/// The format the picture tests render in.
+///
+/// **The thumbnail tests deliberately do not use it**, and run over
+/// [`THUMBNAIL_FORMATS`] instead. Both GPU harnesses in this workspace pinned
+/// this one format, which is exactly why a hardcoded thumbnail atlas format
+/// would have been green here and fatal in the application: iced picks the
+/// first sRGB format the surface reports, which on Linux/Vulkan is normally
+/// `Bgra8UnormSrgb`, and binding the sculpt pipeline against a mismatched
+/// colour attachment is a validation error that wgpu's default handler turns
+/// into a dead process.
 const TARGET_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8UnormSrgb;
+
+/// The two formats iced realistically hands the renderer.
+const THUMBNAIL_FORMATS: [wgpu::TextureFormat; 2] =
+    [wgpu::TextureFormat::Rgba8UnormSrgb, wgpu::TextureFormat::Bgra8UnormSrgb];
 
 /// The model, in millimetres, matching what the application seeds.
 const MODEL_RADIUS: f32 = 30.0;
@@ -47,6 +63,10 @@ impl Harness {
     /// Returns `None` when the machine has no usable adapter, so the test can
     /// skip instead of failing for a reason that is not about this code.
     fn new() -> Option<Self> {
+        Self::in_format(TARGET_FORMAT)
+    }
+
+    fn in_format(format: wgpu::TextureFormat) -> Option<Self> {
         let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
         let adapter =
             pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default()))
@@ -62,7 +82,7 @@ impl Harness {
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
-            format: TARGET_FORMAT,
+            format,
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
             view_formats: &[],
         });
@@ -159,6 +179,62 @@ impl Harness {
         }
         drop(mapped);
         self.readback.unmap();
+        pixels
+    }
+
+    /// One cell of the thumbnail atlas, tightly packed, in the texture's own
+    /// channel order.
+    ///
+    /// There is no other way to see a thumbnail from a test, and "the picture
+    /// is there" is the whole claim the feature makes.
+    fn cell(&self, renderer: &SculptRenderer, cell: u32) -> Vec<u8> {
+        let align = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
+        let padded = (THUMBNAIL_SIZE * 4).div_ceil(align) * align;
+        let readback = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("thumbnail readback"),
+            size: u64::from(padded * THUMBNAIL_SIZE),
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("thumbnail") });
+        encoder.copy_texture_to_buffer(
+            wgpu::TexelCopyTextureInfo {
+                texture: renderer.thumbnails().texture(),
+                mip_level: 0,
+                origin: wgpu::Origin3d { x: 0, y: 0, z: cell },
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyBufferInfo {
+                buffer: &readback,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(padded),
+                    rows_per_image: Some(THUMBNAIL_SIZE),
+                },
+            },
+            wgpu::Extent3d {
+                width: THUMBNAIL_SIZE,
+                height: THUMBNAIL_SIZE,
+                depth_or_array_layers: 1,
+            },
+        );
+        self.queue.submit([encoder.finish()]);
+
+        let slice = readback.slice(..);
+        slice.map_async(wgpu::MapMode::Read, |result| result.expect("readback map failed"));
+        self.device.poll(wgpu::PollType::wait_indefinitely()).expect("device poll failed");
+
+        let mapped = slice.get_mapped_range();
+        let mut pixels = Vec::with_capacity((THUMBNAIL_SIZE * THUMBNAIL_SIZE * 4) as usize);
+        for row in 0..THUMBNAIL_SIZE {
+            let start = (row * padded) as usize;
+            pixels.extend_from_slice(&mapped[start..start + (THUMBNAIL_SIZE * 4) as usize]);
+        }
+        drop(mapped);
+        readback.unmap();
         pixels
     }
 }
@@ -313,6 +389,9 @@ fn view_projection(distance: f32) -> glam::Mat4 {
     projection * view_matrix(distance)
 }
 
+/// The camera, and the mask drawn the way the application ships it: tint on,
+/// polarity normal. Tests that are about the tint override with
+/// `Uniforms { mask_tint: .., ..uniforms(distance) }`.
 fn uniforms(distance: f32) -> Uniforms {
     let view = view_matrix(distance);
     Uniforms {
@@ -321,7 +400,9 @@ fn uniforms(distance: f32) -> Uniforms {
         // The offscreen target is an sRGB format, so the shader must not encode
         // a second time.
         srgb_target: 1,
-        padding: [0; 3],
+        mask_inverted: 0,
+        mask_tint: 1.0,
+        padding: [0; 1],
     }
 }
 
@@ -1087,4 +1168,785 @@ fn hiding_a_body_removes_exactly_that_body_from_the_picture() {
     let shown = mask(&harness.frame(&renderer));
     let wrong = shown.iter().zip(&both).filter(|(one, other)| one != other).count();
     assert_eq!(wrong, 0, "{wrong} pixels did not come back when the body was shown again");
+}
+
+/// How cool a pixel is: blue minus red, in sRGB levels.
+///
+/// The one number the mask's tint moves and the matcap barely does. Its whole
+/// gamut on the clay runs from a rim at -28 to a fill-lit cavity at +17, which
+/// is why the tint was designed to leave that range rather than to be a shade
+/// of it -- and why this, rather than luminance, is what these tests measure.
+fn chroma(pixels: &[u8]) -> Vec<i32> {
+    pixels.chunks_exact(4).map(|pixel| i32::from(pixel[2]) - i32::from(pixel[0])).collect()
+}
+
+/// Fully protect every voxel of the model, or the half of it at x below zero.
+fn protect(volume: &mut Volume, half: bool) {
+    let reach = (MODEL_RADIUS / VOXEL_SIZE) as i32 + 4;
+    let high = IVec3::new(if half { 0 } else { reach }, reach, reach);
+    volume.edit_mask(IVec3::splat(-reach), high, |_, _, _| brokkr_core::PROTECTED);
+}
+
+/// A masked body is tinted where it is masked, and is the same SHAPE either
+/// way.
+///
+/// Three claims. The second is the one that makes the first safe to make: the
+/// mask must never move a vertex. It is a read-only multiplier on what a brush
+/// may do, so a silhouette that changed would mean the attribute had reached
+/// the geometry. The third is that the tint STOPS at the mask, bounded above
+/// and below over the body's own pixels -- see the comment on it for why a
+/// one-sided count taken over the whole frame proves nothing at all.
+///
+/// **The tint is measured against the DISTRIBUTION of the unmasked pixels of
+/// the same body**, not against one of them. The matcap's own luminance swing
+/// is 102 levels, so a tint compared with a single reference pixel proves
+/// nothing about whether a human can separate it from form; compared with the
+/// whole spread of what the clay can be, "outside that range" is exactly the
+/// claim the hue was chosen to make.
+#[test]
+fn a_masked_body_is_tinted_beyond_anything_the_unmasked_one_can_be() {
+    let Some(harness) = Harness::new() else {
+        eprintln!("no usable wgpu adapter, skipping the mask tint render test");
+        return;
+    };
+
+    let distance = MODEL_RADIUS * 3.0;
+    let mut renderer = SculptRenderer::new(&harness.device, &harness.queue, TARGET_FORMAT);
+    renderer.resize(&harness.device, WIDTH, HEIGHT);
+    renderer.write_uniforms(&harness.queue, &uniforms(distance));
+
+    let mut volume = Volume::new(VOXEL_SIZE);
+    volume.seed_sphere(Vec3::ZERO, MODEL_RADIUS);
+    upload_all(&mut renderer, &harness.device, &harness.queue, &mut volume);
+    let bare = harness.frame(&renderer);
+    dump("mask-none", &bare);
+
+    // Half of it, so one frame carries both answers and the boundary between
+    // them is on screen.
+    protect(&mut volume, true);
+    let remeshed = upload_dirty(&mut renderer, &harness.device, &harness.queue, &mut volume);
+    assert!(remeshed > 0, "painting the mask marked no brick for remesh");
+    let masked = harness.frame(&renderer);
+    dump("mask-half", &masked);
+
+    let before = mask(&bare);
+    let after = mask(&masked);
+    let moved = before.iter().zip(&after).filter(|(one, other)| one != other).count();
+    assert_eq!(moved, 0, "{moved} pixels changed shape, so the mask reached the geometry");
+
+    // What the clay itself can be, over the drawn pixels of this very body.
+    let bare_chroma = chroma(&bare);
+    let masked_chroma = chroma(&masked);
+    let clay_coolest = bare_chroma
+        .iter()
+        .zip(&before)
+        .filter_map(|(value, drawn)| drawn.then_some(*value))
+        .max()
+        .expect("the fixture drew nothing");
+
+    let outside_the_gamut = masked_chroma
+        .iter()
+        .zip(&after)
+        .filter(|(value, drawn)| **drawn && **value > clay_coolest)
+        .count();
+    let drawn = after.iter().filter(|drawn| **drawn).count();
+    assert!(
+        outside_the_gamut * 5 > drawn,
+        "only {outside_the_gamut} of {drawn} drawn pixels are cooler than the coolest the \
+         unmasked body reaches ({clay_coolest}), so the tint is not separable from the form"
+    );
+
+    // And the tint stops where the mask does: the masked part of the body
+    // changed, the rest of it did not change by one byte.
+    //
+    // **Counted over the DRAWN pixels only, and bounded on BOTH sides.** Over
+    // the whole frame neither bound would mean anything: the background is
+    // 98,659 of this 172,800-pixel frame and the body shader never writes it,
+    // so an "unchanged" count taken over the frame is dominated by pixels
+    // neither picture ever drew, and a tint that washed the entire body would
+    // still leave it far above any share of the drawn pixels. That is the
+    // shape of a GPU-side leak -- a wrong `@location`, a stride slip, a floor
+    // ORed in -- and it is invisible to the core tests, which is exactly why
+    // it has to be caught here.
+    //
+    // The band is a real geometric quantity, not a formality. The fixture
+    // protects the half of the ball at x below zero, but the camera sits at
+    // +x, so the masked half is the one turned AWAY: with the view direction's
+    // x component at 0.391, an orthographic camera would put 30.5% of the
+    // silhouette under the mask ((1 - 0.391) / 2, integrating the visible cap
+    // against the plane x = 0), and this perspective camera at three radii
+    // measures 23.6%. Anything below 15% means the tint is failing to reach
+    // most of the mask; anything above 35% means it is bleeding off it.
+    let unchanged = bare
+        .chunks_exact(4)
+        .zip(masked.chunks_exact(4))
+        .zip(&before)
+        .filter(|((one, other), drawn)| **drawn && one == other)
+        .count();
+    let changed = drawn - unchanged;
+    assert!(
+        changed * 100 > drawn * 15,
+        "only {changed} of {drawn} drawn pixels changed when half the body was masked, so the \
+         tint is not following the attribute onto the masked half"
+    );
+    assert!(
+        changed * 100 < drawn * 35,
+        "{changed} of {drawn} drawn pixels changed, far past the third of the silhouette the \
+         mask is on, so the tint spread past the mask and washed the body it is on"
+    );
+}
+
+/// **Switching the tint off draws a masked body exactly as an unmasked one**,
+/// byte for byte, with no remesh and no upload.
+///
+/// This is the whole of what makes a `show mask` toggle safe to ship: it is a
+/// uniform and reaches nothing else. The comparison is against the frame the
+/// body drew BEFORE it was ever masked, which is a stronger claim than "it
+/// changed back" -- a tint that had leaked into the mesh would come back as a
+/// difference here and nowhere else.
+///
+/// What is NOT asserted here, because it cannot be seen from this crate: that
+/// the standing mask card stays up with its percentage unchanged. That half
+/// lives beside the card, in `brokkr-app`.
+#[test]
+fn switching_the_tint_off_draws_a_masked_body_exactly_as_an_unmasked_one() {
+    let Some(harness) = Harness::new() else {
+        eprintln!("no usable wgpu adapter, skipping the mask tint toggle test");
+        return;
+    };
+
+    let distance = MODEL_RADIUS * 3.0;
+    let mut renderer = SculptRenderer::new(&harness.device, &harness.queue, TARGET_FORMAT);
+    renderer.resize(&harness.device, WIDTH, HEIGHT);
+    renderer.write_uniforms(&harness.queue, &uniforms(distance));
+
+    let mut volume = Volume::new(VOXEL_SIZE);
+    volume.seed_sphere(Vec3::ZERO, MODEL_RADIUS);
+    upload_all(&mut renderer, &harness.device, &harness.queue, &mut volume);
+    let bare = harness.frame(&renderer);
+
+    protect(&mut volume, false);
+    upload_dirty(&mut renderer, &harness.device, &harness.queue, &mut volume);
+    let tinted = harness.frame(&renderer);
+    assert_ne!(tinted, bare, "the fixture masked nothing");
+    let slots = renderer.stats();
+
+    // The toggle, and nothing but the toggle: one uniform write, no upload.
+    renderer.write_uniforms(&harness.queue, &Uniforms { mask_tint: 0.0, ..uniforms(distance) });
+    let untinted = harness.frame(&renderer);
+    dump("mask-tint-off", &untinted);
+    assert_eq!(
+        untinted, bare,
+        "a body with the tint switched off must be pixel-identical to an unmasked one"
+    );
+    assert_eq!(renderer.stats().bricks, slots.bricks, "the toggle moved pool slots");
+    assert_eq!(renderer.stats().vertices_watermark, slots.vertices_watermark);
+}
+
+/// **The tint is continuous across a brick seam.**
+///
+/// The attribute is sampled by the vertex's lattice CELL, which two bricks
+/// either side of a seam derive from the same world coordinate, so both look
+/// the same voxel up and get the same byte. Sampling by position instead --
+/// the obvious alternative -- splits that pair in the last bits, and what the
+/// user would see is a hard line of mismatched tint every 32 voxels.
+///
+/// A previous revision of the plan said no numeric test could see this. It can:
+/// mask the body UNIFORMLY, so the tint owes the same amount everywhere, and
+/// walk a row of pixels across several brick boundaries taking the difference
+/// between the tinted frame and the untinted one. A seam that dropped to the
+/// unmasked byte is a step of tens of levels in a signal that otherwise moves
+/// by ones.
+#[test]
+fn the_tint_is_continuous_across_a_brick_seam() {
+    let Some(harness) = Harness::new() else {
+        eprintln!("no usable wgpu adapter, skipping the mask seam render test");
+        return;
+    };
+
+    let distance = MODEL_RADIUS * 3.0;
+    let mut renderer = SculptRenderer::new(&harness.device, &harness.queue, TARGET_FORMAT);
+    renderer.resize(&harness.device, WIDTH, HEIGHT);
+    renderer.write_uniforms(&harness.queue, &uniforms(distance));
+
+    let mut volume = Volume::new(VOXEL_SIZE);
+    volume.seed_sphere(Vec3::ZERO, MODEL_RADIUS);
+    upload_all(&mut renderer, &harness.device, &harness.queue, &mut volume);
+    let bare = harness.frame(&renderer);
+
+    // The whole body, so any variation left in the difference below belongs to
+    // the mesher and not to the mask.
+    protect(&mut volume, false);
+    upload_dirty(&mut renderer, &harness.device, &harness.queue, &mut volume);
+    let tinted = harness.frame(&renderer);
+    dump("mask-uniform", &tinted);
+
+    // A 60 mm ball at 0.5 mm voxels is 120 voxels across, so a row through its
+    // middle crosses three brick boundaries at least.
+    let drawn = mask(&bare);
+    let bare_chroma = chroma(&bare);
+    let tinted_chroma = chroma(&tinted);
+    let row = (HEIGHT / 2) as usize;
+
+    let mut samples = 0;
+    let mut worst = 0;
+    let mut previous: Option<i32> = None;
+    for x in 0..WIDTH as usize {
+        let index = row * WIDTH as usize + x;
+        if !drawn[index] {
+            previous = None;
+            continue;
+        }
+        let lift = tinted_chroma[index] - bare_chroma[index];
+        if let Some(last) = previous {
+            worst = worst.max((lift - last).abs());
+            samples += 1;
+        }
+        previous = Some(lift);
+    }
+
+    assert!(samples > 100, "the row crossed only {samples} pixels of the model");
+    // Chosen against what a broken seam would produce, not against the noise:
+    // a vertex that fell back to the unmasked byte moves this by tens, because
+    // the tint's own lift on lit clay is around 70 levels.
+    assert!(
+        worst < 20,
+        "the tint jumps by {worst} levels between two neighbouring pixels of a uniformly \
+         masked body, which is a brick seam showing through"
+    );
+}
+
+/// Flipping the polarity changes the picture and marks NOTHING dirty.
+///
+/// The payoff of resolving the polarity in the shader rather than baking it
+/// into the attribute: Invert and Mask All are one word, where baking makes
+/// them a remesh of the whole body -- 71 ms on the dragon and roughly 475 ms at
+/// the brick count the pool is sized for.
+#[test]
+fn flipping_the_polarity_changes_the_picture_and_dirties_no_brick() {
+    let Some(harness) = Harness::new() else {
+        eprintln!("no usable wgpu adapter, skipping the mask polarity render test");
+        return;
+    };
+
+    let distance = MODEL_RADIUS * 3.0;
+    let mut renderer = SculptRenderer::new(&harness.device, &harness.queue, TARGET_FORMAT);
+    renderer.resize(&harness.device, WIDTH, HEIGHT);
+    renderer.write_uniforms(&harness.queue, &uniforms(distance));
+
+    let mut volume = Volume::new(VOXEL_SIZE);
+    volume.seed_sphere(Vec3::ZERO, MODEL_RADIUS);
+    protect(&mut volume, true);
+    upload_all(&mut renderer, &harness.device, &harness.queue, &mut volume);
+    let normal = harness.frame(&renderer);
+    let before = renderer.stats();
+
+    // The engine's half of the flip...
+    volume.mask_mut().set_inverted(true);
+    let mut dirty: Vec<BrickCoord> = Vec::new();
+    volume.take_dirty(&mut dirty);
+    assert!(dirty.is_empty(), "{} bricks were marked for remesh by a bool", dirty.len());
+
+    // ...and the viewport's, which is one word.
+    renderer.write_uniforms(&harness.queue, &Uniforms { mask_inverted: 1, ..uniforms(distance) });
+    let flipped = harness.frame(&renderer);
+    dump("mask-inverted", &flipped);
+    assert_ne!(flipped, normal, "the polarity did not reach the shader");
+    assert_eq!(renderer.stats().bricks, before.bricks, "a flip moved pool slots");
+
+    // The halves swapped rather than the whole body changing: what was masked
+    // is now free and what was free is now masked.
+    let drawn = mask(&normal);
+    let normal_chroma = chroma(&normal);
+    let flipped_chroma = chroma(&flipped);
+    let cooler = normal_chroma
+        .iter()
+        .zip(&flipped_chroma)
+        .zip(&drawn)
+        .filter(|((one, other), drawn)| **drawn && other > one)
+        .count();
+    let warmer = normal_chroma
+        .iter()
+        .zip(&flipped_chroma)
+        .zip(&drawn)
+        .filter(|((one, other), drawn)| **drawn && other < one)
+        .count();
+    assert!(
+        cooler > 100 && warmer > 100,
+        "inverting tinted {cooler} pixels and untinted {warmer}, so it was not an inversion"
+    );
+}
+
+/// **Two bodies that disagree about polarity are each drawn with their own.**
+///
+/// Increment 24's review finding, in the only place a pixel exists. The mask is
+/// per BODY and `Uniforms::mask_inverted` is one word for the whole draw, so
+/// when the application published only the ACTIVE body's, every other body was
+/// drawn through it. The harmless direction of that is an unmasked body coming
+/// out fully tinted; the direction that matters is the other one -- a body under
+/// Mask All, whose stored bytes are all zero, drawn as free. A fully protected
+/// body with no tint on it is the failure the whole masking design is arranged
+/// around.
+///
+/// The fixture isolates the bind-group choice and nothing else: BOTH masks are
+/// empty, so both bodies' vertex attributes are zero and the two meshes are
+/// identical in everything the shader reads. The only difference between the
+/// frames is which uniform buffer each bucket is bound against.
+///
+/// The last frame is the control. Without it, "the unmasked body was not
+/// tinted" would also pass if the tint had simply stopped working, so the same
+/// document is drawn once more with an EMPTY opposite set -- the old behaviour
+/// -- and the unmasked body has to come out tinted there.
+#[test]
+fn two_bodies_that_disagree_about_polarity_are_each_drawn_with_their_own() {
+    let Some(harness) = Harness::new() else {
+        eprintln!("no usable wgpu adapter, skipping the split polarity render test");
+        return;
+    };
+
+    const BODY_A: NodeId = NodeId(1);
+    const BODY_B: NodeId = NodeId(2);
+    // Small enough and close enough in that both land well inside a frustum
+    // built for one model of `MODEL_RADIUS`, and far enough apart that no pixel
+    // belongs to both.
+    const RADIUS: f32 = 11.0;
+    const OFFSET: f32 = 18.0;
+
+    let distance = MODEL_RADIUS * 3.0;
+    let mut left = Volume::new(VOXEL_SIZE);
+    left.seed_sphere(Vec3::new(-OFFSET, 0.0, 0.0), RADIUS);
+    let mut right = Volume::new(VOXEL_SIZE);
+    right.seed_sphere(Vec3::new(OFFSET, 0.0, 0.0), RADIUS);
+
+    // Which pixels are whose, from each body drawn on its own.
+    let where_it_is = |volume: &mut Volume, body: NodeId| {
+        let mut alone = SculptRenderer::new(&harness.device, &harness.queue, TARGET_FORMAT);
+        alone.resize(&harness.device, WIDTH, HEIGHT);
+        alone.write_uniforms(&harness.queue, &uniforms(distance));
+        upload_body(&mut alone, &harness.device, &harness.queue, volume, body);
+        mask(&harness.frame(&alone))
+    };
+    let is_a = where_it_is(&mut left, BODY_A);
+    let is_b = where_it_is(&mut right, BODY_B);
+    let a_pixels = is_a.iter().filter(|drawn| **drawn).count();
+    let b_pixels = is_b.iter().filter(|drawn| **drawn).count();
+    assert!(a_pixels > 500 && b_pixels > 500, "the fixture drew {a_pixels} and {b_pixels} pixels");
+    assert_eq!(
+        is_a.iter().zip(&is_b).filter(|(one, other)| **one && **other).count(),
+        0,
+        "the two bodies overlap on screen, so no pixel can be attributed to either"
+    );
+
+    let mut renderer = SculptRenderer::new(&harness.device, &harness.queue, TARGET_FORMAT);
+    renderer.resize(&harness.device, WIDTH, HEIGHT);
+    renderer.write_uniforms(&harness.queue, &uniforms(distance));
+    upload_body(&mut renderer, &harness.device, &harness.queue, &mut left, BODY_A);
+    upload_body(&mut renderer, &harness.device, &harness.queue, &mut right, BODY_B);
+    let agreed = harness.frame(&renderer);
+
+    // Mask all on body A: an empty map read inverted. Nothing is remeshed and
+    // nothing is re-uploaded, which is the point of resolving polarity at read.
+    left.mask_mut().set_inverted(true);
+    let mut dirty: Vec<BrickCoord> = Vec::new();
+    left.take_dirty(&mut dirty);
+    assert!(dirty.is_empty(), "{} bricks were marked for remesh by a bool", dirty.len());
+
+    renderer.write_uniforms(&harness.queue, &Uniforms { mask_inverted: 1, ..uniforms(distance) });
+    renderer.set_opposite_polarity(&[BODY_B]);
+    assert_eq!(renderer.opposite_polarity_bodies(), &[BODY_B], "the set did not reach the pool");
+    let split = harness.frame(&renderer);
+    dump("polarity-split", &split);
+
+    let agreed_chroma = chroma(&agreed);
+    let split_chroma = chroma(&split);
+    let average_lift = |drawn: &[bool], after: &[i32]| {
+        let total: i32 = drawn
+            .iter()
+            .zip(agreed_chroma.iter().zip(after))
+            .filter(|(drawn, _)| **drawn)
+            .map(|(_, (before, after))| after - before)
+            .sum();
+        total / drawn.iter().filter(|drawn| **drawn).count().max(1) as i32
+    };
+
+    // The masked body is tinted. The threshold is against what a broken tint
+    // would produce and not against the noise: the tint's lift on lit clay is
+    // around 70 levels, where the matcap's whole chroma gamut is 45.
+    let lifted = average_lift(&is_a, &split_chroma);
+    assert!(lifted > 30, "the fully masked body lifted by only {lifted}");
+
+    // ...and the unmasked one is untouched, pixel for pixel. This is the
+    // assertion the finding is about.
+    let changed = is_b
+        .iter()
+        .enumerate()
+        .filter(|(index, drawn)| {
+            let texel = index * 4..index * 4 + 3;
+            **drawn && agreed[texel.clone()] != split[texel]
+        })
+        .count();
+    assert_eq!(
+        changed, 0,
+        "{changed} pixels of the UNMASKED body changed when the other body was masked, so it was \
+         drawn through the active body's polarity"
+    );
+
+    // The control: the same document with an empty opposite set is the old
+    // behaviour, and there the unmasked body IS tinted.
+    renderer.set_opposite_polarity(&[]);
+    let one_word = harness.frame(&renderer);
+    let lift = average_lift(&is_b, &chroma(&one_word));
+    assert!(
+        lift > 30,
+        "the control did not reproduce the defect: the unmasked body lifted by {lift} with one \
+         polarity for the whole draw, so this test would pass with a dead tint"
+    );
+}
+
+/// The thumbnail atlas, end to end: a real body drawn into a real cell, read
+/// back, and looked at.
+///
+/// **Run over both formats iced realistically picks, and that is the whole
+/// point of the parameter.** The sculpt pipeline is built against the target
+/// format it was handed, and binding it in a pass whose colour attachment has a
+/// different format is an `IncompatibleColorAttachment` validation error at
+/// `set_pipeline` -- which, under wgpu's default uncaptured-error handler,
+/// kills the process. A hardcoded atlas format would therefore have passed
+/// every test in this file, which pins `Rgba8UnormSrgb`, and killed the
+/// application on the common Linux/Vulkan configuration 200 ms after the first
+/// stroke.
+///
+/// Four claims, and each one fails differently:
+///
+///  * a rendered cell holds a PICTURE -- more than one colour. A blank cell is
+///    what a wrong camera, a wrong matrix buffer or a body with no slots all
+///    look like, and it is indistinguishable from "not rendered yet";
+///  * that picture is not just the background with the sphere missing, so the
+///    lit fraction is bounded from both sides;
+///  * rendering another cell leaves this one BYTE IDENTICAL. The atlas is one
+///    texture and a layer index off by anything at all would show here;
+///  * a cell nothing has drawn into is exactly the placeholder colour, in the
+///    texture's own channel order. That is what makes the free placeholder
+///    free, and getting the swizzle wrong makes every unrendered cell blue on
+///    exactly the configuration iced picks.
+#[test]
+fn a_body_renders_into_its_own_cell_and_leaves_the_others_alone() {
+    /// The cell the body is drawn into, and a second one to prove the first is
+    /// not simply "wherever the atlas happens to write".
+    const DRAWN: u32 = 3;
+    const OTHER: u32 = 5;
+    /// A cell nothing ever touches.
+    const UNTOUCHED: u32 = 0;
+    const BODY: NodeId = NodeId(1);
+    const SECOND: NodeId = NodeId(2);
+
+    for format in THUMBNAIL_FORMATS {
+        let Some(harness) = Harness::in_format(format) else {
+            eprintln!("no usable wgpu adapter, skipping the thumbnail render test");
+            return;
+        };
+
+        let mut renderer = SculptRenderer::new(&harness.device, &harness.queue, format);
+        let mut sphere = Volume::new(VOXEL_SIZE);
+        sphere.seed_sphere(Vec3::ZERO, MODEL_RADIUS);
+        let bounds = sphere.world_bounds().expect("a seeded sphere has bricks");
+        upload_body(&mut renderer, &harness.device, &harness.queue, &mut sphere, BODY);
+
+        let background = background_texel(format);
+        let placeholder = harness.cell(&renderer, UNTOUCHED);
+        for (index, texel) in placeholder.chunks_exact(4).enumerate() {
+            assert_eq!(
+                texel, background,
+                "{format:?}: texel {index} of an unrendered cell is {texel:?}, not the \
+                 placeholder colour {background:?}"
+            );
+        }
+
+        renderer.render_thumbnail(&harness.device, &harness.queue, DRAWN, BODY, bounds);
+        let drawn = harness.cell(&renderer, DRAWN);
+
+        let lit = drawn.chunks_exact(4).filter(|texel| texel[..3] != background[..3]).count();
+        let total = (THUMBNAIL_SIZE * THUMBNAIL_SIZE) as usize;
+        assert!(
+            lit > total / 8,
+            "{format:?}: only {lit} of {total} texels differ from the background, so the body \
+             barely reached its cell"
+        );
+        assert!(
+            lit < total * 9 / 10,
+            "{format:?}: {lit} of {total} texels are lit, so the body fills the cell rather than \
+             sitting in it -- the framing is too close"
+        );
+
+        // A picture, not a flat fill: the matcap has to be shading it.
+        let shades: std::collections::HashSet<[u8; 3]> = drawn
+            .chunks_exact(4)
+            .map(|texel| [texel[0], texel[1], texel[2]])
+            .filter(|texel| texel[..] != background[..3])
+            .collect();
+        assert!(
+            shades.len() > 8,
+            "{format:?}: the cell holds {} distinct colours, so it is a silhouette rather than a \
+             rendered body",
+            shades.len()
+        );
+
+        // Every other cell is untouched, including one that has never been
+        // written and one that is about to be.
+        let before_other = harness.cell(&renderer, OTHER);
+        assert_eq!(
+            harness.cell(&renderer, UNTOUCHED),
+            placeholder,
+            "{format:?}: drawing cell {DRAWN} changed cell {UNTOUCHED}"
+        );
+
+        let mut cube = Volume::new(VOXEL_SIZE);
+        seed_cube(&mut cube, MODEL_RADIUS * 0.5);
+        let cube_bounds = cube.world_bounds().expect("a seeded cube has bricks");
+        upload_body(&mut renderer, &harness.device, &harness.queue, &mut cube, SECOND);
+        renderer.render_thumbnail(&harness.device, &harness.queue, OTHER, SECOND, cube_bounds);
+
+        assert_eq!(
+            harness.cell(&renderer, DRAWN),
+            drawn,
+            "{format:?}: rendering cell {OTHER} changed cell {DRAWN}"
+        );
+        assert_ne!(
+            harness.cell(&renderer, OTHER),
+            before_other,
+            "{format:?}: rendering into cell {OTHER} left it as it was"
+        );
+    }
+}
+
+/// A request naming a body the pool has never heard of leaves a correctly
+/// cleared cell rather than the last body drawn there, and a cell past the end
+/// of the atlas does nothing at all.
+///
+/// Both are states the application can genuinely reach for a frame: the cell
+/// bookkeeping and the pool's contents are separate pieces of state, and a
+/// delete that lands between the request and the drain is exactly the gap.
+#[test]
+fn a_request_for_a_body_the_pool_does_not_hold_clears_the_cell_rather_than_keeping_the_last_one() {
+    const CELL: u32 = 7;
+    const REAL: NodeId = NodeId(1);
+    const GHOST: NodeId = NodeId(99);
+
+    let Some(harness) = Harness::new() else {
+        eprintln!("no usable wgpu adapter, skipping the thumbnail clearing test");
+        return;
+    };
+
+    let mut renderer = SculptRenderer::new(&harness.device, &harness.queue, TARGET_FORMAT);
+    let mut sphere = Volume::new(VOXEL_SIZE);
+    sphere.seed_sphere(Vec3::ZERO, MODEL_RADIUS);
+    let bounds = sphere.world_bounds().expect("a seeded sphere has bricks");
+    upload_body(&mut renderer, &harness.device, &harness.queue, &mut sphere, REAL);
+
+    renderer.render_thumbnail(&harness.device, &harness.queue, CELL, REAL, bounds);
+    let background = background_texel(TARGET_FORMAT);
+    let with_body = harness.cell(&renderer, CELL);
+    assert!(
+        with_body.chunks_exact(4).any(|texel| texel[..3] != background[..3]),
+        "the fixture drew nothing, so this test proves nothing"
+    );
+
+    renderer.render_thumbnail(&harness.device, &harness.queue, CELL, GHOST, bounds);
+    let after = harness.cell(&renderer, CELL);
+    for (index, texel) in after.chunks_exact(4).enumerate() {
+        assert_eq!(
+            texel, background,
+            "texel {index} still holds the previous body: the pass loaded instead of clearing, \
+             so a deleted body's picture would stay in a cell that now belongs to another one"
+        );
+    }
+
+    // Past the end of the atlas: no panic, no submission, nothing changed.
+    let far = harness.cell(&renderer, 1);
+    renderer.render_thumbnail(&harness.device, &harness.queue, u32::MAX, REAL, bounds);
+    assert_eq!(harness.cell(&renderer, 1), far, "an out of range cell wrote somewhere else");
+}
+
+/// The atlas is exactly as big as a document may be, and no bigger.
+///
+/// Two constants in two crates, and a mismatch is either a body with no picture
+/// or 1.72 MiB of VRAM nothing can ever address.
+#[test]
+fn the_atlas_has_one_cell_per_body_a_document_is_allowed() {
+    let Some(harness) = Harness::new() else {
+        eprintln!("no usable wgpu adapter, skipping the atlas size test");
+        return;
+    };
+    let renderer = SculptRenderer::new(&harness.device, &harness.queue, TARGET_FORMAT);
+    assert_eq!(renderer.thumbnails().cells(), brokkr_core::MAX_BODIES as u32);
+    // And the placeholder constant is opaque, or every cell the model does not
+    // cover blends against whatever the panel left there -- while an RGB dump
+    // of the texture looks perfect.
+    assert_eq!(THUMBNAIL_BACKGROUND[3], 0xff);
+}
+
+/// **The blit, which is the only part of a thumbnail the user actually looks
+/// at, and the only part no other test touches.**
+///
+/// `render_thumbnail` puts pixels in the atlas; everything between there and
+/// the panel is the twenty-five lines of `blit.wgsl` and one pipeline built
+/// with `depth_stencil: None`. A flipped `uv`, a triangle that misses a corner,
+/// a bind group naming the wrong layer or an sRGB round trip that encodes twice
+/// all leave every other assertion in this file green and the running
+/// application visibly wrong -- and the running application is the one thing a
+/// test cannot open.
+///
+/// Blitted at 1:1, so the linear sampler lands on texel centres and the answer
+/// is the atlas cell itself. That makes the assertion an equality rather than a
+/// resemblance, and it is what pins the sRGB round trip: the atlas decodes on
+/// sample and the target encodes on write, so the two have to cancel exactly.
+/// Run over both formats, because that cancellation is a property of the
+/// format and not of the shader.
+#[test]
+fn a_cell_blits_into_a_row_unflipped_and_with_the_srgb_round_trip_cancelling() {
+    const CELL: u32 = 6;
+    const BODY: NodeId = NodeId(1);
+
+    for format in THUMBNAIL_FORMATS {
+        let Some(harness) = Harness::in_format(format) else {
+            eprintln!("no usable wgpu adapter, skipping the thumbnail blit test");
+            return;
+        };
+
+        let mut renderer = SculptRenderer::new(&harness.device, &harness.queue, format);
+        // A cube rather than a sphere: a sphere is symmetric about the
+        // horizontal axis from this camera, so a vertical flip would be
+        // invisible. A cube seen from above one corner is not.
+        let mut cube = Volume::new(VOXEL_SIZE);
+        seed_cube(&mut cube, MODEL_RADIUS * 0.6);
+        let bounds = cube.world_bounds().expect("a seeded cube has bricks");
+        upload_body(&mut renderer, &harness.device, &harness.queue, &mut cube, BODY);
+        renderer.render_thumbnail(&harness.device, &harness.queue, CELL, BODY, bounds);
+        let cell = harness.cell(&renderer, CELL);
+        // The control, without which a comparison of two flat fills would pass
+        // over a blit that drew nothing at all.
+        let background = background_texel(format);
+        let lit = cell.chunks_exact(4).filter(|texel| texel[..3] != background[..3]).count();
+        assert!(lit > 400, "{format:?}: the fixture cell holds only {lit} lit texels");
+
+        // A row, one to one with the cell, drawn the way iced draws one: an
+        // already-open pass with NO depth attachment, viewport and scissor
+        // already set to the row's bounds.
+        let row = harness.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("thumbnail row"),
+            size: wgpu::Extent3d {
+                width: THUMBNAIL_SIZE,
+                height: THUMBNAIL_SIZE,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let row_view = row.create_view(&wgpu::TextureViewDescriptor::default());
+
+        let mut encoder = harness
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("row") });
+        let mut drawn = false;
+        {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("row pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &row_view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        // Magenta: nothing the blit can produce, so an
+                        // untouched pixel is unmistakable.
+                        load: wgpu::LoadOp::Clear(wgpu::Color { r: 1.0, g: 0.0, b: 1.0, a: 1.0 }),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+            pass.set_viewport(0.0, 0.0, THUMBNAIL_SIZE as f32, THUMBNAIL_SIZE as f32, 0.0, 1.0);
+            pass.set_scissor_rect(0, 0, THUMBNAIL_SIZE, THUMBNAIL_SIZE);
+            drawn = renderer.blit_thumbnail(&mut pass, CELL) || drawn;
+        }
+        harness.queue.submit([encoder.finish()]);
+        assert!(drawn, "{format:?}: the blit returned false, so iced would open a second pass");
+
+        let blitted = read_back(&harness, &row);
+        let close = blitted
+            .chunks_exact(4)
+            .zip(cell.chunks_exact(4))
+            .filter(|(a, b)| a[..3].iter().zip(&b[..3]).all(|(x, y)| x.abs_diff(*y) <= 1))
+            .count();
+        let total = (THUMBNAIL_SIZE * THUMBNAIL_SIZE) as usize;
+        assert!(
+            close * 100 >= total * 99,
+            "{format:?}: only {close} of {total} row pixels match the cell they came from. A \
+             flipped uv, a triangle that misses the corners, or an sRGB round trip that encodes \
+             twice all land here."
+        );
+
+        // And the corners specifically, because a triangle one unit too small
+        // fails only there and would still pass a 99% match.
+        let last = THUMBNAIL_SIZE - 1;
+        for (x, y) in [(0, 0), (last, 0), (0, last), (last, last)] {
+            let at = ((y * THUMBNAIL_SIZE + x) * 4) as usize;
+            assert_eq!(
+                blitted[at..at + 3],
+                cell[at..at + 3],
+                "{format:?}: corner ({x}, {y}) of the row is not the corner of the cell"
+            );
+        }
+    }
+}
+
+/// One texture read back tightly packed, for the blit test's row target.
+fn read_back(harness: &Harness, texture: &wgpu::Texture) -> Vec<u8> {
+    let align = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
+    let padded = (THUMBNAIL_SIZE * 4).div_ceil(align) * align;
+    let buffer = harness.device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("row readback"),
+        size: u64::from(padded * THUMBNAIL_SIZE),
+        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+        mapped_at_creation: false,
+    });
+    let mut encoder = harness
+        .device
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("row readback") });
+    encoder.copy_texture_to_buffer(
+        wgpu::TexelCopyTextureInfo {
+            texture,
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
+        wgpu::TexelCopyBufferInfo {
+            buffer: &buffer,
+            layout: wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(padded),
+                rows_per_image: Some(THUMBNAIL_SIZE),
+            },
+        },
+        wgpu::Extent3d { width: THUMBNAIL_SIZE, height: THUMBNAIL_SIZE, depth_or_array_layers: 1 },
+    );
+    harness.queue.submit([encoder.finish()]);
+
+    let slice = buffer.slice(..);
+    slice.map_async(wgpu::MapMode::Read, |result| result.expect("readback map failed"));
+    harness.device.poll(wgpu::PollType::wait_indefinitely()).expect("device poll failed");
+    let mapped = slice.get_mapped_range();
+    let mut pixels = Vec::with_capacity((THUMBNAIL_SIZE * THUMBNAIL_SIZE * 4) as usize);
+    for row in 0..THUMBNAIL_SIZE {
+        let start = (row * padded) as usize;
+        pixels.extend_from_slice(&mapped[start..start + (THUMBNAIL_SIZE * 4) as usize]);
+    }
+    drop(mapped);
+    buffer.unmap();
+    pixels
 }

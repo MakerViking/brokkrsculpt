@@ -664,8 +664,60 @@ const MERGE_DOWN: Glyph = Glyph {
     ],
 };
 
-/// Every icon in the set.
+/// Split by loose parts: one shape parted into two, with the parting shown.
 ///
+/// **Two blocks side by side and a dashed line between them**, and each half of
+/// that is doing work. The blocks alone would be [`COPY`] with the sheets set
+/// apart -- that pair sits three columns from each other in the same verb row,
+/// so the drawings may not be near-twins -- and the dashed line alone is the
+/// parting [`CUT_PLANE`] already uses, which is the visual grammar this set has
+/// settled on for "where the geometry comes apart". Put together they are the
+/// one thing neither is: a body that has been separated rather than copied or
+/// sliced.
+///
+/// The gap is 3 units, which at [`crate::theme::ICON_INLINE`] is 1.4 px -- wide
+/// enough to read as two objects, narrow enough that the blocks stay 3.2 px
+/// each and do not become a pair of ticks.
+const SPLIT: Glyph = Glyph {
+    subs: &[
+        Sub { segs: &[Seg::Rect { x: 3.5, y: 7.0, w: 7.0, h: 10.0, r: 1.5 }], ink: Ink::Stroke },
+        Sub { segs: &[Seg::Rect { x: 13.5, y: 7.0, w: 7.0, h: 10.0, r: 1.5 }], ink: Ink::Stroke },
+        Sub { segs: &[Seg::Move(12.0, 3.5), Seg::Line(12.0, 20.5)], ink: Ink::Dashed },
+    ],
+};
+
+/// Mask: a shield, for the one tool whose whole job is protecting material.
+///
+/// **A shield rather than anything drawn from the model.** The two obvious
+/// alternatives are both near-twins of something already in this set: a circle
+/// with a filled half sits one column from [`SOLO`], which is a circle with a
+/// filled centre, and a box with a filled half sits in the same verb row as
+/// [`COPY`] and [`SPLIT`], which are two boxes and two boxes with a parting.
+/// The shield collides with nothing here and says "protected" without needing
+/// the word -- which matters, because it is also the only icon in the set whose
+/// tool is a MODE rather than an action, and a mode's icon is read while it is
+/// lit rather than while it is being chosen.
+///
+/// Bare outline, no half-fill. `Ink::Fill` is reserved for dots and for shapes
+/// whose whole meaning is that they are solid; a shield's meaning is its
+/// silhouette, and filling half of it at
+/// [`crate::theme::ICON_TOOL`]'s 18 px turns a 6 px sliver into a smudge.
+const MASK: Glyph = Glyph {
+    subs: &[Sub {
+        segs: &[
+            Seg::Move(12.0, 3.5),
+            Seg::Line(19.5, 6.5),
+            Seg::Line(19.5, 11.5),
+            Seg::Quad { cx: 19.0, cy: 17.5, x: 12.0, y: 20.5 },
+            Seg::Quad { cx: 5.0, cy: 17.5, x: 4.5, y: 11.5 },
+            Seg::Line(4.5, 6.5),
+            Seg::Close,
+        ],
+        ink: Ink::Stroke,
+    }],
+};
+
+/// Every icon in the set.
 /// An enum rather than a string lookup for the reason SindriCAD moved to
 /// `keyof typeof PATHS`: a misspelling becomes a compile error instead of a
 /// silently empty icon that nobody notices.
@@ -693,6 +745,7 @@ pub enum IconName {
     BrushFlatten,
     BrushMove,
     CutPlane,
+    Mask,
     Eye,
     EyeOff,
     Plus,
@@ -700,6 +753,7 @@ pub enum IconName {
     Copy,
     Solo,
     MergeDown,
+    Split,
 }
 
 impl IconName {
@@ -711,7 +765,7 @@ impl IconName {
     /// set's index, and anything that needs the whole set rather than one icon
     /// starts here.
     #[allow(dead_code)]
-    pub const ALL: [IconName; 29] = [
+    pub const ALL: [IconName; 31] = [
         IconName::Close,
         IconName::Minimise,
         IconName::Maximise,
@@ -734,6 +788,7 @@ impl IconName {
         IconName::BrushFlatten,
         IconName::BrushMove,
         IconName::CutPlane,
+        IconName::Mask,
         IconName::Eye,
         IconName::EyeOff,
         IconName::Plus,
@@ -741,6 +796,7 @@ impl IconName {
         IconName::Copy,
         IconName::Solo,
         IconName::MergeDown,
+        IconName::Split,
     ];
 
     /// The icon standing for a sculpting brush.
@@ -800,6 +856,7 @@ impl IconName {
             IconName::BrushFlatten => &BRUSH_FLATTEN,
             IconName::BrushMove => &BRUSH_MOVE,
             IconName::CutPlane => &CUT_PLANE,
+            IconName::Mask => &MASK,
             IconName::Eye => &EYE,
             IconName::EyeOff => &EYE_OFF,
             IconName::Plus => &PLUS,
@@ -807,6 +864,7 @@ impl IconName {
             IconName::Copy => &COPY,
             IconName::Solo => &SOLO,
             IconName::MergeDown => &MERGE_DOWN,
+            IconName::Split => &SPLIT,
         }
     }
 }

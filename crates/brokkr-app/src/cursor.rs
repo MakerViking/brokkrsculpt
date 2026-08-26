@@ -25,7 +25,7 @@
 //! than the band carries at a 0.5 mm voxel. One step left the ring visibly
 //! floating; see [`SURFACE_STEPS`].
 
-use brokkr_core::{Brush, BrushDirection, FalloffCurve, MirrorAxis, Symmetry, Volume};
+use brokkr_core::{Brush, BrushDirection, FalloffCurve, MaskOp, MirrorAxis, Symmetry, Volume};
 use brokkr_gpu::OverlayBatch;
 use glam::Vec3;
 
@@ -71,6 +71,24 @@ pub enum CursorMood {
     /// and deliberately not as a fourth hue: the three hues are spent, and the
     /// difference this is reporting is a verb rather than an intensity.
     Selecting,
+    /// Painting protection in. The mask tool's plain left drag.
+    ///
+    /// **A hue outside the matcap's own gamut**, which is the same argument the
+    /// mask's viewport tint is made on: the clay is deliberately warm, its
+    /// coolest pixel is a fill-lit cavity at `b - r = +17`, and a ring that
+    /// merely desaturates would read as "a bit darker" rather than as a
+    /// different tool. A cool blue at full saturation cannot be mistaken for
+    /// anything the model can be.
+    Masking,
+    /// Taking it away — `ctrl`, `alt`, or the eraser end of the stylus.
+    ///
+    /// Not [`CursorMood::Subtract`]'s red. Red means "this removes material",
+    /// and unmasking removes no material at all — it is the *reverse* of the
+    /// blue ring beside it, so it is drawn as the pale end of the same hue
+    /// rather than as a different one. Add and Subtract can afford two hues
+    /// because they really are two things; these two are one thing and its
+    /// inverse.
+    Unmasking,
 }
 
 /// Convert a theme colour to the linear space the overlay shader expects.
@@ -246,6 +264,8 @@ pub fn build(
         CursorMood::Subtract => linear(theme::ERROR, 0.95),
         CursorMood::Sizing => linear(theme::ACCENT_HOT, 1.0),
         CursorMood::Selecting => linear(theme::TEXT, 0.95),
+        CursorMood::Masking => linear(theme::MASK, 0.95),
+        CursorMood::Unmasking => linear(theme::MASK_PALE, 0.95),
     };
 
     push_ring(batch, volume, centre, normal, brush.radius, colour);
@@ -267,9 +287,29 @@ pub fn build(
 /// `selecting` is answered before the stroke direction because it overrides it:
 /// see [`CursorMood::Selecting`]. Sizing outranks even that, because a sizing
 /// gesture is not a press on anything.
-pub fn mood(direction: BrushDirection, sizing: bool, selecting: bool) -> CursorMood {
+///
+/// `masking` is `Some` only while the mask tool is live, and it outranks the
+/// add/subtract pair for the same reason `selecting` does: in mask mode a press
+/// changes no geometry at all, so a ring saying "this adds" or "this removes"
+/// would be describing a stroke that is not going to happen. It sits BELOW
+/// sizing, because a sizing drag is not a press on anything whichever tool is
+/// chosen. Blur takes the masking colour rather than a third: it is neither
+/// adding protection nor taking it away, and the ring's job here is to say
+/// which tool is live, which the strip's live `blur` label already qualifies.
+pub fn mood(
+    direction: BrushDirection,
+    sizing: bool,
+    selecting: bool,
+    masking: Option<MaskOp>,
+) -> CursorMood {
     if sizing {
         return CursorMood::Sizing;
+    }
+    if let Some(op) = masking {
+        return match op {
+            MaskOp::Lower => CursorMood::Unmasking,
+            MaskOp::Raise | MaskOp::Blur => CursorMood::Masking,
+        };
     }
     if selecting {
         return CursorMood::Selecting;
@@ -480,19 +520,48 @@ mod tests {
         let add = colour_for(CursorMood::Add);
         assert_ne!(add, colour_for(CursorMood::Subtract), "carving looks like adding");
         assert_ne!(add, colour_for(CursorMood::Sizing), "sizing looks like adding");
+        // The two mask rings against everything else and against each other.
+        // Masking sharing a colour with adding is the failure this is really
+        // about: it would say "this stroke changes the model" over one that
+        // changes no geometry at all.
+        let masking = colour_for(CursorMood::Masking);
+        let unmasking = colour_for(CursorMood::Unmasking);
+        assert_ne!(masking, add, "masking looks like adding");
+        assert_ne!(masking, colour_for(CursorMood::Subtract), "masking looks like carving");
+        assert_ne!(masking, unmasking, "unmasking looks like masking");
+        assert_ne!(unmasking, colour_for(CursorMood::Subtract), "unmasking looks like carving");
     }
 
     #[test]
     fn the_mood_follows_the_stroke_direction_unless_sizing() {
-        assert_eq!(mood(BrushDirection::Add, false, false), CursorMood::Add);
-        assert_eq!(mood(BrushDirection::Subtract, false, false), CursorMood::Subtract);
+        assert_eq!(mood(BrushDirection::Add, false, false, None), CursorMood::Add);
+        assert_eq!(mood(BrushDirection::Subtract, false, false, None), CursorMood::Subtract);
         // Sizing wins: mid gesture the pointer is not sculpting at all, so the
         // direction it would have used is not what the ring should report.
-        assert_eq!(mood(BrushDirection::Add, true, false), CursorMood::Sizing);
-        assert_eq!(mood(BrushDirection::Subtract, true, false), CursorMood::Sizing);
+        assert_eq!(mood(BrushDirection::Add, true, false, None), CursorMood::Sizing);
+        assert_eq!(mood(BrushDirection::Subtract, true, false, None), CursorMood::Sizing);
         // And over a body that is not the active one the press selects, which
         // outranks the direction and is outranked by sizing.
-        assert_eq!(mood(BrushDirection::Subtract, false, true), CursorMood::Selecting);
-        assert_eq!(mood(BrushDirection::Add, true, true), CursorMood::Sizing);
+        assert_eq!(mood(BrushDirection::Subtract, false, true, None), CursorMood::Selecting);
+        assert_eq!(mood(BrushDirection::Add, true, true, None), CursorMood::Sizing);
+    }
+
+    /// Mask mode outranks the stroke direction, and is outranked by sizing.
+    ///
+    /// The first half is the one worth pinning: in mask mode a press changes no
+    /// geometry, so an Add or Subtract ring would be describing a stroke that is
+    /// not going to happen -- and `stroke_direction` is still computed and still
+    /// passed, because the caller has no reason to suppress it.
+    #[test]
+    fn the_mask_tool_owns_the_ring_whichever_way_the_brush_is_pointing() {
+        for direction in [BrushDirection::Add, BrushDirection::Subtract] {
+            assert_eq!(mood(direction, false, false, Some(MaskOp::Raise)), CursorMood::Masking);
+            assert_eq!(mood(direction, false, false, Some(MaskOp::Lower)), CursorMood::Unmasking);
+            // Blur is neither adding protection nor taking it away, and the ring
+            // says which tool is live rather than which of the three.
+            assert_eq!(mood(direction, false, false, Some(MaskOp::Blur)), CursorMood::Masking);
+            // A sizing drag is not a press on anything, whichever tool is live.
+            assert_eq!(mood(direction, true, false, Some(MaskOp::Raise)), CursorMood::Sizing);
+        }
     }
 }

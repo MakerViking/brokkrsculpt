@@ -12,11 +12,13 @@ pub mod matcap;
 pub mod mesh_pool;
 pub mod overlay;
 pub mod renderer;
+pub mod thumbnail;
 
 pub use frustum::Frustum;
 pub use mesh_pool::{
-    INDEX_CAPACITY, MAX_BUFFERS, MeshPool, NodeId, PoolStats, SlotKey, THE_ONLY_BODY,
+    INDEX_CAPACITY, MAX_BUFFERS, MaskPolarity, MeshPool, NodeId, PoolStats, SlotKey, THE_ONLY_BODY,
     TOTAL_INDEX_CAPACITY, TOTAL_VERTEX_CAPACITY, VERTEX_CAPACITY,
 };
 pub use overlay::{OverlayBatch, OverlayRenderer, OverlayVertex};
 pub use renderer::{PixelRect, SculptRenderer, Uniforms};
+pub use thumbnail::{THUMBNAIL_BACKGROUND, THUMBNAIL_SIZE, ThumbnailAtlas, background_texel};

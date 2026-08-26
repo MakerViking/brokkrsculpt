@@ -20,6 +20,7 @@ mod slicer;
 mod spacemouse;
 mod tablet;
 mod theme;
+mod thumbnails;
 mod timeline;
 mod viewport;
 

@@ -2,10 +2,10 @@
 
 //! Messages exchanged between the widget tree and the application.
 
-use brokkr_core::{BrushKind, FalloffCurve, MirrorAxis, PatternKind};
+use brokkr_core::{BrushKind, FalloffCurve, MaskFilter, MirrorAxis, PatternKind};
 use iced::Vector;
 
-use crate::app::SizingTarget;
+use crate::app::{SizingTarget, Tool};
 use crate::spacemouse::{Action, Axis, ButtonAction, Mode};
 
 /// A file format the sculpt can be written to.
@@ -427,8 +427,10 @@ pub enum Message {
     /// Show or hide the stats readout over the viewport. Collapsed it is one
     /// icon in the corner; open it is seven lines of numbers.
     StatsToggled,
-    /// Arm or disarm the plane cut. The next left drag becomes the cut line.
-    CutToggled,
+    /// Choose what a left drag does. Pressing the live tool goes back to
+    /// [`crate::app::Tool::Sculpt`], so this covers arming AND disarming and
+    /// the cut costs no second variant.
+    ToolChanged(Tool),
 
     // --- the body panel ------------------------------------------------------
     /// Make this body the one edits land on.
@@ -490,6 +492,15 @@ pub enum Message {
     /// Go ahead with a merge the prompt asked about.
     BodyMergeConfirmed,
     BodyMergeCancelled,
+    /// Split the active body into its loose parts.
+    ///
+    /// No payload, for the reason `BodyDuplicated` gives. Always raises the
+    /// preview card first, because the number of parts is the whole of what
+    /// there is to decide about; see `Brokkr::pending_split`.
+    BodySplit,
+    /// Go ahead with the split the preview card described.
+    BodySplitConfirmed,
+    BodySplitCancelled,
     /// `ctrl+G`: wrap the active row in a new folder, in place, no dialog.
     BodyGrouped,
     /// `ctrl+shift+G`: dissolve the folder the active row sits in.
@@ -498,12 +509,23 @@ pub enum Message {
     /// a body has nothing to dissolve. That is also what makes the pair
     /// symmetric: ctrl+G then ctrl+shift+G leaves the document as it was.
     BodyUngrouped,
-    /// Re-parent the active row into a folder, or `None` for the top level.
+    /// The pointer moved over row `over` while a row is being dragged,
+    /// `fraction` of the way down that row's height.
     ///
-    /// **Increment 17 deletes this the day a drag lands.** Two routes to one
-    /// operation is two sets of drop rules to keep consistent in a 214 px
-    /// panel, and neither ever gets removed once shipped.
-    BodyMovedToFolder(Option<brokkr_core::NodeId>),
+    /// **A fraction and not a pixel offset**, because which of a row's bands
+    /// the pointer is in is the whole of the gesture and a band is a share of
+    /// the row rather than a number of pixels -- the list is 32 px a row with
+    /// pictures and 22 without. `mouse_area::on_move` hands over a point in the
+    /// row's own space and the panel divides by the height it laid the row out
+    /// at, which is why that height is `Length::Fixed` and not left to the
+    /// content.
+    ///
+    /// Raised only while a drag is armed: the panel attaches no `on_move` at
+    /// all otherwise, so an idle pointer over the list costs nothing.
+    BodyRowDragged {
+        over: usize,
+        fraction: f32,
+    },
     /// Fold a folder's children away in the panel, or show them again.
     ///
     /// Names the folder rather than acting on the active row: the chevron is
@@ -537,4 +559,99 @@ pub enum Message {
     /// Show or hide the thumbnail column. Session state, so it must NOT dirty
     /// the document: nothing about it is written to the file.
     ThumbnailsToggled,
+    /// Show or hide the mask's tint on the model.
+    ///
+    /// **It governs the TINT and nothing else.** The standing mask card is
+    /// unconditional, so switching this off cannot reach the state "a mask is
+    /// active and nothing on screen says so". It is view state, so it must not
+    /// dirty the document, and it changes no protection and marks no brick
+    /// dirty: the polarity and the strength are uniforms the shader reads.
+    ShowMaskToggled,
+    /// How strongly protection is tinted, 0..1.
+    ///
+    /// A view strength and never a protection strength — see
+    /// [`brokkr_gpu::Uniforms::mask_tint`].
+    MaskTintChanged(f32),
+    /// The held peek key went down, or came back up.
+    ///
+    /// Kept alongside the toggle rather than replaced by it: it is the faster
+    /// gesture for a momentary look, and the way back for a user who switched
+    /// the tint off and forgot. Two messages rather than one toggle because the
+    /// key repeats while it is held, and a toggle would strobe.
+    MaskPeekStarted,
+    MaskPeekEnded,
+    /// Throw the active body's mask away. The map is MOVED into the history
+    /// entry, so this allocates nothing however large the mask was.
+    MaskCleared,
+    /// Flip which side of the mask is protected. One bool, no bricks, no bytes.
+    MaskInverted,
+    /// Protect the whole body: clear, then invert, as one change.
+    MaskAllApplied,
+    /// Which of the four absolute filters the amount slider drives.
+    MaskFilterChosen(MaskFilter),
+    /// The amount slider moved, to a fraction in `0..=1`.
+    ///
+    /// **Absolute, and re-applied from the mask as it stood when the drag
+    /// began** -- never accumulated. ZBrush's BlurMask is "press repeatedly for
+    /// progressively more blur" and that is its top masking complaint; Maxon's
+    /// own later fix is documented as "absolute rather than accumulative".
+    MaskAmountChanged(f32),
+    /// The amount slider was let go, which commits the whole drag as ONE entry.
+    MaskAmountReleased,
+    /// Build a whole mask out of the active body's geometry.
+    ///
+    /// The parameters are NOT carried here: they are the two sliders beside the
+    /// buttons, so a press means "with what is on screen" and the message stays
+    /// the same shape however many recipes there turn out to be.
+    MaskGenerated(MaskGenerator),
+    /// The feature-size slider moved, in MILLIMETRES.
+    ///
+    /// Millimetres and never voxels, which is where this beats ZBrush outright
+    /// rather than matching it: its cavity masking is resolution-relative, so
+    /// the same model at a different subdivision masks differently. A body here
+    /// has one fixed voxel size, so "narrower than 1.5 mm" is stable and means
+    /// something to somebody choosing a nozzle.
+    MaskFeatureChanged(f32),
+    /// The thickness slider moved, in VOXELS.
+    ///
+    /// Voxels and not millimetres, and that is the opposite choice from the one
+    /// above for a real reason: the ceiling is
+    /// [`brokkr_core::MAX_THICKNESS_VOXELS`], which is a property of the narrow
+    /// band and not of the model, so a millimetre slider would have a maximum
+    /// that moved every time the body was resampled. The millimetres are shown
+    /// beside the number.
+    MaskThicknessChanged(f32),
+    /// Split the active body in two along its mask.
+    ///
+    /// No preview card, unlike [`Message::BodySplit`]: a masked split always
+    /// makes exactly two bodies, so there is nothing a card could tell the user
+    /// that they do not already see in the tint.
+    BodySplitMasked,
+}
+
+/// Which mask a generator button asked for.
+///
+/// Three and not four: the half-space is a DRAG and not a button, because it
+/// needs a plane and the cut tool already has the gesture that makes one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MaskGenerator {
+    /// Concave detail narrower than the feature slider.
+    Cavity,
+    /// Everything flat at that scale: the same pass read the other way.
+    Smoothness,
+    /// Solid material thinner than the thickness slider.
+    Thickness,
+}
+
+impl MaskGenerator {
+    pub const ALL: [MaskGenerator; 3] =
+        [MaskGenerator::Cavity, MaskGenerator::Smoothness, MaskGenerator::Thickness];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            MaskGenerator::Cavity => "Cavity",
+            MaskGenerator::Smoothness => "Smooth",
+            MaskGenerator::Thickness => "Thin",
+        }
+    }
 }

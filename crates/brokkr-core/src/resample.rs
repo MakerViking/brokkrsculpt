@@ -87,6 +87,10 @@ impl Volume {
         assert!(voxel_size > 0.0, "voxel size must be positive");
 
         let mut resampled = Volume::new(voxel_size);
+        // Before the empty-field return, not after it: a mask can protect empty
+        // space -- that is what stops Draw growing material there -- so a body
+        // with no bricks at all can still have one to carry.
+        *resampled.mask_mut() = self.mask().resampled(self.voxel_size(), voxel_size);
         let Some((world_min, world_max)) = self.world_bounds() else {
             return resampled;
         };
@@ -205,6 +209,79 @@ mod tests {
             last = t;
         }
         last
+    }
+
+    /// The detail button rebuilds the field on a new lattice, and the mask has
+    /// to arrive at the same WORLD point rather than the same voxel index.
+    ///
+    /// Dropping it there would be silent: the resample already clears the undo
+    /// history, so there is nothing to press to get the protection back.
+    #[test]
+    fn resampling_carries_the_mask_to_the_same_world_point() {
+        use crate::{PROTECTED, UNMASKED};
+        use glam::IVec3;
+
+        let mut coarse = sphere(1.0);
+        let world = Vec3::new(RADIUS, 0.0, 0.0);
+        let cell = (world / coarse.voxel_size()).round().as_ivec3();
+        coarse.mask_mut().write(cell, PROTECTED);
+
+        let fine = coarse.resampled(0.5);
+
+        let fine_cell = (world / 0.5).round().as_ivec3();
+        assert_eq!(fine.voxel_size(), 0.5, "the fixture did not resample");
+        assert_eq!(
+            fine.mask().at(fine_cell),
+            PROTECTED,
+            "the mask is not on the world point it was painted on"
+        );
+        assert_eq!(
+            fine.mask().at(fine_cell + IVec3::new(0, 0, 40)),
+            UNMASKED,
+            "the mask spread across the model"
+        );
+    }
+
+    /// A mask over empty space is real -- it is what stops Draw growing
+    /// material there -- so a body with no bricks at all can still have one to
+    /// carry, and the early return for an empty field must not drop it.
+    #[test]
+    fn resampling_an_empty_body_still_carries_its_mask() {
+        use crate::PROTECTED;
+
+        let mut empty = Volume::new(1.0);
+        empty.mask_mut().write(IVec3::new(4, 4, 4), PROTECTED);
+        assert_eq!(empty.brick_count(), 0, "the fixture must hold no geometry");
+
+        let fine = empty.resampled(0.5);
+        assert_eq!(fine.mask().at(IVec3::new(8, 8, 8)), PROTECTED);
+    }
+
+    /// Mask All is a polarity bit over an EMPTY brick map, so for that state the
+    /// bit is the entire mask and a resample that copies no bricks carries
+    /// nothing else -- and the resample clears the undo history, so losing it
+    /// leaves nothing to press to get the protection back.
+    ///
+    /// The reading assertion is the load-bearing one: `inverted()` pins the
+    /// current representation, but `at()` on a cell nothing ever wrote is what
+    /// still holds if the bool is ever refactored away.
+    #[test]
+    fn resampling_carries_mask_all_even_though_it_moves_no_brick() {
+        use crate::PROTECTED;
+
+        let mut coarse = sphere(1.0);
+        coarse.mask_mut().set_inverted(true);
+        assert_eq!(coarse.mask().map_bytes(), 0, "Mask All must store no bricks at all");
+
+        let fine = coarse.resampled(0.5);
+
+        assert_eq!(fine.voxel_size(), 0.5, "the fixture did not resample");
+        assert!(fine.mask().inverted(), "the resample dropped the mask's polarity");
+        assert_eq!(
+            fine.mask().at(IVec3::new(-317, 44, 900)),
+            PROTECTED,
+            "a body that was fully masked came back sculptable"
+        );
     }
 
     #[test]

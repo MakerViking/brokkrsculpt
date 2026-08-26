@@ -9,9 +9,10 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use brokkr_core::{
-    BrickCoord, BrickMesh, Brush, BrushDirection, BrushKind, BrushScratch, Change, Document, Entry,
-    History, HistoryStats, MAX_VOLUME_BYTES, MirrorAxis, MoveStroke, NodeId, NodeMeta, Stamp,
-    Stroke, Symmetry, UndoOutcome, Volume, VolumeStats, lean_normal,
+    BrickCoord, BrickMesh, Brush, BrushDirection, BrushKind, BrushScratch, Change, Document,
+    DropRefusal, DropTarget, Entry, History, HistoryStats, MAX_VOLUME_BYTES, MaskField, MaskFilter,
+    MaskOp, MaskRecipe, MirrorAxis, MoveStroke, NodeId, NodeMeta, Stamp, Stroke, Symmetry,
+    UndoOutcome, Volume, VolumeStats, lean_normal,
 };
 use glam::{Vec2, Vec3};
 use iced::{Subscription, Task};
@@ -19,7 +20,7 @@ use iced::{Subscription, Task};
 use crate::camera::OrbitCamera;
 use crate::cursor;
 use crate::message::{
-    ConfirmChoice, ExportFormat, Message, PanelSection, PointerButton, PointerEvent,
+    ConfirmChoice, ExportFormat, MaskGenerator, Message, PanelSection, PointerButton, PointerEvent,
     SpaceMouseSetting, TopMenu,
 };
 use crate::navcube;
@@ -27,7 +28,7 @@ use crate::spacemouse::{
     Action as PuckAction, AxisBinding, ButtonAction, Config as SpaceMouseConfig, SpaceMouse,
 };
 use crate::tablet::Tablet;
-use crate::viewport::SharedFrame;
+use crate::viewport::{SharedFrame, ThumbRequest};
 
 /// World units are millimetres, because the output of this program is meant to
 /// be printed.
@@ -115,6 +116,60 @@ pub(crate) const MAX_RADIUS_VOXELS: f32 = 100.0;
 pub(crate) const MIN_STRENGTH: f32 = 0.02;
 pub(crate) const MAX_STRENGTH: f32 = 0.80;
 
+/// The most a MASK stroke's strength may be, which is higher than a sculpt
+/// brush's ceiling.
+///
+/// A sculpt brush stops at 0.80 because a stroke is many overlapping stamps and
+/// one at full weight is a gouge. A mask stamp blends toward an exact target --
+/// fully protected, or fully free -- so reaching it in one stamp is a legal and
+/// frequently wanted result: "protect this limb" is a thing a user means
+/// literally. It is also the default the mask arrives with, which is
+/// [`BrushKind::default_strength`]'s 0.15 for Draw seen from the other end.
+pub(crate) const MAX_MASK_STRENGTH: f32 = 1.0;
+
+/// Where the mask's own strength lives in [`Brokkr::strengths`].
+///
+/// One past the last brush, because the table is keyed by brush and the mask is
+/// not one. See the field.
+pub(crate) const MASK_STRENGTH_SLOT: usize = BrushKind::ALL.len();
+
+/// How strongly protection is tinted on the model when the tint is shown.
+///
+/// Full, because the tint was measured to be readable rather than chosen to be
+/// pretty: the matcap's own luminance swing is 102 levels and the shift at full
+/// strength puts a masked lit pixel at b - r = +61 against the matcap's own
+/// maximum of +17. Anything less starts from inside the clay's own gamut.
+/// The slider is there for a user who wants to judge form THROUGH a mask, which
+/// is a different job from seeing where one is.
+pub(crate) const DEFAULT_MASK_TINT: f32 = 1.0;
+
+/// The feature size a cavity mask starts at, in millimetres.
+///
+/// A millimetre and a half, which is the plan's own worked example and is about
+/// the width below which a 0.4 mm nozzle stops resolving detail cleanly.
+pub(crate) const DEFAULT_MASK_FEATURE_MM: f32 = 1.5;
+
+/// The narrowest and widest feature the slider can ask for, in millimetres.
+///
+/// Fixed millimetres rather than a multiple of the voxel, so the slider does not
+/// move under a resample. The core clamps the low end to two voxels of whatever
+/// body it is asked about, which is the resolution floor and is a different
+/// limit from this one.
+pub(crate) const MASK_FEATURE_RANGE_MM: std::ops::RangeInclusive<f32> = 0.2..=10.0;
+
+/// The wall thickness a thickness mask starts at, in voxels.
+///
+/// Three, which is half the band and so the middle of the only range the field
+/// can answer at all.
+pub(crate) const DEFAULT_MASK_THICKNESS_VOXELS: u32 = 3;
+
+/// How wide a half-space mask's feather is, in voxels.
+///
+/// Two, which is the narrowest edge that still carries intermediate values on
+/// both sides of the plane at every voxel size. A step here would be a fold in
+/// the geometry under Move -- see `brokkr_core::mask`.
+pub(crate) const HALFSPACE_FEATHER_VOXELS: f32 = 2.0;
+
 /// How fast a hold-and-drag moves the brush numbers.
 ///
 /// Radius is in log space so the same drag is the same proportion at any size;
@@ -193,6 +248,15 @@ enum DragKind {
     /// The pointer is dragging the line of a plane cut. Nothing happens to the
     /// model until the button comes back up, so the line can be adjusted.
     Cutting,
+    /// The pointer is painting the mask rather than the field.
+    ///
+    /// **No payload, where [`DragKind::Sculpt`] carries its direction.** That
+    /// is deliberate: the mask has three operations rather than two, and one of
+    /// them -- blur, on shift -- has to be live within a gesture because shift
+    /// is live for Smooth on the field side and one rule is better than two. So
+    /// mask mode reads all of its modifiers per event, through
+    /// [`Brokkr::mask_op`], and there is nothing to lock at the press.
+    Masking,
     /// The press landed on a body that was not the active one, so it chose that
     /// body and nothing else.
     ///
@@ -313,8 +377,17 @@ pub struct Brokkr {
     ///
     /// Strength is not the same quantity for every brush -- for Move it is the
     /// fraction of the drag the surface follows -- so one shared slider value
-    /// made Move look broken at Draw's default. Indexed by `BrushKind::ALL`.
-    strengths: [f32; BrushKind::ALL.len()],
+    /// made Move look broken at Draw's default. Indexed by `BrushKind::ALL`,
+    /// **plus one slot on the end for the mask**, which is the whole reason the
+    /// length is written as an expression.
+    ///
+    /// The mask's own slot is not a nicety. Draw's default strength is 0.15,
+    /// which barely deposits, so a user painting a mask drags the slider to 1.0
+    /// to get a usable one -- and the very next Draw stroke after leaving mask
+    /// mode would be a gouge at full strength on a scan they were carefully
+    /// repairing, with the slider showing exactly what they set and no memory
+    /// that it belonged to the other tool.
+    strengths: [f32; MASK_STRENGTH_SLOT + 1],
     /// Where a Move gesture grabbed the surface, fixed for the whole drag.
     ///
     /// The drag target is the pointer projected into the view plane through
@@ -339,6 +412,15 @@ pub struct Brokkr {
     /// [`Brokkr::publish_visibility`] runs on the frame tick.
     shown: Vec<bool>,
     hidden_bodies: Vec<NodeId>,
+    /// The bodies whose mask polarity differs from the active body's, which is
+    /// the polarity the viewport uniform carries. Kept, and refilled by
+    /// [`Brokkr::publish_mask_view`], for the reason `hidden_bodies` is kept.
+    opposite_polarity: Vec<NodeId>,
+    /// What the standing mask card says, or `None` when nothing is masked.
+    ///
+    /// See [`MaskCard`]. Held rather than computed in `view()` because `view()`
+    /// runs at display rate and the percentage is a pass over the mask.
+    pub(crate) mask_card: Option<MaskCard>,
     /// The one row solo is showing, or `None` for the whole document.
     ///
     /// **A field of the APPLICATION, never of the document.** Solo is the third
@@ -496,12 +578,11 @@ pub struct Brokkr {
     /// `Message::MenuClosed` -- must NOT close this. A prompt that a stray click
     /// dismisses is worse than no prompt: the user learns to ignore it.
     confirm: Option<PendingAction>,
-    /// Whether the next left drag cuts the model instead of sculpting it.
+    /// What a left drag in the viewport does: sculpt, paint the mask, or cut.
     ///
-    /// A mode rather than a modifier because a cut is destructive and
-    /// irreversible-looking: arming it deliberately is worth one click, and the
-    /// tool strip shows the armed state so it can never be a surprise.
-    cut_armed: bool,
+    /// A mode rather than a modifier, and one enum rather than a bool per mode.
+    /// See [`Tool`] for both arguments; neither is a preference.
+    pub(crate) tool: Tool,
     /// Sculpts opened or saved recently, for the File menu.
     recent: crate::recent::Recent,
     /// Where the crash net is written.
@@ -527,7 +608,103 @@ pub struct Brokkr {
     /// heavy document is None, so an off switch is faithful to the reference
     /// rather than a retreat from it -- and by the rule that nothing outside the
     /// file may dirty the document, toggling it must not set `unsaved`.
+    ///
+    /// # It defaults OFF, and that is the go/no-go gate showing rather than a
+    /// preference
+    ///
+    /// A live picture is a full-body render riding ON TOP of an ordinary frame,
+    /// 200 ms after every button release. The plan budgets it at 8 ms and makes
+    /// the increment conditional on measuring it: `thumbnail_row` in
+    /// `brokkr-gpu/benches/render.rs` times one and extrapolates to the 45,567
+    /// bricks the mesh pool is sized for. **That bench has never been run**, so
+    /// there is no number, and shipping an unmeasured per-stroke cost switched
+    /// on for everyone is the one thing the gate exists to prevent -- on the
+    /// defective imported scans this application is for, which carry several
+    /// times more geometry per brick than the sculpted sphere the bench
+    /// measures.
+    ///
+    /// **Flip this to `true` when, and only when, someone has run
+    /// `cargo bench -p brokkr-gpu --bench render` on a quiet machine and the
+    /// extrapolated line came in under the budget.** The bench exits 1 if it
+    /// did not. `the_thumbnail_switch_does_not_dirty_the_document` pins the
+    /// default so the flip cannot happen by accident.
     thumbnails: bool,
+    /// Whether protection is tinted on the model, and how strongly.
+    ///
+    /// **Session state, and view state twice over: it is not in the file, and
+    /// it is not protection.** Nothing here changes what a stroke does, which
+    /// is worth saying because a shipping professional tool got it wrong --
+    /// 3D-Coat has to warn in its own documentation that its Freeze Opacity
+    /// "does not affect the freezing strength of the current stroke".
+    ///
+    /// # The toggle governs the TINT ONLY, and that is the whole safety argument
+    ///
+    /// This plan argued for a held-only peek key on the grounds that a tint
+    /// which can be switched off will be left off. Thomas decided otherwise:
+    /// a normal toggle ships. What makes that safe is that [`MaskCard`] is
+    /// **unconditional** -- it is up whenever the mask is non-empty, whatever
+    /// the tool and whatever this is set to -- so the state "a mask is active
+    /// and nothing on screen says so" is still unreachable. Anything added here
+    /// that could also silence the card would undo that; the card takes no
+    /// input from these fields at all, which is the structural half of it.
+    ///
+    /// The residual is accepted knowingly: a user who leaves the tint off for a
+    /// long session paints blind, and the card is a smaller signal than the
+    /// tint it replaces. Revisit on the first report of a stroke that "did
+    /// nothing" while the tint was off.
+    show_mask: bool,
+    /// How strong the tint is when it is shown at all, 0..1.
+    ///
+    /// The shader has its own floor under this (`0.30 + 0.70 * m`), which is
+    /// what makes a first pass at brush strength visible; this scales the
+    /// result and reaches zero only through the toggle.
+    mask_tint: f32,
+    /// Whether the held peek key is down.
+    ///
+    /// Kept alongside the toggle rather than replaced by it, because it costs
+    /// nothing and is the faster gesture for a momentary look -- and because it
+    /// is the way back to seeing the mask for a user who has switched the tint
+    /// off and forgotten they did.
+    mask_peek: bool,
+    /// Which of the four absolute filters the amount slider drives.
+    ///
+    /// One slider for four verbs rather than four sliders, because the tool
+    /// menu is 210 px wide and `const HEIGHT` is sized once for the whole mask
+    /// block. Choosing a different filter mid-drag commits the drag first --
+    /// see `mask_amount_changed`.
+    mask_filter: MaskFilter,
+    /// Where the amount slider sits, and **zero between gestures**.
+    ///
+    /// It is a gesture parameter and not a stored setting: the filter is
+    /// absolute, so leaving the slider at 1.0 would make the next grab re-blur
+    /// an already-blurred mask the moment it was touched. Releasing it puts it
+    /// back to zero, which is the amount at which every filter is the identity.
+    mask_amount: f32,
+    /// The mask as it stood when the current filter gesture began.
+    ///
+    /// **This is what makes the filter absolute rather than accumulative.**
+    /// Every change of the amount re-applies from here, so dragging out and
+    /// back lands exactly where it started, and dragging to zero puts this very
+    /// field object back on the body -- bit for bit, because it is moved and
+    /// never rebuilt. ZBrush's BlurMask is the accumulative alternative and it
+    /// has been its top masking complaint since 2007.
+    mask_grab: Option<MaskGrab>,
+    /// The narrowest feature a cavity or smoothness mask holds, in MILLIMETRES.
+    ///
+    /// Session state and never in the document: it is a question the user asks,
+    /// not a property of the body. In millimetres because a body has one fixed
+    /// voxel size, which is what makes "narrower than 1.5 mm" mean the same
+    /// thing at every resolution.
+    mask_feature_mm: f32,
+    /// The thickest wall a thickness mask selects, in VOXELS.
+    ///
+    /// Voxels because the ceiling is the narrow band's and not the model's --
+    /// see [`Message::MaskThicknessChanged`].
+    mask_thickness_voxels: u32,
+    /// Which body's picture lives in which cell of the atlas, and which of them
+    /// are out of date. See [`crate::thumbnails::Thumbnails`], whose header is
+    /// where the refresh rule is written down.
+    thumbs: crate::thumbnails::Thumbnails,
     /// Whether the `+` button's little menu of primitives is open.
     ///
     /// A plain flag rather than a `stack!` layer: the menu is drawn inside the
@@ -571,6 +748,17 @@ pub struct Brokkr {
     /// that one is exactly as recoverable as deleting the same body, which does
     /// not prompt below the same number either.
     merge_prompt_bytes: usize,
+    /// A split waiting on an answer.
+    ///
+    /// **Always raised, and never on a size threshold**, which is the one place
+    /// this differs from the delete and merge prompts. A split's headline is
+    /// how many loose parts there turn out to be, and that number is not
+    /// something anybody can predict from looking at the model -- an imported
+    /// scan is one row in the panel whether it is one shell or four thousand.
+    /// So the card is the operation's only sensible shape: it reports the
+    /// count, says which parts become bodies and which are swept up, and only
+    /// then does anything happen.
+    pending_split: Option<PendingSplit>,
     /// The row being renamed and what has been typed into its field so far.
     ///
     /// The typed text is held HERE rather than written into the node on every
@@ -584,6 +772,65 @@ pub struct Brokkr {
     /// `ProjectState` names it, and a rename in flight when the application
     /// quits is simply a rename that did not happen.
     renaming: Option<(NodeId, String)>,
+    /// A body row being dragged to a new place in the tree. See [`RowDrag`].
+    row_drag: Option<RowDrag>,
+}
+
+/// A row the pointer picked up, and where letting go would put it.
+///
+/// # Why the target is held here and not worked out when the button comes up
+///
+/// **The value the indicator drew is the value the commit performs.** Every
+/// tree drag that puts a line in one place and the row in another has two
+/// copies of the arithmetic -- one in the drawing code and one in the drop
+/// handler -- and they disagree at the edges. Here there is one:
+/// [`brokkr_core::drop_target`] runs on each pointer event, its answer is
+/// stored, the panel draws that, and [`Brokkr::finish_row_drag`] hands the same
+/// value to [`Document::reparent`].
+///
+/// # It is armed by the row's press and released by the GLOBAL one
+///
+/// `mouse_area::on_press` arms it, but the commit rides on
+/// `PointerEvent::Released`, which `viewport::route_pointer` publishes for
+/// every release anywhere in the window without capturing it. The row's own
+/// `on_release` only fires while the pointer is still over that row, so a drag
+/// that ended over the tool strip -- or outside the window -- would stick.
+#[derive(Debug, Clone, Copy)]
+struct RowDrag {
+    /// The row that was pressed, by id and not by index, so a queued message
+    /// that arrives after the list has moved cannot name a different row.
+    id: NodeId,
+    /// Where a release would put it, or `None` while the pointer is over a gap
+    /// that refuses the block -- which is also the state a press that has not
+    /// moved yet is in, so a click that never became a drag commits nothing.
+    target: Option<DropTarget>,
+    /// The row `target` is the INSIDE of, when it is a closed folder's middle
+    /// band. Purely how the indicator draws: the filled row rather than the
+    /// line. Worked out here because `view()` may not work anything out.
+    into: Option<usize>,
+    /// The refusal already on the status line.
+    ///
+    /// A pointer crossing a 214 px panel raises dozens of move events, and
+    /// rewriting the same sentence on each of them would allocate per event and
+    /// fill the breadcrumb trail with one line repeated. The line is written
+    /// when the reason CHANGES.
+    said: Option<DropRefusal>,
+}
+
+impl RowDrag {
+    /// Whether the pointer has actually moved since the press.
+    ///
+    /// **A press is not yet a drag**, and the difference is visible: this is
+    /// what decides whether the block folds away on screen. Folding on the
+    /// press itself would snap a folder shut and open it again on every plain
+    /// click on its row.
+    ///
+    /// It is derived rather than stored because there is nothing to store: one
+    /// of the two fields is written by every move message and neither is
+    /// written by anything else.
+    fn under_way(self) -> bool {
+        self.target.is_some() || self.said.is_some()
+    }
 }
 
 /// A delete the user has been asked about, held until they answer.
@@ -627,6 +874,21 @@ pub(crate) struct PendingMerge {
     pub(crate) stroke_bytes: usize,
     /// The consumed body, charged to the reclaim allowance.
     pub(crate) reclaim_bytes: usize,
+}
+
+/// A split the user has been asked about, held until they answer.
+///
+/// **It carries the whole plan, and the plan carries the labelling.** The walk
+/// that produced "4,812 loose parts" is a walk of every voxel of the body, and
+/// the emit has to use that same labelling or the card described one split and
+/// the button performed another. It is also far too expensive to run twice.
+///
+/// The `name` is copied for the card rather than looked up at draw time,
+/// because `view()` runs at display rate and a lookup there is a scan of the
+/// node list per frame.
+pub(crate) struct PendingSplit {
+    pub(crate) name: String,
+    pub(crate) plan: brokkr_core::SplitPlan,
 }
 
 /// An animated camera move to an orientation.
@@ -841,11 +1103,206 @@ struct Sizing {
     original: f32,
 }
 
+/// What the standing mask overlay says, cached.
+///
+/// # Why there is a card at all, and why it is unconditional
+///
+/// This is the mechanism that makes "a mask is active and nothing on screen
+/// says so" unreachable. It is up **whenever anything is masked, whatever tool
+/// is live and whatever the tint is set to** -- the show-mask toggle governs the
+/// tint only. That is the whole of the safety argument for shipping a toggle
+/// that can switch the tint off: the card cannot be switched off. A masked
+/// surface reading as a broken brush is the failure the whole masking design is
+/// arranged around, and an invisible mask is the single most-reported ZBrush
+/// masking complaint.
+///
+/// # Why it names the body, and counts the ones off screen
+///
+/// The mask is per body. Mask the head, hide the head, and a card scoped to the
+/// active body disappears while the document still protects material. A
+/// document-wide `MASK 62%` while the user sculpts an unmasked torso is worse
+/// still: it teaches them to ignore it, which is exactly how ZBrush's
+/// darker-thumbnail cue eroded. So it names the body the percentage is about
+/// and appends a count of the masked bodies that are not on screen.
+///
+/// # Why it is a cache
+///
+/// `view()` runs at display rate. Formatting a percentage there would be the
+/// `detail_advice` mistake this project has already made twice; computing one
+/// would be a pass over up to 45,567 mask bricks per frame. So the strings are
+/// built when something changes and `revision` is what says whether it has --
+/// see [`brokkr_core::MaskField::revision`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct MaskCard {
+    /// The body the percentage is about, and the mask revision it was computed
+    /// from. Together these are the cache key.
+    body: NodeId,
+    revision: u64,
+    /// How many masked bodies were off screen when the strings were built, and
+    /// how many were on screen but were not the one the headline is about.
+    ///
+    /// Part of the key rather than part of the answer: the counts come from a
+    /// walk of the node rows, which is cheap, but turning them into words is a
+    /// `format!` and `refresh_mask_card` runs on the frame tick. Keeping them
+    /// here is what lets the rebuild be skipped rather than merely be short.
+    ///
+    /// **Both counts, and that is increment 24's review finding.** Only the
+    /// hidden one was kept, so a body that was masked, VISIBLE and not active
+    /// was counted nowhere: press Mask all on a cube, click another body, and
+    /// the card went away entirely while a fully protected cube sat on screen.
+    /// The first the user heard of it was a cut sparing the whole thing.
+    off_screen_count: usize,
+    elsewhere_count: usize,
+    /// `MASK — head, 62%`, or `MASK — 2 masked, hidden` when the active body
+    /// carries none itself.
+    pub(crate) headline: String,
+    /// `+2 masked, hidden`, or empty. Its own string so the card can dim it.
+    pub(crate) off_screen: String,
+    /// `+2 masked, elsewhere`, or empty. Masked bodies that are on screen but
+    /// are not the one the headline is about.
+    pub(crate) elsewhere: String,
+}
+
+/// The revision a card about a body with no mask of its own is keyed on.
+///
+/// [`brokkr_core::MaskField::revision`] counts writes, so a mask that is not
+/// free has had at least one and can never be mistaken for this.
+const NO_MASK_HERE: u64 = 0;
+
+impl MaskCard {
+    /// `+2 masked, hidden`, or empty when none are.
+    fn hidden_count_line(count: usize) -> String {
+        match count {
+            0 => String::new(),
+            count => format!("+{count} masked, hidden"),
+        }
+    }
+
+    /// `+2 masked, elsewhere`, or empty when none are.
+    fn elsewhere_count_line(count: usize) -> String {
+        match count {
+            0 => String::new(),
+            count => format!("+{count} masked, elsewhere"),
+        }
+    }
+
+    /// The headline and the second line for a card that is up only because
+    /// bodies OTHER than the active one are masked.
+    ///
+    /// One of the two counts is promoted into the headline and the other stays
+    /// a detail line, so neither can go unsaid and the card still opens with a
+    /// sentence rather than with a bare "MASK". "Elsewhere" wins the headline
+    /// when there is a choice, because a masked body the user can SEE is the
+    /// one they are about to try to sculpt.
+    fn about_other_bodies(off_screen: usize, elsewhere: usize) -> (String, String) {
+        match (elsewhere, off_screen) {
+            (0, hidden) => (format!("MASK — {hidden} masked, hidden"), String::new()),
+            (elsewhere, 0) => (format!("MASK — {elsewhere} masked, elsewhere"), String::new()),
+            (elsewhere, hidden) => {
+                (format!("MASK — {elsewhere} masked, elsewhere"), Self::hidden_count_line(hidden))
+            }
+        }
+    }
+
+    /// Say new counts of masked bodies that are not the active one, keeping
+    /// whatever the card already says about the active one.
+    ///
+    /// The one thing that can go stale without the mask itself moving, which is
+    /// why it is a separate write rather than a reason to rebuild: hiding a
+    /// masked body, or making another one active, changes these lines and
+    /// nothing else on the card. Reached only when a count has actually
+    /// changed, so the `format!`s in here are never on an idle frame.
+    fn rewrite_the_other_counts(&mut self, off_screen: usize, elsewhere: usize) {
+        self.off_screen_count = off_screen;
+        self.elsewhere_count = elsewhere;
+        if self.names_the_active_body() {
+            self.off_screen = Self::hidden_count_line(off_screen);
+            self.elsewhere = Self::elsewhere_count_line(elsewhere);
+        } else {
+            // This card IS the counts -- there is no percentage to keep.
+            let (headline, hidden) = Self::about_other_bodies(off_screen, elsewhere);
+            self.headline = headline;
+            self.off_screen = hidden;
+            self.elsewhere = String::new();
+        }
+    }
+
+    /// Whether the percentage on this card is about the ACTIVE body.
+    ///
+    /// What the `[invert]` and `[clear]` buttons are gated on, and they need
+    /// gating: both act on the active body, and a card that is up purely
+    /// because something is masked OFF screen would otherwise offer to clear a
+    /// mask the user cannot see -- on a body that has none.
+    pub(crate) fn names_the_active_body(&self) -> bool {
+        self.revision != NO_MASK_HERE
+    }
+}
+
+/// The mask a live filter gesture re-applies from.
+///
+/// Held by the application rather than by the volume, because the volume is
+/// showing the FILTERED mask for the length of the drag and there is nowhere in
+/// it for a second one. It is moved out of the body on grab and moved back --
+/// or moved into the history entry -- when the drag ends, so a gesture holds
+/// two masks and never three. That is the arithmetic
+/// [`brokkr_core::MaskField::would_fit`] is asked about before the grab starts.
+struct MaskGrab {
+    /// Which body it came off. A drag that outlives a change of active body
+    /// commits rather than following it: the snapshot belongs to one mask.
+    body: NodeId,
+    filter: MaskFilter,
+    snapshot: MaskField,
+}
+
 /// Which number a sizing drag is moving.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SizingTarget {
     Radius,
     Strength,
+}
+
+/// What a left drag in the viewport currently does.
+///
+/// # An enum rather than two bools, and it is the fix rather than tidiness
+///
+/// This replaced `cut_armed: bool`. Adding masking as a second bool would have
+/// been four states with one of them illegal -- cut armed *and* mask active,
+/// reachable from two buttons sixty pixels apart in the same strip -- and the
+/// press dispatch would have let the cut win while MASK stayed highlighted
+/// doing nothing. The enum makes that state unrepresentable, and it is no more
+/// code than the bool it replaced: [`Message::ToolChanged`] toggles back to
+/// [`Tool::Sculpt`] when it lands on the live tool, so the cut costs net zero
+/// message variants.
+///
+/// # Why masking is a mode and not a modifier
+///
+/// There is no free modifier left. Control and alt are deliberate synonyms for
+/// "invert the brush" and were made synonyms so that neither habit is wrong;
+/// shift is smooth; and `viewport::shortcut` is not even handed alt for a bare
+/// key. Worse, the modifier flags are written in exactly one place -- inside a
+/// handler that returns early while a modal is open -- and nothing resets them,
+/// because this application handles no focus event at all. A stale invert flag
+/// today still sculpts and the ring is red about it. **A stale MASK flag would
+/// be a stroke that changes no geometry and silently paints protection over the
+/// model**, which is strictly worse. ZBrush needs two modifiers for mask and
+/// unmask, so its gesture is simply unavailable here and a mode is the answer.
+///
+/// # The collision with the gizmo, named rather than left to be discovered
+///
+/// `docs/BUILD-SPEC.md` parks a `Tool` extraction behind "a third
+/// gesture-scoped operation" and awards it to the transform gizmo. This is not
+/// that one: that one is about the press-lock-commit lifecycle Move and the
+/// plane cut share. When the gizmo lands it adds a VARIANT here rather than a
+/// second concept.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Tool {
+    /// The brush in [`Brokkr::brush`] writes the field. The default.
+    Sculpt,
+    /// The brush paints protection instead. Key `m`.
+    Mask,
+    /// The next left drag is a plane cut line. One shot: [`Brokkr::finish_cut`]
+    /// puts the tool back to [`Tool::Sculpt`].
+    Cut,
 }
 
 /// Turn a window event the widget tree did not want into a message.
@@ -897,16 +1354,20 @@ fn key_event(
         }
         // Releasing a sizing key ends the gesture. Without this the pointer
         // would keep resizing the brush instead of going back to sculpting.
+        // The mask's peek key is here for the same reason and with the same
+        // exemption: a held key that never comes back up leaves the tint stuck
+        // on, which is the safe direction to fail but is still not what the
+        // user asked for.
         //
         // Not routed through `on_key` and deliberately not guarded by the
         // modal check: a modal that opened mid-gesture must still let the
         // gesture end, and ending one that never started is already a no-op.
-        iced::Event::Keyboard(iced::keyboard::Event::KeyReleased { key, .. }) => match key {
-            iced::keyboard::Key::Character(character)
-                if matches!(character.to_ascii_lowercase().as_str(), "s" | "u") =>
-            {
-                Some(Message::SizingEnded)
-            }
+        iced::Event::Keyboard(iced::keyboard::Event::KeyReleased {
+            key: iced::keyboard::Key::Character(character),
+            ..
+        }) => match character.to_ascii_lowercase().as_str() {
+            "s" | "u" => Some(Message::SizingEnded),
+            "h" => Some(Message::MaskPeekEnded),
             _ => None,
         },
         _ => None,
@@ -932,7 +1393,7 @@ pub(crate) const RENAME_FIELD: &str = "brokkr-body-rename";
 /// next year would default to leaving a field open over a document that has
 /// moved on underneath it, and nothing would fail.
 ///
-/// The four that keep it open:
+/// The five that keep it open:
 ///
 /// * the field's own keystrokes, which are the rename;
 /// * every key press, because Escape is captured by the focused field itself
@@ -943,7 +1404,17 @@ pub(crate) const RENAME_FIELD: &str = "brokkr-body-rename";
 ///   outside `viewport::shortcut`" rule intact;
 /// * `MenuClosed`, which is what Escape becomes and which reverts;
 /// * the frame tick and a pointer merely moving. A pointer PRESS is the user
-///   leaving, and does commit.
+///   leaving, and does commit;
+/// * the two gesture-END messages, and this one is not symmetry -- it is a
+///   real bug's fix. A press is captured by the focused field, but a RELEASE
+///   is not: iced 0.14 captures `KeyReleased` for the literal `v` and nothing
+///   else (`text_input.rs:1249-1261`), so releasing the `s`, `u` or `h` of a
+///   body called "Head" or "Skull" arrives here Ignored, decoded by
+///   [`key_event`] into [`Message::SizingEnded`] or
+///   [`Message::MaskPeekEnded`], and the default committed the half-typed
+///   name and closed the field. Both messages clear one field of session
+///   state and by construction touch no document, so keeping the rename open
+///   across them is unconditionally right rather than a lesser evil.
 ///
 /// Note which press that is: `Message::Pointer(Pressed)` is raised only for a
 /// press INSIDE the viewport (`viewport::route_pointer` bounds-checks it), so
@@ -956,6 +1427,7 @@ fn keeps_the_rename_open(message: &Message) -> bool {
     match message {
         Message::BodyRenameEdited(_) => true,
         Message::KeyPressed { .. } | Message::MenuClosed => true,
+        Message::SizingEnded | Message::MaskPeekEnded => true,
         Message::Frame => true,
         Message::Pointer(event) => !matches!(event, PointerEvent::Pressed { .. }),
         _ => false,
@@ -1021,13 +1493,20 @@ impl Brokkr {
             shared,
             mesh_buffers: Vec::new(),
             brush_scratch: BrushScratch::new(),
-            strengths: BrushKind::ALL.map(BrushKind::default_strength),
+            strengths: {
+                let mut seeded = [MAX_MASK_STRENGTH; MASK_STRENGTH_SLOT + 1];
+                seeded[..MASK_STRENGTH_SLOT]
+                    .copy_from_slice(&BrushKind::ALL.map(BrushKind::default_strength));
+                seeded
+            },
             move_grab: None,
             move_stroke: MoveStroke::new(),
             stamp_centres: Vec::new(),
             dirty: Vec::new(),
             shown: Vec::new(),
             hidden_bodies: Vec::new(),
+            opposite_polarity: Vec::new(),
+            mask_card: None,
             solo: None,
             drag: None,
             cursor: None,
@@ -1064,19 +1543,32 @@ impl Brokkr {
             project_path: None,
             unsaved: false,
             confirm: None,
-            cut_armed: false,
+            tool: Tool::Sculpt,
             recent: crate::recent::Recent::load(),
             autosave_file: Self::default_autosave_path(),
             last_autosave: Instant::now(),
             last_activity: Instant::now(),
             menu_edit: None,
-            thumbnails: true,
+            // Off until the go/no-go bench has produced a number. See the
+            // field.
+            thumbnails: false,
+            show_mask: true,
+            mask_tint: DEFAULT_MASK_TINT,
+            mask_peek: false,
+            mask_filter: MaskFilter::Blur,
+            mask_amount: 0.0,
+            mask_grab: None,
+            mask_feature_mm: DEFAULT_MASK_FEATURE_MM,
+            mask_thickness_voxels: DEFAULT_MASK_THICKNESS_VOXELS,
+            thumbs: crate::thumbnails::Thumbnails::new(),
             adding: false,
             pending_delete: None,
             delete_prompt_bytes: brokkr_core::DEFAULT_RECLAIM_BUDGET,
             pending_merge: None,
             merge_prompt_bytes: brokkr_core::DEFAULT_RECLAIM_BUDGET,
+            pending_split: None,
             renaming: None,
+            row_drag: None,
         };
         app.remesh_dirty();
         // Otherwise the overlay reports a zero byte budget until the first
@@ -1355,6 +1847,41 @@ impl Brokkr {
         self.perf.dirty_bricks = self.dirty.len();
         if self.dirty.is_empty() {
             return;
+        }
+
+        // **Every picture that is now out of date, marked in the one place that
+        // already knows which bricks changed.** Undo, redo, delete, merge, add,
+        // import, open, re-orient and resample all reach the GPU through here,
+        // so hooking this covers the lot -- where a list of the sites that
+        // change geometry is a list that goes out of date silently, which is
+        // the argument `publish_visibility` already makes about the eye.
+        //
+        // **Except during a stroke**, which is the load-bearing exception: a
+        // stroke calls this once per pointer event, and the picture is wanted
+        // once, at the end. `finish_stroke` is the other half, and it marks the
+        // body only when the stroke actually produced an edit -- so a press and
+        // release that never touched the model costs no render at all.
+        //
+        // A MASK drag is a stroke by the same argument and is excepted with it:
+        // it calls this per event too, and once the mask is a vertex attribute
+        // every one of those events dirties the footprint for real.
+        if !matches!(
+            self.drag.map(|drag| drag.kind),
+            Some(DragKind::Sculpt(_)) | Some(DragKind::Masking)
+        ) {
+            // One `Instant::now()` and one hash insert per BODY, never per
+            // brick: a whole-document rebuild hands this tens of thousands of
+            // coordinates and they arrive grouped by body. Destructured so the
+            // dirty list and the cells can be borrowed at once.
+            let Self { dirty, thumbs, .. } = self;
+            let mut last = None;
+            for (body, _) in dirty.iter() {
+                if last == Some(*body) {
+                    continue;
+                }
+                last = Some(*body);
+                thumbs.geometry_changed(*body);
+            }
         }
 
         let started = Instant::now();
@@ -1795,6 +2322,124 @@ impl Brokkr {
         self.refresh_overlay();
     }
 
+    /// Walk the active body's loose parts and raise the preview card.
+    ///
+    /// **The refusal comes first and it is free**, read off cached stats: a
+    /// split holds the original and every part at the same time, so the one
+    /// body it cannot run on is a large one -- and finding that out after a
+    /// minute of walking, having already doubled the process's memory, is not a
+    /// refusal, it is a crash with a message attached. See `brokkr_core::split`
+    /// for the arithmetic and for what the message offers instead.
+    ///
+    /// Refused when the body is not DISPLAY-visible, and that is deliberate
+    /// rather than defensive. A split replaces one row with several, and the
+    /// children inherit the source's own eye -- so splitting something that is
+    /// hidden, or that solo is hiding, produces a pile of new rows and no
+    /// change at all on screen. Pixologic published a whole #AskZBrush episode
+    /// on that confusion.
+    ///
+    /// # There is no size prompt, and there is no greyed button
+    ///
+    /// The card is always raised, because "how many parts is this" is the whole
+    /// question and nothing in the panel can answer it in advance. Whether a
+    /// body is worth splitting is not a property a row can display: an imported
+    /// scan is one row whether it is one shell or four thousand.
+    fn split_active_body(&mut self) {
+        let source = self.doc.active();
+        let name = self.doc.node(source).map_or_else(String::new, |node| node.name.clone());
+
+        // `shown` is the resolved display visibility the update pass keeps in
+        // step with the document, so this costs an index rather than a walk.
+        let visible = self
+            .doc
+            .index_of(source)
+            .and_then(|index| self.shown.get(index).copied())
+            .unwrap_or(true);
+        if !visible {
+            self.status = format!(
+                "could not split {name}: it is not on screen, and its parts would not be either"
+            );
+            return;
+        }
+
+        if let Some(why) = self.doc.split_guard(source) {
+            self.status = format!("could not split {name}: {why}");
+            return;
+        }
+
+        let Some(plan) = self.doc.split_plan(source) else {
+            return;
+        };
+        if plan.is_one_piece() {
+            self.status = format!("{name} is one connected part -- there is nothing to split");
+            return;
+        }
+        self.pending_split = Some(PendingSplit { name, plan });
+    }
+
+    /// Run the split and put the renderer back in step with it.
+    ///
+    /// The three lines after the split are the unit `Brokkr::remove_body` and
+    /// `Brokkr::apply_merge` both document, and for the same reason: the source
+    /// stops existing, its bricks are in nobody's dirty set any more, so
+    /// `SharedFrame::forget_body` is what releases its slots and the
+    /// whole-document remesh is the other half. Freeing pool space without
+    /// re-offering every brick takes the MESH POOL FULL banner down and leaves
+    /// the geometry that was refused while it was full missing.
+    ///
+    /// **Not `rebuild_everything`**, for the reason `apply_merge` gives: a
+    /// rebuild clears solo, and a split is not a whole-document swap. Solo is
+    /// dropped anyway when it named the source, but that happens in
+    /// `Brokkr::forget_a_vanished_solo`, which rides the visibility pass and
+    /// therefore covers every route a row can vanish by.
+    fn apply_split(&mut self, pending: PendingSplit) {
+        let PendingSplit { name, plan } = pending;
+        let source = plan.source;
+        let found = plan.found();
+        let swept = plan.swept();
+        let walked = plan.elapsed;
+
+        let Some(outcome) = self.doc.split(plan) else {
+            return;
+        };
+        self.shared.forget_body(source);
+        self.doc.mark_everything_dirty();
+
+        let built = outcome.elapsed;
+        let slow = outcome.is_slow(walked);
+        let bodies = outcome.bodies.len();
+
+        let before = self.history.stats();
+        self.history.push(outcome.entry);
+        self.unsaved = true;
+        self.status = if swept == 0 {
+            format!("split {name} into {found} parts")
+        } else {
+            format!(
+                "split {name}: {} parts, and {swept} of {found} swept into {name} fragments",
+                bodies - 1
+            )
+        };
+        // After the split's own line, so an eviction wins the status.
+        self.record_history(before);
+
+        // Not a status line: a slow operation is a fact about this machine and
+        // this model, and the status bar is already carrying the result. The
+        // perf readout's `worst_frame_ms` is the only instrument that can see
+        // the frame this cost, and it cannot see a frame that never came.
+        if slow {
+            eprintln!(
+                "split of {name} took {} ms to walk and {} ms to build",
+                walked.as_millis(),
+                built.as_millis(),
+            );
+        }
+
+        self.refresh_model_radius();
+        self.remesh_dirty();
+        self.refresh_overlay();
+    }
+
     /// Begin renaming a row: hold its current name as the field's text, and
     /// return the task that focuses the field and selects what is in it.
     ///
@@ -1806,6 +2451,12 @@ impl Brokkr {
             return Task::none();
         };
         self.renaming = Some((id, node.name.clone()));
+        // **Drag is disabled while renaming**, and this is where the two can
+        // meet: `mouse_area` publishes `on_press` and THEN the double click
+        // (`mouse_area.rs:376-392`), so the press that opened the field has
+        // already picked the row up. Put it down. Otherwise the list is armed
+        // behind an open text field and every row is offering to be a drop.
+        self.row_drag = None;
         // Chained rather than batched: `select_all` acts on the field's cursor
         // and there is no reason to find out what a runtime that ran them the
         // other way round would do to it.
@@ -2326,39 +2977,104 @@ impl Brokkr {
         self.status = format!("dissolved {name}");
     }
 
-    /// Re-parent the active row into a folder, or out to the top level.
+    /// Pick a row up. The row's own press, and nothing more than arming.
     ///
-    /// The panel's `Move to ▸` list. **Increment 17 deletes this the day a drag
-    /// lands**: two routes to one operation is two sets of drop rules to keep
-    /// consistent in a 214 px panel, and neither ever gets removed once
-    /// shipped.
-    fn move_to_folder(&mut self, into: Option<NodeId>) {
-        let id = self.doc.active();
-        let where_to = match into {
-            Some(folder) => self
-                .doc
-                .node(folder)
-                .map_or_else(|| "a folder".to_string(), |node| node.name.clone()),
-            None => "the top level".to_string(),
-        };
-        // The list leaves the row's current container out, so this only fires
-        // on a message that was queued before the list was rebuilt -- and
-        // "already there" is a very different thing to be told from "could
-        // not".
-        if self.doc.parent_of(id) == into {
-            self.status = format!("this body is already in {where_to}");
+    /// It arms on EVERY press, including one that never moves: a press that
+    /// stays still leaves `target` at `None`, and `finish_row_drag` then
+    /// commits nothing. That is what keeps a click a click without a slop
+    /// threshold to tune -- the threshold is the row band the pointer would
+    /// have to leave for [`brokkr_core::drop_target`] to name a different gap.
+    fn arm_row_drag(&mut self, id: NodeId) {
+        self.row_drag = Some(RowDrag { id, target: None, into: None, said: None });
+    }
+
+    /// The pointer moved over row `over`, `fraction` of the way down it.
+    ///
+    /// The whole of the state machine is [`brokkr_core::drop_target`]; this
+    /// stores its answer, works out how the indicator draws, and puts a
+    /// refusal's reason on the status line the first time it changes.
+    fn track_row_drag(&mut self, over: usize, fraction: f32) {
+        let Some(RowDrag { id, said, .. }) = self.row_drag else {
             return;
+        };
+        // The row went while the button was down -- only reachable through a
+        // message queued before something else took it. Let go of it rather
+        // than dragging a row that is not there.
+        let Some(dragged) = self.doc.index_of(id) else {
+            self.row_drag = None;
+            return;
+        };
+
+        match brokkr_core::drop_target(self.doc.nodes(), dragged, over, fraction) {
+            Ok(target) => {
+                // Which band produced it, read back off the target rather than
+                // recomputed from the pointer: only a closed folder's middle
+                // band lands at the END of a row's subtree ONE level deeper
+                // than that row.
+                let node = &self.doc.nodes()[over];
+                let inside = target.depth == node.depth() + 1
+                    && target.at == brokkr_core::subtree(self.doc.nodes(), over).end;
+                self.row_drag = Some(RowDrag {
+                    id,
+                    target: Some(target),
+                    into: inside.then_some(over),
+                    said: None,
+                });
+            }
+            Err(refusal) => {
+                if said != Some(refusal) {
+                    let line = {
+                        let name = self.doc.node(id).map_or("that row", |node| node.name.as_str());
+                        format!("{name} {}", refusal.reason())
+                    };
+                    self.status = line;
+                }
+                self.row_drag = Some(RowDrag { id, target: None, into: None, said: Some(refusal) });
+            }
         }
-        let Some(changes) = self.doc.move_to_folder(id, into) else {
-            self.status = format!("could not move this body to {where_to}");
+    }
+
+    /// The button came up: perform the move the indicator was drawing.
+    ///
+    /// One [`Change::Outline`] for the whole reorder however many rows the
+    /// block holds, plus a `NodeRemoved` for any folder the departure left
+    /// empty -- one entry, so one ctrl+Z puts the tree back exactly as it was.
+    ///
+    /// **A drag that changes nothing pushes no entry and does not set
+    /// `unsaved`.** `Document::reparent` answers that question, not this: the
+    /// panel is allowed to draw a line where the row already is, because
+    /// refusing to draw one there would read as "you cannot put it back".
+    fn finish_row_drag(&mut self) {
+        let Some(drag) = self.row_drag.take() else {
+            return;
+        };
+        let Some(target) = drag.target else {
+            return;
+        };
+        let was = self.doc.parent_of(drag.id);
+        let Some(changes) = self.doc.reparent(drag.id, target) else {
             return;
         };
 
         let before = self.history.stats();
         self.history.push(Entry::new(changes));
         self.record_history(before);
+        // The tree is written to the file, so a reorder is a change to the
+        // document even though not one voxel moved.
         self.unsaved = true;
-        self.status = format!("moved to {where_to}");
+
+        let name = self.doc.node(drag.id).map_or_else(String::new, |node| node.name.clone());
+        let now = self.doc.parent_of(drag.id);
+        self.status = if was == now {
+            // A pure reorder among its own siblings. Saying "into Group 1"
+            // here would be true and useless -- it was already in Group 1.
+            format!("moved {name}")
+        } else {
+            match now.and_then(|folder| self.doc.node(folder)) {
+                Some(folder) => format!("moved {name} into {}", folder.name),
+                None => format!("moved {name} out to the top level"),
+            }
+        };
     }
 
     /// Fold a folder's children away, or show them again.
@@ -2510,6 +3226,9 @@ impl Brokkr {
         let hovered = self.hover_body.unwrap_or_else(|| self.doc.active());
         let volume = self.doc.volume(hovered).unwrap_or_else(|| self.doc.active_volume());
         let selecting = self.hover_body.is_some_and(|body| body != self.doc.active());
+        // Mask mode never selects -- see the press dispatch -- so the ring must
+        // not say a press would.
+        let masking = (self.tool == Tool::Mask).then(|| self.mask_op());
         cursor::build(
             &mut batch,
             volume,
@@ -2517,7 +3236,12 @@ impl Brokkr {
             self.symmetry,
             MIRROR_CENTRE,
             self.hover,
-            cursor::mood(self.stroke_direction(), self.sizing.is_some(), selecting),
+            cursor::mood(
+                self.stroke_direction(),
+                self.sizing.is_some(),
+                selecting && masking.is_none(),
+                masking,
+            ),
             self.model_radius,
         );
         self.shared.swap_overlay(&mut batch);
@@ -2557,7 +3281,14 @@ impl Brokkr {
     /// it replaces marched every drawn one, so the stroke path got cheaper
     /// rather than dearer.
     fn refresh_hover(&mut self, pixel: Vec2) {
-        if !matches!(self.drag.map(|drag| drag.kind), Some(DragKind::Sculpt(_))) {
+        // **Mask mode is the same case as a live stroke**, and for the same
+        // reason rather than by analogy: a mask press does not pick, so the
+        // paint lands on the active body wherever the cursor is. A ring built
+        // from another body's field at a point on that other body's surface is
+        // a confident ring in mid air over a body that is not being painted.
+        let owns_the_ring = self.tool == Tool::Mask
+            || matches!(self.drag.map(|drag| drag.kind), Some(DragKind::Sculpt(_)));
+        if !owns_the_ring {
             self.update_hover(pixel);
             return;
         }
@@ -2696,6 +3427,61 @@ impl Brokkr {
         BrushKind::ALL.iter().position(|candidate| *candidate == kind).unwrap_or(0)
     }
 
+    /// Where the LIVE tool's strength lives in the table.
+    ///
+    /// The mask has a slot of its own; the cut has none and borrows the
+    /// brush's, which is correct because arming the cut must not disturb what
+    /// the brush was set to and a cut has no strength to remember.
+    fn live_strength_slot(&self) -> usize {
+        match self.tool {
+            Tool::Mask => MASK_STRENGTH_SLOT,
+            Tool::Sculpt | Tool::Cut => Self::strength_slot(self.brush.kind),
+        }
+    }
+
+    /// The highest strength the live tool allows. See [`MAX_MASK_STRENGTH`].
+    pub(crate) fn max_strength(&self) -> f32 {
+        match self.tool {
+            Tool::Mask => MAX_MASK_STRENGTH,
+            Tool::Sculpt | Tool::Cut => MAX_STRENGTH,
+        }
+    }
+
+    /// What the right-click menu's heading should read.
+    ///
+    /// The menu is contextual on the live tool, so in mask mode it has to say
+    /// MASK -- and it has to say BLUR while shift is held, which is the same
+    /// live substitution the strip makes and the reason this is not just
+    /// `self.tool`.
+    pub(crate) fn live_tool_label(&self) -> String {
+        match (self.tool, self.shift) {
+            (Tool::Mask, true) => "MASK — BLUR".to_string(),
+            (Tool::Mask, false) => "MASK".to_string(),
+            (Tool::Cut, _) => "PLANE CUT".to_string(),
+            (Tool::Sculpt, _) => self.effective_brush().kind.label().to_uppercase(),
+        }
+    }
+
+    /// Put the live strength away and bring out the one the incoming tool or
+    /// brush was last set to.
+    ///
+    /// One function and two callers -- a brush change and a tool change --
+    /// because the swap has to happen on both and two copies of it would drift.
+    ///
+    /// **Deliberately does not clamp on the way out.** `MAX_STRENGTH` is the
+    /// slider's ceiling and not a hard one: `BrushKind::Move`'s own default is
+    /// 1.0, deliberately above it, because for Move strength is the fraction of
+    /// the drag the surface follows and a grab tool at 0.15 crawls. Clamping
+    /// here would silently cap Move at 0.80 on every tool change, which
+    /// `each_brush_remembers_its_own_strength` catches. Nothing needs the
+    /// clamp anyway: the mask's 1.0 lives in its own slot and is never loaded
+    /// into a brush's.
+    fn swap_strength(&mut self, into: impl FnOnce(&mut Self)) {
+        self.strengths[self.live_strength_slot()] = self.brush.strength;
+        into(self);
+        self.brush.strength = self.strengths[self.live_strength_slot()];
+    }
+
     /// Where the pointer is, in the plane through `through` that faces the
     /// camera.
     ///
@@ -2794,6 +3580,183 @@ impl Brokkr {
         self.remesh_dirty();
         self.hover = Some(grab);
         self.refresh_overlay();
+    }
+
+    /// What a left press means while the sculpt tool is live.
+    ///
+    /// Lifted out of the press dispatch when the cut and the mask collapsed
+    /// into one match on [`Tool`]: three arms of body-resolution reasoning
+    /// nested inside a `match` on the tool inside a `match` on the button is
+    /// three levels deep and reads as none of them.
+    ///
+    /// **The body is resolved from the raycast BEFORE anything opens a
+    /// recorder**; see `arm_recorder`. A press over a body that is not the
+    /// active one selects it and carves nothing, and the press after that
+    /// sculpts -- the same rule Photoshop's layer panel has, applied to the
+    /// model itself so that direct manipulation acts on what is drawn. A press
+    /// over a HIDDEN body picks nothing, because `Document::pick` never marches
+    /// one.
+    fn sculpt_press(&mut self, position: Vec2) -> DragKind {
+        match self.pick(position) {
+            Some((body, _)) if body != self.doc.active() => {
+                self.select_body(body);
+                DragKind::Selecting
+            }
+            Some(_) => {
+                self.warn_if_masked(position);
+                DragKind::Sculpt(self.stroke_direction())
+            }
+            // Nothing drawn under the pointer. That is normally a press beside
+            // the model, which is allowed to become a stroke the moment it is
+            // dragged onto one -- but not when the body it would carve is itself
+            // hidden. See `active_is_drawn`: the stroke's own raycast does not
+            // consult the eye, so without this the press carves a body nobody
+            // can see. Saying which body is the honest half; a press that
+            // silently does nothing is its own puzzle.
+            //
+            // **And it must say which of the two hid it.** Under solo, the
+            // active body can be undrawn with its own eye plainly open --
+            // clicking a row outside the scope selects it, and `select_body`
+            // does not veto that, because a view mode never vetoes a structural
+            // operation. "Show it before sculpting it" would then be advice for
+            // a state the user is not in, pointing at an eye that is already on.
+            None if !self.active_is_drawn() => {
+                let active = self.doc.active();
+                let name =
+                    self.doc.node(active).map_or("the active body", |node| node.name.as_str());
+                self.status = if self.in_solo_scope(active) {
+                    format!("{name} is hidden — show it before sculpting it")
+                } else {
+                    format!("{name} is outside the solo scope — escape leaves solo")
+                };
+                DragKind::Refused
+            }
+            None => DragKind::Sculpt(self.stroke_direction()),
+        }
+    }
+
+    /// Say so when a sculpt press lands on protected material.
+    ///
+    /// **The one thing that stops a mask reading as a broken brush.** A stroke
+    /// over a fully protected surface leaves the field bit-identical -- that is
+    /// the whole point of the mask -- and with nothing on screen saying why, the
+    /// brush looks broken. The mask was very possibly painted minutes ago, or on
+    /// another body, so there is nothing under the cursor for the user to
+    /// connect it to. The cut has the same line for the same reason; see
+    /// `finish_cut`.
+    ///
+    /// Answered at the press only, from the ONE voxel under the cursor, and
+    /// both halves are the point: a per-stamp check would be a map probe in the
+    /// stroke loop, and a claim about the whole footprint would need a pass over
+    /// it. So it is deliberately narrow -- "the surface you pressed on is fully
+    /// protected" -- and stays silent about a stroke that is merely weakened,
+    /// which the ring and the tint report instead.
+    fn warn_if_masked(&mut self, pixel: Vec2) {
+        let volume = self.doc.active_volume();
+        if volume.mask().is_free() {
+            return;
+        }
+        let Some(point) = self.surface_under(pixel) else {
+            return;
+        };
+        let cell = (point / self.doc.voxel_size()).round().as_ivec3();
+        if self.doc.active_volume().mask().at(cell) != brokkr_core::PROTECTED {
+            return;
+        }
+        let active = self.doc.active();
+        let name = self.doc.node(active).map_or("this body", |node| node.name.as_str()).to_string();
+        self.status = format!("the mask on {name} protects this — m, then ctrl drag, unmasks");
+    }
+
+    /// Which way a mask stroke is going, and whether it is blurring instead.
+    ///
+    /// **Its own computation, and NOT `stroke_direction`.** That one gates on
+    /// `brush.kind.is_directional()`, which answers false for Smooth, Flatten
+    /// and Move -- so reusing it would make ctrl+drag in mask mode *mask*
+    /// instead of unmasking for three of the seven brushes, with nothing on
+    /// screen to say which three. This is two lines that never consult
+    /// `brush.kind`, and the stylus eraser end falls out unmasking for free.
+    ///
+    /// Shift outranks the pair, which mirrors the field side: shift is Smooth
+    /// there whatever the invert modifier says, and it is Blur here.
+    fn mask_op(&self) -> MaskOp {
+        if self.shift {
+            return MaskOp::Blur;
+        }
+        // Either modifier, and they do NOT compound -- holding both is still one
+        // inversion, exactly as `stroke_direction` reads them.
+        let unmask = (self.control || self.alt) != self.eraser_in_use();
+        if unmask { MaskOp::Lower } else { MaskOp::Raise }
+    }
+
+    /// Paint the mask along the stroke path up to the point under the cursor.
+    ///
+    /// The sculpt path's twin, and deliberately its shape rather than a new
+    /// one: the same [`Stroke`] walker at the same spacing, the same lazy
+    /// recorder, the same pressure sample once per event. Masking is per body
+    /// and lands on the ACTIVE one, so it asks `surface_under` rather than
+    /// picking -- the same rule a live sculpt stroke follows once it has begun.
+    ///
+    /// Move has no analogue here and needs none: the mask is a value at a
+    /// lattice cell, not a shape to warp, and there is nothing for a locked copy
+    /// to be a copy of.
+    fn mask_to(&mut self, pixel: Vec2, start: bool) {
+        let Some(point) = self.surface_under(pixel) else {
+            // The cursor ran off the model. The stroke stays live so coming back
+            // onto it continues rather than restarting, but nothing is painted
+            // in mid air.
+            return;
+        };
+
+        // Past the early return, for the same reason the sculpt path is: the
+        // recorder opens on the body about to be painted and only once there is
+        // something to paint. `end_stroke` then produces ONE entry carrying the
+        // mask bricks, which is what makes a mask-only gesture undoable and
+        // what sets `unsaved`.
+        self.arm_recorder();
+
+        let started = Instant::now();
+        self.stamp_centres.clear();
+        if start {
+            self.stroke.begin(point, &mut self.stamp_centres);
+        } else {
+            let spacing = self.brush.spacing(self.doc.voxel_size());
+            self.stroke.advance(point, spacing, &mut self.stamp_centres);
+        }
+
+        let pressure = self.tablet.stamp_pressure(self.pressure_enabled, self.pressure_curve);
+        let op = self.mask_op();
+        // `self.brush` and not `effective_brush`: shift means Blur here, and
+        // asking for the effective brush would hand the mask painter Smooth's
+        // kind, which it does not read, and Smooth's strength, which it must
+        // not -- the mask keeps its own.
+        let brush = self.brush;
+        let lean = self.pen_lean();
+        let tangent = self.stroke.direction().unwrap_or(Vec3::ZERO);
+
+        for index in 0..self.stamp_centres.len() {
+            let centre = self.stamp_centres[index];
+            let normal = lean_normal(self.doc.active_volume().gradient_world(centre), lean);
+            // The direction a mask stamp carries is never read -- protection has
+            // no add and subtract, `op` says which way this goes -- so `Add` is
+            // the value that cannot be wrong rather than a choice.
+            let stamp = Stamp::new(centre, normal, BrushDirection::Add)
+                .with_pressure(pressure)
+                .with_tangent(tangent);
+            brush.apply_mask_symmetric(
+                self.doc.active_volume_mut(),
+                &stamp,
+                op,
+                self.symmetry,
+                MIRROR_CENTRE,
+                &mut self.brush_scratch,
+            );
+        }
+
+        self.perf.stamps = self.stamp_centres.len();
+        self.perf.pressure = pressure;
+        self.perf.edit_ms = started.elapsed().as_secs_f32() * 1000.0;
+        self.remesh_dirty();
     }
 
     fn sculpt_to(&mut self, pixel: Vec2, direction: BrushDirection, start: bool) {
@@ -2949,6 +3912,12 @@ impl Brokkr {
     /// whole job: solo narrows the set, a hidden body the line passes over is
     /// left bit-identical, and the whole gesture is one undo entry.
     ///
+    /// **And it answers to the mask**, on the same principle: a cut acts on what
+    /// is drawn, and a masked region is drawn as protected. A cut a mask blocked
+    /// entirely produces the same zero as a cut that missed, so the zero case
+    /// below tells the two apart and names the body -- see there for why that
+    /// matters more than the count does.
+    ///
     /// The plane is the one containing the eye and both ends of the line, so it
     /// is exactly the surface the line sweeps out going away from the viewer --
     /// which is what makes a screen-space drag mean something in three
@@ -2970,9 +3939,12 @@ impl Brokkr {
             return;
         };
         // A click is not a cut. Without this, arming the tool and clicking once
-        // would take an arbitrary half of the model away.
+        // would take an arbitrary half of the model away. Ctrl only changes
+        // which field the half-space is written into, so the same slop applies
+        // and the word changes with it.
         if from.distance(to) < CLICK_SLOP_PX {
-            self.status = "cut cancelled: drag a line across the model".to_string();
+            let what = if self.control { "mask" } else { "cut" };
+            self.status = format!("{what} cancelled: drag a line across the model");
             return;
         }
 
@@ -2985,6 +3957,20 @@ impl Brokkr {
             self.status = "cut cancelled: that line has no direction".to_string();
             return;
         };
+
+        // **Ctrl turns the cut into a selection**, which is increment 25c's
+        // "no new gesture": the same drag, the same plane, the same brick
+        // classification, writing protection instead of removing material. It
+        // is checked here at the RELEASE rather than at the press, because that
+        // is where the plane exists and because a user who realises mid-drag
+        // that they meant to select can still say so.
+        if self.control {
+            self.mask_halfspace(plane);
+            // One shot per arming, exactly as the cut is: the assignment below
+            // carries that property and this arm must not skip it.
+            self.tool = Tool::Sculpt;
+            return;
+        }
 
         // **The cut crosses every VISIBLE body**, which is what
         // `Document::clip` is for: solo narrows the set, a hidden body the line
@@ -3011,11 +3997,28 @@ impl Brokkr {
             self.refresh_overlay();
         } else {
             // Nothing changed, so nothing is recorded -- an undo entry for a
-            // no-op would be worse than none. The two ways to get here read
-            // very differently to a user, so they are told apart: a line that
-            // went nowhere near anything, and a line that really did pass over
-            // a body and found only empty space inside its box.
-            self.status = if outcome.bodies_crossed > 0 {
+            // no-op would be worse than none. The three ways to get here read
+            // very differently to a user, so they are told apart: a mask that
+            // blocked the whole cut, a line that really did pass over a body
+            // and found only empty space inside its box, and a line that went
+            // nowhere near anything.
+            self.status = if outcome.bricks_spared_by_mask > 0 {
+                // **The mask comes first, and it names the body.** Without this
+                // the single most confusing thing masking can do -- a cut that
+                // silently does nothing because of protection painted minutes
+                // ago, possibly on a body that is not even the active one --
+                // reports itself as "the cut missed the model", which sends the
+                // user off to redraw a line that was never the problem.
+                match outcome.bodies_spared_by_mask.as_slice() {
+                    [only] => format!(
+                        "the mask on {} blocked the cut",
+                        self.doc
+                            .meta(*only)
+                            .map_or_else(|| "that body".to_string(), |meta| meta.name)
+                    ),
+                    many => format!("the mask blocked the cut on {} bodies", many.len()),
+                }
+            } else if outcome.bodies_crossed > 0 {
                 format!(
                     "the cut crossed {} bodies and found nothing to remove",
                     outcome.bodies_crossed
@@ -3025,8 +4028,11 @@ impl Brokkr {
             };
         }
         // One cut per arming. A destructive tool that stays live is how a
-        // stray click removes half the model.
-        self.cut_armed = false;
+        // stray click removes half the model. **This is the assignment that
+        // carries the one-shot property, not the one in the Escape arm** --
+        // moving it there instead would drop it silently while the Escape test
+        // still passed.
+        self.tool = Tool::Sculpt;
     }
 
     fn finish_stroke(&mut self) {
@@ -3045,6 +4051,12 @@ impl Brokkr {
             // touched the model produces no edit, and must not raise a
             // "discard your work?" prompt on the way out.
             self.unsaved = true;
+            // And in the same guard, for the same reason, the picture. This is
+            // the "on stroke END, never per stamp" half of the refresh rule --
+            // `remesh_dirty` deliberately skips a sculpt drag, so a five second
+            // stroke queues exactly one render rather than one per pointer
+            // event.
+            self.thumbs.geometry_changed(body);
         }
     }
 
@@ -3474,6 +4486,13 @@ impl Brokkr {
         };
 
         self.doc = doc;
+        // The mask card is keyed on `(body, mask revision)`, and a mask read
+        // from a file has the revision the READER left on it -- which counts
+        // the bricks it inserted. Two projects whose active body shares an id
+        // and a mask brick count would then hit each other's cache and the
+        // card would stand there naming the wrong percentage. Nothing of the
+        // old document survives an open, this included.
+        self.mask_card = None;
         // Before `apply_view`, so that a mirror plane the loaded body does not
         // straddle wins the status line: which file was opened is visible in
         // the title and the recent list, and a mirror plane going off is not
@@ -4169,7 +5188,8 @@ impl Brokkr {
                     self.brush.radius = value.clamp(MIN_RADIUS_MM, self.max_radius());
                 }
                 SizingTarget::Strength => {
-                    self.brush.strength = value.clamp(MIN_STRENGTH, MAX_STRENGTH);
+                    // The LIVE tool's ceiling, so the mask's 1.0 is typeable.
+                    self.brush.strength = value.clamp(MIN_STRENGTH, self.max_strength());
                 }
             }
         }
@@ -4212,7 +5232,7 @@ impl Brokkr {
             // Additive: strength is already a small linear range.
             SizingTarget::Strength => {
                 self.brush.strength = (sizing.original + travel * STRENGTH_PER_PIXEL)
-                    .clamp(MIN_STRENGTH, MAX_STRENGTH);
+                    .clamp(MIN_STRENGTH, self.max_strength());
             }
         }
     }
@@ -4293,7 +5313,9 @@ impl Brokkr {
     /// Called from [`Brokkr::update`] after every message rather than from the
     /// handful of places that change an eye, because "the handful of places" is
     /// a list that goes out of date silently. It runs on the frame tick too,
-    /// so it allocates nothing: both buffers are kept and refilled.
+    /// so it allocates nothing: both buffers are kept and refilled, **and so
+    /// are the two inside [`crate::thumbnails::Thumbnails::sync`] at the
+    /// bottom of it**. Anything added here is held to the same rule.
     ///
     /// **Bodies only.** Folder rows have no geometry in the pool, and passing
     /// one to the renderer would be a name it can never match.
@@ -4308,6 +5330,646 @@ impl Brokkr {
             }
         }
         self.shared.set_hidden(&self.hidden_bodies);
+        self.publish_mask_view();
+        // Cells ride along on the same walk, and for the same argument: adding
+        // and removing a body happens in a handful of places, and a handful of
+        // places is a list that goes out of date silently. `sync` is idempotent
+        // -- a call where the body set has not changed marks nothing stale --
+        // so hiding, soloing, renaming and reordering still queue zero renders.
+        self.thumbs.sync(self.doc.nodes().iter().filter(|node| node.is_body()).map(|node| node.id));
+        // Here for the reason the visibility pass itself is here: the set of
+        // messages that can change what the card says -- a stroke, an undo, a
+        // rename, a delete, a merge, a resample, an open, a solo -- is not a
+        // list anyone can keep correct, and a card that goes stale is a card
+        // naming the wrong body. The expensive half is behind a revision check;
+        // see `refresh_mask_card`.
+        self.refresh_mask_card();
+    }
+
+    /// Tell the renderer how to draw the mask: the active body's polarity, the
+    /// bodies that disagree with it, and the tint the view preferences add up
+    /// to.
+    ///
+    /// **Here, on the every-message path, for the reason the visibility pass
+    /// itself is here.** The set of things that change any of the three is
+    /// bigger than it looks -- the toggle, the slider, the held peek key,
+    /// choosing another body, an undo that puts a polarity back -- and a list of
+    /// them is a list that goes silently out of date. What it would go out of
+    /// date INTO is a mask drawn with the wrong polarity, which shows protected
+    /// material as free. Two locks, two word writes and a walk of at most
+    /// `MAX_BODIES` rows asking each one a bool, so the frame tick can afford it
+    /// unconditionally; it allocates nothing, which
+    /// [`Brokkr::publish_visibility`]'s contract requires of everything in it.
+    ///
+    /// # One word cannot answer for a document, so it does not have to
+    ///
+    /// A mask is per BODY and `Uniforms::mask_inverted` is one word for the
+    /// whole draw. The polarity published here is the ACTIVE body's, and every
+    /// body that disagrees with it is named in a set the pool consults per
+    /// bucket -- see [`brokkr_gpu::MaskPolarity`]. Increment 24 shipped Invert
+    /// and Mask All without that set, and its review found what that costs: a
+    /// Mask All on a body that is not the active one drew that body's stored
+    /// zeros through the active body's polarity, so a fully protected body sat
+    /// on screen with no tint on it at all.
+    ///
+    /// The set is relative to the word rather than absolute so that a document
+    /// where every body agrees -- which is every document that has not used the
+    /// verbs -- publishes an empty set and costs the draw nothing.
+    fn publish_mask_view(&mut self) {
+        let inverted =
+            self.doc.volume(self.doc.active()).is_some_and(|volume| volume.mask().inverted());
+        self.opposite_polarity.clear();
+        for node in self.doc.nodes() {
+            if let Some(volume) = node.volume()
+                && volume.mask().inverted() != inverted
+            {
+                self.opposite_polarity.push(node.id);
+            }
+        }
+        self.shared.set_opposite_polarity(&self.opposite_polarity);
+        // The peek key overrides the toggle rather than being overridden by it:
+        // it is what a user who switched the tint off and forgot reaches for.
+        let shown = self.show_mask || self.mask_peek;
+        self.shared.set_mask_view(crate::viewport::MaskView {
+            inverted,
+            tint: if shown { self.mask_tint } else { 0.0 },
+        });
+    }
+
+    /// Rebuild the standing mask card, cheaply enough to do it every message.
+    ///
+    /// **This runs on the frame tick**, so what it costs when nothing has
+    /// changed is what matters, and what it must cost is nothing at all: not a
+    /// `mask_fill`, and not a `format!` either -- `publish_visibility`'s own
+    /// contract two functions up is that the frame path allocates NOTHING, and
+    /// this is at the bottom of it. So everything above the cache gate is a walk
+    /// of at most `MAX_BODIES` rows asking each body a map-empty question, both
+    /// counts stay a `usize` until they are known to be new, and every `String`
+    /// in here is built below the gate.
+    ///
+    /// Three gates, in cheapest-first order: a document with no protection
+    /// anywhere leaves with `None`; a document whose active body, revision and
+    /// two counts are all unchanged leaves without touching the card; and only
+    /// a genuine change pays for [`brokkr_core::Volume::mask_fill`].
+    ///
+    /// # Every masked body is counted somewhere, and that is the point
+    ///
+    /// The card is what makes "a mask is active and nothing on screen says so"
+    /// unreachable, and that has to be a DOCUMENT-wide property rather than an
+    /// active-body one. Increment 24's review found it was not: only the active
+    /// body and the masked bodies that were HIDDEN were counted, so a body that
+    /// was masked, visible and not active fell through both. Mask all on a
+    /// cube, then click another body, and the card vanished while a fully
+    /// protected cube sat on screen; the first the user heard of it was a clip
+    /// plane sparing the whole thing.
+    fn refresh_mask_card(&mut self) {
+        let active = self.doc.active();
+        let active_masked = self.doc.volume(active).is_some_and(|volume| !volume.mask().is_free());
+
+        // Masked bodies that are not the one the headline is about, split by
+        // whether the user can see them. The active body is excluded from both:
+        // the counts mean "as well as what this card already says", so a hidden
+        // active body counting itself would be a card announcing its own
+        // subject twice.
+        let mut off_screen = 0usize;
+        let mut elsewhere = 0usize;
+        for (node, shown) in self.doc.nodes().iter().zip(&self.shown) {
+            if !node.is_body() || node.id == active {
+                continue;
+            }
+            if node.volume().is_some_and(|volume| !volume.mask().is_free()) {
+                if *shown {
+                    elsewhere += 1;
+                } else {
+                    off_screen += 1;
+                }
+            }
+        }
+
+        if !active_masked && off_screen == 0 && elsewhere == 0 {
+            self.mask_card = None;
+            return;
+        }
+
+        // Zero is the revision of a card about a body carrying no mask of its
+        // own, and no live mask can collide with it: `revision` counts writes,
+        // so a mask that is not free has had at least one.
+        let revision =
+            if active_masked { self.doc.active_volume().mask().revision() } else { NO_MASK_HERE };
+
+        if let Some(card) = &mut self.mask_card
+            && card.body == active
+            && card.revision == revision
+        {
+            if card.off_screen_count != off_screen || card.elsewhere_count != elsewhere {
+                card.rewrite_the_other_counts(off_screen, elsewhere);
+            }
+            return;
+        }
+
+        if !active_masked {
+            // Nothing on the active body, but protection is out there on
+            // something else. No percentage, because there is no one body for
+            // it to be about.
+            let (headline, hidden) = MaskCard::about_other_bodies(off_screen, elsewhere);
+            self.mask_card = Some(MaskCard {
+                body: active,
+                revision,
+                off_screen_count: off_screen,
+                elsewhere_count: elsewhere,
+                headline,
+                off_screen: hidden,
+                elsewhere: String::new(),
+            });
+            return;
+        }
+
+        let name = self.doc.node(active).map_or("this body", |node| node.name.as_str()).to_string();
+        let percent = (self.doc.active_volume().mask_fill() * 100.0).round() as u32;
+        self.mask_card = Some(MaskCard {
+            body: active,
+            revision,
+            off_screen_count: off_screen,
+            elsewhere_count: elsewhere,
+            // Never "0%": a mask that exists but rounds to nothing still blocks
+            // a cut and still weakens a stroke, and a card reading zero is a
+            // card saying "ignore me".
+            headline: format!("MASK — {name}, {}%", percent.max(1)),
+            off_screen: MaskCard::hidden_count_line(off_screen),
+            elsewhere: MaskCard::elsewhere_count_line(elsewhere),
+        });
+    }
+
+    // ------------------------------------------------- the whole-mask verbs
+
+    /// Throw the active body's mask away.
+    ///
+    /// **The map is MOVED into the history entry and never copied**, which is
+    /// the [`Change::NodeRemoved`] trick: a gigabyte of protection is cleared
+    /// with no allocation, peak memory does not rise, and `resident_bytes`
+    /// falls back to what it was before the mask existed. The bytes go against
+    /// the reclaim allowance rather than the 256 MB stroke budget, so a Clear
+    /// does not evict the strokes behind it.
+    fn clear_mask(&mut self) {
+        let body = self.doc.active();
+        if self.doc.active_volume().mask().is_free() {
+            self.status = format!("{} carries no mask", self.active_body_name());
+            return;
+        }
+        let volume = self.doc.active_volume_mut();
+        let cleared = volume.mask().cleared(false);
+        let previous = volume.replace_mask(cleared);
+        self.commit_whole_mask(body, previous);
+        self.status = format!("cleared the mask on {}", self.active_body_name());
+    }
+
+    /// Flip which side of the mask is protected.
+    ///
+    /// One bool, whatever the mask holds: no walk, no allocation, no brick
+    /// marked for a remesh. Without that, ctrl+I on a lightly masked
+    /// 45,567-brick model would allocate 1.04 GiB from one keystroke.
+    fn invert_mask(&mut self) {
+        let body = self.doc.active();
+        let edit = self.doc.active_volume_mut().flip_mask_polarity();
+        let before = self.history.stats();
+        self.history.push(Entry::stroke(body, edit));
+        self.record_history(before);
+        self.unsaved = true;
+        // The picture follows from `publish_mask_view`, which `update` runs
+        // after every message: the polarity is a uniform and not a vertex
+        // attribute, so there is deliberately nothing to remesh. The thumbnail
+        // is a different matter -- see `geometry_changed`'s caller list.
+        self.thumbs.geometry_changed(body);
+        self.status = format!("inverted the mask on {}", self.active_body_name());
+    }
+
+    /// Protect the whole body: clear, then invert, as ONE change.
+    ///
+    /// They are one change and not two because the polarity rides inside the
+    /// field, so `cleared(true)` IS clear-then-invert -- and undoing it puts
+    /// both halves back together, which is the only state either half means
+    /// anything in.
+    fn mask_all(&mut self) {
+        let body = self.doc.active();
+        if self.doc.active_volume().mask().protects_everything() {
+            self.status = format!("{} is already fully masked", self.active_body_name());
+            return;
+        }
+        let volume = self.doc.active_volume_mut();
+        let all = volume.mask().cleared(true);
+        let previous = volume.replace_mask(all);
+        self.commit_whole_mask(body, previous);
+        self.status = format!("masked all of {}", self.active_body_name());
+    }
+
+    /// Push the entry a whole-mask change produced and put the picture back in
+    /// step with it.
+    fn commit_whole_mask(&mut self, body: NodeId, previous: MaskField) {
+        let before = self.history.stats();
+        self.history.push(Entry::new(vec![Change::WholeMask { body, mask: Box::new(previous) }]));
+        self.record_history(before);
+        self.unsaved = true;
+        self.thumbs.geometry_changed(body);
+        self.remesh_dirty();
+    }
+
+    /// The amount slider moved.
+    ///
+    /// **Absolute.** The first non-zero amount of a gesture takes the mask off
+    /// the body and keeps it as a snapshot; every amount after that is applied
+    /// to that same snapshot, so the result depends on where the slider IS and
+    /// never on how it got there. Dragging back to zero moves the snapshot back
+    /// onto the body bit for bit and ends the gesture with no entry at all,
+    /// which is why "blur at 0.0 is a no-op" is literally true rather than
+    /// approximately so.
+    ///
+    /// # What one step of the slider costs, said plainly
+    ///
+    /// A whole-body filter and a whole-body remesh, per step. The remesh is the
+    /// larger half and the plan already names it: 71 ms on the reference dragon
+    /// and roughly 475 ms at the 45,567 bricks the pool is sized for. The
+    /// step is 0.05, so a full sweep is at most twenty of those. Two things
+    /// keep it usable rather than one: the uniform fast path in
+    /// [`brokkr_core::MaskField::filtered`] walks only the shell where
+    /// protection actually changes, and a slider emits nothing when the snapped
+    /// value has not moved. **If this becomes the complaint, the answer is the
+    /// two-halves `iced::Task` increment 25a already specifies for the
+    /// generators, not a coarser step.**
+    fn mask_amount_changed(&mut self, amount: f32) {
+        let amount = amount.clamp(0.0, 1.0);
+        self.mask_amount = amount;
+        let body = self.doc.active();
+
+        // A gesture belongs to one body and one filter. Either changing under
+        // it ends it where it stands rather than re-applying one body's
+        // snapshot onto another's mask.
+        if self
+            .mask_grab
+            .as_ref()
+            .is_some_and(|grab| grab.body != body || grab.filter != self.mask_filter)
+        {
+            self.commit_mask_filter();
+        }
+
+        if amount <= 0.0 {
+            // Put the snapshot back, exactly as it was, and push nothing.
+            if let Some(grab) = self.mask_grab.take()
+                && let Some(volume) = self.doc.volume_mut(grab.body)
+            {
+                volume.replace_mask(grab.snapshot);
+                self.remesh_dirty();
+            }
+            return;
+        }
+
+        let filter = self.mask_filter;
+        if self.mask_grab.is_none() {
+            if let Some(why) = self.refuse_the_filter(filter) {
+                self.status = why;
+                log::warn!("{}", self.status);
+                self.mask_amount = 0.0;
+                return;
+            }
+            let snapshot = self.doc.active_volume_mut().take_mask();
+            self.mask_grab = Some(MaskGrab { body, filter, snapshot });
+        } else {
+            // Drop what the last change of this gesture left behind BEFORE the
+            // next one is built, so the peak stays at two masks and not three.
+            drop(self.doc.active_volume_mut().take_mask());
+        }
+
+        let Some(grab) = &self.mask_grab else {
+            return;
+        };
+        let next = grab.snapshot.filtered(filter, amount);
+        self.doc.active_volume_mut().replace_mask(next);
+        self.remesh_dirty();
+    }
+
+    /// The amount slider was let go: one entry for the whole drag.
+    ///
+    /// The slider goes back to zero because the filter is absolute and the
+    /// amount is a property of the gesture rather than of the document -- see
+    /// the field's own documentation.
+    fn mask_amount_released(&mut self) {
+        self.commit_mask_filter();
+        self.mask_amount = 0.0;
+    }
+
+    /// Commit a live filter gesture, if there is one.
+    fn commit_mask_filter(&mut self) {
+        let Some(grab) = self.mask_grab.take() else {
+            return;
+        };
+        let verb = grab.filter.done();
+        let body = grab.body;
+        let name = self.doc.node(body).map_or("this body", |node| node.name.as_str()).to_string();
+        self.commit_whole_mask(body, grab.snapshot);
+        self.status = format!("{verb} the mask on {name}");
+    }
+
+    /// Commit a filter gesture whose slider is no longer there to release it.
+    ///
+    /// **On the frame tick, and two `Option` comparisons.** The amount slider
+    /// lives in the right-click tool menu, and the menu can go away mid-drag --
+    /// Escape closes it, and Escape is also how a user dismisses anything. The
+    /// active body can change under it too. Either way the `MaskAmountReleased`
+    /// that would have committed the drag is never coming, and what is left is
+    /// a filtered mask with no history entry and no `unsaved`: real work that
+    /// ctrl+Z cannot reach and that quitting would not even prompt about.
+    ///
+    /// Here rather than in each of the arms that closes a menu, because a list
+    /// of those is a list that goes out of date silently -- the same argument
+    /// `publish_visibility` makes about the eye.
+    fn settle_an_orphaned_mask_grab(&mut self) {
+        let orphaned = self
+            .mask_grab
+            .as_ref()
+            .is_some_and(|grab| self.menu.is_none() || grab.body != self.doc.active());
+        if orphaned {
+            self.commit_mask_filter();
+            self.mask_amount = 0.0;
+        }
+    }
+
+    /// Why a global filter would not fit under the memory ceiling.
+    ///
+    /// **Not optional, and not a tidy-up.** A filter needs the old mask while
+    /// it writes the new one, and the history entry then holds the old one, so
+    /// the peak is `field + 2 x mask`. A fully painted mask is 25% of its field
+    /// -- 32,768 bytes a brick against 131,072 -- which makes that peak 1.5
+    /// times the field: on the measured 0.0565 mm dragon, 6.22 GiB against a
+    /// 6 GiB ceiling, from one button press. `History::trim` keeps a single
+    /// over-budget entry by design, so the undo budget cannot save it either.
+    ///
+    /// **Clear, Invert and Mask All are deliberately NOT gated**, and that is
+    /// the same paragraph of the plan read to its end rather than a narrowing
+    /// of it: all three are O(1) in memory, none of them builds a second mask,
+    /// and refusing the one verb that GIVES the memory back would trap a user
+    /// with a mask they cannot remove at exactly the moment they need to.
+    fn refuse_the_filter(&self, filter: MaskFilter) -> Option<String> {
+        let mask = self.doc.active_volume().mask();
+        let (why, _coarser) =
+            mask.would_fit(mask.bytes(), self.doc_stats.resident_bytes, self.doc.voxel_size())?;
+        Some(format!("could not {} the mask on {}: {why}", filter.verb(), self.active_body_name()))
+    }
+
+    /// The active body's name, for a status line.
+    fn active_body_name(&self) -> String {
+        self.doc.node(self.doc.active()).map_or("this body", |node| node.name.as_str()).to_string()
+    }
+
+    // ------------------------------------------------- the generated masks
+
+    /// The recipe a generator button means, with the sliders as they stand.
+    fn recipe_for(&self, which: MaskGenerator) -> MaskRecipe {
+        match which {
+            MaskGenerator::Cavity => MaskRecipe::Cavity { feature_mm: self.mask_feature_mm },
+            MaskGenerator::Smoothness => {
+                MaskRecipe::Smoothness { feature_mm: self.mask_feature_mm }
+            }
+            MaskGenerator::Thickness => {
+                MaskRecipe::Thickness { voxels: self.mask_thickness_voxels }
+            }
+        }
+    }
+
+    /// Build a whole mask out of the active body's geometry.
+    ///
+    /// # It runs on this thread, and the plan asked for two halves
+    ///
+    /// Increment 25a specifies an `iced::Task` in two halves like
+    /// `ImportRequested` / `ImportLoaded`, with a progress tick. **It is not
+    /// written that way and the reason is the document, not the effort.** An
+    /// import builds a fresh volume from a path, so the future owns everything
+    /// it touches; a generator reads the volume the document is holding, and
+    /// there is no way to lend that across an await. The three ways out are all
+    /// worse than the hitch: cloning the volume is a second copy of up to four
+    /// gigabytes, moving it out and back leaves the body missing from the
+    /// document mid-flight -- visible, and editable -- and an `Arc<Volume>`
+    /// rewrites every mutating path in the crate.
+    ///
+    /// What it costs, measured on the reference dragon: **39.6 ms on 24 cores**,
+    /// against **71.0 ms for the whole-document remesh that has to follow it**
+    /// and that is already synchronous. So moving only the pass off-thread would
+    /// hide a third of the pause and buy a mid-flight state that nothing else in
+    /// this application has. Extrapolated to the 45,567-brick ceiling the pass
+    /// is about 265 ms, and if that becomes the complaint the answer is to move
+    /// the remesh and the pass together, not the pass alone.
+    ///
+    /// The elapsed time goes to stderr past [`brokkr_core::SLOW_SPLIT`], which
+    /// is the same instrument `apply_split` uses and for the same reason: the
+    /// status bar is already carrying the result, and the perf readout cannot
+    /// see a frame that never came.
+    fn generate_mask(&mut self, which: MaskGenerator) {
+        let body = self.doc.active();
+        let recipe = self.recipe_for(which);
+        let name = self.active_body_name();
+
+        if let Some(why) = self.refuse_the_generator(recipe) {
+            self.status = why;
+            log::warn!("{}", self.status);
+            return;
+        }
+
+        let started = std::time::Instant::now();
+        let mask = self.doc.active_volume().generated_mask(recipe);
+        let elapsed = started.elapsed();
+        if mask.is_free() {
+            // No entry, no `unsaved`, no remesh. A generator that found nothing
+            // has not changed the document, and pushing an entry for it would
+            // spend the undo budget on putting back what is already there.
+            self.status = format!("{}: nothing on {name} matches", recipe.verb());
+            return;
+        }
+
+        let previous = self.doc.active_volume_mut().replace_mask(mask);
+        self.commit_whole_mask(body, previous);
+        self.status = format!("{} on {name}", recipe.done());
+        if elapsed > brokkr_core::SLOW_SPLIT {
+            eprintln!("{} on {name} took {} ms", recipe.verb(), elapsed.as_millis());
+        }
+    }
+
+    /// Why a generated mask would not fit under the memory ceiling.
+    ///
+    /// **The refusal is part of this feature rather than a nicety.** A
+    /// hand-painted mask collapses to tiles almost everywhere; a generated one
+    /// writes a value at every surface voxel, so the +25% of the mask
+    /// arithmetic is what is actually paid -- and the thickness walk copies the
+    /// field on top of that. Predicting it is
+    /// `brokkr_core::Volume::generated_mask_demand`'s job and refusing on it is
+    /// this one's.
+    fn refuse_the_generator(&self, recipe: MaskRecipe) -> Option<String> {
+        let volume = self.doc.active_volume();
+        let extra = volume.generated_mask_demand(recipe);
+        let (why, _coarser) =
+            volume.mask().would_fit(extra, self.doc_stats.resident_bytes, self.doc.voxel_size())?;
+        Some(format!("could not {} on {}: {why}", recipe.verb(), self.active_body_name()))
+    }
+
+    /// Protect the half of every visible body that a cut would have removed.
+    ///
+    /// **The plane is the cut's own and so is the gesture**: ctrl held at the
+    /// end of a cut drag writes protection instead of taking material away.
+    /// That is the whole of increment 25c's "no new gesture" -- the brick
+    /// classification, the ray pair and the plane are all the ones `finish_cut`
+    /// already had, and what changes is which field the half-space is written
+    /// into.
+    ///
+    /// Across every DRAWN body, for the reason `Document::clip` gives: a cut is
+    /// a line the user draws across what they can see, and a mask drawn the same
+    /// way has to mean the same thing. One compound entry of N
+    /// `Change::WholeMask`, so one ctrl+Z takes the whole gesture back.
+    fn mask_halfspace(&mut self, plane: brokkr_core::ClipPlane) {
+        let feather_mm = HALFSPACE_FEATHER_VOXELS * self.doc.voxel_size();
+        let drawn = self.drawn_nodes();
+        let bodies: Vec<NodeId> = self
+            .doc
+            .nodes()
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| drawn.get(*index).copied().unwrap_or(false))
+            .map(|(_, node)| node.id)
+            .collect();
+
+        let mut changes = Vec::new();
+        let mut touched = 0usize;
+        for body in bodies {
+            let Some(volume) = self.doc.volume_mut(body) else {
+                continue;
+            };
+            let mask = volume.generated_mask(MaskRecipe::Halfspace { plane, feather_mm });
+            if mask.is_free() {
+                // The plane missed this body entirely, so it keeps whatever it
+                // was carrying. Replacing it with an empty mask would throw a
+                // hand-painted one away for a line drawn somewhere else.
+                continue;
+            }
+            let previous = volume.replace_mask(mask);
+            changes.push(Change::WholeMask { body, mask: Box::new(previous) });
+            self.thumbs.geometry_changed(body);
+            touched += 1;
+        }
+
+        if changes.is_empty() {
+            self.status = "the mask line missed the model".to_string();
+            return;
+        }
+        let before = self.history.stats();
+        self.history.push(Entry::new(changes));
+        self.record_history(before);
+        self.unsaved = true;
+        self.remesh_dirty();
+        self.status = if touched > 1 {
+            format!("masked that half of {touched} bodies")
+        } else {
+            format!("masked that half of {}", self.active_body_name())
+        };
+    }
+
+    /// Split the active body in two along its mask.
+    ///
+    /// No preview card, unlike `split_active_body`: a masked split always makes
+    /// exactly two bodies, so the question a card exists to answer -- how many
+    /// parts is this -- is already answered, and the tint on screen is a better
+    /// preview than any card could be.
+    ///
+    /// The three lines after the split are the unit `apply_split`,
+    /// `Brokkr::remove_body` and `Brokkr::apply_merge` all document: the source
+    /// stops existing, its bricks are in nobody's dirty set, so
+    /// `SharedFrame::forget_body` is what releases its slots and the
+    /// whole-document remesh is the other half.
+    fn split_the_mask_off(&mut self) {
+        let source = self.doc.active();
+        let name = self.active_body_name();
+
+        let visible = self
+            .doc
+            .index_of(source)
+            .and_then(|index| self.shown.get(index).copied())
+            .unwrap_or(true);
+        if !visible {
+            self.status = format!(
+                "could not split {name}: it is not on screen, and its halves would not be either"
+            );
+            return;
+        }
+        if let Some(why) = self.doc.split_masked_guard(source) {
+            self.status = format!("could not split {name}: {why}");
+            return;
+        }
+
+        let started = std::time::Instant::now();
+        let Some(outcome) = self.doc.split_masked(source) else {
+            // The guard covers the two O(1) cases; this is the third, and it
+            // needs the pass to find out: a mask that is neither empty nor
+            // total can still sit entirely off the material.
+            self.status = format!("the mask on {name} does not divide it");
+            return;
+        };
+        self.shared.forget_body(source);
+        self.doc.mark_everything_dirty();
+
+        let before = self.history.stats();
+        self.history.push(outcome.entry);
+        self.unsaved = true;
+        self.status = format!("split {name} along its mask");
+        self.record_history(before);
+        if started.elapsed() > brokkr_core::SLOW_SPLIT {
+            eprintln!("masked split of {name} took {} ms", outcome.elapsed.as_millis());
+        }
+
+        self.refresh_model_radius();
+        self.remesh_dirty();
+        self.refresh_overlay();
+    }
+
+    /// Ask for one body's picture, if this is a frame that may pay for one.
+    ///
+    /// **Every gate here is about cost, and they are in cheapest-first order.**
+    /// A body the size this application is built for is planned against about
+    /// 8 ms, which fits in a 16 ms frame exactly once and only when the frame
+    /// is otherwise idle.
+    ///
+    /// * the pictures are switched off -- the panel's own pressure valve;
+    /// * a drag or a hold-and-drag resize is in progress, so the user is mid
+    ///   gesture and every millisecond is visible;
+    /// * the geometry has not been still for [`crate::thumbnails::SETTLE`];
+    /// * one is already queued. The mailbox holds exactly one, which is what
+    ///   makes "at most one body per frame" a property of the type rather than
+    ///   a rule someone has to keep.
+    ///
+    /// Driven off the frame tick, like the autosave, and never off `view()`:
+    /// `view()` runs at display rate and a render queued from there would be
+    /// one per frame per row.
+    fn request_a_thumbnail(&mut self) {
+        if !self.thumbnails
+            || self.drag.is_some()
+            || self.sizing.is_some()
+            || !self.thumbs.settled()
+            || self.shared.thumbnail_pending()
+        {
+            return;
+        }
+        let Some(body) = self.thumbs.next_stale() else {
+            return;
+        };
+        let Some(cell) = self.thumbs.cell(body) else {
+            // Past the atlas's sixty-four layers. Nothing to draw into, and
+            // nothing to keep offering.
+            self.thumbs.requested(body);
+            return;
+        };
+        // `world_bounds` and not `surface_bounds`: see `ThumbRequest`, where
+        // the refusal this follows is quoted in full. An empty body has no box
+        // and no picture -- its cell keeps the placeholder, which is the right
+        // answer for a body with nothing in it.
+        let bounds = self.doc.volume(body).and_then(brokkr_core::Volume::world_bounds);
+        self.thumbs.requested(body);
+        if let Some(bounds) = bounds {
+            self.shared.request_thumbnail(ThumbRequest { body, cell, bounds });
+        }
     }
 
     /// Drop solo the moment it stops showing anything, and say so.
@@ -4424,17 +6086,26 @@ impl Brokkr {
     /// # Adding to this list is not automatically right
     ///
     /// It answers "is the document unreachable right now", and every card here
-    /// is a question the user must answer before anything else happens. **A
-    /// modeless overlay that takes the pointer — the split preview, whose
-    /// whole gesture is dragging a plane across the model — belongs in the
-    /// keyboard guard and NOT in the pointer one.** Split this function in two
-    /// at that point rather than widening it and quietly killing the drag.
+    /// is a question the user must answer before anything else happens.
+    ///
+    /// **This comment used to say that the split preview belonged in the
+    /// keyboard guard and NOT the pointer one, and that whoever added it should
+    /// split this function in two.** That was written against a split preview
+    /// whose gesture was dragging a plane across the model. The split that
+    /// landed is split by loose parts, and its card is a question with two
+    /// buttons and no gesture at all -- so it belongs in both guards, as the
+    /// plan for increment 16 asks, and the function stays one list.
+    ///
+    /// The warning still stands for whatever modeless overlay does eventually
+    /// take the pointer: **split this function in two at that point rather than
+    /// widening it and quietly killing the drag.**
     fn modal_open(&self) -> bool {
         self.confirm.is_some()
             || self.orient_prompt.is_some()
             || self.bug_report.is_some()
             || self.pending_delete.is_some()
             || self.pending_merge.is_some()
+            || self.pending_split.is_some()
     }
 
     /// What a key press means, now that nothing in the widget tree wanted it.
@@ -4492,6 +6163,14 @@ impl Brokkr {
         // is about to discard, into a model they are about to turn, or into
         // the very state a bug report is describing.
         if self.modal_open() {
+            // ...but a row picked up before the card went up has to be put
+            // down, or the list stays armed and the NEXT press in the panel
+            // arrives with a drag already in flight. Dropped rather than
+            // performed: a move committed from behind a scrim is exactly the
+            // edit this guard exists to refuse.
+            if matches!(event, PointerEvent::Released { .. }) {
+                self.row_drag = None;
+            }
             return;
         }
         self.last_activity = Instant::now();
@@ -4546,60 +6225,30 @@ impl Brokkr {
                 }
 
                 let kind = match button {
-                    // A cut outranks sculpting: the mode was armed deliberately
-                    // and the next left drag is the line, not a stroke.
-                    PointerButton::Left if self.cut_armed => DragKind::Cutting,
                     // Left sculpts -- unless a hold-and-drag resize is in
                     // progress, in which case the pointer belongs to that
                     // gesture and a press must not lay down a stroke.
+                    //
+                    // **This now outranks an armed cut, where it used to lose
+                    // to one.** The cut and the mask collapsed into one match
+                    // when `cut_armed` became a `Tool`, and the merged arm takes
+                    // MASK's precedence rather than the cut's: a destructive
+                    // one-shot may reasonably outrank a resize, an ongoing paint
+                    // may not, and a resize whose press turned into a stroke is
+                    // the worse of the two surprises.
                     PointerButton::Left if self.sizing.is_some() => DragKind::Sizing,
-                    // **The body is resolved from the raycast BEFORE anything
-                    // opens a recorder**, which is the whole ordering this
-                    // increment exists for; see `arm_recorder`. A press over a
-                    // body that is not the active one selects it and carves
-                    // nothing, and the press after that sculpts -- the same
-                    // rule Photoshop's layer panel has, applied to the model
-                    // itself so that direct manipulation acts on what is drawn.
-                    // A press over a HIDDEN body picks nothing, because
-                    // `Document::pick` never marches one.
-                    PointerButton::Left => match self.pick(position) {
-                        Some((body, _)) if body != self.doc.active() => {
-                            self.select_body(body);
-                            DragKind::Selecting
-                        }
-                        Some(_) => DragKind::Sculpt(self.stroke_direction()),
-                        // Nothing drawn under the pointer. That is normally a
-                        // press beside the model, which is allowed to become a
-                        // stroke the moment it is dragged onto one -- but not
-                        // when the body it would carve is itself hidden. See
-                        // `active_is_drawn`: the stroke's own raycast does not
-                        // consult the eye, so without this the press carves a
-                        // body nobody can see. Saying which body is the honest
-                        // half; a press that silently does nothing is its own
-                        // puzzle.
-                        //
-                        // **And it must say which of the two hid it.** Under
-                        // solo, the active body can be undrawn with its own eye
-                        // plainly open -- clicking a row outside the scope
-                        // selects it, and `select_body` does not veto that,
-                        // because a view mode never vetoes a structural
-                        // operation. "Show it before sculpting it" would then be
-                        // advice for a state the user is not in, pointing at an
-                        // eye that is already on.
-                        None if !self.active_is_drawn() => {
-                            let active = self.doc.active();
-                            let name = self
-                                .doc
-                                .node(active)
-                                .map_or("the active body", |node| node.name.as_str());
-                            self.status = if self.in_solo_scope(active) {
-                                format!("{name} is hidden — show it before sculpting it")
-                            } else {
-                                format!("{name} is outside the solo scope — escape leaves solo")
-                            };
-                            DragKind::Refused
-                        }
-                        None => DragKind::Sculpt(self.stroke_direction()),
+                    PointerButton::Left => match self.tool {
+                        // The mode was chosen deliberately and the next left
+                        // drag is the line, not a stroke.
+                        Tool::Cut => DragKind::Cutting,
+                        // Deliberately does NOT pick: masking paints the ACTIVE
+                        // body, and a press that silently moved the target
+                        // mid-mask would paint protection onto a body the user
+                        // was not looking at. `refresh_hover` puts the ring on
+                        // the active body while this tool is live, for the same
+                        // reason and so that the two agree.
+                        Tool::Mask => DragKind::Masking,
+                        Tool::Sculpt => self.sculpt_press(position),
                     },
                     // Right and middle move the camera. Shift slides instead of
                     // turning.
@@ -4622,16 +6271,31 @@ impl Brokkr {
                 if let DragKind::Sculpt(direction) = kind {
                     self.sculpt_to(position, direction, true);
                 }
+                if kind == DragKind::Masking {
+                    self.mask_to(position, true);
+                }
                 self.refresh_hover(position);
                 self.refresh_overlay();
             }
             PointerEvent::Released { button } => {
+                // **The one commit path for a row drag**, and it is the global
+                // release rather than the row's own `on_release`: a row only
+                // sees a release while the pointer is still over it, so a drag
+                // that ended anywhere else would leave the list armed. See
+                // `RowDrag`.
+                if button == PointerButton::Left {
+                    self.finish_row_drag();
+                }
                 if let Some(drag) = self.drag.filter(|drag| drag.button == button) {
                     if matches!(drag.kind, DragKind::Cutting) {
                         // The drag already recorded where the button went down.
                         self.finish_cut(drag.origin);
                     }
-                    if matches!(drag.kind, DragKind::Sculpt(_)) {
+                    // A mask gesture ends the same way a sculpt one does, and
+                    // through the same function: both opened the same recorder,
+                    // and one gesture is one entry whichever of the two maps it
+                    // wrote.
+                    if matches!(drag.kind, DragKind::Sculpt(_) | DragKind::Masking) {
                         self.finish_stroke();
                     }
                     // A right press that neither moved nor lingered was a click,
@@ -4672,6 +6336,7 @@ impl Brokkr {
 
                 match self.drag.map(|drag| drag.kind) {
                     Some(DragKind::Sculpt(direction)) => self.sculpt_to(position, direction, false),
+                    Some(DragKind::Masking) => self.mask_to(position, false),
                     Some(DragKind::Orbit) => {
                         self.camera.orbit(delta);
                         self.publish_camera();
@@ -4772,14 +6437,17 @@ impl Brokkr {
                     self.fly_camera_to(&pose);
                 }
                 self.drive_from_spacemouse(elapsed_ms);
+                self.settle_an_orphaned_mask_grab();
                 self.maybe_autosave();
+                self.request_a_thumbnail();
             }
             Message::BrushKindChanged(kind) => {
                 // Remember what the outgoing brush was set to, and restore what
-                // this one was last on.
-                self.strengths[Self::strength_slot(self.brush.kind)] = self.brush.strength;
-                self.brush.kind = kind;
-                self.brush.strength = self.strengths[Self::strength_slot(kind)];
+                // this one was last on. While the MASK tool is live both sides
+                // resolve to the mask's own slot, so choosing a different brush
+                // mid-mask leaves the mask strength exactly where the user put
+                // it -- which is the whole point of the mask having a slot.
+                self.swap_strength(|app| app.brush.kind = kind);
             }
             Message::FalloffChanged(curve) => self.brush.falloff = curve,
             // Clamped rather than trusted. The slider's own range is already
@@ -4791,7 +6459,8 @@ impl Brokkr {
             }
             Message::BrushStrengthChanged(strength) => {
                 self.brush.strength = strength;
-                self.strengths[Self::strength_slot(self.brush.kind)] = strength;
+                let slot = self.live_strength_slot();
+                self.strengths[slot] = strength;
             }
             Message::SymmetryAxisToggled(axis) => self.toggle_mirror(axis),
             Message::PatternChanged(kind) => self.brush.pattern.kind = kind,
@@ -4943,6 +6612,12 @@ impl Brokkr {
                 if self.pending_merge.take().is_some() {
                     return Task::none();
                 }
+                // And the split preview, which is the third card of the same
+                // family. Escape means "don't", and the walk it throws away
+                // cost nothing but time.
+                if self.pending_split.take().is_some() {
+                    return Task::none();
+                }
                 // And one card further down: Escape against a rename means
                 // "keep the old name", which is the harmless answer, and it
                 // must not also disarm the cut on its way past.
@@ -4979,9 +6654,19 @@ impl Brokkr {
                     self.exit_solo();
                     return Task::none();
                 }
-                // Escape is also the way out of an armed cut, which is the only
-                // mode in the application that changes what a click does.
-                self.cut_armed = false;
+                // Escape is also the way out of an armed cut.
+                //
+                // **And out of the cut ONLY, never out of mask mode.** A cut is
+                // a pending destructive thing and Escape is the standard way to
+                // call one off. A mask is neither pending nor destructive: it is
+                // expensive user work, and Escape is also the key that closes
+                // every menu below, so a user dismissing a dropdown would
+                // silently drop the mode they are painting in. The next reader
+                // will want to add it here for symmetry; this paragraph is why
+                // not.
+                if self.tool == Tool::Cut {
+                    self.tool = Tool::Sculpt;
+                }
                 self.adding = false;
                 self.menu = None;
                 self.menu_edit = None;
@@ -5011,19 +6696,35 @@ impl Brokkr {
                     self.orient(brokkr_core::AxisRotation::taking(up, brokkr_core::Facing::Up));
                 }
             }
-            Message::CutToggled => {
-                self.cut_armed = !self.cut_armed;
-                self.status = if self.cut_armed {
-                    "cut armed: drag a line across the model, the left of the arrow goes"
-                        .to_string()
-                } else {
-                    String::new()
+            // Pressing the live tool goes back to sculpting, which is what
+            // makes one variant cover arming and disarming both.
+            Message::ToolChanged(tool) => {
+                let tool = if tool == self.tool { Tool::Sculpt } else { tool };
+                // Through the swap so the mask's own strength is put away and
+                // the brush's is brought back, and vice versa. See `strengths`.
+                self.swap_strength(|app| app.tool = tool);
+                self.status = match tool {
+                    Tool::Cut => {
+                        "cut armed: drag a line across the model, the left of the arrow goes"
+                            .to_string()
+                    }
+                    Tool::Mask => "mask: drag to protect, ctrl or alt to unprotect, \
+                                   shift to soften"
+                        .to_string(),
+                    Tool::Sculpt => String::new(),
                 };
             }
             Message::DynamicRadiusToggled(on) => self.dynamic_radius = on,
 
             // --- the body panel ----------------------------------------------
-            Message::BodySelected(id) => self.select_body(id),
+            Message::BodySelected(id) => {
+                // One press, two jobs: it chooses the row AND picks it up. The
+                // row's `mouse_area` has one `on_press` message to give, and
+                // the second job costs nothing until the pointer moves.
+                self.select_body(id);
+                self.arm_row_drag(id);
+            }
+            Message::BodyRowDragged { over, fraction } => self.track_row_drag(over, fraction),
             Message::BodyVisibilityToggled(id) => self.toggle_visibility(id),
             Message::ActiveBodyVisibilityToggled => {
                 let active = self.doc.active();
@@ -5042,7 +6743,6 @@ impl Brokkr {
             Message::BodyDuplicated => self.duplicate_active_body(),
             Message::BodyGrouped => self.group_active_body(),
             Message::BodyUngrouped => self.ungroup_active_body(),
-            Message::BodyMovedToFolder(into) => self.move_to_folder(into),
             Message::FolderCollapseToggled(id) => self.toggle_collapse(id),
             Message::FolderDeleted(id) => self.delete_folder(id),
             Message::BodyDeleteConfirmed => {
@@ -5066,9 +6766,62 @@ impl Brokkr {
                 // the only reason it is safe to ask.
                 self.pending_merge = None;
             }
+            Message::BodySplit => self.split_active_body(),
+            Message::BodySplitConfirmed => {
+                if let Some(pending) = self.pending_split.take() {
+                    self.apply_split(pending);
+                }
+            }
+            Message::BodySplitCancelled => {
+                // The plan goes with it, and with the plan the labelling. That
+                // is the whole cost of cancelling: a walk that has to be done
+                // again if they press the button once more.
+                self.pending_split = None;
+            }
             // Session state, so deliberately NOT `unsaved`: nothing about it is
             // written to the file.
-            Message::ThumbnailsToggled => self.thumbnails = !self.thumbnails,
+            Message::ThumbnailsToggled => {
+                self.thumbnails = !self.thumbnails;
+                if self.thumbnails {
+                    // Nothing was kept up to date while they were off, so every
+                    // picture is a guess until it is drawn again. Marking them
+                    // stale is not a document change and does not dirty it.
+                    self.thumbs.stale_everything();
+                }
+            }
+            // The tint, and nothing but the tint. None of these three marks a
+            // brick dirty, touches a protection value or dirties the document:
+            // the polarity and the strength are uniforms the shader reads, and
+            // the standing card is unconditional and does not consult them. See
+            // the `show_mask` field for the whole of that argument.
+            Message::ShowMaskToggled => self.show_mask = !self.show_mask,
+            Message::MaskTintChanged(tint) => self.mask_tint = tint.clamp(0.0, 1.0),
+            Message::MaskPeekStarted => self.mask_peek = true,
+            Message::MaskPeekEnded => self.mask_peek = false,
+            // And the verbs, which DO change protection and all of which are
+            // undoable in one entry apiece.
+            Message::MaskCleared => self.clear_mask(),
+            Message::MaskInverted => self.invert_mask(),
+            Message::MaskAllApplied => self.mask_all(),
+            Message::MaskFilterChosen(filter) => {
+                // A live gesture belongs to the filter it started under, so
+                // this commits it rather than switching under it.
+                self.commit_mask_filter();
+                self.mask_amount = 0.0;
+                self.mask_filter = filter;
+            }
+            Message::MaskAmountChanged(amount) => self.mask_amount_changed(amount),
+            Message::MaskAmountReleased => self.mask_amount_released(),
+            Message::MaskGenerated(which) => self.generate_mask(which),
+            Message::MaskFeatureChanged(mm) => {
+                self.mask_feature_mm =
+                    mm.clamp(*MASK_FEATURE_RANGE_MM.start(), *MASK_FEATURE_RANGE_MM.end());
+            }
+            Message::MaskThicknessChanged(voxels) => {
+                self.mask_thickness_voxels =
+                    (voxels.round().max(1.0) as u32).min(brokkr_core::MAX_THICKNESS_VOXELS);
+            }
+            Message::BodySplitMasked => self.split_the_mask_off(),
             // A view mode, and likewise not `unsaved` -- with the one exception
             // `enter_solo` documents, where soloing a row whose eye is off turns
             // that eye on and THAT is an ordinary edit.
@@ -6328,6 +8081,19 @@ mod tests {
             );
         }
 
+        // And the mask's peek key, which is held for the same reason and needs
+        // its release for a sharper one: a peek that never ends leaves the tint
+        // stuck on with nothing the user can do about it but press again.
+        let message = key_event(
+            key_release_event("h"),
+            iced::event::Status::Ignored,
+            iced::window::Id::unique(),
+        );
+        assert!(
+            matches!(message, Some(Message::MaskPeekEnded)),
+            "releasing h produced {message:?} rather than ending the peek"
+        );
+
         let message = key_event(
             key_release_event("x"),
             iced::event::Status::Ignored,
@@ -7196,8 +8962,8 @@ mod tests {
         app.publish_camera();
 
         let middle_y = SIZE.y / 2.0;
-        update(&mut app, Message::CutToggled);
-        assert!(app.cut_armed, "the cut did not arm");
+        update(&mut app, Message::ToolChanged(Tool::Cut));
+        assert_eq!(app.tool, Tool::Cut, "the cut did not arm");
 
         // Drag left to right across the middle of the viewport.
         press(&mut app, Vector::new(SIZE.x * 0.1, middle_y));
@@ -7207,7 +8973,7 @@ mod tests {
         });
         release(&mut app);
 
-        assert!(!app.cut_armed, "the cut stayed armed after being used");
+        assert_ne!(app.tool, Tool::Cut, "the cut stayed armed after being used");
         assert!(app.unsaved, "a cut did not mark the document unsaved");
 
         let above = app.doc.active_volume().sample_world(Vec3::new(0.0, 12.0, 0.0));
@@ -7232,7 +8998,7 @@ mod tests {
     #[test]
     fn a_click_with_the_cut_armed_does_nothing() {
         let mut app = app();
-        update(&mut app, Message::CutToggled);
+        update(&mut app, Message::ToolChanged(Tool::Cut));
         let before = app.doc.active_volume().brick_coords().count();
 
         press(&mut app, centre_of_viewport());
@@ -7249,7 +9015,7 @@ mod tests {
         let probe = Vec3::new(0.0, 12.0, 0.0);
         let before = app.doc.active_volume().sample_world(probe);
 
-        update(&mut app, Message::CutToggled);
+        update(&mut app, Message::ToolChanged(Tool::Cut));
         press(&mut app, Vector::new(SIZE.x * 0.1, SIZE.y / 2.0));
         app.on_pointer(PointerEvent::Moved {
             position: Vector::new(SIZE.x * 0.9, SIZE.y / 2.0),
@@ -7270,15 +9036,62 @@ mod tests {
         );
     }
 
+    /// A cut a mask blocked entirely must never report itself as a cut that
+    /// missed.
+    ///
+    /// This is the one failure masking adds to a tool that had none: the cut
+    /// does nothing, and the reason is protection painted minutes ago, possibly
+    /// on a body that is not even the one being looked at. "The cut missed the
+    /// model" sends the user off to redraw a line that was never the problem,
+    /// so the message names the mask AND the body it is on.
+    #[test]
+    fn a_cut_a_mask_blocked_names_the_mask_and_the_body_it_is_on() {
+        let mut app = app();
+        let body = app.doc.active();
+        let mut meta = app.doc.meta(body).expect("the active body");
+        meta.name = "Left Ear".to_string();
+        app.doc.set_meta(&meta);
+        // Mask All: an empty map read inverted, so every voxel of the body is
+        // protected and it costs nothing.
+        app.doc.active_volume_mut().mask_mut().set_inverted(true);
+
+        let before = app.doc.active_volume().brick_coords().count();
+        update(&mut app, Message::ToolChanged(Tool::Cut));
+        press(&mut app, Vector::new(SIZE.x * 0.1, SIZE.y / 2.0));
+        app.on_pointer(PointerEvent::Moved {
+            position: Vector::new(SIZE.x * 0.9, SIZE.y / 2.0),
+            size: SIZE,
+        });
+        release(&mut app);
+
+        assert_eq!(
+            app.doc.active_volume().brick_coords().count(),
+            before,
+            "the mask did not stop the cut"
+        );
+        assert!(!app.unsaved, "a cut that changed nothing marked the document unsaved");
+        assert!(
+            !app.status.contains("missed"),
+            "a cut a mask blocked reported that it missed: {}",
+            app.status
+        );
+        assert!(app.status.contains("mask"), "the message does not name the mask: {}", app.status);
+        assert!(
+            app.status.contains("Left Ear"),
+            "the message does not name the body the mask is on: {}",
+            app.status
+        );
+    }
+
     /// Escape is the way out of every other mode, and a destructive one must
     /// not be the exception.
     #[test]
     fn escape_disarms_the_cut() {
         let mut app = app();
-        update(&mut app, Message::CutToggled);
-        assert!(app.cut_armed);
+        update(&mut app, Message::ToolChanged(Tool::Cut));
+        assert_eq!(app.tool, Tool::Cut);
         update(&mut app, Message::MenuClosed);
-        assert!(!app.cut_armed, "escape left a destructive mode armed");
+        assert_ne!(app.tool, Tool::Cut, "escape left a destructive mode armed");
     }
 
     // --- importing a mesh ----------------------------------------------------
@@ -8005,7 +9818,7 @@ mod tests {
         let above = Vec3::new(10.0, 12.0, 0.0);
         let before = app.doc.volume(other).expect("a live body").sample_world(above);
 
-        update(&mut app, Message::CutToggled);
+        update(&mut app, Message::ToolChanged(Tool::Cut));
         press(&mut app, Vector::new(SIZE.x * 0.1, SIZE.y / 2.0));
         app.on_pointer(PointerEvent::Moved {
             position: Vector::new(SIZE.x * 0.9, SIZE.y / 2.0),
@@ -8050,7 +9863,7 @@ mod tests {
         let over_the_soloed = Vec3::new(0.0, 12.0, 0.0);
         let cut_away = app.doc.volume(first).expect("a live body").sample_world(over_the_soloed);
 
-        update(&mut app, Message::CutToggled);
+        update(&mut app, Message::ToolChanged(Tool::Cut));
         press(&mut app, Vector::new(SIZE.x * 0.1, SIZE.y / 2.0));
         app.on_pointer(PointerEvent::Moved {
             position: Vector::new(SIZE.x * 0.9, SIZE.y / 2.0),
@@ -10462,16 +12275,16 @@ mod solo_tests {
         let mut app = app();
         let first = app.doc.active();
         add_body(&mut app, "Body 2", 30.0);
-        update(&mut app, Message::CutToggled);
+        update(&mut app, Message::ToolChanged(Tool::Cut));
         update(&mut app, Message::SoloEntered(first));
-        assert!(app.cut_armed && app.solo.is_some(), "the fixture did not arm both modes");
+        assert!(app.tool == Tool::Cut && app.solo.is_some(), "the fixture did not arm both modes");
 
         update(&mut app, Message::MenuClosed);
         assert_eq!(app.solo, None, "escape did not leave solo");
-        assert!(app.cut_armed, "escape disarmed the cut on its way past solo");
+        assert_eq!(app.tool, Tool::Cut, "escape disarmed the cut on its way past solo");
 
         update(&mut app, Message::MenuClosed);
-        assert!(!app.cut_armed, "the second escape did not reach the cut");
+        assert_ne!(app.tool, Tool::Cut, "the second escape did not reach the cut");
     }
 
     /// `ctrl+alt+comma` leaves solo as well as turning every eye on -- a
@@ -10746,6 +12559,63 @@ mod body_panel_tests {
 
     fn names(app: &Brokkr) -> Vec<String> {
         app.doc.nodes().iter().map(|node| node.name.clone()).collect()
+    }
+
+    /// The whole gesture: press a row, move the pointer to `fraction` of the
+    /// way down the row at `over`, and let go.
+    ///
+    /// **The release is the GLOBAL one** and not the row's, because that is the
+    /// one the application commits on -- a test that called `finish_row_drag`
+    /// directly would not notice the day the wiring came undone.
+    fn drag_row(app: &mut Brokkr, row: NodeId, over: usize, fraction: f32) {
+        update(app, Message::BodySelected(row));
+        update(app, Message::BodyRowDragged { over, fraction });
+        update(app, Message::Pointer(PointerEvent::Released { button: PointerButton::Left }));
+    }
+
+    /// Drag `row` in as the FIRST child of `folder`, which is the lower band of
+    /// an open folder's own row: the gap under it is already inside it.
+    fn drag_into_folder(app: &mut Brokkr, row: NodeId, folder: NodeId) {
+        let over = app.doc.index_of(folder).expect("the folder is in the document");
+        drag_row(app, row, over, 0.9);
+    }
+
+    /// Drag `row` so it lands directly below `sibling`, at the same depth --
+    /// the lower band of a body's row.
+    fn drag_below(app: &mut Brokkr, row: NodeId, sibling: NodeId) {
+        let over = app.doc.index_of(sibling).expect("the sibling is in the document");
+        drag_row(app, row, over, 0.9);
+    }
+
+    /// Drag `row` out to the top level, above everything: the top band of the
+    /// very first row, which is always at depth 0.
+    fn drag_to_top_level(app: &mut Brokkr, row: NodeId) {
+        drag_row(app, row, 0, 0.1);
+    }
+
+    /// Open the tool's own controls the way the user does: a right click in the
+    /// viewport that neither moves nor lingers.
+    ///
+    /// Through the real gesture rather than by setting `menu` directly, so that
+    /// the day the click test changes shape this stops opening the menu and the
+    /// tree it builds stops being covered -- loudly, because the assertion is
+    /// right here.
+    fn open_the_tool_menu(app: &mut Brokkr) {
+        // Widget-local pixels, and a size this module has no constant for --
+        // the panel tests build no viewport. Anywhere inside it will do: the
+        // menu opens where the click was.
+        let size = iced::Vector::new(800.0, 600.0);
+        let at = iced::Vector::new(size.x / 2.0, size.y / 2.0);
+        update(
+            app,
+            Message::Pointer(PointerEvent::Pressed {
+                button: PointerButton::Right,
+                position: at,
+                size,
+            }),
+        );
+        update(app, Message::Pointer(PointerEvent::Released { button: PointerButton::Right }));
+        assert!(app.menu.is_some(), "the right click did not open the tool menu");
     }
 
     /// **The waterline.** Press `+`, pick Cube, and there is a second body in
@@ -11349,10 +13219,21 @@ mod body_panel_tests {
 
     /// The thumbnail switch is session state. Nothing about it is written to the
     /// file, so by the rule that governs that it must not dirty the document.
+    ///
+    /// It also pins the DEFAULT, which is off: a live picture is an unmeasured
+    /// full-body render on top of an ordinary frame and the bench that would
+    /// clear it has never been run. See the field. Flipping this assertion is
+    /// meant to be the deliberate act that ships the feature on.
     #[test]
     fn the_thumbnail_switch_does_not_dirty_the_document() {
         let mut app = app();
-        assert!(app.thumbnails, "thumbnails default off");
+        assert!(
+            !app.thumbnails,
+            "the pictures default ON while the go/no-go bench has produced no number"
+        );
+        update(&mut app, Message::ThumbnailsToggled);
+        assert!(app.thumbnails);
+        assert!(!app.unsaved, "turning the pictures on marked the sculpt unsaved");
         update(&mut app, Message::ThumbnailsToggled);
         assert!(!app.thumbnails);
         assert!(!app.unsaved, "turning the pictures off marked the sculpt unsaved");
@@ -11417,7 +13298,7 @@ mod body_panel_tests {
         let folder = app.doc.parent_of(cube).expect("the new folder");
         update(&mut app, Message::PrimitiveAdded(PrimitiveKind::Sphere));
         let sphere = app.doc.active();
-        update(&mut app, Message::BodyMovedToFolder(Some(folder)));
+        drag_below(&mut app, sphere, cube);
         update(&mut app, Message::BodySelected(cube));
         assert_eq!(
             app.doc.subtree_body_count(folder),
@@ -11752,7 +13633,7 @@ mod body_panel_tests {
         let bricks = app.doc.volume(other).unwrap().brick_count();
         let entries = app.history_stats.undo_entries;
 
-        update(&mut app, Message::CutToggled);
+        update(&mut app, Message::ToolChanged(Tool::Cut));
         app.on_pointer(PointerEvent::Pressed {
             button: PointerButton::Left,
             position: iced::Vector::new(80.0, 300.0),
@@ -11792,7 +13673,7 @@ mod body_panel_tests {
     #[test]
     fn the_widget_tree_builds_after_every_operation_at_every_size() {
         type Step = (&'static str, fn(&mut Brokkr));
-        let steps: [Step; 31] = [
+        let steps: [Step; 39] = [
             ("add a cube", |app| update(app, Message::PrimitiveAdded(PrimitiveKind::Cube))),
             ("add a sphere", |app| update(app, Message::PrimitiveAdded(PrimitiveKind::Sphere))),
             ("add a cylinder", |app| update(app, Message::PrimitiveAdded(PrimitiveKind::Cylinder))),
@@ -11862,11 +13743,37 @@ mod body_panel_tests {
                 update(app, Message::BodySelected(first));
             }),
             ("leave the folder's solo", |app| update(app, Message::SoloExited)),
-            ("move a body into a folder", |app| {
+            ("drag a body into a folder", |app| {
                 let folder = app.doc.folders().next().map(|folder| folder.id);
-                update(app, Message::BodyMovedToFolder(folder));
+                let active = app.doc.active();
+                if let Some(folder) = folder {
+                    drag_into_folder(app, active, folder);
+                }
             }),
-            ("move it back out", |app| update(app, Message::BodyMovedToFolder(None))),
+            ("drag it back out", |app| {
+                let active = app.doc.active();
+                drag_to_top_level(app, active);
+            }),
+            // A drag in flight, which is a different tree from every state
+            // above it: the dragged row is folded away, one row carries the
+            // filled indicator or a two-pixel line sits between two others,
+            // and every row is tracking the pointer.
+            ("hold a row over another one", |app| {
+                let last = app.doc.nodes().last().expect("a row").id;
+                update(app, Message::BodySelected(last));
+                for over in 0..app.doc.node_count() {
+                    for band in [0.1_f32, 0.5, 0.9] {
+                        update(app, Message::BodyRowDragged { over, fraction: band });
+                        let _ = app.view();
+                    }
+                }
+            }),
+            ("let go", |app| {
+                update(
+                    app,
+                    Message::Pointer(PointerEvent::Released { button: PointerButton::Left }),
+                );
+            }),
             ("hide a folder", |app| {
                 let folder = app.doc.folders().next().map(|folder| folder.id);
                 if let Some(folder) = folder {
@@ -11905,8 +13812,34 @@ mod body_panel_tests {
                 update(app, Message::BodyMergeCancelled);
             }),
             ("delete", |app| update(app, Message::BodyDeleted)),
+            // The mask tool changes two things about the tree at once: the
+            // strip grows a lit eleventh button, and the viewport grows a
+            // standing overlay card that nothing else here builds. Both are
+            // built before the mask exists and again after it does, which is
+            // why this is two steps rather than one.
+            ("enter mask mode", |app| update(app, Message::ToolChanged(Tool::Mask))),
+            ("paint a mask", |app| {
+                let volume = app.doc.active_volume_mut();
+                volume.mask_mut().write(glam::IVec3::ZERO, 128);
+            }),
             ("undo", |app| update(app, Message::Undo)),
             ("redo", |app| update(app, Message::Redo)),
+            // The right-click tool menu, whose foot is a different block in
+            // mask mode from every other tool: the tint slider, the show-mask
+            // switch and the pattern readout, in place of the pattern's own
+            // controls. Nothing else in this list opens the menu at all.
+            ("choose a pattern", |app| {
+                update(app, Message::PatternChanged(brokkr_core::PatternKind::Scales));
+            }),
+            ("open the tool menu", |app| open_the_tool_menu(app)),
+            ("open the tool menu while masking", |app| {
+                update(app, Message::MenuClosed);
+                if app.tool != Tool::Mask {
+                    update(app, Message::ToolChanged(Tool::Mask));
+                }
+                open_the_tool_menu(app);
+            }),
+            ("close the tool menu", |app| update(app, Message::MenuClosed)),
         ];
 
         for rows in [1usize, 2, 12, 64] {
@@ -12055,9 +13988,7 @@ mod body_panel_tests {
         let folder = app.doc.parent_of(sphere).expect("the new folder");
         // A second body inside, so the folder has a reason to survive.
         let cube = app.doc.nodes().iter().find(|node| node.name == "Cube").expect("the cube").id;
-        update(&mut app, Message::BodyMovedToFolder(Some(folder)));
-        update(&mut app, Message::BodySelected(cube));
-        update(&mut app, Message::BodyMovedToFolder(Some(folder)));
+        drag_into_folder(&mut app, cube, folder);
         update(&mut app, Message::FolderCollapseToggled(folder));
         update(&mut app, Message::BodySelected(sphere));
 
@@ -12077,7 +14008,8 @@ mod body_panel_tests {
         update(&mut app, Message::BodyGrouped);
         let folder = app.doc.nodes()[1].id;
         update(&mut app, Message::PrimitiveAdded(PrimitiveKind::Sphere));
-        update(&mut app, Message::BodyMovedToFolder(Some(folder)));
+        let sphere = app.doc.active();
+        drag_into_folder(&mut app, sphere, folder);
         let was = shape(&app);
         assert_eq!(app.doc.subtree_body_count(folder), 2);
 
@@ -12122,7 +14054,8 @@ mod body_panel_tests {
         update(&mut app, Message::BodyGrouped);
         let folder = app.doc.nodes()[1].id;
         update(&mut app, Message::PrimitiveAdded(PrimitiveKind::Sphere));
-        update(&mut app, Message::BodyMovedToFolder(Some(folder)));
+        let sphere = app.doc.active();
+        drag_into_folder(&mut app, sphere, folder);
 
         let summed = app.subtree_bytes(folder);
         let one = app
@@ -12167,18 +14100,19 @@ mod body_panel_tests {
         assert!(app.doc.volume(app.doc.active()).is_some(), "a folder became the active row");
     }
 
-    /// Move-to-folder is a round trip, and moving the folder's last child out
-    /// dissolves the folder in the SAME entry.
+    /// Dragging a folder's last child out dissolves the folder in the SAME
+    /// entry, so one ctrl+Z puts both back.
     #[test]
-    fn moving_the_last_child_out_of_a_folder_dissolves_it_in_one_entry() {
+    fn dragging_the_last_child_out_of_a_folder_dissolves_it_in_one_entry() {
         let mut app = app();
         update(&mut app, Message::PrimitiveAdded(PrimitiveKind::Cube));
         update(&mut app, Message::BodyGrouped);
         let folder = app.doc.nodes()[1].id;
+        let cube = app.doc.active();
         let was = shape(&app);
 
         let entries = app.history_stats.undo_entries;
-        update(&mut app, Message::BodyMovedToFolder(None));
+        drag_to_top_level(&mut app, cube);
         assert!(app.doc.node(folder).is_none(), "an empty folder was left behind");
         assert_eq!(
             app.history_stats.undo_entries,
@@ -12188,6 +14122,384 @@ mod body_panel_tests {
 
         update(&mut app, Message::Undo);
         assert_eq!(shape(&app), was, "one ctrl+Z did not restore the folder and the row together");
+    }
+
+    // --- dragging a row ------------------------------------------------------
+
+    /// A folder holding one body, a body beside it, and a second body inside
+    /// the folder below the first. Returns the folder and its two children in
+    /// panel order.
+    ///
+    /// ```text
+    /// 0 Body 1
+    /// 1 Group 1
+    /// 2   Cube
+    /// 3   Sphere
+    /// ```
+    fn a_folder_of_two(app: &mut Brokkr) -> (NodeId, NodeId, NodeId) {
+        update(app, Message::PrimitiveAdded(PrimitiveKind::Cube));
+        let cube = app.doc.active();
+        update(app, Message::BodyGrouped);
+        let folder = app.doc.parent_of(cube).expect("the new folder");
+        update(app, Message::PrimitiveAdded(PrimitiveKind::Sphere));
+        let sphere = app.doc.active();
+        drag_below(app, sphere, cube);
+        assert_eq!(
+            shape(app),
+            vec![
+                (0, "Body 1".into()),
+                (0, "Group 1".into()),
+                (1, "Cube".into()),
+                (1, "Sphere".into()),
+            ],
+            "the fixture is not the shape under test"
+        );
+        (folder, cube, sphere)
+    }
+
+    /// **The round trip the increment exists for**: a row goes into a folder
+    /// and comes back out again, one gesture and one undo press each way.
+    #[test]
+    fn a_row_drags_into_a_folder_and_back_out_again() {
+        let mut app = app();
+        update(&mut app, Message::PrimitiveAdded(PrimitiveKind::Cube));
+        let cube = app.doc.active();
+        update(&mut app, Message::BodyGrouped);
+        let folder = app.doc.parent_of(cube).expect("the new folder");
+        update(&mut app, Message::PrimitiveAdded(PrimitiveKind::Sphere));
+        let sphere = app.doc.active();
+        let was = shape(&app);
+        let entries = app.history_stats.undo_entries;
+
+        drag_into_folder(&mut app, sphere, folder);
+        assert_eq!(app.doc.parent_of(sphere), Some(folder), "it did not go in: {}", app.status);
+        assert_eq!(app.history_stats.undo_entries, entries + 1, "a drag in is not one entry");
+        assert!(app.unsaved, "the tree is in the file, so a reorder is a change");
+        assert!(app.status.contains("Group 1"), "the line does not say where: {}", app.status);
+
+        drag_to_top_level(&mut app, sphere);
+        assert_eq!(app.doc.parent_of(sphere), None, "it did not come out: {}", app.status);
+        assert_eq!(app.history_stats.undo_entries, entries + 2);
+        assert!(app.status.contains("top level"), "the line does not say where: {}", app.status);
+
+        update(&mut app, Message::Undo);
+        update(&mut app, Message::Undo);
+        assert_eq!(shape(&app), was, "two ctrl+Z did not put the two drags back");
+    }
+
+    /// A whole subtree moves as a BLOCK, and one ctrl+Z puts all of it back.
+    ///
+    /// The rows under a folder are a contiguous preorder run, so this is one
+    /// splice however many rows are in it -- which is also why it is one
+    /// `Change::Outline` and one entry rather than one per row.
+    #[test]
+    fn dragging_a_folder_takes_everything_in_it_and_one_undo_brings_it_back() {
+        let mut app = app();
+        let (folder, cube, sphere) = a_folder_of_two(&mut app);
+        let outer = app.doc.nodes()[0].id;
+        update(&mut app, Message::BodySelected(outer));
+        update(&mut app, Message::BodyGrouped);
+        // 0 Group 2, 1 Body 1, 2 Group 1, 3 Cube, 4 Sphere
+        let target = app.doc.parent_of(outer).expect("the outer folder");
+        let was = shape(&app);
+        let entries = app.history_stats.undo_entries;
+
+        drag_into_folder(&mut app, folder, target);
+        assert_eq!(app.doc.parent_of(folder), Some(target), "the folder did not move");
+        assert_eq!(app.doc.parent_of(cube), Some(folder), "the cube did not come with it");
+        assert_eq!(app.doc.parent_of(sphere), Some(folder), "the sphere did not come with it");
+        assert_eq!(
+            app.history_stats.undo_entries,
+            entries + 1,
+            "three rows moved as three gestures"
+        );
+
+        update(&mut app, Message::Undo);
+        assert_eq!(shape(&app), was, "one ctrl+Z did not take the whole block back");
+    }
+
+    /// **A drag that changes nothing pushes no entry and does not set
+    /// `unsaved`.** Three ways to ask for where the row already is.
+    #[test]
+    fn a_drag_that_changes_nothing_costs_no_undo_press() {
+        let mut app = app();
+        let (_, cube, sphere) = a_folder_of_two(&mut app);
+        let was = shape(&app);
+        app.unsaved = false;
+        let entries = app.history_stats.undo_entries;
+
+        let cube_at = app.doc.index_of(cube).expect("the cube");
+        let sphere_at = app.doc.index_of(sphere).expect("the sphere");
+        for (what, row, over, band) in [
+            ("above itself", cube, cube_at, 0.1),
+            ("below itself", cube, cube_at, 0.9),
+            ("below the row it already follows", sphere, cube_at, 0.9),
+            ("above the row it already precedes", cube, sphere_at, 0.1),
+        ] {
+            drag_row(&mut app, row, over, band);
+            assert_eq!(shape(&app), was, "dropping {what} moved something");
+            assert_eq!(
+                app.history_stats.undo_entries, entries,
+                "dropping {what} cost an undo press"
+            );
+            assert!(!app.unsaved, "dropping {what} marked the document unsaved");
+        }
+    }
+
+    /// A press that never moves is a selection, not a drag. There is no slop
+    /// threshold to tune: without a move message there is no target, and
+    /// without a target there is nothing to commit.
+    #[test]
+    fn a_press_that_never_moves_selects_and_moves_nothing() {
+        let mut app = app();
+        let (_, cube, _) = a_folder_of_two(&mut app);
+        let was = shape(&app);
+        app.unsaved = false;
+        let entries = app.history_stats.undo_entries;
+
+        update(&mut app, Message::BodySelected(cube));
+        update(&mut app, Message::Pointer(PointerEvent::Released { button: PointerButton::Left }));
+
+        assert_eq!(app.doc.active(), cube, "the press did not select the row");
+        assert_eq!(shape(&app), was);
+        assert_eq!(app.history_stats.undo_entries, entries);
+        assert!(!app.unsaved);
+    }
+
+    /// **A folder cannot be dropped into its own child**, and the refusal
+    /// arrives as a line rather than as an indicator that quietly fails to
+    /// appear.
+    #[test]
+    fn a_folder_dropped_inside_itself_is_refused_with_the_reason() {
+        let mut app = app();
+        let (folder, cube, _) = a_folder_of_two(&mut app);
+        let was = shape(&app);
+        app.unsaved = false;
+        let entries = app.history_stats.undo_entries;
+
+        // The folder's own row, middle band. It is folded away for the duration
+        // of its own drag, so that band means "inside me".
+        let folder_at = app.doc.index_of(folder).expect("the folder");
+        update(&mut app, Message::BodySelected(folder));
+        update(&mut app, Message::BodyRowDragged { over: folder_at, fraction: 0.5 });
+        assert!(
+            app.row_drag.expect("the drag is armed").target.is_none(),
+            "an illegal gap still offered a target"
+        );
+        assert!(app.status.contains("inside itself"), "no line explains it: {}", app.status);
+
+        update(&mut app, Message::Pointer(PointerEvent::Released { button: PointerButton::Left }));
+        assert_eq!(shape(&app), was, "a refused drop moved rows anyway");
+        assert_eq!(app.history_stats.undo_entries, entries);
+        assert!(!app.unsaved);
+        // And the row under it -- which is only reachable through a message
+        // queued before the fold hid it -- is refused the same way.
+        let cube_at = app.doc.index_of(cube).expect("the cube");
+        update(&mut app, Message::BodySelected(folder));
+        update(&mut app, Message::BodyRowDragged { over: cube_at, fraction: 0.5 });
+        assert!(
+            app.row_drag.expect("armed").target.is_none(),
+            "a row inside the block took a drop"
+        );
+    }
+
+    /// Eight levels is the cap, and a drop that would go past it is refused
+    /// with the reason rather than silently flattened into one that fits.
+    #[test]
+    fn a_drop_past_the_eighth_level_is_refused_and_says_so() {
+        let mut app = app();
+        update(&mut app, Message::PrimitiveAdded(PrimitiveKind::Cube));
+        let cube = app.doc.active();
+        // A chain as deep as the panel goes, with the cube at the bottom of it.
+        // ctrl+G is the only way to get there before a drag exists, which is
+        // why this fixture is built out of presses.
+        while app.doc.node(cube).expect("the cube").depth() < brokkr_core::MAX_DEPTH - 1 {
+            update(&mut app, Message::BodySelected(cube));
+            update(&mut app, Message::BodyGrouped);
+        }
+        // A two-level block: a folder holding one body. A single body would
+        // FIT under the cube -- it is the block's own height that goes over.
+        update(&mut app, Message::PrimitiveAdded(PrimitiveKind::Sphere));
+        let sphere = app.doc.active();
+        update(&mut app, Message::BodyGrouped);
+        let block = app.doc.parent_of(sphere).expect("the block's folder");
+        let was = shape(&app);
+        app.unsaved = false;
+
+        let cube_at = app.doc.index_of(cube).expect("the cube");
+        update(&mut app, Message::BodySelected(block));
+        update(&mut app, Message::BodyRowDragged { over: cube_at, fraction: 0.9 });
+
+        assert!(app.row_drag.expect("armed").target.is_none(), "the cap did not refuse");
+        assert!(app.status.contains("eighth level"), "no line names the cap: {}", app.status);
+        update(&mut app, Message::Pointer(PointerEvent::Released { button: PointerButton::Left }));
+        assert_eq!(shape(&app), was, "a drop past the cap still moved rows");
+        assert!(!app.unsaved);
+    }
+
+    /// **Drag is disabled while renaming.** A double click publishes the press
+    /// FIRST and the double click second, so the row is picked up and then the
+    /// field opens on top of it -- and the pickup has to be undone, or the list
+    /// sits armed behind an open text field.
+    #[test]
+    fn opening_a_rename_puts_the_row_back_down() {
+        let mut app = app();
+        let (_, cube, _) = a_folder_of_two(&mut app);
+        let was = shape(&app);
+
+        // Exactly what a double click delivers, in that order.
+        update(&mut app, Message::BodySelected(cube));
+        drop(app.update(Message::BodyRenameBegan(cube)));
+        assert!(app.renaming.is_some(), "the field did not open");
+        assert!(app.row_drag.is_none(), "the list is still armed behind the rename field");
+
+        // ...and a pointer that keeps moving cannot pick it back up.
+        update(&mut app, Message::BodyRowDragged { over: 0, fraction: 0.1 });
+        update(&mut app, Message::Pointer(PointerEvent::Released { button: PointerButton::Left }));
+        assert_eq!(shape(&app), was, "a drag ran while a rename was open");
+    }
+
+    /// The commit rides on the GLOBAL release, so a drag that ends anywhere --
+    /// over the tool strip, over the viewport, outside the window -- still
+    /// lands, and a card that opened mid-drag drops the row rather than
+    /// performing the move behind its scrim.
+    #[test]
+    fn a_drag_interrupted_by_a_card_is_dropped_rather_than_performed() {
+        let mut app = app();
+        let (folder, _, sphere) = a_folder_of_two(&mut app);
+        let folder_at = app.doc.index_of(folder).expect("the folder");
+        let was = shape(&app);
+        app.unsaved = false;
+
+        update(&mut app, Message::BodySelected(sphere));
+        update(&mut app, Message::BodyRowDragged { over: folder_at, fraction: 0.1 });
+        assert!(app.row_drag.expect("armed").target.is_some(), "the fixture drag is not legal");
+
+        // A prompt goes up while the button is still down.
+        app.confirm = Some(PendingAction::NewSculpt);
+        assert!(app.modal_open(), "the fixture did not raise a modal");
+        update(&mut app, Message::Pointer(PointerEvent::Released { button: PointerButton::Left }));
+
+        assert!(app.row_drag.is_none(), "the list stayed armed behind the card");
+        assert_eq!(shape(&app), was, "the move ran from behind a scrim");
+        assert!(!app.unsaved);
+    }
+
+    /// **The third indicator**, which is the one every shipped tree drag gets
+    /// wrong: a CLOSED folder's middle band means "inside it", and the row
+    /// itself is filled to say so where a line between two rows could not.
+    ///
+    /// The bands either side of it still mean before and after, so all three
+    /// answers are reachable on the one row a user cannot see the inside of.
+    #[test]
+    fn a_closed_folders_middle_band_puts_the_row_inside_it() {
+        let mut app = app();
+        let (folder, _, _) = a_folder_of_two(&mut app);
+        update(&mut app, Message::FolderCollapseToggled(folder));
+        let loose = app.doc.nodes()[0].id;
+        let folder_at = app.doc.index_of(folder).expect("the folder");
+        let was = shape(&app);
+
+        // Above it: a line at the top level, and no row is filled.
+        update(&mut app, Message::BodySelected(loose));
+        update(&mut app, Message::BodyRowDragged { over: folder_at, fraction: 0.1 });
+        let drag = app.row_drag.expect("armed");
+        assert_eq!(drag.into, None, "the top band filled the folder");
+        assert_eq!(drag.target.expect("a target").depth, 0, "the top band went inside");
+
+        // Its middle: the folder is the destination, and the panel is told to
+        // fill that row rather than draw a line anywhere.
+        update(&mut app, Message::BodyRowDragged { over: folder_at, fraction: 0.5 });
+        let drag = app.row_drag.expect("armed");
+        assert_eq!(drag.into, Some(folder_at), "the middle band did not name the folder");
+        assert_eq!(drag.target.expect("a target").depth, 1, "the middle band stayed outside");
+        // The tree still builds with a row filled, which nothing else covers.
+        drop(app.view());
+
+        update(&mut app, Message::Pointer(PointerEvent::Released { button: PointerButton::Left }));
+        assert_eq!(app.doc.parent_of(loose), Some(folder), "it did not go in: {}", app.status);
+        assert!(
+            app.doc.node(folder).expect("the folder").collapsed,
+            "the drop opened the folder it landed in"
+        );
+
+        update(&mut app, Message::Undo);
+        assert_eq!(shape(&app), was, "one ctrl+Z did not put it back");
+    }
+
+    /// The gap under a folder's last child and the gap above the row after it
+    /// are the SAME index at two depths, and choosing between them by which
+    /// side of the boundary the pointer is on is the whole of how a row gets
+    /// back out of a folder.
+    #[test]
+    fn the_row_below_a_folders_last_child_is_the_way_out_of_it() {
+        let mut app = app();
+        update(&mut app, Message::PrimitiveAdded(PrimitiveKind::Cube));
+        let cube = app.doc.active();
+        update(&mut app, Message::BodyGrouped);
+        let folder = app.doc.parent_of(cube).expect("the folder");
+        update(&mut app, Message::PrimitiveAdded(PrimitiveKind::Sphere));
+        let sphere = app.doc.active();
+        drag_below(&mut app, sphere, cube);
+        // 0 Body 1, 1 Group 1, 2 Cube, 3 Sphere
+        assert_eq!(app.doc.parent_of(sphere), Some(folder), "the fixture is wrong");
+
+        // The bottom band of the last child keeps it in the folder...
+        let sphere_at = app.doc.index_of(sphere).expect("the sphere");
+        update(&mut app, Message::BodySelected(cube));
+        update(&mut app, Message::BodyRowDragged { over: sphere_at, fraction: 0.9 });
+        assert_eq!(
+            app.row_drag.expect("armed").target.expect("a target").depth,
+            1,
+            "the gap below the last child left the folder"
+        );
+
+        // ...and the top band of the row above the folder takes it out.
+        update(&mut app, Message::BodyRowDragged { over: 0, fraction: 0.1 });
+        assert_eq!(
+            app.row_drag.expect("armed").target.expect("a target").depth,
+            0,
+            "the top band of a top-level row did not mean the top level"
+        );
+        update(&mut app, Message::Pointer(PointerEvent::Released { button: PointerButton::Left }));
+        assert_eq!(app.doc.parent_of(cube), None, "it did not come out: {}", app.status);
+        assert_eq!(app.doc.parent_of(sphere), Some(folder), "the folder lost its other child");
+    }
+
+    /// **No cell is staled by any drag.** Reordering the panel moves no
+    /// geometry, so a picture that was up to date before the gesture is up to
+    /// date after it -- and a list of sixty-four bodies does not queue
+    /// sixty-four full-body renders because somebody tidied it.
+    #[test]
+    fn no_drag_ever_stales_a_thumbnail() {
+        let mut app = app();
+        app.thumbnails = true;
+        let (folder, cube, sphere) = a_folder_of_two(&mut app);
+        // Every body's picture up to date, which is the state a drag has to
+        // leave alone.
+        for node in app.doc.nodes().iter().filter(|node| node.is_body()) {
+            app.thumbs.requested(node.id);
+        }
+        assert_eq!(app.thumbs.stale_count(), 0, "the fixture did not settle");
+        let cells: Vec<(NodeId, Option<u32>)> = app
+            .doc
+            .nodes()
+            .iter()
+            .filter(|node| node.is_body())
+            .map(|node| (node.id, app.thumbs.cell(node.id)))
+            .collect();
+
+        drag_to_top_level(&mut app, sphere);
+        drag_into_folder(&mut app, sphere, folder);
+        drag_below(&mut app, cube, sphere);
+        drag_to_top_level(&mut app, folder);
+        drop(app.view());
+
+        assert_eq!(app.thumbs.stale_count(), 0, "a drag marked a picture stale");
+        assert!(!app.shared.thumbnail_pending(), "a drag queued a render");
+        for (body, cell) in cells {
+            assert_eq!(app.thumbs.cell(body), cell, "a body's cell moved under it");
+        }
     }
 
     /// The row cap is a refusal with a line that names it, exactly as the body
@@ -12248,6 +14560,160 @@ mod body_panel_tests {
             "the refusal does not say why: {}",
             app.status
         );
+    }
+
+    // --- split by loose parts ---------------------------------------------------
+
+    /// ONE body holding TWO loose parts, built out of the application's own
+    /// verbs.
+    ///
+    /// The ball and a cube placed clear of it, merged: `merge_down` is a `min`
+    /// of two fields that do not touch, so the result is a single row whose
+    /// material is in two pieces. That is exactly the shape an imported scan
+    /// arrives in, and building it this way means the fixture cannot drift away
+    /// from what the application really produces.
+    fn one_body_of_two_parts() -> Brokkr {
+        let mut app = app();
+        update(&mut app, Message::PrimitiveAdded(PrimitiveKind::Cube));
+        let upper = app.doc.nodes()[0].id;
+        update(&mut app, Message::BodySelected(upper));
+        update(&mut app, Message::BodyMergedDown);
+        assert_eq!(app.doc.body_count(), 1, "the fixture is not one body: {}", app.status);
+        app.unsaved = false;
+        app
+    }
+
+    /// **The whole feature from the user's chair**: press the button, read how
+    /// many parts there are, say yes, and the row is two rows.
+    #[test]
+    fn splitting_asks_first_and_then_makes_one_body_per_part() {
+        let mut app = one_body_of_two_parts();
+        let source = app.doc.active();
+        let entries = app.history_stats.undo_entries;
+
+        update(&mut app, Message::BodySplit);
+        let pending = app.pending_split.as_ref().expect("split raised no card");
+        assert_eq!(pending.plan.found(), 2, "the walk did not find the two parts");
+        assert!(!pending.plan.has_fragments(), "a cube and a ball are not debris");
+        assert_eq!(app.doc.body_count(), 1, "the card split it anyway");
+        assert!(!app.unsaved, "raising the card dirtied the document");
+        assert!(app.modal_open(), "the split card is not modal, so a press behind it sculpts");
+
+        update(&mut app, Message::BodySplitConfirmed);
+        assert_eq!(app.doc.body_count(), 2, "confirming did not split: {}", app.status);
+        assert!(app.doc.node(source).is_none(), "the source row survived its own split");
+        assert!(app.unsaved, "splitting did not mark the document unsaved");
+        assert!(app.pending_split.is_none(), "the card stayed up");
+        assert_eq!(app.history_stats.undo_entries, entries + 1, "a split is not one entry");
+        assert!(app.status.contains("into 2 parts"), "the split said nothing: {}", app.status);
+
+        // And one press puts it back, whole.
+        update(&mut app, Message::Undo);
+        assert_eq!(app.doc.body_count(), 1, "one undo did not take the split apart");
+        assert!(app.doc.node(source).is_some(), "the source row did not come back");
+    }
+
+    /// Cancelling, by either route, changes not one byte -- which is the whole
+    /// reason it is safe to ask.
+    #[test]
+    fn cancelling_a_split_leaves_the_document_exactly_as_it_was() {
+        for cancel in [Message::BodySplitCancelled, Message::MenuClosed] {
+            let mut app = one_body_of_two_parts();
+            let entries = app.history_stats.undo_entries;
+            update(&mut app, Message::BodySplit);
+            assert!(app.pending_split.is_some(), "split raised no card");
+
+            update(&mut app, cancel);
+            assert!(app.pending_split.is_none(), "the card stayed up");
+            assert_eq!(app.doc.body_count(), 1, "cancelling split it anyway");
+            assert!(!app.unsaved, "cancelling dirtied the document");
+            assert_eq!(app.history_stats.undo_entries, entries, "cancelling recorded an entry");
+        }
+    }
+
+    /// Escape reaches the card through the real key path, and does not fall
+    /// through to disarm the cut on its way past.
+    #[test]
+    fn escape_answers_the_split_card_before_anything_else() {
+        let mut app = one_body_of_two_parts();
+        update(&mut app, Message::ToolChanged(Tool::Cut));
+        assert_eq!(app.tool, Tool::Cut, "the fixture did not arm the cut");
+        update(&mut app, Message::BodySplit);
+
+        update(
+            &mut app,
+            Message::KeyPressed {
+                key: iced::keyboard::Key::Named(iced::keyboard::key::Named::Escape),
+                modifiers: iced::keyboard::Modifiers::default(),
+            },
+        );
+        assert!(app.pending_split.is_none(), "escape did not reach the card");
+        assert_eq!(app.tool, Tool::Cut, "escape went past the card and disarmed the cut as well");
+    }
+
+    /// A body that is one piece says so and raises nothing. The alternative is
+    /// a card that asks a question with one answer.
+    #[test]
+    fn a_body_that_is_one_piece_says_so_and_raises_no_card() {
+        let mut app = app();
+        update(&mut app, Message::BodySplit);
+        assert!(app.pending_split.is_none(), "one connected ball raised a card");
+        assert_eq!(app.doc.body_count(), 1);
+        assert!(!app.unsaved, "a refused split dirtied the document");
+        assert!(
+            app.status.contains("one connected part"),
+            "the refusal does not say why: {}",
+            app.status
+        );
+    }
+
+    /// Refused when the source is not on screen, because its parts would not be
+    /// either: children inherit the source's own eye.
+    #[test]
+    fn splitting_a_body_that_is_not_on_screen_is_refused_by_name() {
+        let mut app = one_body_of_two_parts();
+        let source = app.doc.active();
+        cheap_body(&mut app, "Somewhere else");
+        update(&mut app, Message::BodyVisibilityToggled(source));
+        // Hiding the active row moved the selection; put it back on the hidden
+        // one, which is what a click on its name does.
+        update(&mut app, Message::BodySelected(source));
+        assert_eq!(app.doc.active(), source, "the fixture did not select the hidden row");
+        app.unsaved = false;
+
+        update(&mut app, Message::BodySplit);
+        assert!(app.pending_split.is_none(), "a hidden body raised a card");
+        assert_eq!(app.doc.body_count(), 2, "a hidden body was split anyway");
+        assert!(
+            app.status.contains("not on screen"),
+            "the refusal does not say why: {}",
+            app.status
+        );
+    }
+
+    /// The parts are meshed after the split, and the source's slots are
+    /// released. Without the pair of them the new bodies are right in the
+    /// document and absent from the viewport, which is the failure this project
+    /// has shipped twice.
+    #[test]
+    fn every_part_is_offered_to_the_renderer_and_the_source_is_forgotten() {
+        let mut app = one_body_of_two_parts();
+        let source = app.doc.active();
+        update(&mut app, Message::BodySplit);
+        update(&mut app, Message::BodySplitConfirmed);
+
+        assert!(
+            app.shared.take_forgotten_for_tests().contains(&source),
+            "the source's pool slots were never released"
+        );
+        for (id, volume) in app.doc.bodies() {
+            assert_eq!(
+                volume.dirty_count(),
+                0,
+                "{id:?} still has bricks nobody has meshed after the split"
+            );
+            assert!(volume.brick_count() > 0, "{id:?} came out with no bricks at all");
+        }
     }
 }
 
@@ -12433,14 +14899,14 @@ mod rename_tests {
     fn escape_against_a_rename_leaves_an_armed_cut_armed() {
         let mut app = app();
         let first = app.doc.nodes()[0].id;
-        update(&mut app, Message::CutToggled);
-        assert!(app.cut_armed, "the cut did not arm");
+        update(&mut app, Message::ToolChanged(Tool::Cut));
+        assert_eq!(app.tool, Tool::Cut, "the cut did not arm");
 
         type_into_the_field(&mut app, first, "Discarded");
         update(&mut app, Message::MenuClosed);
 
         assert!(app.renaming.is_none(), "escape left the field open");
-        assert!(app.cut_armed, "escaping a rename also disarmed the cut");
+        assert_eq!(app.tool, Tool::Cut, "escaping a rename also disarmed the cut");
     }
 
     /// **What "blur commits" means here.** Every way of leaving the field that
@@ -12540,6 +15006,65 @@ mod rename_tests {
         };
         assert_eq!(*id, first);
         assert_eq!(typed, "Still typing more");
+    }
+
+    /// **Typing a name with an `h`, an `s` or a `u` in it does not commit the
+    /// rename halfway through the word.**
+    ///
+    /// The trap is that a focused `text_input` captures its key PRESSES but
+    /// not its key RELEASES: iced 0.14 captures `KeyReleased` for the literal
+    /// `v` and nothing else (`text_input.rs:1249-1261`). So every other
+    /// release arrives at [`key_event`] Ignored, exactly as if no field were
+    /// focused, and `s`, `u` and `h` are the three letters it decodes there.
+    /// Before the arm in [`keeps_the_rename_open`], the user typing "Head" got
+    /// a body called "H" and a closed field on the release of the very first
+    /// letter -- and "Skull" lost its own name to the `S`.
+    ///
+    /// The events are fed through `key_event` rather than the messages being
+    /// posted directly, because the whole defect lives in that decode: a test
+    /// that sent `MaskPeekEnded` itself would prove nothing about whether a
+    /// release ever becomes one while a field is focused.
+    #[test]
+    fn releasing_a_gesture_key_while_renaming_does_not_commit_the_half_typed_name() {
+        fn release(character: &str) -> iced::Event {
+            iced::Event::Keyboard(iced::keyboard::Event::KeyReleased {
+                key: iced::keyboard::Key::Character(character.into()),
+                modified_key: iced::keyboard::Key::Character(character.into()),
+                physical_key: iced::keyboard::key::Physical::Unidentified(
+                    iced::keyboard::key::NativeCode::Unidentified,
+                ),
+                location: iced::keyboard::Location::Standard,
+                modifiers: iced::keyboard::Modifiers::empty(),
+            })
+        }
+
+        for letter in ["h", "s", "u"] {
+            let mut app = app();
+            let first = app.doc.nodes()[0].id;
+            let was = name_of(&app, first);
+            type_into_the_field(&mut app, first, "H");
+
+            let message = key_event(
+                release(letter),
+                iced::event::Status::Ignored,
+                iced::window::Id::unique(),
+            );
+            let Some(message) = message else {
+                panic!("releasing {letter} produced no message, so this test proves nothing");
+            };
+            update(&mut app, message);
+
+            let Some((id, typed)) = &app.renaming else {
+                panic!("releasing {letter} closed the rename field mid-word");
+            };
+            assert_eq!(*id, first);
+            assert_eq!(typed, "H", "releasing {letter} threw away what had been typed");
+            assert_eq!(
+                name_of(&app, first),
+                was,
+                "releasing {letter} committed the half-typed name to the document"
+            );
+        }
     }
 
     /// **A multi-byte name at exactly the field's length round-trips
@@ -12704,5 +15229,1831 @@ mod rename_tests {
         for message in commits {
             assert!(!keeps_the_rename_open(&message), "{message:?} left the rename field open");
         }
+    }
+}
+
+/// The thumbnail refresh rule, which is the load-bearing part of live pictures.
+///
+/// Every test here is headless: the pixels are `brokkr-gpu`'s problem and are
+/// checked in `offscreen.rs`. What is checked here is WHEN a picture is asked
+/// for, because the two ways of getting that wrong are a stutter the user
+/// cannot explain and a panel that quietly stops telling the truth.
+#[cfg(test)]
+mod thumbnail_tests {
+    use super::*;
+    use iced::Vector;
+
+    const SIZE: Vector = Vector { x: 800.0, y: 600.0 };
+
+    fn update(app: &mut Brokkr, message: Message) {
+        drop(app.update(message));
+    }
+
+    /// A fresh application with the pictures switched ON.
+    ///
+    /// **The default is off** -- the go/no-go bench has produced no number yet,
+    /// so the feature does not ship enabled; see the `thumbnails` field. Every
+    /// test in this module is about the refresh RULE rather than about the
+    /// default, so they all turn it on the way the user's own switch does. The
+    /// default itself is pinned in
+    /// `the_thumbnail_switch_does_not_dirty_the_document`.
+    fn app() -> Brokkr {
+        let mut app = Brokkr::with_tablet(crate::tablet::Tablet::inert());
+        app.thumbnails = true;
+        app
+    }
+
+    /// Everything the starting document wants drawn, taken, so a test is about
+    /// what its own gesture asked for.
+    fn settle(app: &mut Brokkr) {
+        for _ in 0..brokkr_core::MAX_BODIES + 2 {
+            app.thumbs.settle_now();
+            update(app, Message::Frame);
+            if app.shared.take_thumbnail_for_tests().is_none() {
+                return;
+            }
+        }
+        panic!("the document never stopped asking for pictures");
+    }
+
+    /// One frame, with the geometry pretended to have been still long enough.
+    fn quiet_frame(app: &mut Brokkr) -> Option<crate::viewport::ThumbRequest> {
+        app.thumbs.settle_now();
+        update(app, Message::Frame);
+        app.shared.take_thumbnail_for_tests()
+    }
+
+    fn press(app: &mut Brokkr, at: Vector) {
+        app.on_pointer(PointerEvent::Pressed {
+            button: PointerButton::Left,
+            position: at,
+            size: SIZE,
+        });
+    }
+
+    fn drag_to(app: &mut Brokkr, at: Vector) {
+        app.on_pointer(PointerEvent::Moved { position: at, size: SIZE });
+    }
+
+    fn release(app: &mut Brokkr) {
+        app.on_pointer(PointerEvent::Released { button: PointerButton::Left });
+    }
+
+    /// One presentation gesture: what it is called, and how to perform it on a
+    /// named body.
+    type Gesture = (&'static str, fn(&mut Brokkr, NodeId));
+
+    /// **`view()` may not ask for anything, ever.**    ///
+    /// It runs at display rate off `window::frames()`, so a row that enqueued a
+    /// render, diffed staleness or measured a bound would repeat the
+    /// `detail_advice` mistake multiplied by the number of bodies -- and this
+    /// one would be multiplied again by a full-body GPU draw. The cell a row
+    /// reads is allocated in `update`; `view` only ever looks it up.
+    #[test]
+    fn nothing_in_view_ever_asks_for_a_picture() {
+        let mut app = app();
+        update(&mut app, Message::PrimitiveAdded(brokkr_core::PrimitiveKind::Cube));
+        settle(&mut app);
+
+        let stale_before = app.thumbs.stale_count();
+        for _ in 0..8 {
+            app.thumbs.settle_now();
+            drop(app.view());
+        }
+
+        assert!(!app.shared.thumbnail_pending(), "view() queued a render");
+        assert_eq!(app.thumbs.stale_count(), stale_before, "view() marked a picture stale");
+
+        // ...and every body still has a cell to draw, which is what a row
+        // reads. A `view` that had to allocate one would be the same mistake
+        // wearing a different hat.
+        for node in app.doc.nodes().iter().filter(|node| node.is_body()) {
+            assert!(app.thumbs.cell(node.id).is_some(), "{} has no cell", node.name);
+        }
+    }
+
+    /// **A stroke is one picture, at the end, however long it lasted.**
+    ///
+    /// A stroke calls `remesh_dirty` once per pointer event -- hundreds of
+    /// times over a few seconds -- and a picture per stamp would be a full-body
+    /// render riding on top of every one of them. So `remesh_dirty` skips a
+    /// sculpt drag and `finish_stroke` marks the body once.
+    #[test]
+    fn a_five_second_stroke_asks_for_exactly_one_picture_after_it_ends() {
+        let mut app = app();
+        settle(&mut app);
+        let body = app.doc.active();
+
+        let centre = Vector::new(SIZE.x / 2.0, SIZE.y / 2.0);
+        press(&mut app, centre);
+        // Three hundred pointer events is about five seconds of drawing at a
+        // display rate, and the frames between them are what a real stroke
+        // interleaves.
+        for step in 0..300 {
+            drag_to(&mut app, Vector::new(centre.x + (step % 20) as f32, centre.y));
+            app.thumbs.settle_now();
+            update(&mut app, Message::Frame);
+            assert!(
+                app.shared.take_thumbnail_for_tests().is_none(),
+                "a picture was asked for mid stroke, at stamp {step}"
+            );
+        }
+        release(&mut app);
+
+        let request = quiet_frame(&mut app).expect("the stroke never asked for its picture");
+        assert_eq!(request.body, body, "the wrong body's picture was asked for");
+        assert_eq!(
+            request.cell,
+            app.thumbs.cell(body).expect("the active body has a cell"),
+            "the request names a cell the panel is not reading"
+        );
+        assert!(quiet_frame(&mut app).is_none(), "one stroke asked for two pictures");
+    }
+
+    /// **A press and release that never touched the model costs nothing.**
+    ///
+    /// The counterpart to the test above, and the reason the stroke's mark
+    /// lives inside `finish_stroke`'s edit guard rather than beside it.
+    #[test]
+    fn a_click_that_changes_nothing_asks_for_no_picture() {
+        let mut app = app();
+        settle(&mut app);
+
+        // Well clear of the model, so the raycast misses and no recorder opens.
+        press(&mut app, Vector::new(4.0, 4.0));
+        release(&mut app);
+
+        assert!(quiet_frame(&mut app).is_none(), "a click on empty space asked for a picture");
+    }
+
+    /// **A held ctrl+Z asks for one picture, after it stops.**
+    ///
+    /// This is the failure the settle timer exists for and the reason it is not
+    /// `last_activity`. Key repeat runs at about 25 a second and touches no
+    /// pointer event at all, so a gate reading pointer activity would be wide
+    /// open throughout -- and every undo in the burst would pay a full-body
+    /// render on top of its own remesh.
+    ///
+    /// The burst is checked by comparing the timer against ITSELF rather than
+    /// by asserting "not settled yet". The second form would be asserting that
+    /// the machine did not deschedule this thread for 200 ms, which under a
+    /// full suite it sometimes does, and a test that fails on a loaded runner
+    /// teaches people to rerun it.
+    #[test]
+    fn a_held_undo_asks_for_one_picture_only_once_it_stops() {
+        let mut app = app();
+        let centre = Vector::new(SIZE.x / 2.0, SIZE.y / 2.0);
+        for _ in 0..4 {
+            press(&mut app, centre);
+            drag_to(&mut app, Vector::new(centre.x + 6.0, centre.y));
+            release(&mut app);
+        }
+        settle(&mut app);
+        // Driven off what the history really holds: an undo with nothing left
+        // to undo changes no geometry and restarts no timer.
+        let available = app.history.stats().undo_entries;
+        assert!(available >= 3, "the fixture has only {available} entries to undo");
+
+        for step in 0..available {
+            // Pretend a long quiet gap, so the gate is wide open going in.
+            app.thumbs.settle_now();
+            let opened = app.thumbs.last_change();
+            update(&mut app, Message::Undo);
+            assert!(
+                app.thumbs.last_change() > opened,
+                "undo {step} of a held ctrl+Z did not restart the settle timer, so the next \
+                 frame would pay a full-body render on top of the undo's own remesh -- and none \
+                 of these undos touches the pointer, which is what a gate on `last_activity` \
+                 would be reading"
+            );
+        }
+
+        assert!(quiet_frame(&mut app).is_some(), "the undo burst never asked for its picture");
+        assert!(quiet_frame(&mut app).is_none(), "an undo burst asked for two pictures");
+    }
+
+    /// **Nothing about how a body is PRESENTED stales its picture.**
+    ///
+    /// Visibility, solo, rename, folder membership and selection all leave the
+    /// geometry exactly as it was, so soloing sixty-four bodies has to cost
+    /// zero renders. A staleness rule hung off "the document changed" rather
+    /// than off "a brick was marked dirty" would fail every line of this.
+    #[test]
+    fn hiding_soloing_renaming_and_reordering_ask_for_nothing() {
+        let mut app = app();
+        update(&mut app, Message::PrimitiveAdded(brokkr_core::PrimitiveKind::Cube));
+        let second = app.doc.active();
+        settle(&mut app);
+
+        let gestures: [Gesture; 8] = [
+            ("hiding a body", |app, id| update(app, Message::BodyVisibilityToggled(id))),
+            ("showing it again", |app, id| update(app, Message::BodyVisibilityToggled(id))),
+            ("selecting another row", |app, _| {
+                let first = app.doc.nodes()[0].id;
+                update(app, Message::BodySelected(first));
+            }),
+            ("entering solo", |app, id| {
+                update(app, Message::BodySelected(id));
+                update(app, Message::SoloEntered(id));
+            }),
+            ("leaving solo", |app, _| update(app, Message::SoloExited)),
+            ("starting a rename", |app, id| update(app, Message::BodyRenameBegan(id))),
+            ("finishing a rename", |app, _| {
+                update(app, Message::BodyRenameEdited("Renamed".into()));
+                update(app, Message::BodyRenameSubmitted);
+            }),
+            ("grouping the row into a folder", |app, _| update(app, Message::BodyGrouped)),
+        ];
+
+        for (what, gesture) in gestures {
+            gesture(&mut app, second);
+            assert!(
+                quiet_frame(&mut app).is_none(),
+                "{what} asked for a picture, which it must never do -- the geometry did not change"
+            );
+        }
+    }
+
+    /// A new body gets a cell of its own and one picture; a deleted body gives
+    /// its cell back and asks for nothing more.
+    #[test]
+    fn a_new_body_is_drawn_once_and_a_deleted_one_gives_its_cell_back() {
+        let mut app = app();
+        settle(&mut app);
+        let first = app.doc.active();
+        let first_cell = app.thumbs.cell(first).expect("the starting ball has a cell");
+
+        update(&mut app, Message::PrimitiveAdded(brokkr_core::PrimitiveKind::Cube));
+        let cube = app.doc.active();
+        let cube_cell = app.thumbs.cell(cube).expect("a new body gets a cell");
+        assert_ne!(cube_cell, first_cell, "the new body was given the ball's cell");
+
+        let request = quiet_frame(&mut app).expect("a new body was never drawn");
+        assert_eq!(request.body, cube);
+        assert_eq!(request.cell, cube_cell);
+        assert!(quiet_frame(&mut app).is_none(), "adding one body asked for two pictures");
+
+        update(&mut app, Message::BodyDeleted);
+        assert_eq!(app.thumbs.cell(cube), None, "a deleted body kept its cell");
+        assert_eq!(app.thumbs.cell(first), Some(first_cell), "the delete moved another picture");
+
+        // **A delete DOES redraw what is left, and that is the rule working
+        // rather than the rule leaking.** `remove_body` pairs the pool's forget
+        // with `mark_everything_dirty` -- it has to, or a brick the pool
+        // refused while it was full stays missing -- so every surviving body's
+        // bricks really were marked dirty and every surviving picture really is
+        // a guess. What must never happen is a request naming the body that has
+        // gone: its cell is back on the free list and may belong to someone
+        // else by the time the drain runs.
+        let mut asked_for = Vec::new();
+        while let Some(request) = quiet_frame(&mut app) {
+            assert_ne!(request.body, cube, "a picture was asked for of a deleted body");
+            asked_for.push(request.body);
+            assert!(asked_for.len() <= 4, "the delete never stopped asking for pictures");
+        }
+        assert_eq!(asked_for, vec![first], "the delete redrew something other than what is left");
+    }
+
+    /// Turning the pictures off costs nothing and turning them back on redraws
+    /// them all, because nothing was kept up to date in between.
+    #[test]
+    fn the_pictures_switch_stops_and_restarts_the_renders() {
+        let mut app = app();
+        settle(&mut app);
+
+        update(&mut app, Message::ThumbnailsToggled);
+        assert!(!app.thumbnails);
+        // A stroke with the pictures off must not queue one.
+        let centre = Vector::new(SIZE.x / 2.0, SIZE.y / 2.0);
+        press(&mut app, centre);
+        drag_to(&mut app, Vector::new(centre.x + 6.0, centre.y));
+        release(&mut app);
+        assert!(
+            quiet_frame(&mut app).is_none(),
+            "a render was queued with the pictures switched off"
+        );
+
+        update(&mut app, Message::ThumbnailsToggled);
+        assert!(app.thumbnails);
+        assert!(
+            quiet_frame(&mut app).is_some(),
+            "turning the pictures back on left them showing whatever they held when they went off"
+        );
+        // ...and it is not a document change.
+        assert_eq!(app.thumbs.stale_count(), 0, "one body took more than one render to come back");
+    }
+}
+
+/// The mask TOOL: the mode, the gesture, and what one mask stroke costs.
+///
+/// Its own module because every test here is about the tool rather than about
+/// the brush -- what a press means, which map it writes, and what the release
+/// pushes onto history.
+#[cfg(test)]
+mod mask_tool_tests {
+    use super::*;
+    use crate::tablet::PenState;
+    use iced::Vector;
+
+    const SIZE: Vector = Vector { x: 800.0, y: 600.0 };
+
+    fn update(app: &mut Brokkr, message: Message) {
+        drop(app.update(message));
+    }
+
+    fn app() -> Brokkr {
+        Brokkr::with_tablet(crate::tablet::Tablet::inert())
+    }
+
+    fn centre_of_viewport() -> Vector {
+        Vector::new(SIZE.x / 2.0, SIZE.y / 2.0)
+    }
+
+    /// Pointer events routed through `update` rather than straight into
+    /// `on_pointer`.
+    ///
+    /// The difference matters here and nowhere else in this file: the standing
+    /// mask card is rebuilt in `publish_visibility`, which `update` runs after
+    /// every message and which `on_pointer` never reaches. A test that poked
+    /// the pointer handler directly would paint a mask and then find no card,
+    /// which is a fact about the test harness rather than about the
+    /// application.
+    fn press(app: &mut Brokkr, at: Vector) {
+        update(
+            app,
+            Message::Pointer(PointerEvent::Pressed {
+                button: PointerButton::Left,
+                position: at,
+                size: SIZE,
+            }),
+        );
+    }
+
+    fn drag_to(app: &mut Brokkr, at: Vector) {
+        update(app, Message::Pointer(PointerEvent::Moved { position: at, size: SIZE }));
+    }
+
+    fn release(app: &mut Brokkr) {
+        update(app, Message::Pointer(PointerEvent::Released { button: PointerButton::Left }));
+    }
+
+    /// A short mask drag across the middle of the model.
+    fn mask_drag(app: &mut Brokkr) {
+        let centre = centre_of_viewport();
+        press(app, centre);
+        drag_to(app, Vector::new(centre.x + 20.0, centre.y));
+        drag_to(app, Vector::new(centre.x + 40.0, centre.y));
+        release(app);
+    }
+
+    /// Every field value of the active body, in a fixed order, for a bit-for-bit
+    /// comparison across a gesture.
+    fn field_of(app: &Brokkr) -> Vec<(brokkr_core::BrickCoord, Vec<f32>)> {
+        let volume = app.doc.active_volume();
+        let mut coords: Vec<_> = volume.brick_coords().collect();
+        coords.sort_by_key(|coord| (coord.0.z, coord.0.y, coord.0.x));
+        coords
+            .into_iter()
+            .map(|coord| {
+                let origin = coord.origin();
+                let dim = brokkr_core::BRICK_DIM as i32;
+                let values = (0..dim)
+                    .flat_map(|z| {
+                        (0..dim).flat_map(move |y| (0..dim).map(move |x| glam::IVec3::new(x, y, z)))
+                    })
+                    .map(|local| volume.sample_voxel(origin + local))
+                    .collect();
+                (coord, values)
+            })
+            .collect()
+    }
+
+    /// `m` enters and leaves, and the brush selection underneath is untouched.
+    ///
+    /// The second half is the one worth pinning. Mask is a TOOL and not an
+    /// eighth brush, so entering it must not disturb which brush a user will be
+    /// back on when they leave -- and the digits, `s`, `[` and `]` all keep
+    /// working on the mask because it borrows the brush's radius and falloff.
+    #[test]
+    fn m_enters_and_leaves_mask_mode_and_leaves_the_brush_alone() {
+        let mut app = app();
+        update(&mut app, Message::BrushKindChanged(BrushKind::Clay));
+        let radius = app.brush.radius;
+
+        update(&mut app, Message::ToolChanged(Tool::Mask));
+        assert_eq!(app.tool, Tool::Mask, "m did not enter mask mode");
+        assert_eq!(app.brush.kind, BrushKind::Clay, "entering mask mode changed the brush");
+
+        update(&mut app, Message::ToolChanged(Tool::Mask));
+        assert_eq!(app.tool, Tool::Sculpt, "pressing the live tool did not go back to sculpting");
+        assert_eq!(app.brush.kind, BrushKind::Clay, "leaving mask mode changed the brush");
+        assert_eq!(app.brush.radius, radius, "the mask tool kept the brush's radius");
+    }
+
+    /// `m` really is the key, decoded the same way every other shortcut is.
+    #[test]
+    fn the_m_key_decodes_to_the_mask_tool() {
+        assert!(
+            matches!(
+                crate::viewport::shortcut("m", false, false, false),
+                Some(Message::ToolChanged(Tool::Mask))
+            ),
+            "m does not reach the mask tool"
+        );
+        // Chorded it belongs to the toolkit, like everything else under a
+        // modifier that this application has not claimed.
+        assert!(crate::viewport::shortcut("m", true, false, false).is_none());
+        assert!(crate::viewport::shortcut("m", false, false, true).is_none());
+    }
+
+    /// `h` starts a peek, and only bare.
+    ///
+    /// ZBrush's own mask-visibility key, taken rather than invented. Chorded it
+    /// belongs to the toolkit: `ctrl+h` is a browser and toolkit shortcut in
+    /// several places and this application has claimed neither form.
+    #[test]
+    fn the_h_key_decodes_to_a_mask_peek() {
+        assert!(
+            matches!(
+                crate::viewport::shortcut("h", false, false, false),
+                Some(Message::MaskPeekStarted)
+            ),
+            "h does not start a peek"
+        );
+        assert!(crate::viewport::shortcut("h", true, false, false).is_none());
+        assert!(crate::viewport::shortcut("h", false, false, true).is_none());
+    }
+
+    /// **A mask drag changes the mask and not one field value.**
+    ///
+    /// The whole of what the tool promises. A field that moved here is a mask
+    /// tool that has quietly become a sculpt brush, which a user would find in
+    /// an exported print rather than on screen.
+    #[test]
+    fn a_mask_drag_changes_the_mask_and_not_one_field_value() {
+        let mut app = app();
+        update(&mut app, Message::ToolChanged(Tool::Mask));
+        let before = field_of(&app);
+
+        mask_drag(&mut app);
+
+        assert!(app.doc.active_volume().mask_fill() > 0.0, "the drag painted no mask at all");
+        assert_eq!(field_of(&app), before, "a mask drag moved the field");
+    }
+
+    /// **Ctrl lowers the mask with every one of the seven brushes selected.**
+    ///
+    /// This is the `is_directional` trap, and it is the reason mask mode
+    /// computes its own direction. `stroke_direction` gates on
+    /// `brush.kind.is_directional()`, which answers false for Smooth, Flatten
+    /// and Move -- so a mask painter that reused it would MASK on ctrl+drag for
+    /// three of the seven, with nothing on screen to say which three.
+    #[test]
+    fn ctrl_lowers_the_mask_with_every_brush_selected() {
+        for kind in BrushKind::ALL {
+            let mut app = app();
+            update(&mut app, Message::BrushKindChanged(kind));
+            update(&mut app, Message::ToolChanged(Tool::Mask));
+
+            mask_drag(&mut app);
+            let raised = app.doc.active_volume().mask_fill();
+            assert!(raised > 0.0, "{kind}: the plain drag painted nothing");
+
+            app.control = true;
+            for _ in 0..6 {
+                mask_drag(&mut app);
+            }
+            assert!(
+                app.doc.active_volume().mask_fill() < raised,
+                "{kind}: ctrl+drag did not lower the mask"
+            );
+
+            // ...and alt is its synonym, exactly as it is for the brush.
+            app.control = false;
+            app.alt = true;
+            assert_eq!(app.mask_op(), MaskOp::Lower, "{kind}: alt is not ctrl's synonym");
+        }
+    }
+
+    /// The eraser end of the stylus unmasks, and combines with the modifier the
+    /// way it does everywhere else.
+    #[test]
+    fn the_stylus_eraser_lowers_the_mask() {
+        let mut app = app();
+        update(&mut app, Message::ToolChanged(Tool::Mask));
+        assert_eq!(app.mask_op(), MaskOp::Raise);
+
+        app.tablet.simulate(PenState {
+            in_proximity: true,
+            pressure: 1.0,
+            eraser: true,
+            tilt: glam::Vec2::ZERO,
+        });
+        assert_eq!(app.mask_op(), MaskOp::Lower, "the eraser end did not unmask");
+
+        // The two combine rather than override: holding the modifier while
+        // using the eraser gives back the additive gesture.
+        app.control = true;
+        assert_eq!(app.mask_op(), MaskOp::Raise);
+
+        // And shift outranks both, because blur is a different operation rather
+        // than a direction.
+        app.shift = true;
+        assert_eq!(app.mask_op(), MaskOp::Blur);
+    }
+
+    /// **A mask-only stroke sets `unsaved` and pushes exactly one history
+    /// entry**, and undoing it puts the mask back and marks bricks dirty.
+    ///
+    /// It did neither before this increment: `end_stroke` recorded field bricks
+    /// only, so a mask gesture produced no entry, never set `unsaved`, and did
+    /// not even raise the discard prompt on the way out.
+    #[test]
+    fn a_mask_stroke_is_one_undoable_entry_that_marks_the_document_unsaved() {
+        let mut app = app();
+        update(&mut app, Message::ToolChanged(Tool::Mask));
+        let entries = app.history_stats.undo_entries;
+
+        mask_drag(&mut app);
+
+        let painted = app.doc.active_volume().mask_fill();
+        assert!(painted > 0.0, "the fixture painted nothing");
+        assert!(app.unsaved, "a mask stroke did not mark the document unsaved");
+        assert_eq!(
+            app.history_stats.undo_entries,
+            entries + 1,
+            "one mask gesture became {} entries",
+            app.history_stats.undo_entries - entries
+        );
+
+        app.perf.dirty_bricks = 0;
+        app.undo();
+        assert_eq!(app.doc.active_volume().mask_fill(), 0.0, "undo did not take the mask off");
+        assert!(app.perf.dirty_bricks > 0, "undoing a mask stroke remeshed nothing");
+
+        app.redo();
+        assert!(
+            (app.doc.active_volume().mask_fill() - painted).abs() < 1.0e-9,
+            "redo did not put the mask back"
+        );
+    }
+
+    /// Escape leaves mask mode ON, and clears the cut.
+    ///
+    /// A cut is a pending destructive thing and Escape calls it off. A mask is
+    /// expensive user work, and Escape is also the key that closes every menu,
+    /// so a user dismissing a dropdown must not silently lose the mode they are
+    /// painting in.
+    #[test]
+    fn escape_clears_the_cut_and_leaves_mask_mode_on() {
+        let mut app = app();
+        update(&mut app, Message::ToolChanged(Tool::Cut));
+        update(&mut app, Message::MenuClosed);
+        assert_eq!(app.tool, Tool::Sculpt, "escape did not disarm the cut");
+
+        update(&mut app, Message::ToolChanged(Tool::Mask));
+        update(&mut app, Message::MenuClosed);
+        assert_eq!(app.tool, Tool::Mask, "escape threw away the mask mode");
+    }
+
+    /// An in-progress resize outranks BOTH modes, which is a change of ordering
+    /// from the cut alone.
+    ///
+    /// A destructive one-shot may reasonably outrank a resize; an ongoing paint
+    /// may not, and once the two collapsed into one match on the tool the merged
+    /// arm had to take one of the two precedences. It takes the mask's.
+    #[test]
+    fn a_sizing_drag_outranks_both_modes() {
+        for tool in [Tool::Cut, Tool::Mask] {
+            let mut app = app();
+            app.cursor = Some(Vec2::new(SIZE.x / 2.0, SIZE.y / 2.0));
+            update(&mut app, Message::ToolChanged(tool));
+            update(&mut app, Message::SizingStarted(SizingTarget::Radius));
+            assert!(app.sizing.is_some(), "the fixture did not start a resize");
+
+            press(&mut app, centre_of_viewport());
+            assert_eq!(
+                app.drag.map(|drag| drag.kind),
+                Some(DragKind::Sizing),
+                "{tool:?} stole a press that belonged to a resize"
+            );
+        }
+    }
+
+    /// The mask keeps its own strength, and the brush gets its own back.
+    ///
+    /// Draw's default is 0.15, which barely deposits; a user painting a mask
+    /// drags the slider up to get a usable one. Sharing the number would make
+    /// the very next Draw stroke after leaving mask mode a gouge at full
+    /// strength on a scan they were carefully repairing.
+    #[test]
+    fn the_mask_remembers_its_own_strength_and_the_brush_keeps_its() {
+        let mut app = app();
+        update(&mut app, Message::BrushKindChanged(BrushKind::Draw));
+        assert!((app.brush.strength - 0.15).abs() < 1.0e-6);
+
+        update(&mut app, Message::ToolChanged(Tool::Mask));
+        assert!(app.brush.strength > 0.9, "the mask arrived at {}", app.brush.strength);
+
+        update(&mut app, Message::BrushStrengthChanged(0.6));
+        // Choosing a different brush mid-mask must not disturb it: both sides of
+        // the swap resolve to the mask's own slot.
+        update(&mut app, Message::BrushKindChanged(BrushKind::Clay));
+        assert!((app.brush.strength - 0.6).abs() < 1.0e-6, "the mask forgot its setting");
+
+        update(&mut app, Message::ToolChanged(Tool::Mask));
+        assert_eq!(app.tool, Tool::Sculpt);
+        assert!(
+            (app.brush.strength - 0.15).abs() < 1.0e-6,
+            "clay came back at the mask's strength"
+        );
+
+        update(&mut app, Message::ToolChanged(Tool::Mask));
+        assert!((app.brush.strength - 0.6).abs() < 1.0e-6, "the mask did not get its own back");
+    }
+
+    /// The standing card is up whenever anything is masked, whatever tool is
+    /// live, and it names the body.
+    ///
+    /// This is the mechanism that makes "a mask is active and nothing on screen
+    /// says so" unreachable, so the assertion is about it being UNCONDITIONAL
+    /// rather than about its wording.
+    #[test]
+    fn the_mask_card_stands_whatever_tool_is_live() {
+        let mut app = app();
+        assert!(app.mask_card.is_none(), "an unmasked document showed a mask card");
+
+        update(&mut app, Message::ToolChanged(Tool::Mask));
+        mask_drag(&mut app);
+        let card = app.mask_card.clone().expect("a painted mask showed no card");
+        let name = app.doc.node(app.doc.active()).expect("an active body").name.clone();
+        assert!(
+            card.headline.contains(&name),
+            "the card does not name the body: {}",
+            card.headline
+        );
+        assert!(card.headline.contains('%'), "the card carries no percentage: {}", card.headline);
+
+        // Back to sculpting, and the card stays: the whole point is that it is
+        // not scoped to the tool that made the mask.
+        update(&mut app, Message::ToolChanged(Tool::Mask));
+        assert_eq!(app.tool, Tool::Sculpt);
+        assert!(app.mask_card.is_some(), "leaving mask mode took the card with it");
+
+        // And it goes away when the mask does.
+        update(&mut app, Message::Undo);
+        assert!(app.mask_card.is_none(), "undoing the mask left its card behind");
+    }
+
+    /// **Switching the tint off leaves the card up, unchanged, and marks no
+    /// brick dirty.** This is the whole of what makes decision 13 safe.
+    ///
+    /// A `show mask` toggle ships where this plan argued for a held-only peek
+    /// key, on the reasoning that a tint which can be switched off will be left
+    /// off. What closes the hole is that the toggle governs the TINT ONLY: the
+    /// card is built from the document and consults neither the toggle nor the
+    /// strength, so "a mask is active and nothing on screen says so" stays
+    /// unreachable. If this test ever has to be relaxed, the toggle is the
+    /// thing to delete rather than the assertion.
+    ///
+    /// The pixel half of the claim -- that a body with the tint off is
+    /// pixel-identical to an unmasked one -- is in `brokkr-gpu`'s
+    /// `offscreen.rs`, which is the only place a pixel exists.
+    #[test]
+    fn switching_the_tint_off_leaves_the_card_up_and_every_brick_alone() {
+        let mut app = app();
+        update(&mut app, Message::ToolChanged(Tool::Mask));
+        mask_drag(&mut app);
+
+        let card = app.mask_card.clone().expect("a painted mask showed no card");
+        let fill = app.doc.active_volume().mask_fill();
+        let revision = app.doc.active_volume().mask().revision();
+        assert_eq!(app.doc.active_volume().dirty_count(), 0, "the fixture left a remesh pending");
+        assert_eq!(app.shared.mask_view().tint, DEFAULT_MASK_TINT, "the tint did not start on");
+
+        update(&mut app, Message::ShowMaskToggled);
+        assert_eq!(app.shared.mask_view().tint, 0.0, "the toggle did not reach the renderer");
+        assert_eq!(app.mask_card, Some(card.clone()), "switching the tint off changed the card");
+        assert_eq!(app.doc.active_volume().mask_fill(), fill, "the toggle changed protection");
+        assert_eq!(app.doc.active_volume().mask().revision(), revision);
+        assert_eq!(
+            app.doc.active_volume().dirty_count(),
+            0,
+            "the toggle marked bricks for remesh, which it has no reason to: the tint is a uniform"
+        );
+
+        update(&mut app, Message::ShowMaskToggled);
+        assert_eq!(app.shared.mask_view().tint, DEFAULT_MASK_TINT, "the tint did not come back");
+        assert_eq!(app.mask_card, Some(card), "switching the tint back on changed the card");
+    }
+
+    /// The held peek key shows the mask whatever the toggle says, and puts it
+    /// back exactly as it was.
+    ///
+    /// It is kept alongside the toggle rather than replaced by it because it is
+    /// the way back for a user who switched the tint off and forgot -- so the
+    /// case worth pinning is the one where the toggle is OFF.
+    #[test]
+    fn the_held_peek_key_shows_the_mask_whatever_the_toggle_says() {
+        let mut app = app();
+        update(&mut app, Message::ToolChanged(Tool::Mask));
+        mask_drag(&mut app);
+        update(&mut app, Message::ShowMaskToggled);
+        update(&mut app, Message::MaskTintChanged(0.6));
+        assert_eq!(app.shared.mask_view().tint, 0.0, "the fixture did not switch the tint off");
+
+        update(&mut app, Message::MaskPeekStarted);
+        assert_eq!(app.shared.mask_view().tint, 0.6, "the peek key showed nothing");
+        // It repeats while it is held, which must be idempotent rather than a
+        // strobe -- which is why the peek is two messages and not a toggle.
+        update(&mut app, Message::MaskPeekStarted);
+        assert_eq!(app.shared.mask_view().tint, 0.6);
+
+        update(&mut app, Message::MaskPeekEnded);
+        assert_eq!(app.shared.mask_view().tint, 0.0, "the peek key latched");
+        assert_eq!(app.doc.active_volume().dirty_count(), 0, "a peek marked bricks for remesh");
+    }
+
+    /// The tint strength is a view strength in 0..1, and nothing it does
+    /// reaches protection.
+    #[test]
+    fn the_tint_strength_is_clamped_and_changes_no_protection() {
+        let mut app = app();
+        update(&mut app, Message::ToolChanged(Tool::Mask));
+        mask_drag(&mut app);
+        let fill = app.doc.active_volume().mask_fill();
+
+        update(&mut app, Message::MaskTintChanged(4.0));
+        assert_eq!(app.shared.mask_view().tint, 1.0);
+        update(&mut app, Message::MaskTintChanged(-2.0));
+        assert_eq!(app.shared.mask_view().tint, 0.0);
+        update(&mut app, Message::MaskTintChanged(0.25));
+        assert_eq!(app.shared.mask_view().tint, 0.25);
+
+        assert_eq!(
+            app.doc.active_volume().mask_fill(),
+            fill,
+            "the tint slider changed how much of the body is protected, which is the confusion \
+             3D-Coat has to warn about in its own documentation"
+        );
+    }
+
+    /// The polarity handed to the shader is read out of the ACTIVE body every
+    /// time, not remembered beside it.
+    ///
+    /// Remembering it is how the two come to disagree, and what a disagreement
+    /// looks like is protected material drawn as free -- the mask at its most
+    /// misleading. Nothing in the application can set the polarity yet, so this
+    /// sets it the way the increment that ships Invert will.
+    #[test]
+    fn the_published_polarity_is_the_active_bodys_own() {
+        let mut app = app();
+        assert!(!app.shared.mask_view().inverted);
+
+        app.doc.active_volume_mut().mask_mut().set_inverted(true);
+        update(&mut app, Message::Frame);
+        assert!(app.shared.mask_view().inverted, "the flip never reached the renderer");
+
+        app.doc.active_volume_mut().mask_mut().set_inverted(false);
+        update(&mut app, Message::Frame);
+        assert!(!app.shared.mask_view().inverted);
+    }
+
+    /// The card's percentage is CACHED and only recomputed when the mask moves.
+    ///
+    /// `view()` runs at display rate off `window::frames()`, so a frame that
+    /// changed nothing must not pay for a pass over the mask.
+    ///
+    /// **Asserted with a sentinel, because comparing the card against itself
+    /// cannot fail.** A rebuild writes the same words as the card it replaces,
+    /// so `assert_eq!(card, card_before)` passes just as happily with the
+    /// revision gate deleted and `mask_fill` running on every one of the sixty
+    /// frames a second -- which is the entire cost the cache exists to avoid. A
+    /// word only the test could have written is the one thing a recompute
+    /// destroys.
+    #[test]
+    fn a_frame_that_changed_nothing_does_not_rebuild_the_mask_card() {
+        let mut app = app();
+        update(&mut app, Message::ToolChanged(Tool::Mask));
+        mask_drag(&mut app);
+        assert!(app.mask_card.is_some(), "a painted mask showed no card");
+
+        let revision = app.doc.active_volume().mask().revision();
+        app.mask_card.as_mut().expect("a painted mask showed no card").headline =
+            "SENTINEL".to_string();
+        for _ in 0..8 {
+            update(&mut app, Message::Frame);
+        }
+        assert_eq!(
+            app.doc.active_volume().mask().revision(),
+            revision,
+            "an idle frame moved the mask revision, so the cache can never hit"
+        );
+        assert_eq!(
+            app.mask_card.as_ref().map(|card| card.headline.as_str()),
+            Some("SENTINEL"),
+            "eight idle frames rebuilt the card, so every frame pays for mask_fill"
+        );
+        assert_eq!(app.mask_card.as_ref().map(|card| card.revision), Some(revision));
+
+        // And the gate is not so wide that a real change slips through it.
+        mask_drag(&mut app);
+        assert_ne!(
+            app.mask_card.as_ref().map(|card| card.headline.as_str()),
+            Some("SENTINEL"),
+            "painting more mask left the card saying what it said before"
+        );
+    }
+
+    /// A hidden masked body costs the frame tick nothing either.
+    ///
+    /// The count of masked bodies off screen is the one line on the card that
+    /// goes stale without the mask moving, so it sits outside the revision key
+    /// -- and that is exactly how a `format!` gets back onto the frame path.
+    /// `publish_visibility` allocates nothing by contract and this runs at the
+    /// bottom of it, so the count is compared as a number and only turned into
+    /// words when it is a NEW number. Sentinels on both strings, because a
+    /// rebuild of either one is the bug.
+    #[test]
+    fn hiding_a_masked_body_does_not_put_a_format_on_the_frame_path() {
+        let mut app = app();
+        let first = app.doc.active();
+        update(&mut app, Message::ToolChanged(Tool::Mask));
+        mask_drag(&mut app);
+        // The copy carries the mask, so this is two masked bodies in the same
+        // place -- and hiding the original leaves the active one masked, which
+        // is the arm where the count sits outside the revision key.
+        update(&mut app, Message::BodyDuplicated);
+        update(&mut app, Message::BodyVisibilityToggled(first));
+
+        let card = app.mask_card.as_ref().expect("a hidden masked body showed no card");
+        assert!(card.headline.ends_with('%'), "no percentage on the card: {}", card.headline);
+        assert_eq!(card.off_screen, "+1 masked, hidden", "the hidden body was not counted");
+
+        let card = app.mask_card.as_mut().expect("a hidden masked body showed no card");
+        card.headline = "SENTINEL".to_string();
+        card.off_screen = "SENTINEL".to_string();
+        for _ in 0..8 {
+            update(&mut app, Message::Frame);
+        }
+        let card = app.mask_card.as_ref().expect("eight frames took the card away");
+        assert_eq!(card.headline, "SENTINEL", "an idle frame rebuilt the headline");
+        assert_eq!(card.off_screen, "SENTINEL", "an idle frame rebuilt the hidden count");
+
+        // A body with no mask of its own, with one hidden and one visible out
+        // there: the card is nothing but the counts, both of them are said, and
+        // it is cached on both.
+        update(&mut app, Message::PrimitiveAdded(brokkr_core::PrimitiveKind::Cube));
+        let card = app.mask_card.as_ref().expect("the hidden masked body stopped being named");
+        assert_eq!(card.headline, "MASK — 1 masked, elsewhere");
+        assert_eq!(card.off_screen, "+1 masked, hidden", "the hidden body stopped being counted");
+
+        app.mask_card.as_mut().expect("a card").headline = "SENTINEL".to_string();
+        for _ in 0..8 {
+            update(&mut app, Message::Frame);
+        }
+        assert_eq!(
+            app.mask_card.as_ref().map(|card| card.headline.as_str()),
+            Some("SENTINEL"),
+            "an idle frame rebuilt the whole card for a body that has no mask on it"
+        );
+
+        // Showing it again is a real change, and the counts have to move with
+        // it -- the hidden line goes and the body joins the visible ones.
+        // **The card does NOT go away**, which is increment 24's review
+        // finding: it used to, leaving two masked bodies on screen with the
+        // active body unmasked and nothing anywhere saying protection existed.
+        update(&mut app, Message::BodyVisibilityToggled(first));
+        let card = app.mask_card.as_ref().expect("two masked bodies on screen showed no card");
+        assert_eq!(card.headline, "MASK — 2 masked, elsewhere");
+        assert!(card.off_screen.is_empty(), "nothing is hidden now: {}", card.off_screen);
+        assert!(
+            !card.names_the_active_body(),
+            "the card offered to clear a mask the active body does not have"
+        );
+    }
+
+    /// A sculpt press onto fully protected material says so.
+    ///
+    /// Without this the mask's most confusing behaviour -- a stroke that does
+    /// nothing because of protection painted minutes ago -- reads as a broken
+    /// brush, and there is nothing under the cursor for the user to connect it
+    /// to.
+    #[test]
+    fn a_sculpt_press_onto_a_protected_surface_says_the_mask_blocked_it() {
+        let mut app = app();
+        update(&mut app, Message::ToolChanged(Tool::Mask));
+        // Wide and repeated, so the surface under the cursor really does reach
+        // full protection rather than the feathered rim's fraction of it.
+        update(&mut app, Message::BrushRadiusChanged(12.0));
+        for _ in 0..4 {
+            mask_drag(&mut app);
+        }
+        update(&mut app, Message::ToolChanged(Tool::Mask));
+        assert_eq!(app.tool, Tool::Sculpt, "the fixture did not go back to sculpting");
+
+        app.status.clear();
+        press(&mut app, centre_of_viewport());
+        release(&mut app);
+        assert!(
+            app.status.contains("mask"),
+            "a press onto protected material reported: {}",
+            app.status
+        );
+    }
+}
+
+/// The whole-mask VERBS: Clear, Invert, Mask all, and the four absolute
+/// filters.
+///
+/// Its own module rather than more of `mask_tool_tests`, because none of these
+/// is a gesture in the viewport: they are buttons and a slider, and what they
+/// have to answer for is memory and undo rather than what a press means.
+#[cfg(test)]
+mod mask_verb_tests {
+    use super::*;
+    use iced::Vector;
+
+    const SIZE: Vector = Vector { x: 800.0, y: 600.0 };
+
+    fn update(app: &mut Brokkr, message: Message) {
+        drop(app.update(message));
+    }
+
+    fn app() -> Brokkr {
+        Brokkr::with_tablet(crate::tablet::Tablet::inert())
+    }
+
+    /// An application with a real painted mask on its one body.
+    fn masked() -> Brokkr {
+        let mut app = app();
+        let centre = Vector::new(SIZE.x / 2.0, SIZE.y / 2.0);
+        update(&mut app, Message::ToolChanged(Tool::Mask));
+        update(&mut app, Message::BrushRadiusChanged(10.0));
+        update(
+            &mut app,
+            Message::Pointer(PointerEvent::Pressed {
+                button: PointerButton::Left,
+                position: centre,
+                size: SIZE,
+            }),
+        );
+        for step in 1..=3 {
+            update(
+                &mut app,
+                Message::Pointer(PointerEvent::Moved {
+                    position: Vector::new(centre.x + step as f32 * 15.0, centre.y),
+                    size: SIZE,
+                }),
+            );
+        }
+        update(&mut app, Message::Pointer(PointerEvent::Released { button: PointerButton::Left }));
+        assert!(app.doc.active_volume().mask_fill() > 0.0, "the fixture painted no mask");
+        app
+    }
+
+    /// Every stored mask byte of the active body, for a bit-for-bit comparison.
+    fn mask_of(app: &Brokkr) -> Vec<(brokkr_core::BrickCoord, Vec<u8>)> {
+        let mask = app.doc.active_volume().mask();
+        let mut coords: Vec<_> = mask.brick_coords().collect();
+        coords.sort_by_key(|coord| (coord.0.z, coord.0.y, coord.0.x));
+        let dim = brokkr_core::BRICK_DIM as i32;
+        coords
+            .into_iter()
+            .map(|coord| {
+                let origin = coord.origin();
+                let bytes = (0..dim)
+                    .flat_map(|z| {
+                        (0..dim).flat_map(move |y| (0..dim).map(move |x| glam::IVec3::new(x, y, z)))
+                    })
+                    .map(|local| mask.at(origin + local))
+                    .collect();
+                (coord, bytes)
+            })
+            .collect()
+    }
+
+    /// Clear takes the mask off, gives its bytes back, and one ctrl+Z puts it
+    /// back exactly as it was.
+    #[test]
+    fn clearing_the_mask_frees_its_bytes_and_one_undo_restores_it_bit_for_bit() {
+        let mut app = masked();
+        let before = mask_of(&app);
+        let entries = app.history.stats().undo_entries;
+        let masked_bytes = app.doc_stats.resident_bytes;
+
+        update(&mut app, Message::MaskCleared);
+        assert!(app.doc.active_volume().mask().is_free(), "Clear left protection behind");
+        assert_eq!(app.history.stats().undo_entries, entries + 1, "Clear was not one entry");
+        assert!(app.unsaved, "Clear did not mark the document unsaved");
+        assert!(
+            app.doc_stats.resident_bytes < masked_bytes,
+            "Clear kept the mask's bytes: {} against {masked_bytes}",
+            app.doc_stats.resident_bytes
+        );
+        assert!(app.mask_card.is_none(), "the card outlived the mask it was about");
+
+        update(&mut app, Message::Undo);
+        assert_eq!(mask_of(&app), before, "undoing a Clear did not put the mask back");
+        assert_eq!(app.doc_stats.resident_bytes, masked_bytes);
+        assert!(app.mask_card.is_some(), "the card did not come back with the mask");
+    }
+
+    /// **Clear charges the reclaim allowance and not the stroke budget.**
+    ///
+    /// The map is moved into the entry rather than copied into it, so there is
+    /// nothing for the 256 MB stroke budget to hold -- and charging it there
+    /// would evict every stroke behind it the first time somebody cleared a
+    /// mask off a large body.
+    #[test]
+    fn clearing_the_mask_costs_the_reclaim_allowance_and_not_the_stroke_budget() {
+        let mut app = masked();
+        let before = app.history.stats();
+        update(&mut app, Message::MaskCleared);
+        let after = app.history.stats();
+        assert_eq!(after.bytes, before.bytes, "a moved mask was charged to the stroke budget");
+        assert!(
+            after.reclaim_bytes > before.reclaim_bytes,
+            "the reclaim allowance is not counting the mask the entry is holding"
+        );
+    }
+
+    /// **Invert twice is the mask that went in, and costs nothing either way.**
+    ///
+    /// Without the polarity bool this is a rewrite of every mask brick, which
+    /// on a lightly masked 45,567-brick model is 1.04 GiB from one keystroke.
+    #[test]
+    fn inverting_twice_is_bit_identical_and_marks_no_bricks() {
+        let mut app = masked();
+        let before = mask_of(&app);
+        let history_before = app.history.stats();
+        // Drained rather than read off `perf`, which still holds whatever the
+        // fixture's last remesh counted -- an Invert does not call one, so the
+        // counter would pass this test with the claim reversed.
+        let mut dirty = Vec::new();
+        app.doc.take_dirty(&mut dirty);
+
+        update(&mut app, Message::MaskInverted);
+        assert!(app.doc.active_volume().mask().inverted());
+        assert!(app.shared.mask_view().inverted, "the flip never reached the renderer");
+        app.doc.take_dirty(&mut dirty);
+        assert!(dirty.is_empty(), "an Invert marked {} bricks for a remesh", dirty.len());
+
+        update(&mut app, Message::MaskInverted);
+        assert!(!app.doc.active_volume().mask().inverted());
+        assert_eq!(mask_of(&app), before, "two Inverts did not come back to the same mask");
+
+        let after = app.history.stats();
+        assert_eq!(
+            after.undo_entries,
+            history_before.undo_entries + 2,
+            "two Inverts were not two entries"
+        );
+        assert_eq!(after.bytes, history_before.bytes, "an Invert cost the stroke budget bytes");
+        assert_eq!(after.reclaim_bytes, history_before.reclaim_bytes);
+
+        // And back out again through undo, which has to be just as cheap: a
+        // remesh here is 475 ms at the brick count the pool is sized for.
+        app.doc.take_dirty(&mut dirty);
+        update(&mut app, Message::Undo);
+        assert!(app.doc.active_volume().mask().inverted(), "undo did not flip it back");
+        app.doc.take_dirty(&mut dirty);
+        assert!(dirty.is_empty(), "undoing an Invert marked {} bricks", dirty.len());
+    }
+
+    /// Mask All over an empty map is one bool: no map, no bricks, no bytes.
+    #[test]
+    fn masking_all_over_an_empty_map_allocates_nothing() {
+        let mut app = app();
+        // `doc.totals()` and not `doc_stats`, which is written by `remesh_dirty`
+        // and is still zero on an application nothing has remeshed yet.
+        let before = app.doc.totals().resident_bytes;
+        let history_before = app.history.stats();
+
+        update(&mut app, Message::MaskAllApplied);
+        assert!(app.doc.active_volume().mask().protects_everything());
+        assert_eq!(app.doc.totals().resident_bytes, before, "Mask All allocated a map");
+        assert_eq!(app.history.stats().bytes, history_before.bytes);
+        // The entry's own struct is charged to the reclaim allowance and
+        // nothing else: no map, no brick, and nothing that grows with the size
+        // of the body it protects.
+        let held = app.history.stats().reclaim_bytes - history_before.reclaim_bytes;
+        assert!(held < 256, "Mask All over an empty map is holding {held} bytes");
+        assert!(app.mask_card.is_some(), "a fully masked body showed no card");
+
+        // Twice is refused rather than pushed as a second no-op entry.
+        let entries = app.history.stats().undo_entries;
+        update(&mut app, Message::MaskAllApplied);
+        assert_eq!(app.history.stats().undo_entries, entries, "Mask All twice pushed two entries");
+        assert!(app.status.contains("already"), "the refusal said: {}", app.status);
+    }
+
+    /// Mask All over a painted mask throws the map away and inverts, as ONE
+    /// change, so undo puts both halves back together.
+    #[test]
+    fn masking_all_over_a_painted_mask_is_one_entry_that_undoes_whole() {
+        let mut app = masked();
+        let before = mask_of(&app);
+        let entries = app.history.stats().undo_entries;
+
+        update(&mut app, Message::MaskAllApplied);
+        assert!(app.doc.active_volume().mask().protects_everything());
+        assert_eq!(app.history.stats().undo_entries, entries + 1, "Mask All was not one entry");
+
+        update(&mut app, Message::Undo);
+        assert!(!app.doc.active_volume().mask().inverted(), "undo left the polarity inverted");
+        assert_eq!(mask_of(&app), before, "undo did not put the map back");
+    }
+
+    /// **A gesture whose slider went away is committed on the next frame.**
+    ///
+    /// The amount slider lives in the right-click menu, and Escape closes that
+    /// menu -- so the release that commits a drag can simply never arrive. What
+    /// would be left is a filtered mask with no history entry and no `unsaved`:
+    /// work ctrl+Z cannot reach and that quitting would not prompt about.
+    #[test]
+    fn a_filter_gesture_orphaned_by_a_closing_menu_is_committed_on_the_next_frame() {
+        let mut app = masked();
+        app.menu = Some(Vec2::ZERO);
+        let entries = app.history.stats().undo_entries;
+
+        update(&mut app, Message::MaskAmountChanged(1.0));
+        let filtered = mask_of(&app);
+
+        // A frame DURING the drag must not commit it early, or every filter
+        // becomes one entry per sixtieth of a second.
+        update(&mut app, Message::Frame);
+        assert!(app.mask_grab.is_some(), "a frame mid-drag ended the drag");
+        assert_eq!(app.history.stats().undo_entries, entries, "a frame mid-drag pushed an entry");
+
+        // The menu goes -- Escape, a press in the viewport, anything.
+        app.menu = None;
+        update(&mut app, Message::Frame);
+        assert!(app.mask_grab.is_none(), "the drag is still open with nothing to release it");
+        assert_eq!(app.history.stats().undo_entries, entries + 1, "the orphaned drag was lost");
+        assert_eq!(mask_of(&app), filtered, "committing the orphan changed what it committed");
+        assert!(app.unsaved, "an orphaned drag left the document looking saved");
+        assert_eq!(app.mask_amount, 0.0);
+
+        update(&mut app, Message::Undo);
+        assert_ne!(mask_of(&app), filtered, "the committed orphan is not undoable");
+    }
+
+    /// **Blur at 0.0 is a no-op: no change, and no entry.**
+    ///
+    /// Literally rather than approximately: dragging back to zero moves the
+    /// snapshot itself back onto the body, so it is the same field object.
+    #[test]
+    fn a_filter_at_zero_changes_nothing_and_pushes_no_entry() {
+        let mut app = masked();
+        let before = mask_of(&app);
+        let entries = app.history.stats().undo_entries;
+
+        update(&mut app, Message::MaskAmountChanged(0.0));
+        update(&mut app, Message::MaskAmountReleased);
+        assert_eq!(mask_of(&app), before, "a filter at zero moved a value");
+        assert_eq!(app.history.stats().undo_entries, entries, "a filter at zero pushed an entry");
+
+        // And out and back within one drag is the same claim about the middle
+        // of a gesture rather than the start of one.
+        update(&mut app, Message::MaskAmountChanged(0.8));
+        update(&mut app, Message::MaskAmountChanged(0.0));
+        update(&mut app, Message::MaskAmountReleased);
+        assert_eq!(mask_of(&app), before, "dragging out and back did not land where it started");
+        assert_eq!(
+            app.history.stats().undo_entries,
+            entries,
+            "dragging out and back pushed an entry"
+        );
+    }
+
+    /// **The standing card follows a drag rather than freezing on its first
+    /// step**, which the mask's own revision counter cannot deliver on its own.
+    ///
+    /// Every step of an absolute filter is built from ONE snapshot, so each
+    /// carries `snapshot.revision + 1` -- the same number for a grow at 0.3 and
+    /// a grow at 0.9. The card is keyed on that number. `Volume::replace_mask`
+    /// is what moves it past the mask leaving the body; delete that one line
+    /// and this test is the only thing that notices.
+    #[test]
+    fn the_standing_card_follows_a_filter_drag_step_by_step() {
+        let mut app = masked();
+        update(&mut app, Message::MaskFilterChosen(MaskFilter::Grow));
+
+        update(&mut app, Message::MaskAmountChanged(0.3));
+        let light = app.mask_card.clone().expect("a masked body showed no card");
+        let light_fill = app.doc.active_volume().mask_fill();
+        assert_eq!(
+            light.revision,
+            app.doc.active_volume().mask().revision(),
+            "the card is keyed on a revision the mask is not at"
+        );
+
+        update(&mut app, Message::MaskAmountChanged(0.9));
+        let heavy = app.mask_card.clone().expect("a masked body showed no card");
+        assert_ne!(
+            app.doc.active_volume().mask_fill(),
+            light_fill,
+            "the fixture's two steps produce the same mask, so it proves nothing"
+        );
+        assert_ne!(
+            light.revision, heavy.revision,
+            "two steps of one drag share a revision, so the card can never update"
+        );
+        assert_eq!(
+            heavy.revision,
+            app.doc.active_volume().mask().revision(),
+            "the card froze on the first step of the drag"
+        );
+    }
+
+    /// **The whole drag is ONE entry, and the same amount twice from the same
+    /// grab lands in the same place.**
+    ///
+    /// This is the absolute gesture. ZBrush's accumulative alternative has been
+    /// its top masking complaint since 2007.
+    #[test]
+    fn blurring_at_one_twice_in_a_drag_equals_blurring_once_and_is_one_entry() {
+        let mut app = masked();
+        let entries = app.history.stats().undo_entries;
+
+        update(&mut app, Message::MaskAmountChanged(1.0));
+        let once = mask_of(&app);
+        update(&mut app, Message::MaskAmountChanged(1.0));
+        assert_eq!(mask_of(&app), once, "the second application of the same amount moved it");
+        update(&mut app, Message::MaskAmountReleased);
+
+        assert_eq!(
+            app.history.stats().undo_entries,
+            entries + 1,
+            "one drag became more than one entry"
+        );
+        assert_eq!(mask_of(&app), once, "the release changed the mask");
+        assert_eq!(app.mask_amount, 0.0, "the slider did not go back to zero");
+        assert!(app.unsaved);
+        assert!(app.status.contains("blurred"), "the status said: {}", app.status);
+    }
+
+    /// A blur really blurs -- a softened mask has values the painted one does
+    /// not -- and one undo takes the whole drag back off.
+    #[test]
+    fn a_blur_softens_the_mask_and_one_undo_takes_the_whole_drag_off() {
+        let mut app = masked();
+        let before = mask_of(&app);
+
+        update(&mut app, Message::MaskAmountChanged(0.4));
+        update(&mut app, Message::MaskAmountChanged(1.0));
+        update(&mut app, Message::MaskAmountReleased);
+        assert_ne!(mask_of(&app), before, "the blur changed nothing at all");
+
+        update(&mut app, Message::Undo);
+        assert_eq!(mask_of(&app), before, "one undo did not take the whole drag off");
+    }
+
+    /// Choosing a different filter mid-drag commits the drag it interrupts
+    /// rather than re-applying one filter's snapshot under another's name.
+    #[test]
+    fn choosing_another_filter_mid_drag_commits_the_drag_it_interrupts() {
+        let mut app = masked();
+        let entries = app.history.stats().undo_entries;
+
+        update(&mut app, Message::MaskAmountChanged(1.0));
+        update(&mut app, Message::MaskFilterChosen(MaskFilter::Grow));
+        assert_eq!(app.history.stats().undo_entries, entries + 1, "the interrupted drag was lost");
+        assert!(app.mask_grab.is_none(), "the grab outlived its filter");
+        assert_eq!(app.mask_amount, 0.0, "the slider kept the old filter's amount");
+
+        update(&mut app, Message::MaskAmountChanged(1.0));
+        update(&mut app, Message::MaskAmountReleased);
+        assert_eq!(app.history.stats().undo_entries, entries + 2);
+        assert!(app.status.contains("grew"), "the status said: {}", app.status);
+    }
+
+    /// All four filters run, and each of them changes the mask.
+    #[test]
+    fn every_one_of_the_four_filters_changes_the_mask() {
+        for filter in MaskFilter::ALL {
+            let mut app = masked();
+            let before = mask_of(&app);
+            update(&mut app, Message::MaskFilterChosen(filter));
+            update(&mut app, Message::MaskAmountChanged(1.0));
+            update(&mut app, Message::MaskAmountReleased);
+            assert_ne!(mask_of(&app), before, "{filter:?} did nothing");
+        }
+    }
+
+    /// **The refusal fires before the walk, and the filter never runs.**
+    ///
+    /// The peak of a filter is `field + 2 x mask`, which on a fully painted
+    /// mask is 1.5 times the field -- 6.22 GiB against a 6 GiB ceiling on the
+    /// measured 0.0565 mm dragon, from one button press. `History::trim` keeps
+    /// a single over-budget entry by design, so the undo budget cannot save it.
+    ///
+    /// The document is driven to the ceiling by writing `doc_stats`, which is
+    /// the number the guard reads and the only way to reach a six-gigabyte
+    /// document in a unit test.
+    #[test]
+    fn a_filter_that_would_not_fit_is_refused_and_never_runs() {
+        let mut app = masked();
+        let before = mask_of(&app);
+        let entries = app.history.stats().undo_entries;
+        app.doc_stats.resident_bytes = MAX_VOLUME_BYTES as usize;
+
+        update(&mut app, Message::MaskAmountChanged(1.0));
+        assert_eq!(mask_of(&app), before, "the filter ran after the guard refused it");
+        assert!(app.mask_grab.is_none(), "the refusal still took the mask off the body");
+        assert_eq!(app.mask_amount, 0.0, "the slider stayed up after the refusal");
+        assert_eq!(app.history.stats().undo_entries, entries, "a refused filter pushed an entry");
+        assert!(
+            app.status.contains("could not blur the mask") && app.status.contains("GB"),
+            "the refusal has to name the verb and the cost: {}",
+            app.status
+        );
+
+        // And a release after a refusal commits nothing.
+        update(&mut app, Message::MaskAmountReleased);
+        assert_eq!(app.history.stats().undo_entries, entries);
+    }
+
+    /// **Clear is NOT gated by the memory guard**, and that is deliberate: it
+    /// is the one verb that gives the memory back, and refusing it at the
+    /// ceiling would trap a user with a mask they cannot remove.
+    #[test]
+    fn clear_still_works_with_the_document_at_the_memory_ceiling() {
+        let mut app = masked();
+        app.doc_stats.resident_bytes = MAX_VOLUME_BYTES as usize;
+        update(&mut app, Message::MaskCleared);
+        assert!(app.doc.active_volume().mask().is_free(), "Clear was refused at the ceiling");
+
+        let mut app = masked();
+        app.doc_stats.resident_bytes = MAX_VOLUME_BYTES as usize;
+        update(&mut app, Message::MaskInverted);
+        assert!(app.doc.active_volume().mask().inverted(), "Invert was refused at the ceiling");
+    }
+
+    /// Clearing a body that carries no mask says so rather than pushing an
+    /// entry that restores nothing.
+    #[test]
+    fn clearing_an_unmasked_body_refuses_by_name() {
+        let mut app = app();
+        let entries = app.history.stats().undo_entries;
+        update(&mut app, Message::MaskCleared);
+        assert_eq!(app.history.stats().undo_entries, entries, "Clear on nothing pushed an entry");
+        assert!(app.status.contains("no mask"), "the refusal said: {}", app.status);
+    }
+
+    /// The two reflex buttons are on the card only when the percentage above
+    /// them is about the body they would act on.
+    #[test]
+    fn the_cards_verbs_appear_only_when_it_names_the_active_body() {
+        let mut app = masked();
+        let card = app.mask_card.as_ref().expect("a painted mask showed no card");
+        assert!(card.names_the_active_body(), "the card is about the body that was masked");
+
+        // A second body, active and unmasked, with the masked one hidden: the
+        // card is up for the hidden one and must not offer to clear this one.
+        let masked_body = app.doc.active();
+        update(&mut app, Message::PrimitiveAdded(brokkr_core::PrimitiveKind::Cube));
+        update(&mut app, Message::BodyVisibilityToggled(masked_body));
+        let card = app.mask_card.as_ref().expect("a hidden masked body showed no card");
+        assert!(
+            !card.names_the_active_body(),
+            "the card offered its verbs on a body with no mask: {}",
+            card.headline
+        );
+    }
+
+    /// **A fully protected body VISIBLE on screen is announced even when it is
+    /// not the active one.** Increment 24's review finding, inverted into an
+    /// assertion.
+    ///
+    /// The shape of it, as the review reproduced it: add a Cube, press Mask
+    /// all, click the other body in the BODIES panel. The active body carries
+    /// no mask and the Cube is not hidden, so it was counted nowhere and the
+    /// card was set to `None` -- a body that spares every cut and refuses every
+    /// stroke, sitting in plain view, with nothing anywhere saying so. The
+    /// first the user heard of it was the `bricks spared` status line after
+    /// drawing a clip plane.
+    ///
+    /// The tint is the other half of the signal and it is fixed too -- see
+    /// `MeshPool::draw`'s per-bucket polarity -- but the tint is a preference
+    /// the user can switch off, and the card is the channel that cannot be. So
+    /// this is the assertion that has to hold.
+    #[test]
+    fn a_fully_masked_body_on_screen_is_announced_even_when_it_is_not_active() {
+        let mut app = app();
+        let first = app.doc.active();
+        update(&mut app, Message::PrimitiveAdded(brokkr_core::PrimitiveKind::Cube));
+        let cube = app.doc.active();
+        assert_ne!(cube, first, "the primitive did not become the active body");
+
+        update(&mut app, Message::MaskAllApplied);
+        assert!(app.doc.active_volume().mask().protects_everything(), "Mask all did nothing");
+
+        // Away to the other body, exactly as clicking its panel row does.
+        update(&mut app, Message::BodySelected(first));
+        assert_eq!(app.doc.active(), first);
+        assert!(app.doc.active_volume().mask().is_free(), "the fixture masked the wrong body");
+        assert!(
+            app.shown.iter().all(|shown| *shown),
+            "the fixture hid something, which is the case the card already covered"
+        );
+
+        let card = app.mask_card.as_ref().expect("a fully masked body on screen showed no card");
+        assert_eq!(card.headline, "MASK — 1 masked, elsewhere");
+        assert!(card.off_screen.is_empty(), "nothing is hidden: {}", card.off_screen);
+        assert!(
+            !card.names_the_active_body(),
+            "the card offered to clear a mask the active body does not have"
+        );
+
+        // And it goes when the protection does, rather than standing on stale
+        // counts: back to the Cube, Clear, and the document is free again.
+        update(&mut app, Message::BodySelected(cube));
+        update(&mut app, Message::MaskCleared);
+        update(&mut app, Message::BodySelected(first));
+        assert!(app.mask_card.is_none(), "the card outlived the mask it was counting");
+    }
+
+    /// **Every body that disagrees with the published polarity is named, and
+    /// the set follows which body is active.**
+    ///
+    /// The rendering half of the same finding. `Uniforms::mask_inverted` is one
+    /// word for the whole draw and carries the ACTIVE body's polarity, so the
+    /// bodies that disagree with it have to be published beside it or they are
+    /// drawn through it -- which is how a fully protected body came to be drawn
+    /// with no tint. See [`brokkr_gpu::MaskPolarity`]; the pixels are pinned in
+    /// `brokkr-gpu`'s `offscreen.rs`, which is the only place a pixel exists.
+    ///
+    /// The assertions are on `app.shared`, which is what the render callback
+    /// actually reads, rather than on the application's own kept buffer.
+    #[test]
+    fn the_bodies_that_disagree_about_polarity_are_published_beside_the_word() {
+        let mut app = app();
+        let first = app.doc.active();
+        update(&mut app, Message::PrimitiveAdded(brokkr_core::PrimitiveKind::Cube));
+        let cube = app.doc.active();
+
+        // A document where every body agrees costs the draw nothing.
+        assert!(!app.shared.mask_view().inverted);
+        assert!(
+            app.shared.opposite_polarity_snapshot().is_empty(),
+            "an unmasked document published a polarity exception"
+        );
+
+        update(&mut app, Message::MaskAllApplied);
+        assert!(app.shared.mask_view().inverted, "the active body's polarity did not reach it");
+        assert_eq!(
+            app.shared.opposite_polarity_snapshot(),
+            vec![first],
+            "the body that is NOT masked was left to be drawn through the masked one's polarity"
+        );
+
+        // The word is the active body's, so choosing another body swaps which
+        // side of the document is the exception.
+        update(&mut app, Message::BodySelected(first));
+        assert!(!app.shared.mask_view().inverted);
+        assert_eq!(
+            app.shared.opposite_polarity_snapshot(),
+            vec![cube],
+            "the fully masked body was left to be drawn as free"
+        );
+
+        // And undoing the Mask All puts the document back to agreeing.
+        update(&mut app, Message::BodySelected(cube));
+        update(&mut app, Message::Undo);
+        assert!(!app.shared.mask_view().inverted, "undo did not put the polarity back");
+        assert!(
+            app.shared.opposite_polarity_snapshot().is_empty(),
+            "the exception outlived the mask that caused it"
+        );
+    }
+}
+
+/// The GENERATED masks: cavity, smoothness, thickness, the half-space that
+/// rides the cut's own drag, and the split that ends the arc.
+///
+/// Its own module rather than more of `mask_verb_tests`, because what these
+/// have to answer for is different: a verb is O(1) and a generator is a pass
+/// over the whole body, so the questions are whether it refuses before it runs,
+/// whether it pushes an entry when it found nothing, and whether the one
+/// gesture it borrows still does what it did.
+#[cfg(test)]
+mod mask_generator_tests {
+    use super::*;
+    use iced::Vector;
+
+    const SIZE: Vector = Vector { x: 800.0, y: 600.0 };
+
+    fn update(app: &mut Brokkr, message: Message) {
+        drop(app.update(message));
+    }
+
+    fn app() -> Brokkr {
+        Brokkr::with_tablet(crate::tablet::Tablet::inert())
+    }
+
+    /// An application with a real painted mask on its one body.
+    ///
+    /// The same shape `mask_verb_tests::masked` uses, and deliberately a second
+    /// copy rather than a shared helper: that module's fixture is about the
+    /// verbs and is free to change with them, and a split that quietly started
+    /// testing a different mask would be very hard to see.
+    fn masked() -> Brokkr {
+        let mut app = app();
+        let centre = Vector::new(SIZE.x / 2.0, SIZE.y / 2.0);
+        update(&mut app, Message::ToolChanged(Tool::Mask));
+        update(&mut app, Message::BrushRadiusChanged(10.0));
+        update(
+            &mut app,
+            Message::Pointer(PointerEvent::Pressed {
+                button: PointerButton::Left,
+                position: centre,
+                size: SIZE,
+            }),
+        );
+        for step in 1..=3 {
+            update(
+                &mut app,
+                Message::Pointer(PointerEvent::Moved {
+                    position: Vector::new(centre.x + step as f32 * 15.0, centre.y),
+                    size: SIZE,
+                }),
+            );
+        }
+        update(&mut app, Message::Pointer(PointerEvent::Released { button: PointerButton::Left }));
+        assert!(app.doc.active_volume().mask_fill() > 0.0, "the fixture painted no mask");
+        update(&mut app, Message::ToolChanged(Tool::Sculpt));
+        app
+    }
+
+    /// Every stored mask byte of the active body, for a bit-for-bit comparison.
+    fn mask_of(app: &Brokkr) -> Vec<(brokkr_core::BrickCoord, Vec<u8>)> {
+        let mask = app.doc.active_volume().mask();
+        let mut coords: Vec<_> = mask.brick_coords().collect();
+        coords.sort_by_key(|coord| (coord.0.z, coord.0.y, coord.0.x));
+        let dim = brokkr_core::BRICK_DIM as i32;
+        coords
+            .into_iter()
+            .map(|coord| {
+                let origin = coord.origin();
+                let bytes = (0..dim)
+                    .flat_map(|z| {
+                        (0..dim).flat_map(move |y| (0..dim).map(move |x| glam::IVec3::new(x, y, z)))
+                    })
+                    .map(|local| mask.at(origin + local))
+                    .collect();
+                (coord, bytes)
+            })
+            .collect()
+    }
+
+    /// A checksum of the FIELD, so a generator that quietly wrote a distance is
+    /// caught by the tests that say it must not.
+    fn field_of(app: &Brokkr) -> u64 {
+        let volume = app.doc.active_volume();
+        let mut coords: Vec<brokkr_core::BrickCoord> = volume.brick_coords().collect();
+        coords.sort_by_key(|coord| (coord.0.z, coord.0.y, coord.0.x));
+        let dim = brokkr_core::BRICK_DIM as i32;
+        let mut hash = 0xcbf2_9ce4_8422_2325u64;
+        for coord in coords {
+            let origin = coord.origin();
+            for z in 0..dim {
+                for y in 0..dim {
+                    for x in 0..dim {
+                        let value = volume.sample_voxel(origin + glam::IVec3::new(x, y, z));
+                        hash = (hash ^ u64::from(value.to_bits())).wrapping_mul(0x1000_0000_01b3);
+                    }
+                }
+            }
+        }
+        hash
+    }
+
+    /// The default body is a 30 mm sphere, which is smooth everywhere at every
+    /// feature size the slider offers -- so this is the generator fixture that
+    /// needs no sculpting to produce a mask.
+    #[test]
+    fn a_smoothness_mask_protects_the_body_and_pushes_exactly_one_entry() {
+        let mut app = app();
+        let entries = app.history.stats().undo_entries;
+        let field = field_of(&app);
+
+        update(&mut app, Message::MaskGenerated(MaskGenerator::Smoothness));
+
+        assert!(!app.doc.active_volume().mask().is_free(), "the smoothness mask protected nothing");
+        assert_eq!(app.history.stats().undo_entries, entries + 1, "a generator was not one entry");
+        assert!(app.unsaved, "a generated mask did not mark the document unsaved");
+        assert!(app.mask_card.is_some(), "a generated mask raised no overlay card");
+        assert_eq!(field_of(&app), field, "a generator wrote to the FIELD");
+    }
+
+    /// The sign, from the outside. A solid sphere is convex everywhere, so
+    /// asking for its cavities has to change nothing at all -- and changing
+    /// nothing means no entry and no `unsaved`, not an entry that restores what
+    /// is already there.
+    #[test]
+    fn a_cavity_mask_on_a_convex_sphere_finds_nothing_and_pushes_no_entry() {
+        let mut app = app();
+        let entries = app.history.stats().undo_entries;
+
+        update(&mut app, Message::MaskGenerated(MaskGenerator::Cavity));
+
+        assert!(app.doc.active_volume().mask().is_free(), "a convex sphere was masked as a cavity");
+        assert_eq!(app.history.stats().undo_entries, entries, "an empty result pushed an entry");
+        assert!(!app.unsaved, "an empty result marked the document unsaved");
+        assert!(app.status.contains("nothing"), "the status does not say why: {}", app.status);
+    }
+
+    /// A generator REPLACES the mask, and the mask it replaced has to come back
+    /// whole -- including its polarity, which a generator always resets.
+    #[test]
+    fn undoing_a_generated_mask_puts_the_hand_painted_one_back_bit_for_bit() {
+        let mut app = masked();
+        update(&mut app, Message::MaskInverted);
+        let before = mask_of(&app);
+        assert!(app.doc.active_volume().mask().inverted());
+
+        update(&mut app, Message::MaskGenerated(MaskGenerator::Smoothness));
+        assert!(
+            !app.doc.active_volume().mask().inverted(),
+            "a generated mask inherited the polarity it was asked to replace"
+        );
+
+        update(&mut app, Message::Undo);
+        assert_eq!(mask_of(&app), before, "undo did not put the painted mask back");
+        assert!(app.doc.active_volume().mask().inverted(), "undo did not put the polarity back");
+    }
+
+    /// Nothing thin about a 60 mm ball, and the honest answer to that is a
+    /// status line rather than a mask over the whole thing.
+    #[test]
+    fn a_thickness_mask_on_a_solid_ball_selects_nothing() {
+        let mut app = app();
+        update(&mut app, Message::MaskGenerated(MaskGenerator::Thickness));
+        assert!(app.doc.active_volume().mask().is_free(), "a 60 mm ball was called thin");
+    }
+
+    /// The two sliders are session state and both are clamped where they are
+    /// received, because a message can arrive from anywhere and the thickness
+    /// ceiling is a property of the narrow band rather than a preference.
+    #[test]
+    fn both_generator_sliders_are_clamped_where_the_message_lands() {
+        let mut app = app();
+
+        update(&mut app, Message::MaskThicknessChanged(400.0));
+        assert_eq!(app.mask_thickness_voxels, brokkr_core::MAX_THICKNESS_VOXELS);
+        update(&mut app, Message::MaskThicknessChanged(-4.0));
+        assert_eq!(app.mask_thickness_voxels, 1, "the thinnest wall is one voxel, never zero");
+
+        update(&mut app, Message::MaskFeatureChanged(-1.0));
+        assert_eq!(app.mask_feature_mm, *MASK_FEATURE_RANGE_MM.start());
+        update(&mut app, Message::MaskFeatureChanged(1000.0));
+        assert_eq!(app.mask_feature_mm, *MASK_FEATURE_RANGE_MM.end());
+    }
+
+    /// **The refusal is part of the feature and not a nicety.** A generated
+    /// mask writes a value at every surface voxel, so the +25% is what is
+    /// actually paid -- and it has to be predicted rather than discovered by an
+    /// allocator.
+    ///
+    /// The ceiling cannot be reached by building a document (six gigabytes of
+    /// resident bricks is six gigabytes of real allocation), so what is moved
+    /// here is the number the guard is asked about, which is the same thing
+    /// `brokkr_core::split`'s own refusal test does with its guard.
+    #[test]
+    fn a_generated_mask_that_would_not_fit_is_refused_before_it_runs() {
+        let mut app = app();
+        // Everything but a few megabytes of the ceiling is already spoken for.
+        app.doc_stats.resident_bytes = MAX_VOLUME_BYTES as usize - 4 * 1024 * 1024;
+        let entries = app.history.stats().undo_entries;
+
+        update(&mut app, Message::MaskGenerated(MaskGenerator::Smoothness));
+
+        assert!(app.doc.active_volume().mask().is_free(), "the refusal did not stop the pass");
+        assert_eq!(app.history.stats().undo_entries, entries, "a refusal pushed an entry");
+        assert!(!app.unsaved, "a refusal marked the document unsaved");
+        assert!(
+            app.status.contains("GB of memory") && app.status.contains("mm"),
+            "the refusal names neither the ceiling nor a voxel size that would fit: {}",
+            app.status
+        );
+    }
+
+    // --------------------------------------------- the half-space, and its control
+
+    /// Ctrl at the end of a cut drag writes protection instead of taking
+    /// material away: the same gesture, the same plane, a different field.
+    #[test]
+    fn a_ctrl_cut_drag_masks_the_half_instead_of_removing_it() {
+        let mut app = app();
+        app.camera.yaw = 0.0;
+        app.camera.pitch = 0.0;
+        app.publish_camera();
+        let field = field_of(&app);
+
+        update(&mut app, Message::ToolChanged(Tool::Cut));
+        app.control = true;
+        let middle_y = SIZE.y / 2.0;
+        update(
+            &mut app,
+            Message::Pointer(PointerEvent::Pressed {
+                button: PointerButton::Left,
+                position: Vector::new(SIZE.x * 0.1, middle_y),
+                size: SIZE,
+            }),
+        );
+        app.on_pointer(PointerEvent::Moved {
+            position: Vector::new(SIZE.x * 0.9, middle_y),
+            size: SIZE,
+        });
+        update(&mut app, Message::Pointer(PointerEvent::Released { button: PointerButton::Left }));
+
+        assert_eq!(field_of(&app), field, "a ctrl cut removed material");
+        assert!(!app.doc.active_volume().mask().is_free(), "a ctrl cut protected nothing");
+        assert_ne!(app.tool, Tool::Cut, "the cut stayed armed after being used");
+        assert!(app.mask_card.is_some(), "the half-space mask raised no overlay card");
+
+        // The half a plain cut would have removed is the half that is protected,
+        // and its opposite is free -- which is the sentence the doc comment
+        // makes and the only part of it a number can hold up.
+        let voxel = app.doc.voxel_size();
+        let protection = |mm: f32| {
+            let cell = (Vec3::new(0.0, mm, 0.0) / voxel).round().as_ivec3();
+            app.doc.active_volume().mask().at(cell)
+        };
+        assert_ne!(protection(12.0) > 128, protection(-12.0) > 128, "both halves read the same");
+    }
+
+    /// The control for the test above, in the same module: without ctrl the cut
+    /// still cuts, so the branch cannot be reached by a modifier that is stuck
+    /// on.
+    #[test]
+    fn a_cut_drag_without_ctrl_still_removes_material() {
+        let mut app = app();
+        app.camera.yaw = 0.0;
+        app.camera.pitch = 0.0;
+        app.publish_camera();
+        let field = field_of(&app);
+
+        update(&mut app, Message::ToolChanged(Tool::Cut));
+        let middle_y = SIZE.y / 2.0;
+        update(
+            &mut app,
+            Message::Pointer(PointerEvent::Pressed {
+                button: PointerButton::Left,
+                position: Vector::new(SIZE.x * 0.1, middle_y),
+                size: SIZE,
+            }),
+        );
+        app.on_pointer(PointerEvent::Moved {
+            position: Vector::new(SIZE.x * 0.9, middle_y),
+            size: SIZE,
+        });
+        update(&mut app, Message::Pointer(PointerEvent::Released { button: PointerButton::Left }));
+
+        assert_ne!(field_of(&app), field, "a plain cut removed nothing");
+        assert!(app.doc.active_volume().mask().is_free(), "a plain cut painted a mask");
+    }
+
+    // --------------------------------------------------- splitting the mask off
+
+    #[test]
+    fn splitting_off_the_mask_makes_two_bodies_and_one_undo_puts_the_source_back() {
+        let mut app = masked();
+        let source = app.doc.active();
+        let bodies = app.doc.body_count();
+        let entries = app.history.stats().undo_entries;
+
+        update(&mut app, Message::BodySplitMasked);
+
+        assert_eq!(app.doc.body_count(), bodies + 1, "a masked split did not make a second body");
+        assert!(app.doc.index_of(source).is_none(), "the source was not consumed");
+        assert_eq!(app.history.stats().undo_entries, entries + 1, "a split was not one entry");
+        assert!(app.unsaved);
+        assert!(
+            app.doc.active_volume().mask().is_free(),
+            "the half the user was left on arrived carrying a mask"
+        );
+
+        update(&mut app, Message::Undo);
+        assert_eq!(app.doc.body_count(), bodies, "one undo did not take both halves back");
+        assert!(app.doc.index_of(source).is_some(), "undo did not restore the source row");
+        assert!(
+            !app.doc.active_volume().mask().is_free(),
+            "undo restored the geometry but not the mask that chose the split"
+        );
+    }
+
+    /// The refusal names the body, because a document with sixty-four rows in it
+    /// makes "carries no mask" a question about which one.
+    #[test]
+    fn splitting_off_a_mask_that_is_not_there_is_refused_by_name() {
+        let mut app = app();
+        let bodies = app.doc.body_count();
+        update(&mut app, Message::BodySplitMasked);
+        assert_eq!(app.doc.body_count(), bodies, "an unmasked body was split anyway");
+        assert!(app.status.contains("no mask"), "the refusal does not say why: {}", app.status);
+        assert!(!app.unsaved, "a refusal marked the document unsaved");
     }
 }

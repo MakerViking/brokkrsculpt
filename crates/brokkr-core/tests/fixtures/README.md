@@ -31,7 +31,7 @@ Layout, confirmed with `od` against both these files and the real ones:
 |---|---|---|
 | 0 | 8 | `BROKKR\0\1` |
 | 8 | 2 | container version — `1` here, `2` in the other file |
-| 10 | 2 | field version |
+| 10 | 2 | field version — `1` in both, and still `1` now that the mask has made this a range |
 | 12 | 8 | the lattice: `BRICK_DIM` then `NARROW_BAND` |
 | 20 | 4 | `voxel_size` — the byte that refuses with the same error a corrupt brick does |
 | 24 | 39 | the view |
@@ -49,6 +49,13 @@ header rather than by naming a byte range, which is why the node table landed
 without touching a byte of either file — checked, not assumed: both fixtures
 still compare byte for byte against what this build produces for the old
 layouts, and both still open as one body named `Body 1`.
+
+**The mask did not touch them either, and that is the point of the field
+version being a range.** Field version 2 appends a per-body mask stream after
+that body's bricks, and the writer stamps the *lowest* version a document needs
+— so a document nobody masked still says `1` at byte 10 and still writes not
+one byte of mask stream. These two carry no mask, compare byte for byte as
+before, and open with nothing protected.
 
 **If a test says these no longer match what this build writes, do not
 regenerate them.** They represent files that do not change when this code does.

@@ -39,6 +39,8 @@
 //! 71..     node_count records of EXACTLY NODE_RECORD_BYTES, in PREORDER
 //! --- then, IN TABLE ORDER, one brick stream per body record
 //!          brick_count u64 LE, then that many brick records
+//!          then, at field version 2 and later ONLY, that body's mask stream
+//!          mask_flags u8, mask_count u64 LE, then that many mask records
 //! --- then the key trailer, LAST
 //!          key_count u32 LE, then 43 bytes per key
 //! ```
@@ -54,7 +56,9 @@
 //! reader being a forward stream. So appending a second stream per body -- a
 //! mask, a colour, anything per voxel -- is a [`FIELD_VERSION`] change and
 //! **never** a container change: the container says where the sections are, and
-//! the field version says what is in them.
+//! the field version says what is in them. The mask is the first thing to take
+//! that route, and it took it exactly as written: no container bump, no flag
+//! bit, no reserved bytes spent.
 //!
 //! # Why the node table precedes the geometry
 //!
@@ -89,6 +93,7 @@ use glam::{IVec3, Vec3};
 
 use crate::body::{Document, MAX_BODIES, MAX_DEPTH, MAX_NODES, Node, NodeId, NodeMeta};
 use crate::brick::{BRICK_DIM, BRICK_VOXELS, Brick, BrickCoord, INSIDE, NARROW_BAND, OUTSIDE};
+use crate::mask::{MaskBrick, MaskField};
 use crate::volume::Volume;
 
 /// Magic bytes. Long enough that a truncated or mistyped file is rejected
@@ -125,10 +130,22 @@ const OLDEST_CONTAINER_VERSION: u16 = 1;
 /// header field is not a new encoding, and a new encoding is not a new layout.
 /// SindriCAD's container learned this distinction the hard way.
 ///
+/// 2 appended a per-body **mask stream** after that body's brick stream: a
+/// flags byte, a count, and a record per mask brick. Nothing about the field
+/// itself moved, which is exactly why it is on this axis and not the
+/// container's.
+///
 /// This is the NEWEST encoding this build understands, and what it *writes* is
 /// [`lowest_field_version`] rather than this. See [`OLDEST_FIELD_VERSION`] for
 /// why both halves of that are needed.
-const FIELD_VERSION: u16 = 1;
+const FIELD_VERSION: u16 = 2;
+
+/// The field encoding that carries a mask.
+///
+/// Named rather than written as a bare 2 at the four places that compare
+/// against it -- the writer, the reader, and one test at each end -- because
+/// the day a colour makes it 3 those four have to keep meaning *mask*.
+const FIELD_VERSION_WITH_MASK: u16 = 2;
 
 /// The oldest field encoding this build still reads.
 ///
@@ -148,18 +165,24 @@ const OLDEST_FIELD_VERSION: u16 = 1;
 /// The lowest field encoding that can express everything in `doc`.
 ///
 /// **Write the lowest version the document NEEDS, never the newest the build
-/// knows.** There is nothing per-voxel beyond the field itself yet, so this is
-/// [`OLDEST_FIELD_VERSION`] for every document -- and it is here, with its
-/// caller and its test, from the commit that adds the range check, because the
-/// rule is what makes the next bump survivable in both directions and it is
-/// unenforceable once a second encoding exists and this function does not.
+/// knows.** This is the half of the version discipline that
+/// [`OLDEST_FIELD_VERSION`] does not buy: the range lets a new build read an
+/// old file, and this lets an old build read a new one whenever the document
+/// uses nothing the old build is missing. Without it every save from the day
+/// masking shipped would stamp 2 and be refused by every build that predates
+/// it, whether or not one voxel of the document is masked.
+///
+/// The question it asks is [`crate::MaskField::is_free`], and both halves of
+/// that matter. A body with entries in its map needs version 2 to carry them.
+/// So does a body whose map is *empty* under inversion -- that is Mask All,
+/// where the whole model is protected and not one byte is stored -- and
+/// dropping the polarity would reopen the file with the protection gone.
 fn lowest_field_version(doc: &Document) -> u16 {
-    // Nothing per-voxel beyond the field itself exists yet, so nothing in the
-    // document can ask for a newer encoding. The parameter is here because the
-    // CALLER has to be written to ask the document rather than to reach for
-    // the constant, and that is the whole of the rule.
-    let _ = doc;
-    OLDEST_FIELD_VERSION
+    if doc.bodies().any(|(_, volume)| !volume.mask().is_free()) {
+        FIELD_VERSION_WITH_MASK
+    } else {
+        OLDEST_FIELD_VERSION
+    }
 }
 
 /// Largest sculpt this will read, as a guard against a corrupt or hostile
@@ -205,6 +228,64 @@ const MAX_BRICKS: u64 = 8 * 1024 * 1024 * 1024 / BRICK_BYTES as u64;
 /// predicted growth factor; see [`crate::voxelise`]'s `MAX_IMPORT_BYTES`,
 /// which is the same number in the same shape for the same reason.
 pub const MAX_VOLUME_BYTES: f64 = 6.0 * 1024.0 * 1024.0 * 1024.0;
+
+/// The same ceiling, as the integer the format counts against.
+///
+/// [`MAX_VOLUME_BYTES`] is an `f64` because every other consumer multiplies it
+/// by a predicted growth factor. The reader adds whole bytes to a running
+/// total and compares, so it wants the integer -- derived from the `f64`
+/// rather than written out again, because two spellings of one ceiling is how
+/// they drift apart.
+const MAX_DOCUMENT_BYTES: u64 = MAX_VOLUME_BYTES as u64;
+
+/// What one loaded field brick costs in memory beyond its voxels: the map's
+/// key and the enum slot that holds it.
+///
+/// **Load-bearing rather than pedantic.** Without the per-entry term a uniform
+/// brick would charge four bytes, and a file claiming billions of them would
+/// pass a byte cap while asking for hundreds of gigabytes of hash map. The
+/// mask makes that concrete: [`MAX_BRICKS`] bounds the field's declared count
+/// and there is no equivalent bound on `mask_count`, because a mask brick may
+/// exist where no field brick does.
+const FIELD_ENTRY_BYTES: u64 = (size_of::<BrickCoord>() + size_of::<Brick>()) as u64;
+
+/// The same, for one mask brick.
+const MASK_ENTRY_BYTES: u64 = (size_of::<BrickCoord>() + size_of::<MaskBrick>()) as u64;
+
+/// Memory one field brick occupies once loaded.
+const fn field_brick_bytes(dense: bool) -> u64 {
+    FIELD_ENTRY_BYTES + if dense { BRICK_BYTES as u64 } else { 0 }
+}
+
+/// Memory one mask brick occupies once loaded, at exactly a quarter of a dense
+/// field brick's voxels.
+const fn mask_brick_bytes(dense: bool) -> u64 {
+    MASK_ENTRY_BYTES + if dense { MASK_BRICK_BYTES as u64 } else { 0 }
+}
+
+/// Add `bytes` to a document's running total and refuse once it passes the
+/// ceiling.
+///
+/// **Counted as memory rather than as declared bricks, and the difference is
+/// what makes it bind.** [`MAX_BRICKS`] bounds the field stream's declared
+/// count and cannot bound the mask's: a mask brick may exist where no field
+/// brick does -- protection over empty space is exactly what stops Draw
+/// growing material there -- so a document that masks the gap between two
+/// fingers legitimately has more mask bricks than field bricks. This total is
+/// the bound that actually protects the allocation, and it is the same number
+/// on both sides of the format: [`refuse_bytes`] sums it over the document
+/// before a byte goes out.
+///
+/// `limit` is a parameter rather than [`MAX_DOCUMENT_BYTES`] read straight out
+/// of the module, and that is what makes the write side testable -- see
+/// [`refuse_bytes`]. Every production caller passes [`MAX_DOCUMENT_BYTES`].
+fn charge(total: &mut u64, bytes: u64, limit: u64) -> Result<()> {
+    *total = total.saturating_add(bytes);
+    if *total > limit {
+        return Err(ProjectError::TooMuchData { bytes: *total, limit });
+    }
+    Ok(())
+}
 
 /// How far from the origin a brick coordinate may sit.
 ///
@@ -318,6 +399,30 @@ const TAG_UNIFORM: u8 = 0;
 /// Tag for a brick stored as a full array.
 const TAG_DENSE: u8 = 1;
 
+/// Bytes a dense mask brick occupies in the file, at one byte per voxel.
+///
+/// Exactly a quarter of [`BRICK_BYTES`], which is the +25.000% the masking
+/// design budgets for and the number every file-size figure about masking is
+/// arithmetic over.
+const MASK_BRICK_BYTES: usize = BRICK_VOXELS;
+
+/// Tag for a mask brick stored as a single byte.
+const TAG_MASK_UNIFORM: u8 = 0;
+/// Tag for a mask brick stored as a full byte array.
+const TAG_MASK_DENSE: u8 = 1;
+
+/// `mask_flags` bit 0: this body's mask is read inverted.
+///
+/// The polarity is per-body state that is not per-voxel, and there is nowhere
+/// else it could live that does not cost one of the fourteen reserved node
+/// flags -- and spending one of those would make every file this build writes
+/// unreadable by every shipped version 3 build.
+const MASK_FLAG_INVERTED: u8 = 1 << 0;
+
+/// The seven `mask_flags` bits that must be zero, refused rather than ignored
+/// for the same reason [`RESERVED_FLAGS`] is.
+const RESERVED_MASK_FLAGS: u8 = !MASK_FLAG_INVERTED;
+
 /// Where the camera was and what the brush was set to.
 ///
 /// Deliberately small. These are conveniences, and a file whose header is
@@ -423,6 +528,12 @@ pub struct Progress {
     /// Bricks the reader has *started*, which is not the same as bricks it
     /// finished.
     ///
+    /// **Field bricks only.** A mask brick is not counted here and must not
+    /// be: the count is compared against `Volume::brick_coords().count()` by
+    /// the test that opens the real projects, and a mask brick can exist where
+    /// no field brick does, so folding the two together would make that
+    /// comparison wrong for every masked document.
+    ///
     /// Counted at the top of each iteration, so after a successful read it is
     /// the count the header claimed, and after a failure inside the loop it is
     /// the one-based index of the brick that failed. Both readings are wanted:
@@ -479,6 +590,17 @@ pub enum ProjectError {
         bricks: u64,
         limit: u64,
     },
+    /// The document's voxel and mask data together pass the memory ceiling.
+    ///
+    /// Separate from [`ProjectError::TooLarge`], which bounds the field
+    /// stream's *declared count* before a brick of it is read. This one is the
+    /// running byte total, and it is what bounds the mask: `mask_count` cannot
+    /// be checked against the body's own brick count, because a mask brick may
+    /// exist where no field brick does.
+    TooMuchData {
+        bytes: u64,
+        limit: u64,
+    },
     /// A node table with no rows, or with more than [`MAX_NODES`].
     NodeCount {
         found: u32,
@@ -519,6 +641,17 @@ pub enum ProjectError {
     NoBodies,
     /// A brick tag that is neither uniform nor dense.
     UnknownBrickTag(u8),
+    /// A mask brick tag that is neither uniform nor dense. On the geometry side
+    /// of the refuse/repair line for the same reason
+    /// [`ProjectError::UnknownBrickTag`] is: the tag decides how many bytes to
+    /// consume, so repairing it misaligns every stream after it -- and a mask
+    /// stream sits between two bodies' bricks, so "after it" is the rest of the
+    /// document.
+    UnknownMaskTag(u8),
+    /// A mask stream with one of the seven reserved flag bits set.
+    ReservedMaskFlags {
+        found: u8,
+    },
     /// A distance value that is not a finite number.
     NonFiniteValue,
     /// A distance value outside the narrow band, which every writer in this
@@ -563,6 +696,11 @@ impl std::fmt::Display for ProjectError {
             ProjectError::TooLarge { bricks, limit } => {
                 write!(f, "{bricks} bricks is past this build's limit of {limit}")
             }
+            ProjectError::TooMuchData { bytes, limit } => write!(
+                f,
+                "the file's bodies and masks come to {bytes} bytes, and this build reads at \
+                 most {limit}"
+            ),
             ProjectError::NodeCount { found, limit } => {
                 write!(f, "the file claims {found} rows, and a document holds 1 to {limit}")
             }
@@ -581,6 +719,10 @@ impl std::fmt::Display for ProjectError {
             ProjectError::UnknownNodeKind(kind) => write!(f, "unknown row kind {kind}"),
             ProjectError::NoBodies => write!(f, "the file holds no bodies at all"),
             ProjectError::UnknownBrickTag(tag) => write!(f, "unknown brick kind {tag}"),
+            ProjectError::UnknownMaskTag(tag) => write!(f, "unknown mask brick kind {tag}"),
+            ProjectError::ReservedMaskFlags { found } => {
+                write!(f, "a mask sets a reserved flag bit: {found:#010b}")
+            }
             ProjectError::TooManyKeys { keys, limit } => {
                 write!(f, "the file claims {keys} timeline keys, and the limit is {limit}")
             }
@@ -740,7 +882,8 @@ pub fn write(out: &mut impl Write, doc: &Document, state: &ProjectState) -> Resu
     out.write_all(MAGIC)?;
     write_u16(out, CONTAINER_VERSION)?;
     // The LOWEST encoding this document needs, not the newest this build knows.
-    write_u16(out, lowest_field_version(doc))?;
+    let field = lowest_field_version(doc);
+    write_u16(out, field)?;
 
     // The lattice. Written as the values themselves rather than as a hash, so a
     // mismatch can say what it found.
@@ -761,8 +904,17 @@ pub fn write(out: &mut impl Write, doc: &Document, state: &ProjectState) -> Resu
     // One brick stream per body, in TABLE ORDER, with nothing between them.
     // `Document::bodies` yields the rows in display order, which is table
     // order, which is the order the reader consumes them in.
+    //
+    // At field version 2 each body's mask stream follows its bricks
+    // immediately, so the two are one section per body rather than two
+    // sections over the document. That is what lets the reader take them in
+    // one forward pass, and it is why the mask could never have been a
+    // trailer.
     for (_, volume) in doc.bodies() {
         write_bricks(out, volume)?;
+        if field >= FIELD_VERSION_WITH_MASK {
+            write_mask(out, volume.mask())?;
+        }
     }
 
     // The key trailer, after the bricks rather than in the header. A version 1
@@ -807,6 +959,45 @@ fn refuse_what_could_not_be_read_back(doc: &Document) -> Result<()> {
     let bricks: u64 = doc.bodies().map(|(_, volume)| volume.brick_count() as u64).sum();
     if bricks > MAX_BRICKS {
         return Err(ProjectError::TooLarge { bricks, limit: MAX_BRICKS });
+    }
+    // And the running BYTE total, which is the one the mask rides in.
+    refuse_bytes(doc, MAX_DOCUMENT_BYTES)?;
+    Ok(())
+}
+
+/// What the document will cost once read back, refused past `limit`.
+///
+/// Summed from the census rather than from a second walk of the maps, and
+/// charged per brick with exactly the arithmetic [`charge`] applies on the way
+/// back in -- a writer that counted this any other way would let a document out
+/// that the reader then refuses.
+///
+/// **`limit` is a parameter because the real ceiling is unreachable from a
+/// test.** Six gibibytes of resident bricks is six gibibytes of real
+/// allocation, and [`Document`]'s own growth guard refuses long before a test
+/// could build one -- so a gate hard-wired to [`MAX_DOCUMENT_BYTES`] is a gate
+/// no test can enter, which is a gate that can be deleted outright with the
+/// suite still green. That is the exact shape of the save gate this file's
+/// history is about. `GrowthGuard::of` in `body.rs` is a `#[cfg(test)]`
+/// constructor for the same reason and says so. Production passes
+/// [`MAX_DOCUMENT_BYTES`] and nothing else does outside of tests.
+fn refuse_bytes(doc: &Document, limit: u64) -> Result<()> {
+    let mut bytes = 0u64;
+    for (_, volume) in doc.bodies() {
+        let stats = volume.stats();
+        // `mask_bricks` counts EVERY mask brick and `mask_dense_bricks` the
+        // subset carrying an array, so the uniform ones are the difference.
+        // Charging `mask_bricks` at the uniform rate on top of the dense rate
+        // would bill every dense mask brick twice.
+        let uniform_masks = stats.mask_bricks.saturating_sub(stats.mask_dense_bricks);
+        for (count, each) in [
+            (stats.dense_bricks, field_brick_bytes(true)),
+            (stats.uniform_bricks, field_brick_bytes(false)),
+            (stats.mask_dense_bricks, mask_brick_bytes(true)),
+            (uniform_masks, mask_brick_bytes(false)),
+        ] {
+            charge(&mut bytes, (count as u64).saturating_mul(each), limit)?;
+        }
     }
     Ok(())
 }
@@ -937,6 +1128,50 @@ fn write_bricks(out: &mut impl Write, volume: &Volume) -> Result<()> {
     Ok(())
 }
 
+/// One body's mask stream: a flags byte, a count, then that many mask records.
+///
+/// Written at field version 2 and later for **every** body, masked or not, so
+/// that an unmasked body inside a masked document costs nine bytes and the
+/// reader's forward pass needs no per-body condition. A document with no mask
+/// anywhere costs nothing at all, because [`lowest_field_version`] then stamps
+/// 1 and this is never called.
+///
+/// Sorted by coordinate, for the reason [`write_bricks`] is: hash order breaks
+/// byte-identity nondeterministically, which passes locally and fails on CI.
+/// And the count comes from the pairs actually resolved, for the reason
+/// [`write_bricks`] gives -- a short stream here misparses the *next* body.
+fn write_mask(out: &mut impl Write, mask: &MaskField) -> Result<()> {
+    let mut flags = 0u8;
+    if mask.inverted() {
+        flags |= MASK_FLAG_INVERTED;
+    }
+    out.write_all(&[flags])?;
+
+    let mut coords: Vec<BrickCoord> = mask.brick_coords().collect();
+    coords.sort_unstable();
+    let pairs: Vec<(BrickCoord, &MaskBrick)> = coords
+        .into_iter()
+        .filter_map(|coord| mask.brick(coord).map(|brick| (coord, brick)))
+        .collect();
+
+    write_u64(out, pairs.len() as u64)?;
+    for (coord, brick) in pairs {
+        for component in coord.0.to_array() {
+            out.write_all(&component.to_le_bytes())?;
+        }
+        match brick {
+            MaskBrick::Uniform(value) => out.write_all(&[TAG_MASK_UNIFORM, *value])?,
+            MaskBrick::Dense(values) => {
+                // One byte per voxel, so unlike the field there is no
+                // endianness to be explicit about and the array goes out whole.
+                out.write_all(&[TAG_MASK_DENSE])?;
+                out.write_all(values.as_slice())?;
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Read a sculpt.
 ///
 /// A thin wrapper over [`read_reporting`] for the callers that only want the
@@ -969,7 +1204,7 @@ pub struct Outline {
 /// here too, because it is the same code. What it does NOT do is validate one
 /// brick, so a file that passes this can still be refused by [`read`].
 pub fn read_outline(input: &mut impl Read) -> Result<Outline> {
-    let header = read_header(input)?;
+    let header = read_header(input, FIELD_VERSION)?;
     let mut progress = Progress::default();
     let (rows, _) = read_table_or_synthesize(input, header.container, &mut progress)?;
     Ok(Outline {
@@ -989,12 +1224,24 @@ struct Row {
 /// Everything the fixed header carries, once it has been checked.
 struct Header {
     container: u16,
+    /// The field encoding, kept rather than discarded once checked: it is what
+    /// says whether a mask stream follows each body's bricks.
+    field: u16,
     voxel_size: f32,
     view: View,
 }
 
 /// The first sixty-three bytes, which are the same in every version.
-fn read_header(input: &mut impl Read) -> Result<Header> {
+///
+/// **`newest_field` is a parameter and not [`FIELD_VERSION`] read directly**,
+/// and the reason is that there is otherwise no way to test the forward
+/// refusal in one process. "A version 2 file is refused by a build whose
+/// newest field encoding is 1" needs a second, older binary to demonstrate --
+/// and this plan refused two other features for exactly that unrunnability, so
+/// it does not get to exempt this one. With the range as a parameter a test
+/// pins a reader to 1, hands it a masked file, and sees the refusal it would
+/// have had to trust otherwise.
+fn read_header(input: &mut impl Read, newest_field: u16) -> Result<Header> {
     let magic: [u8; 8] = read_exact(input)?;
     if &magic != MAGIC {
         return Err(ProjectError::NotABrokkrFile);
@@ -1007,16 +1254,15 @@ fn read_header(input: &mut impl Read) -> Result<Header> {
             supported: CONTAINER_VERSION,
         });
     }
-    // A RANGE on this axis too, and it is the whole of what the next per-voxel
-    // encoding asks of this commit. Exact equality here would refuse every file
-    // ever written on the day a mask or a colour bumps the field version --
-    // including every multi-body file saved between now and then -- with an
-    // error that reads backwards. Still only downward: a file written by a
-    // NEWER encoding is refused flatly, because reading one as though it were
-    // this one is the plausible-looking-sculpt failure again.
+    // A RANGE on this axis too, and the mask is the first encoding to need it.
+    // Exact equality here would refuse every file ever written on the day the
+    // field version moved -- including every multi-body file saved before it
+    // -- with an error that reads backwards. Still only downward: a file
+    // written by a NEWER encoding is refused flatly, because reading one as
+    // though it were this one is the plausible-looking-sculpt failure again.
     let field = read_u16(input)?;
-    if !(OLDEST_FIELD_VERSION..=FIELD_VERSION).contains(&field) {
-        return Err(ProjectError::FieldVersion { found: field, supported: FIELD_VERSION });
+    if !(OLDEST_FIELD_VERSION..=newest_field).contains(&field) {
+        return Err(ProjectError::FieldVersion { found: field, supported: newest_field });
     }
 
     // The check this format exists to make. See the module documentation: a
@@ -1043,7 +1289,7 @@ fn read_header(input: &mut impl Read) -> Result<Header> {
         return Err(ProjectError::NonFiniteValue);
     }
 
-    Ok(Header { container, voxel_size, view: read_view(input)? })
+    Ok(Header { container, field, voxel_size, view: read_view(input)? })
 }
 
 /// The node table of a version 3 file, or the one implicit body an older one
@@ -1228,7 +1474,21 @@ pub(crate) fn read_reporting(
     input: &mut impl Read,
     progress: &mut Progress,
 ) -> Result<(Document, ProjectState)> {
-    let header = read_header(input)?;
+    read_understanding_field_versions_to(input, progress, FIELD_VERSION)
+}
+
+/// The same read, by a build whose newest field encoding is `newest_field`.
+///
+/// **The parameter exists so that the forward refusal can be tested at all.**
+/// See [`read_header`]: "an old build refuses a masked file" is otherwise a
+/// claim that needs a second binary to check, and this plan rejected two other
+/// features on exactly that unrunnability.
+fn read_understanding_field_versions_to(
+    input: &mut impl Read,
+    progress: &mut Progress,
+    newest_field: u16,
+) -> Result<(Document, ProjectState)> {
+    let header = read_header(input, newest_field)?;
     let mut state = ProjectState { view: header.view, keys: Vec::new() };
 
     let (rows, active) = read_table_or_synthesize(input, header.container, progress)?;
@@ -1238,6 +1498,11 @@ pub(crate) fn read_reporting(
     // is refused rather than repaired: a wrong `kind` would misalign every
     // stream after it.
     let mut total = 0u64;
+    // And the running byte total, which the mask rides in. Two counters rather
+    // than one because they bound different things: this one is memory and is
+    // the ceiling the running application is held to, while `total` bounds a
+    // *declared* count before the stream it describes is entered at all.
+    let mut bytes = 0u64;
     let mut loaded: Vec<(NodeMeta, Option<Volume>)> = Vec::with_capacity(rows.len());
     for row in rows {
         if !row.is_body {
@@ -1259,7 +1524,14 @@ pub(crate) fn read_reporting(
         if total > MAX_BRICKS {
             return Err(ProjectError::TooLarge { bricks: total, limit: MAX_BRICKS });
         }
-        loaded.push((row.meta, Some(read_bricks(input, count, header.voxel_size, progress)?)));
+        let mut volume = read_bricks(input, count, header.voxel_size, &mut bytes, progress)?;
+        // This body's mask, immediately after its bricks and before the next
+        // body's count. Only at field version 2 and later, which is the same
+        // shape the key trailer's `container >= 2` already has.
+        if header.field >= FIELD_VERSION_WITH_MASK {
+            read_mask(input, volume.mask_mut(), &mut bytes)?;
+        }
+        loaded.push((row.meta, Some(volume)));
     }
 
     // The key trailer, which only version 2 and later carry. A version 1 file
@@ -1295,6 +1567,7 @@ fn read_bricks(
     input: &mut impl Read,
     count: u64,
     voxel_size: f32,
+    document_bytes: &mut u64,
     progress: &mut Progress,
 ) -> Result<Volume> {
     let mut volume = Volume::new(voxel_size);
@@ -1303,23 +1576,13 @@ fn read_bricks(
         // first brick is corrupt still reports the geometry as reached. See
         // `Progress::bricks`.
         progress.bricks += 1;
-        let coord = BrickCoord(IVec3::new(
-            i32::from_le_bytes(read_exact::<4>(input)?),
-            i32::from_le_bytes(read_exact::<4>(input)?),
-            i32::from_le_bytes(read_exact::<4>(input)?),
-        ));
-        // Compared against both ends rather than through `abs`, because
-        // `i32::MIN.abs()` overflows -- the check would then panic on exactly
-        // the value it exists to refuse.
-        let limit = IVec3::splat(MAX_BRICK_COORD);
-        if coord.0.cmpgt(limit).any() || coord.0.cmplt(-limit).any() {
-            return Err(ProjectError::BrickOutOfRange {
-                found: coord.0.to_array(),
-                limit: MAX_BRICK_COORD,
-            });
-        }
+        let coord = read_brick_coord(input)?;
 
         let tag: [u8; 1] = read_exact(input)?;
+        // Charged before the array is allocated rather than after it is
+        // inserted, so the ceiling bounds what this build asks the allocator
+        // for and not merely what it ends up holding.
+        charge(document_bytes, field_brick_bytes(tag[0] == TAG_DENSE), MAX_DOCUMENT_BYTES)?;
         let brick = match tag[0] {
             TAG_UNIFORM => Brick::Uniform(read_distance(input)?),
             TAG_DENSE => {
@@ -1341,6 +1604,86 @@ fn read_bricks(
         volume.insert_brick(coord, brick);
     }
     Ok(volume)
+}
+
+/// Twelve bytes of little-endian coordinate, bounded to what the lattice can
+/// represent.
+///
+/// Shared by the field and mask streams rather than written twice, because the
+/// bound is a property of [`BrickCoord::origin`]'s arithmetic and not of what
+/// the brick holds: a mask brick past it overflows the same multiply into the
+/// same wrapped coordinate.
+fn read_brick_coord(input: &mut impl Read) -> Result<BrickCoord> {
+    let coord = BrickCoord(IVec3::new(
+        i32::from_le_bytes(read_exact::<4>(input)?),
+        i32::from_le_bytes(read_exact::<4>(input)?),
+        i32::from_le_bytes(read_exact::<4>(input)?),
+    ));
+    // Compared against both ends rather than through `abs`, because
+    // `i32::MIN.abs()` overflows -- the check would then panic on exactly the
+    // value it exists to refuse.
+    let limit = IVec3::splat(MAX_BRICK_COORD);
+    if coord.0.cmpgt(limit).any() || coord.0.cmplt(-limit).any() {
+        return Err(ProjectError::BrickOutOfRange {
+            found: coord.0.to_array(),
+            limit: MAX_BRICK_COORD,
+        });
+    }
+    Ok(coord)
+}
+
+/// One body's mask stream, into the mask of the volume that was just read.
+///
+/// **`mask_count` is not bounded by the body's own brick count**, and a
+/// previous revision of the design said it was -- which would have made this
+/// build write files it then refuses. A mask value in empty space is exactly
+/// what stops Draw growing material there, and masking the gap between two
+/// fingers is a supported thing to do, so a real document can hold more mask
+/// bricks than field bricks. What bounds it instead is the running document
+/// byte total, charged here at the *cheapest* a record can be -- a uniform
+/// brick, no array -- before one allocation is made, and then at what each
+/// record actually costs as it arrives.
+fn read_mask(input: &mut impl Read, mask: &mut MaskField, document_bytes: &mut u64) -> Result<()> {
+    let flags = read_exact::<1>(input)?[0];
+    if flags & RESERVED_MASK_FLAGS != 0 {
+        return Err(ProjectError::ReservedMaskFlags { found: flags });
+    }
+    mask.set_inverted(flags & MASK_FLAG_INVERTED != 0);
+
+    let count = read_u64(input)?;
+    // The claim, at its floor, before anything is read from it: a count of a
+    // billion is refused here rather than after a billion map insertions.
+    // Charged against a copy of the total, because the floor is a prediction
+    // about records that have not arrived and each one is charged what it
+    // really costs below.
+    let floor = document_bytes.saturating_add(count.saturating_mul(mask_brick_bytes(false)));
+    if floor > MAX_DOCUMENT_BYTES {
+        return Err(ProjectError::TooMuchData { bytes: floor, limit: MAX_DOCUMENT_BYTES });
+    }
+
+    for _ in 0..count {
+        let coord = read_brick_coord(input)?;
+        let tag: [u8; 1] = read_exact(input)?;
+        charge(document_bytes, mask_brick_bytes(tag[0] == TAG_MASK_DENSE), MAX_DOCUMENT_BYTES)?;
+        let brick = match tag[0] {
+            TAG_MASK_UNIFORM => MaskBrick::Uniform(read_exact::<1>(input)?[0]),
+            TAG_MASK_DENSE => {
+                let mut values = vec![0u8; MASK_BRICK_BYTES];
+                input.read_exact(&mut values)?;
+                let boxed: Box<[u8; BRICK_VOXELS]> = values
+                    .into_boxed_slice()
+                    .try_into()
+                    .expect("the vector was built at exactly BRICK_VOXELS");
+                MaskBrick::Dense(boxed)
+            }
+            other => return Err(ProjectError::UnknownMaskTag(other)),
+        };
+        // Every byte in 0..=255 is a legal protection value, so unlike a
+        // distance there is nothing here to refuse or repair -- which is why
+        // this stream has two refusals and not three.
+        mask.restore_brick(coord, Some(brick));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1773,6 +2116,15 @@ mod tests {
                         volume.voxel_size() > 0.0,
                         "seed {seed}: a non positive voxel size loaded"
                     );
+                    // Every byte of a mask record is a legal protection value,
+                    // so there is no band to check there -- but the COORDINATE
+                    // is exactly as dangerous as a field brick's. `origin`
+                    // multiplies by BRICK_DIM, so one the reader let through
+                    // wraps: a panic in this build, and in a release one a
+                    // mask that lands somewhere else in the model.
+                    for coord in volume.mask().brick_coords() {
+                        let _ = coord.origin();
+                    }
                     for coord in volume.brick_coords().collect::<Vec<_>>() {
                         let origin = coord.origin();
                         for offset in [IVec3::ZERO, IVec3::splat(BRICK_DIM as i32 - 1)] {
@@ -1790,19 +2142,41 @@ mod tests {
         reach
     }
 
-    /// Three bodies of four uniform bricks each inside two nested folders.
+    /// Three bodies of four uniform bricks each inside two nested folders, one
+    /// of them carrying a mask.
     ///
-    /// **The corpus that can actually reach the node table.** Measured at 503
-    /// bytes, of which the table is 208 -- 41% of the file, against 4.8e-5 for
-    /// the sculpt below. The bodies are `Uniform(INSIDE)` bricks rather than a
-    /// sphere because the point is the table, and seventeen bytes a brick is
-    /// what keeps the table's share of the file high enough for the mutants to
-    /// land in it.
+    /// **The corpus that can actually reach the node table.** The bodies are
+    /// `Uniform(INSIDE)` bricks rather than a sphere because the point is the
+    /// table, and seventeen bytes a brick is what keeps the table's share of
+    /// the file high enough for the mutants to land in it.
+    ///
+    /// **The mask here is uniform tiles only, and deliberately.** One dense
+    /// mask brick is 32,768 bytes, which would take this corpus from hundreds
+    /// of bytes to tens of kilobytes and stop it aiming at the table at all --
+    /// which is the whole reason it exists. The dense mask tag is fuzzed by
+    /// the four-megabyte sculpt below, where 32 KB is nothing.
     fn a_small_tree() -> Document {
         let mut doc = Document::from_volume(uniform_bricks(0));
         let first = doc.active();
         let second = doc.add_body("Body 2", uniform_bricks(8));
         let third = doc.add_body("Body 3", uniform_bricks(16));
+
+        // A tile per brick on one body, and an inverted polarity on another, so
+        // that both halves of `mask_flags` and the uniform record are in front
+        // of the mutants.
+        let mask = doc.volume_mut(second).expect("a body has a volume").mask_mut();
+        for step in 0..4 {
+            let origin = BrickCoord::new(8 + step, 0, 0).origin();
+            for x in 0..BRICK_DIM as i32 {
+                for y in 0..BRICK_DIM as i32 {
+                    for z in 0..BRICK_DIM as i32 {
+                        mask.write(origin + IVec3::new(x, y, z), 160);
+                    }
+                }
+            }
+        }
+        mask.collapse();
+        doc.volume_mut(third).expect("a body has a volume").mask_mut().set_inverted(true);
 
         let (inner, _) = doc.group(first, "Inner").expect("the inner group");
         doc.move_to_folder(second, Some(inner)).expect("the second body in");
@@ -1825,14 +2199,21 @@ mod tests {
     /// sculpt below structurally cannot.
     ///
     /// Measured on this build, from the counters and not from the error
-    /// variants: of 1800 mutants, **1444** get at least one record out of the
-    /// table, **944** reach the brick loop and **158** load whole. The 356 that
-    /// never reach a record are the header refusals -- the header is 63 of 503
-    /// bytes here, an eighth of the file, where in the sculpt corpus it is
-    /// 1.5e-5 of it. The 500 that read a record and never reach a brick are the
+    /// variants: of 1800 mutants, **1490** get at least one record out of the
+    /// table, **1040** reach the brick loop and **178** load whole. The 310 that
+    /// never reach a record are the header refusals -- the header is 63 of 586
+    /// bytes here, a ninth of the file, where in the sculpt corpus it is
+    /// 1.4e-5 of it. The 450 that read a record and never reach a brick are the
     /// folder reader doing its job: a `kind` outside `{0, 1}`, a reserved flag
     /// bit, a duplicate id or a truncation inside the table, on a file where
-    /// the table is 41% of the bytes.
+    /// the table is 208 of 586 bytes.
+    ///
+    /// **Re-measured when the mask stream went in**, which took the corpus from
+    /// 503 bytes to 586 and every counter up with it: 1444 to 1490, 944 to
+    /// 1040, 158 to 178. The direction is the one to expect -- 83 bytes of mask
+    /// stream is 83 more bytes a mutant can land in and still be answered --
+    /// and the previous numbers are recorded here so that a future regrowth
+    /// has two points to reason from rather than one.
     ///
     /// Both floors are the same ones the sculpt corpus is held to, deliberately
     /// unnudged: over a quarter reaching the geometry, and at least one loading.
@@ -1844,7 +2225,7 @@ mod tests {
         // day it grows to four megabytes it stops aiming at the table and
         // nothing else would say so.
         assert!(
-            (400..600).contains(&valid.len()),
+            (400..700).contains(&valid.len()),
             "the small corpus is {} bytes, which is no longer small",
             valid.len()
         );
@@ -1886,8 +2267,15 @@ mod tests {
         // File > Recover, so the file most likely to be corrupt is the crash
         // net a user is reaching for precisely because something already went
         // wrong.
+        //
+        // **Masked, since the mask stream ships.** The handoff's rule is that
+        // anything parsing bytes from disk gets a mutation fuzz, and a corpus
+        // with no mask stream in it would leave the two new refusals -- the
+        // reserved flag bits and the unknown tag -- covered only by the
+        // targeted tests. This is also the corpus that carries the DENSE mask
+        // records: 32 KB apiece is nothing here and would wreck the small tree.
         let mut valid = Vec::new();
-        write(&mut valid, &sculpted_doc(), &ProjectState::default()).expect("write failed");
+        write(&mut valid, &masked_doc(), &ProjectState::default()).expect("write failed");
 
         let reach = fuzz_the_reader(&valid);
 
@@ -1902,19 +2290,31 @@ mod tests {
         //
         // Measured on this build, from the counters rather than from the error
         // variants: **1800 of 1800** mutants reach the brick loop, of which
-        // **22** load whole. All 1800 is not a surprise once counted -- the
-        // header and table together are 111 of 4,194,843 bytes, so a handful of
+        // **96** load whole. All 1800 is not a surprise once counted -- the
+        // header and table together are 111 of 4,457,114 bytes, so a handful of
         // flipped bits, a cut at a random offset or a 256-byte overwrite lands
         // in the geometry essentially every time.
+        //
+        // **Re-measured when the mask went into this corpus, and the "loaded
+        // whole" figure moved for a reason worth naming.** It was 22 against an
+        // unmasked 4,194,843-byte file and is 96 against this one. The mask is
+        // 262,271 of the extra bytes, and **every byte of a mask record is a
+        // legal protection value** -- there is no band to fall outside of, the
+        // way a distance has -- so a mutation that lands in the mask stream
+        // corrupts the protection and the file still loads. That is the design
+        // and not a hole in it: a wrong protection value is a wrong shade of
+        // grey on the model, where a wrong distance is a surface where there is
+        // none. What is refused in that stream is what decides how many bytes
+        // to consume: the tag, and the reserved flag bits.
         //
         // **That is also exactly why this corpus says nothing about the node
         // table**, and why `a_corrupted_folder_tree_is_answered_rather_than_survived`
         // exists beside it. The table counter here is **1800 of 1800** as well,
         // and it is worthless: every mutant gets the first record out before it
         // dies somewhere in four megabytes of bricks, because this document's
-        // whole table is 48 of 4,194,843 bytes -- 1.1e-5 of the file -- and
-        // almost nothing ever lands IN it. The small corpus reads 1444 and 944
-        // on the same two counters, and the 500 between them is the folder
+        // whole table is 48 of 4,457,114 bytes -- 1.1e-5 of the file -- and
+        // almost nothing ever lands IN it. The small corpus reads 1490 and 1040
+        // on the same two counters, and the 450 between them is the folder
         // reader actually refusing something.
         //
         // The previously recorded "1200 of 1800" was wrong in both directions
@@ -3008,6 +3408,477 @@ mod tests {
         assert!(matches!(read(&mut older.as_slice()), Err(ProjectError::FieldVersion { .. })));
     }
 
+    // ------------------------------------------------------- the mask stream
+
+    /// A sculpt carrying a mask with one of each kind of brick.
+    ///
+    /// A feathered patch that varies inside its bricks, so they stay dense and
+    /// the byte array is exercised; a whole brick at one value, collapsed to a
+    /// tile so the uniform tag is exercised too; and both of those sit at
+    /// coordinates the sculpt itself does not reach, which is the case section
+    /// 2 requires -- protection over empty space is what stops Draw growing
+    /// material there, and it is why `mask_count` cannot be bounded by the
+    /// body's own brick count.
+    fn masked(mut volume: Volume) -> Volume {
+        let mask = volume.mask_mut();
+        for x in 0..48 {
+            for y in 0..48 {
+                for z in 0..48 {
+                    // Varying, so the bricks cannot collapse, and feathered
+                    // rather than a step because every writer of a mask is
+                    // held to that.
+                    let value = ((x * 5 + y * 3 + z) % 256) as u8;
+                    mask.write(IVec3::new(x, y, z), value);
+                }
+            }
+        }
+        let tile = BrickCoord::new(9, -4, 7);
+        let origin = tile.origin();
+        for x in 0..BRICK_DIM as i32 {
+            for y in 0..BRICK_DIM as i32 {
+                for z in 0..BRICK_DIM as i32 {
+                    mask.write(origin + IVec3::new(x, y, z), 200);
+                }
+            }
+        }
+        mask.collapse();
+        assert!(
+            matches!(mask.brick(tile), Some(MaskBrick::Uniform(200))),
+            "the fixture stopped covering the uniform mask tag"
+        );
+        assert!(
+            mask.brick_coords().any(|coord| matches!(mask.brick(coord), Some(MaskBrick::Dense(_)))),
+            "the fixture stopped covering the dense mask tag"
+        );
+        volume
+    }
+
+    /// The sculpt above, as the one-body document the format takes.
+    fn masked_doc() -> Document {
+        Document::from_volume(masked(sculpted()))
+    }
+
+    /// Where the FIRST body's mask stream begins in a file whose table holds
+    /// `nodes` rows, by walking that body's brick records.
+    ///
+    /// Walked rather than measured the way [`first_brick_at`] is, because the
+    /// mask sits *after* the geometry and the empty-document trick only
+    /// self-adjusts for growth before it. `nodes` is a parameter for the same
+    /// reason [`record_at`] takes an index: the table's length is what moves
+    /// when a test adds a second body, and getting it wrong walks the brick
+    /// records from the wrong place and reads a coordinate as a count.
+    fn mask_stream_at(bytes: &[u8], nodes: usize) -> usize {
+        let count_at = record_at(nodes);
+        debug_assert_eq!(
+            record_at(1),
+            first_brick_at() - 8,
+            "the two ways of finding a single body's brick count disagree"
+        );
+        let count = u64::from_le_bytes(bytes[count_at..count_at + 8].try_into().unwrap());
+        let mut at = count_at + 8;
+        for _ in 0..count {
+            at += 12;
+            let payload = if bytes[at] == TAG_DENSE { BRICK_BYTES } else { 4 };
+            at += 1 + payload;
+        }
+        at
+    }
+
+    /// A masked document comes back with the same protection, brick for brick,
+    /// tag for tag, and with its polarity.
+    #[test]
+    fn a_mask_survives_a_round_trip_byte_for_byte_and_keeps_its_polarity() {
+        let mut volume = masked(sculpted());
+        volume.mask_mut().set_inverted(true);
+        let doc = Document::from_volume(volume);
+
+        let (loaded, _) = round_trip(&doc, &ProjectState::default());
+        assert_same_bricks(doc.active_volume(), loaded.active_volume());
+        assert!(
+            loaded.active_volume().mask().inverted(),
+            "the polarity was dropped, so the whole model came back unprotected"
+        );
+    }
+
+    /// **Byte identical twice, and unchanged through a write, a read and a
+    /// second write.**
+    ///
+    /// Two different claims and neither implies the other. The first says the
+    /// writer is deterministic -- hash order does not leak into the file, which
+    /// is what makes a diff of two saves meaningful. The second says the READER
+    /// gives back exactly what the writer put in, and it is the one that would
+    /// have caught a mask stream read in a different order from the one it was
+    /// written in: the existing round trip test never runs the reader against
+    /// the bytes, and the existing byte test never runs the reader at all.
+    #[test]
+    fn a_masked_document_writes_the_same_bytes_twice_and_again_after_a_round_trip() {
+        let doc = masked_doc();
+        let state = ProjectState::default();
+
+        let mut first = Vec::new();
+        let mut second = Vec::new();
+        write(&mut first, &doc, &state).expect("write failed");
+        write(&mut second, &doc, &state).expect("write failed");
+        assert_eq!(first, second, "two saves of one masked document differ");
+
+        let (reread, reread_state) = read(&mut first.as_slice()).expect("read failed");
+        let mut third = Vec::new();
+        write(&mut third, &reread, &reread_state).expect("write failed");
+        assert_eq!(
+            first.len(),
+            third.len(),
+            "the file changed length across write, read and write again"
+        );
+        let differs = first.iter().zip(&third).position(|(a, b)| a != b);
+        assert_eq!(differs, None, "write, read and write again differ at byte {differs:?}");
+    }
+
+    /// A document nobody masked is byte for byte what the pre-mask writer
+    /// produced, and says so at bytes 10..12.
+    ///
+    /// **This is the whole of what makes the bump survivable in the other
+    /// direction.** The range check protects a new build reading an old file;
+    /// this protects an old build reading a new one, and without it every save
+    /// from the day masking shipped would stamp 2 and be refused by every build
+    /// that predates it.
+    ///
+    /// The length is computed from the document rather than compared against a
+    /// recorded number, so it says "not one byte of mask stream anywhere"
+    /// rather than "the same size as last time".
+    #[test]
+    fn a_document_with_no_mask_writes_field_version_1_and_no_mask_stream() {
+        let doc = sculpted_doc();
+        assert!(doc.active_volume().mask().is_free(), "the fixture arrived masked");
+
+        let mut bytes = Vec::new();
+        write(&mut bytes, &doc, &ProjectState::default()).expect("write failed");
+        assert_eq!(
+            u16::from_le_bytes([bytes[10], bytes[11]]),
+            1,
+            "an unmasked document was stamped with the mask encoding"
+        );
+        assert_eq!(
+            mask_stream_at(&bytes, 1) + EMPTY_TRAILER_BYTES,
+            bytes.len(),
+            "there are bytes between the last brick and the key trailer, which at field \
+             version 1 there cannot be"
+        );
+
+        // And the empty document is still the 123 bytes every offset in this
+        // module is measured against.
+        assert_eq!(first_brick_at() + EMPTY_TRAILER_BYTES, 123);
+    }
+
+    /// A masked document is stamped 2, and the stream is the nine bytes plus
+    /// its records and nothing else.
+    #[test]
+    fn a_masked_document_writes_field_version_2_and_one_stream_per_body() {
+        let mut bytes = Vec::new();
+        write(&mut bytes, &masked_doc(), &ProjectState::default()).expect("write failed");
+        assert_eq!(u16::from_le_bytes([bytes[10], bytes[11]]), FIELD_VERSION_WITH_MASK);
+
+        let at = mask_stream_at(&bytes, 1);
+        assert_eq!(bytes[at], 0, "an uninverted mask wrote a flag bit");
+        let count = u64::from_le_bytes(bytes[at + 1..at + 9].try_into().unwrap());
+        assert!(count > 0, "a masked body wrote no mask records");
+
+        // An unmasked body inside a masked document still writes its nine
+        // bytes, so the reader needs no per-body condition.
+        let mut two = Document::from_volume(masked(sculpted()));
+        two.add_body("Body 2", Volume::new(0.5));
+        let mut pair = Vec::new();
+        write(&mut pair, &two, &ProjectState::default()).expect("write failed");
+        let (loaded, _) = read(&mut pair.as_slice()).expect("read failed");
+        let second = loaded.bodies().nth(1).expect("a second body").1;
+        assert!(second.mask().is_free(), "an unmasked body came back masked");
+    }
+
+    /// Mask All is an empty map under inversion, and dropping the polarity
+    /// would reopen the file with the whole model unprotected.
+    #[test]
+    fn an_inverted_mask_with_no_bricks_at_all_still_needs_the_mask_encoding() {
+        let mut volume = sculpted();
+        volume.mask_mut().set_inverted(true);
+        assert_eq!(volume.mask().brick_coords().count(), 0);
+        let doc = Document::from_volume(volume);
+
+        let mut bytes = Vec::new();
+        write(&mut bytes, &doc, &ProjectState::default()).expect("write failed");
+        assert_eq!(
+            u16::from_le_bytes([bytes[10], bytes[11]]),
+            FIELD_VERSION_WITH_MASK,
+            "Mask All was written as an unmasked document"
+        );
+
+        let (loaded, _) = read(&mut bytes.as_slice()).expect("read failed");
+        assert!(loaded.active_volume().mask().inverted(), "Mask All came back as no mask at all");
+    }
+
+    /// Protection where there is no geometry survives, which is the case that
+    /// makes `mask_count` unboundable by the body's own brick count.
+    #[test]
+    fn a_mask_over_empty_space_survives_a_save_and_outnumbers_the_bricks() {
+        let mut volume = Volume::new(0.5);
+        let mask = volume.mask_mut();
+        for brick in 0..40 {
+            let origin = BrickCoord::new(brick, 0, 0).origin();
+            mask.write(origin, 128);
+        }
+        let doc = Document::from_volume(volume);
+        assert!(
+            doc.active_volume().mask().brick_coords().count() > doc.active_volume().brick_count(),
+            "the fixture no longer has more mask bricks than field bricks"
+        );
+
+        let (loaded, _) = round_trip(&doc, &ProjectState::default());
+        assert_eq!(loaded.active_volume().brick_count(), 0, "empty space grew geometry");
+        assert_same_masks(doc.active_volume().mask(), loaded.active_volume().mask());
+    }
+
+    /// A file this build wrote is refused by a build that predates the mask,
+    /// **in this process**.
+    ///
+    /// "Opens in a pre-masking build" and "refused by a build whose newest
+    /// field encoding is 1" both otherwise need a second, older binary, and
+    /// this plan rejected two other features on exactly that unrunnability --
+    /// so it does not get to exempt this one. The accepted range is a parameter
+    /// of the reader precisely so that this can be checked here.
+    #[test]
+    fn a_reader_that_predates_the_mask_refuses_a_masked_file_and_takes_an_unmasked_one() {
+        let mut masked_bytes = Vec::new();
+        write(&mut masked_bytes, &masked_doc(), &ProjectState::default()).expect("write failed");
+        let mut progress = Progress::default();
+        match read_understanding_field_versions_to(&mut masked_bytes.as_slice(), &mut progress, 1) {
+            Err(ProjectError::FieldVersion { found, supported }) => {
+                assert_eq!(found, FIELD_VERSION_WITH_MASK);
+                assert_eq!(supported, 1);
+            }
+            Ok(_) => panic!("a pre-mask reader loaded a masked file, mask and all"),
+            Err(other) => panic!("expected a field version refusal, got {other}"),
+        }
+        assert_eq!(progress.bricks, 0, "the refusal came after the geometry");
+
+        // And the other half, which is the point of writing the lowest version:
+        // the same reader takes an unmasked document from this build.
+        let mut plain = Vec::new();
+        write(&mut plain, &sculpted_doc(), &ProjectState::default()).expect("write failed");
+        read_understanding_field_versions_to(&mut plain.as_slice(), &mut Progress::default(), 1)
+            .expect("a pre-mask reader refused an unmasked file this build wrote");
+    }
+
+    /// A file written before the mask existed opens with an empty mask rather
+    /// than with no answer.
+    #[test]
+    fn a_file_from_before_the_mask_opens_with_nothing_protected() {
+        for name in ["container-v1.brokkr", "container-v2.brokkr"] {
+            let bytes = committed_fixture(name);
+            let (doc, _) = read(&mut bytes.as_slice()).unwrap_or_else(|error| {
+                panic!("{name} was refused once the mask stream existed: {error}")
+            });
+            let mask = doc.active_volume().mask();
+            assert!(mask.is_free(), "{name} opened with protection nobody painted");
+            assert!(!mask.inverted(), "{name} opened inverted");
+        }
+    }
+
+    /// The seven reserved `mask_flags` bits are refused rather than ignored,
+    /// which is what reserves them at no cost on disk.
+    #[test]
+    fn a_mask_flag_this_build_does_not_know_is_refused() {
+        let mut bytes = Vec::new();
+        write(&mut bytes, &masked_doc(), &ProjectState::default()).expect("write failed");
+        let at = mask_stream_at(&bytes, 1);
+
+        bytes[at] |= 1 << 3;
+        match read(&mut bytes.as_slice()) {
+            Err(ProjectError::ReservedMaskFlags { found }) => assert_eq!(found, 1 << 3),
+            Ok(_) => panic!("a mask flag from a future encoding was ignored"),
+            Err(other) => panic!("expected a reserved flag refusal, got {other}"),
+        }
+    }
+
+    /// An unknown mask tag is refused, not repaired: it decides how many bytes
+    /// to consume, so repairing it misaligns everything after it -- and what
+    /// comes after a mask stream is the next body.
+    #[test]
+    fn an_unknown_mask_brick_kind_is_refused() {
+        let mut bytes = Vec::new();
+        write(&mut bytes, &masked_doc(), &ProjectState::default()).expect("write failed");
+        // Past the flags byte, the count and the first record's coordinate.
+        let tag_at = mask_stream_at(&bytes, 1) + 1 + 8 + 12;
+        bytes[tag_at] = 7;
+        match read(&mut bytes.as_slice()) {
+            Err(ProjectError::UnknownMaskTag(tag)) => assert_eq!(tag, 7),
+            Ok(_) => panic!("an unknown mask kind was accepted"),
+            Err(other) => panic!("expected an unknown mask tag, got {other}"),
+        }
+    }
+
+    /// `mask_count` decides an allocation, and it is bounded by the running
+    /// document byte total before one brick of it is read.
+    ///
+    /// Bounded by BYTES and not by the body's brick count, because a mask brick
+    /// may exist where no field brick does -- the previous revision's rule that
+    /// the brick count bounds it would have made this build refuse files it
+    /// writes itself.
+    #[test]
+    fn an_absurd_mask_count_is_refused_before_anything_is_allocated() {
+        let mut bytes = Vec::new();
+        write(&mut bytes, &masked_doc(), &ProjectState::default()).expect("write failed");
+        let count_at = mask_stream_at(&bytes, 1) + 1;
+        bytes[count_at..count_at + 8].copy_from_slice(&u64::MAX.to_le_bytes());
+
+        match read(&mut bytes.as_slice()) {
+            Err(ProjectError::TooMuchData { bytes, limit }) => {
+                assert_eq!(limit, MAX_DOCUMENT_BYTES);
+                assert!(bytes > limit, "the refusal reported a total inside the ceiling");
+            }
+            Ok(_) => panic!("a mask count of u64::MAX was accepted"),
+            Err(other) => panic!("expected a byte total refusal, got {other}"),
+        }
+    }
+
+    /// A short `mask_count` must not quietly turn into the next body.
+    ///
+    /// The streams are consecutive and the reader never seeks, so a body that
+    /// declares fewer mask records than it wrote leaves the reader taking the
+    /// rest of them as the next body's brick count and coordinates. That has to
+    /// come back as an error rather than as a second body full of
+    /// plausible-looking rubbish.
+    #[test]
+    fn a_short_mask_count_does_not_misparse_the_body_after_it() {
+        let mut doc = Document::from_volume(masked(sculpted()));
+        doc.add_body("Body 2", one_brick(BrickCoord::new(40, 0, 0), INSIDE));
+
+        let mut bytes = Vec::new();
+        write(&mut bytes, &doc, &ProjectState::default()).expect("write failed");
+        let count_at = mask_stream_at(&bytes, 2) + 1;
+        let count = u64::from_le_bytes(bytes[count_at..count_at + 8].try_into().unwrap());
+        assert!(count > 1, "the fixture wrote too few mask records to shorten one");
+        bytes[count_at..count_at + 8].copy_from_slice(&(count - 1).to_le_bytes());
+
+        if let Ok((loaded, _)) = read(&mut bytes.as_slice()) {
+            panic!(
+                "a short mask count loaded as a {}-body document instead of failing",
+                loaded.body_count()
+            );
+        }
+    }
+
+    /// The accounting the byte total is made of, pinned so that a future edit
+    /// to either side of the format has to move both.
+    ///
+    /// A dense mask brick is exactly a quarter of a dense field brick's
+    /// payload, which is the +25.000% every file-size figure about masking is
+    /// arithmetic over. The per-entry term is what stops a file claiming
+    /// billions of uniform mask bricks -- one byte of payload each -- from
+    /// passing a byte cap while asking for hundreds of gigabytes of hash map.
+    #[test]
+    fn a_dense_mask_brick_costs_a_quarter_of_a_dense_field_brick() {
+        assert_eq!(MASK_BRICK_BYTES * 4, BRICK_BYTES);
+        assert_eq!(mask_brick_bytes(true), MASK_ENTRY_BYTES + MASK_BRICK_BYTES as u64);
+        assert_eq!(mask_brick_bytes(false), MASK_ENTRY_BYTES);
+        assert!(
+            mask_brick_bytes(false) > 0,
+            "a uniform mask brick charging nothing bounds nothing: a file could claim billions \
+             of them and pass the byte cap"
+        );
+        assert_eq!(field_brick_bytes(true), FIELD_ENTRY_BYTES + BRICK_BYTES as u64);
+    }
+
+    /// The write side of the byte ceiling, entered at a limit a test can reach.
+    ///
+    /// **The point of this test is that the gate is deletable without it.** The
+    /// real ceiling is six gibibytes of resident bricks, which no test can
+    /// build, so before the limit became a parameter the whole census in
+    /// [`refuse_bytes`] could be replaced with `Ok(())` and the suite stayed
+    /// green -- the same shape of never-entered save gate this file's history
+    /// is about. Handing it a small limit runs the arithmetic for real.
+    ///
+    /// The document is chosen so that all four census rows are non-empty: a
+    /// mutation that bills `mask_bricks` at the uniform rate on top of the
+    /// dense one, or that drops the two mask rows while keeping the field ones,
+    /// moves the total and fails here.
+    #[test]
+    fn the_writer_refuses_a_document_whose_bytes_would_not_fit() {
+        let mut doc = masked_doc();
+        // A second body purely to put a uniform FIELD brick in the census; the
+        // sculpt is all dense ones.
+        doc.add_body("Body 2", one_brick(BrickCoord::new(40, 0, 0), INSIDE));
+
+        // Counted here from the census, so the expected number is arrived at
+        // by a different route than the one under test only in its shape --
+        // what it pins is the SET of rows and the rate each is billed at.
+        let mut dense = 0u64;
+        let mut uniform = 0u64;
+        let mut dense_masks = 0u64;
+        let mut uniform_masks = 0u64;
+        for (_, volume) in doc.bodies() {
+            let stats = volume.stats();
+            dense += stats.dense_bricks as u64;
+            uniform += stats.uniform_bricks as u64;
+            dense_masks += stats.mask_dense_bricks as u64;
+            uniform_masks += (stats.mask_bricks - stats.mask_dense_bricks) as u64;
+        }
+        for (count, what) in [
+            (dense, "dense field bricks"),
+            (uniform, "uniform field bricks"),
+            (dense_masks, "dense mask bricks"),
+            (uniform_masks, "uniform mask bricks"),
+        ] {
+            assert!(count > 0, "the fixture has no {what}, so this test cannot pin their row");
+        }
+        let expected = dense * field_brick_bytes(true)
+            + uniform * field_brick_bytes(false)
+            + dense_masks * mask_brick_bytes(true)
+            + uniform_masks * mask_brick_bytes(false);
+
+        // A document that fits its ceiling exactly is accepted: the refusal is
+        // past the limit, not at it.
+        refuse_bytes(&doc, expected).expect("a document at exactly the limit was refused");
+
+        // One byte under, and the total is monotone, so the first charge that
+        // crosses is the last one -- the reported total is the whole document.
+        match refuse_bytes(&doc, expected - 1) {
+            Err(ProjectError::TooMuchData { bytes, limit }) => {
+                assert_eq!(limit, expected - 1);
+                assert_eq!(
+                    bytes, expected,
+                    "the refusal reported a total the census disagrees with"
+                );
+            }
+            Ok(()) => panic!("a document over the limit was accepted by the writer"),
+            Err(other) => panic!("expected a byte total refusal, got {other}"),
+        }
+
+        // And the real ceiling still lets this one out, so the test above is
+        // measuring the gate production runs and not a second one.
+        let mut bytes = Vec::new();
+        write(&mut bytes, &doc, &ProjectState::default()).expect("write failed");
+    }
+
+    /// Compare two masks brick for brick, so a failure names the brick rather
+    /// than saying only that protection changed.
+    fn assert_same_masks(expected: &MaskField, found: &MaskField) {
+        assert_eq!(found.inverted(), expected.inverted(), "the mask's polarity changed");
+        let mut wanted: Vec<BrickCoord> = expected.brick_coords().collect();
+        let mut got: Vec<BrickCoord> = found.brick_coords().collect();
+        wanted.sort_unstable();
+        got.sort_unstable();
+        assert_eq!(wanted, got, "the set of mask bricks changed");
+        for coord in wanted {
+            match (expected.brick(coord).expect("listed"), found.brick(coord).expect("listed")) {
+                (MaskBrick::Uniform(a), MaskBrick::Uniform(b)) => {
+                    assert_eq!(a, b, "the mask tile at {coord:?} changed")
+                }
+                (MaskBrick::Dense(a), MaskBrick::Dense(b)) => {
+                    assert_eq!(a.as_slice(), b.as_slice(), "the mask at {coord:?} changed")
+                }
+                _ => panic!("the mask brick at {coord:?} changed kind"),
+            }
+        }
+    }
+
     /// The outline is what a save reads back to check that what landed on disk
     /// is the document that was meant to go into it.
     #[test]
@@ -3326,6 +4197,11 @@ mod tests {
 
     /// Compare two volumes brick for brick, so a fixture failure names the
     /// brick rather than saying only that something changed.
+    ///
+    /// **The mask is compared here rather than in a separate helper beside
+    /// every call**, so that every existing round trip check gained the mask
+    /// the moment the mask could be saved -- including the one that opens the
+    /// real projects on the maintainer's machine.
     fn assert_same_bricks(expected: &Volume, found: &Volume) {
         assert_eq!(found.voxel_size(), expected.voxel_size(), "the voxel size changed");
         let mut wanted: Vec<BrickCoord> = expected.brick_coords().collect();
@@ -3342,6 +4218,7 @@ mod tests {
                 _ => panic!("the brick at {coord:?} changed kind"),
             }
         }
+        assert_same_masks(expected.mask(), found.mask());
     }
 
     /// Compare two documents body for body, so a failure names the body and
@@ -3386,6 +4263,13 @@ mod tests {
     /// temp directory, which is worth doing here because on this machine that
     /// directory is a RAM disk.
     ///
+    /// **Each file is round tripped twice: as it is, and with a mask painted on
+    /// it.** The first is what has to keep working and must not be able to hide
+    /// behind the second. The second is the one that matters for the mask
+    /// stream, because the autosave is again the first thing to write one in
+    /// the wild and the mask is compared brick for brick on the way back --
+    /// `assert_same_bricks` does that for every caller it has.
+    ///
     /// Every path that is absent is skipped and said so, because the file set
     /// moves -- the autosave is rewritten every session and the downloads come
     /// and go. **A run that reports "0 of 5" has checked nothing**, which the
@@ -3419,7 +4303,7 @@ mod tests {
             let mut reader = std::io::BufReader::with_capacity(1 << 20, file);
 
             let mut progress = Progress::default();
-            let (doc, state) = match read_reporting(&mut reader, &mut progress) {
+            let (mut doc, state) = match read_reporting(&mut reader, &mut progress) {
                 Ok(loaded) => loaded,
                 Err(error) => panic!("{} ({size} bytes) was refused: {error}", path.display()),
             };
@@ -3432,6 +4316,11 @@ mod tests {
             );
             assert!(volume.voxel_size() > 0.0);
             assert_eq!(doc.body_count(), 1, "these files all predate the node table");
+            assert!(
+                volume.mask().is_free(),
+                "{} predates the mask stream and opened with protection on it",
+                path.display()
+            );
             eprintln!(
                 "{}: {size} bytes, {} bricks, voxel {} mm, {} keys",
                 path.display(),
@@ -3440,6 +4329,11 @@ mod tests {
                 state.keys.len()
             );
 
+            // Unmasked first, because a real file's own round trip is the
+            // thing that has to keep working, and the mask must not be able
+            // to hide a regression in it.
+            round_trip_through_version_3(path, &doc, &state);
+            paint_a_mask_over(doc.active_volume_mut());
             round_trip_through_version_3(path, &doc, &state);
             opened += 1;
         }
@@ -3484,8 +4378,36 @@ mod tests {
         assert_eq!(reread_state.view, state.view, "the view did not survive the round trip");
         assert_eq!(reread_state.keys, state.keys, "the timeline did not survive the round trip");
         eprintln!(
-            "  round tripped through container {CONTAINER_VERSION}: {written} bytes, {:.0} ms",
+            "  round tripped through container {CONTAINER_VERSION} at field {}: {written} \
+             bytes, {:.0} ms",
+            lowest_field_version(doc),
             started.elapsed().as_secs_f64() * 1000.0
         );
+    }
+
+    /// Paint protection over part of a real model, for the round trip that has
+    /// to carry it.
+    ///
+    /// **Anchored on the model's own lowest brick coordinate rather than on the
+    /// world origin**, so the patch lands ON geometry whatever bounds the file
+    /// happens to have -- a mask over nothing would round trip perfectly while
+    /// saying nothing about a mask over a body. The 128-voxel cube is 64 dense
+    /// mask bricks, 2 MB, which is a real mask and a bounded cost against a
+    /// document of tens of thousands of bricks.
+    fn paint_a_mask_over(volume: &mut Volume) {
+        let anchor = volume.brick_coords().min().unwrap_or(BrickCoord::new(0, 0, 0)).origin();
+        let mask = volume.mask_mut();
+        for x in 0..128 {
+            for y in 0..128 {
+                for z in 0..128 {
+                    // Feathered, never a step: every writer of a mask is held
+                    // to that, this one included.
+                    let value = ((x + y + z) % 256) as u8;
+                    mask.write(anchor + IVec3::new(x, y, z), value);
+                }
+            }
+        }
+        mask.collapse();
+        assert!(!mask.is_free(), "the patch left nothing to save");
     }
 }

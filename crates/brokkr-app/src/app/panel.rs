@@ -12,7 +12,7 @@
 
 use std::sync::Arc;
 
-use brokkr_core::{BrushKind, FalloffCurve, MirrorAxis, PatternKind};
+use brokkr_core::{BrushKind, FalloffCurve, MaskFilter, MirrorAxis, PatternKind};
 use iced::widget::{
     button, checkbox, column, container, mouse_area, opaque, pick_list, rich_text, row, scrollable,
     sensor, slider, space, span, stack, text, text_editor, text_input,
@@ -24,38 +24,13 @@ use super::{
 };
 use glam::Vec2;
 
-use crate::app::SizingTarget;
+use crate::app::{MaskCard, SizingTarget, Tool};
 use crate::icon;
-use crate::message::{ConfirmChoice, ExportFormat, Message, PanelSection, TopMenu};
+use crate::message::{ConfirmChoice, ExportFormat, MaskGenerator, Message, PanelSection, TopMenu};
 use crate::spacemouse::{self, ButtonAction};
 use crate::tablet::Diagnosis;
 use crate::theme;
-use crate::viewport::Viewport;
-
-/// One entry in the "Move to ▸" list: a folder, or the top level.
-///
-/// **It BORROWS the folder's name.** The list is rebuilt whenever the panel is
-/// laid out, which is at display rate, so an owned `String` per folder would be
-/// up to sixty-four allocations a frame for a control the user opens once a
-/// session. `pick_list` asks only for `Clone + PartialEq + ToString`, and a
-/// borrow satisfies all three -- the lifetime is the borrow of `Brokkr` the
-/// whole widget tree already holds.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct FolderChoice<'a> {
-    /// `None` is the top level, which is a real destination and not an absent
-    /// one: it is how a row gets back out of a folder.
-    id: Option<brokkr_core::NodeId>,
-    label: &'a str,
-}
-
-impl std::fmt::Display for FolderChoice<'_> {
-    /// The name and nothing else. `pick_list` calls `to_string` on every option
-    /// it draws, so anything computed here -- an indent, a count, a prefix --
-    /// would be computed per option per frame.
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.label)
-    }
-}
+use crate::viewport::{ThumbnailCell, Viewport};
 
 /// A folder's body count, as a string that was never formatted.
 ///
@@ -101,6 +76,83 @@ struct RowFacts {
     /// Solo is off, or this row is inside the soloed subtree. `false` is the
     /// fourth eye state: the row's own eye is on and it is still not drawn.
     in_scope: bool,
+    /// A row drag is in flight, so every row tracks the pointer and the one
+    /// under it decides where the block would go.
+    ///
+    /// List-wide rather than per row, as `refusing` below it is, and here
+    /// anyway: the alternative is more positional arguments on `body_row`,
+    /// which is the shape this struct exists to avoid.
+    dragging: bool,
+    /// ...and the gap the pointer is over refuses the block, so the cursor says
+    /// so. There is no indicator in this state, which is exactly why the cursor
+    /// has to carry it. A press that has not moved yet is NOT this: nothing has
+    /// been refused, the drag simply has not started.
+    refusing: bool,
+    /// This row is the dragged block's root, folded away for the duration.
+    ///
+    /// Otherwise an expanded twelve-child folder makes twelve rows dead with no
+    /// local feedback while the explanation appears in a status line at the
+    /// other end of the window. **It is a drawing state and not a document
+    /// edit**: the `collapsed` bit is in the file, and a drag that dirtied it
+    /// would cost an undo press for a gesture that moved nothing.
+    folded: bool,
+    /// The drop would land INSIDE this row: it is a closed folder and the
+    /// pointer is in its middle band.
+    drop_into: bool,
+}
+
+/// One row of the body list, and how tall it is laid out.
+///
+/// **Fixed rather than left to the content**, and that is load-bearing rather
+/// than tidy: which band of a row the pointer is in is a fraction of the row's
+/// height, `mouse_area::on_move` reports a point and not a fraction, and the
+/// only height the panel can divide by is one it chose. It is also the number
+/// the scrollable is already sized in, so the six-rows-visible promise stops
+/// being approximate.
+const ROW_H: f32 = 32.0;
+const ROW_H_BARE: f32 = 22.0;
+
+/// How far one level of nesting indents a row, and the width of the accent bar
+/// down its inside edge.
+///
+/// At module scope because the drop indicator is drawn at the same indent as
+/// the row it would become a sibling of, and it is not a row.
+const INDENT_PER_DEPTH: f32 = 12.0;
+const MARKER: f32 = 2.0;
+
+/// Where a row's first real column -- the chevron, or the blank standing in for
+/// one -- begins, at a given depth.
+///
+/// **Four terms and not two, because [`Brokkr::body_row`] builds the offset out
+/// of three widgets rather than one number**: its leading run is
+/// `row![marker(MARKER), space(depth * INDENT_PER_DEPTH), ..].spacing(theme::S2)`,
+/// so a spacing falls after the marker AND after the indent, and the second one
+/// belongs to no child. Anything drawing at a row's depth without being a row of
+/// that shape has to reproduce all four. Dropping the trailing `S2` lands half
+/// an indent step short -- 6 px right of the depth above and 6 px left of the
+/// depth named -- which is dead centre between the two depths the drop line
+/// exists to tell apart.
+fn row_content_x(depth: u8) -> f32 {
+    MARKER + theme::S2 + f32::from(depth) * INDENT_PER_DEPTH + theme::S2
+}
+
+/// The two-pixel line that says where a dragged row would land, indented to the
+/// depth it would take.
+///
+/// **The indent is the whole message.** A line between two rows says where in
+/// the ORDER the block goes; only its indent says whose child it becomes, and
+/// the two adjacent rows either side of a folder's last child name the same
+/// gap at two different depths. A line with no indent would make the one
+/// gesture that gets a row back out of a folder indistinguishable from the one
+/// that keeps it in -- and a line at HALF a step is worse, because it reads as
+/// ambiguous against both neighbours rather than as wrong. This row carries no
+/// spacing of its own, so the whole offset is the one space.
+fn drop_line<'a>(depth: u8) -> Element<'a, Message> {
+    row![
+        space().width(Length::Fixed(row_content_x(depth))),
+        container(space()).width(Length::Fill).height(Length::Fixed(2.0)).style(theme::drop_line),
+    ]
+    .into()
 }
 
 impl Brokkr {
@@ -160,6 +212,14 @@ impl Brokkr {
         // other could be -- but the ordering is stated rather than assumed.
         if let Some(pending) = &self.pending_merge {
             return stack![body, self.merge_card(pending), self.resize_frame()].into();
+        }
+
+        // And the split preview, which is the same family again: one row is
+        // about to become several and the card is the only place the number is
+        // ever said. Below the merge card by the same argument -- neither can
+        // be up at once, and the order is stated rather than assumed.
+        if let Some(pending) = &self.pending_split {
+            return stack![body, self.split_card(pending), self.resize_frame()].into();
         }
 
         // Same reasoning, one rank down: the bug report is modal too, and it
@@ -688,7 +748,73 @@ impl Brokkr {
             );
         }
 
+        if let Some(card) = &self.mask_card {
+            stacked = stacked.push(self.mask_card(card));
+        }
+
         container(stacked).padding(theme::S4).into()
+    }
+
+    /// The standing mask card, over the viewport, whenever anything is masked.
+    ///
+    /// See [`MaskCard`] for why it exists and why it is
+    /// unconditional. This is the layout half; the two things worth reading
+    /// here are the `opaque` and the absence of any formatting.
+    ///
+    /// # It MUST be `opaque`, and "a `stack!` child captures" is not true
+    ///
+    /// Capture only happens where a child actually captures. `Button` does, so
+    /// the two verb buttons below are safe; everything else on this card is a
+    /// `container` and a `text`, and neither captures anything.
+    /// `Stack::update` levitates the cursor for the layers below only when the
+    /// upper child's `mouse_interaction` is non-`None`
+    /// (`iced_widget-0.14.2/src/stack.rs:266-273`), and both of those return
+    /// `Interaction::None`. So without this wrapper a press on the card's
+    /// padding falls straight through to the shader and starts a stroke on the
+    /// model behind it — this project's own recorded gotcha, walked back into.
+    /// `opaque` captures presses only, only inside its bounds, which is legal
+    /// under the rule the viewport is written to; see [`modal_layer`].
+    ///
+    /// # The two reflex verbs, and why only when the card names this body
+    ///
+    /// Invert and Clear are here so that the two things a user reaches for
+    /// mid-sculpt are one click away without a chord or a menu. They act on the
+    /// ACTIVE body, so they are shown only when the percentage above them is
+    /// about the active body: a card that is up purely because something is
+    /// masked OFF screen would otherwise offer to clear a mask that is not
+    /// there. See [`MaskCard::names_the_active_body`].
+    ///
+    /// # Nothing here computes or formats
+    ///
+    /// Both strings arrive built. `view()` runs at display rate, and a
+    /// percentage worked out in here would be a pass over the mask every frame.
+    fn mask_card<'a>(&self, card: &'a MaskCard) -> Element<'a, Message> {
+        let mut body =
+            column![text(card.headline.as_str()).size(theme::TEXT_SIZE_SMALL).color(theme::MASK)]
+                .spacing(theme::S1);
+        if !card.off_screen.is_empty() {
+            body = body.push(
+                text(card.off_screen.as_str()).size(theme::CAPTION_SIZE).color(theme::TEXT_MUTE),
+            );
+        }
+        if !card.elsewhere.is_empty() {
+            body = body.push(
+                text(card.elsewhere.as_str()).size(theme::CAPTION_SIZE).color(theme::TEXT_MUTE),
+            );
+        }
+        if card.names_the_active_body() {
+            let verb = |label: &'static str, message: Message| {
+                button(text(label).size(theme::CAPTION_SIZE))
+                    .padding(theme::S1)
+                    .style(theme::tool_button)
+                    .on_press(message)
+            };
+            body = body.push(
+                row![verb("invert", Message::MaskInverted), verb("clear", Message::MaskCleared),]
+                    .spacing(theme::S2),
+            );
+        }
+        opaque(container(body).padding(theme::S3).style(theme::overlay_card))
     }
 
     /// What the stats readout says: frame rate, frame time, triangles, bricks,
@@ -884,8 +1010,17 @@ impl Brokkr {
     fn tool_menu(&self, at: Vec2) -> Element<'_, Message> {
         const WIDTH: f32 = 210.0;
         // Roughly how tall it comes out. Only used to keep it on screen, so
-        // being a little out costs nothing.
-        const HEIGHT: f32 = 300.0;
+        // being a little out costs nothing. Sized for the taller of the two
+        // blocks at the foot, which is the mask's: three verb buttons, two rows
+        // of filters, an amount slider, a tint slider, a switch and a pattern
+        // readout all come out well above the pattern block they replace.
+        // **Sized once for all seven verbs**, which is why Grow and Shrink ship
+        // with Blur and Sharpen rather than after them -- and once again for the
+        // three generators, their two sliders and the masked split, which is
+        // where the block's growth stops. At a 768-high window this card now
+        // reaches most of the way down it; anything further has to take
+        // something out rather than add to the number.
+        const HEIGHT: f32 = 660.0;
 
         let numeric = |label: &'static str,
                        which: SizingTarget,
@@ -929,7 +1064,7 @@ impl Brokkr {
                 )
             });
 
-        let patterns =
+        let patterns = || {
             PatternKind::ALL.into_iter().fold(row![].spacing(theme::S1), |assembled, kind| {
                 let (style, ink) = theme::tool_toggle(kind == self.brush.pattern.kind);
                 assembled.push(
@@ -938,12 +1073,11 @@ impl Brokkr {
                         .style(style)
                         .on_press(Message::PatternChanged(kind)),
                 )
-            });
+            })
+        };
 
         let mut body = column![
-            text(self.effective_brush().kind.label().to_uppercase())
-                .size(theme::CAPTION_SIZE)
-                .color(theme::TEXT_MUTE),
+            text(self.live_tool_label()).size(theme::CAPTION_SIZE).color(theme::TEXT_MUTE),
             numeric(
                 "Radius mm",
                 SizingTarget::Radius,
@@ -954,39 +1088,47 @@ impl Brokkr {
             numeric(
                 "Strength",
                 SizingTarget::Strength,
-                super::MIN_STRENGTH..=super::MAX_STRENGTH,
+                super::MIN_STRENGTH..=self.max_strength(),
                 0.01,
                 Message::BrushStrengthChanged
             ),
             text("Falloff").size(theme::CAPTION_SIZE).color(theme::TEXT_DIM),
             falloff,
-            text("Pattern").size(theme::CAPTION_SIZE).color(theme::TEXT_DIM),
-            patterns,
         ]
         .spacing(theme::S3);
 
-        // The pattern's own numbers only mean anything once one is chosen.
-        if self.brush.pattern.kind != PatternKind::None {
-            let floor = self.doc.voxel_size() * brokkr_core::MIN_SCALE_VOXELS;
-            body = body.push(
-                column![
-                    text(format!("Feature  {:.2} mm", self.brush.pattern.scale_mm))
-                        .size(theme::CAPTION_SIZE)
-                        .color(theme::TEXT_DIM),
-                    slider(
-                        floor..=brokkr_core::MAX_SCALE_MM,
-                        self.brush.pattern.scale_mm.clamp(floor, brokkr_core::MAX_SCALE_MM),
-                        Message::PatternScaleChanged
-                    )
-                    .step(0.05_f32),
-                    text(format!("Depth  {:.2}", self.brush.pattern.depth))
-                        .size(theme::CAPTION_SIZE)
-                        .color(theme::TEXT_DIM),
-                    slider(0.0..=1.0, self.brush.pattern.depth, Message::PatternDepthChanged)
-                        .step(0.02_f32),
-                ]
-                .spacing(theme::S1),
-            );
+        if self.tool == Tool::Mask {
+            // The pattern's own row is NOT built here, and the mask block
+            // carries a readout of it instead. See `mask_block`.
+            body = body.push(self.mask_block());
+        } else {
+            body = body
+                .push(text("Pattern").size(theme::CAPTION_SIZE).color(theme::TEXT_DIM))
+                .push(patterns());
+
+            // The pattern's own numbers only mean anything once one is chosen.
+            if self.brush.pattern.kind != PatternKind::None {
+                let floor = self.doc.voxel_size() * brokkr_core::MIN_SCALE_VOXELS;
+                body = body.push(
+                    column![
+                        text(format!("Feature  {:.2} mm", self.brush.pattern.scale_mm))
+                            .size(theme::CAPTION_SIZE)
+                            .color(theme::TEXT_DIM),
+                        slider(
+                            floor..=brokkr_core::MAX_SCALE_MM,
+                            self.brush.pattern.scale_mm.clamp(floor, brokkr_core::MAX_SCALE_MM),
+                            Message::PatternScaleChanged
+                        )
+                        .step(0.05_f32),
+                        text(format!("Depth  {:.2}", self.brush.pattern.depth))
+                            .size(theme::CAPTION_SIZE)
+                            .color(theme::TEXT_DIM),
+                        slider(0.0..=1.0, self.brush.pattern.depth, Message::PatternDepthChanged)
+                            .step(0.02_f32),
+                    ]
+                    .spacing(theme::S1),
+                );
+            }
         }
 
         // Kept on screen: opened near the right or bottom edge it would
@@ -1002,6 +1144,148 @@ impl Brokkr {
         .into()
     }
 
+    /// The mask's own controls, in place of the PATTERN block.
+    ///
+    /// # The pattern is still live here, and that is why it is still named here
+    ///
+    /// Masking keeps the pattern deliberately -- it is ZBrush's alpha masking
+    /// and it costs nothing, because a pattern is already a multiplier in
+    /// 0..1 and so is a mask. But this block REPLACES the pattern's controls,
+    /// so without the readout at the foot the pattern would go on multiplying
+    /// into every mask stamp with nothing on screen saying which one. That is
+    /// worse than switching it off, which is why the answer is a line of text
+    /// and not a `PatternKind::None`. **Do not "fix" the missing pattern row by
+    /// disabling the pattern.**
+    ///
+    /// # What the toggle does and does not reach
+    ///
+    /// The tint, and only the tint. The standing mask card is built in
+    /// `refresh_mask_card` from the document alone and consults neither of
+    /// these, so switching the tint off cannot produce a masked body with
+    /// nothing on screen to say so. Both are session state and neither dirties
+    /// the document.
+    ///
+    /// # Seven verbs in a two-column grid, and one slider
+    ///
+    /// Clear, Invert and Mask All happen on the press: all three are O(1) and
+    /// there is nothing to drag. Blur, Sharpen, Grow and Shrink choose which
+    /// filter the ONE absolute amount slider below them drives. Two columns
+    /// rather than one row of four, and not only for the plan's sake: the four
+    /// across the 178 px this block gets is 44 px a button, and "Sharpen" does
+    /// not fit in it -- the falloff row above gets away with the same layout
+    /// because its longest label is a character shorter.
+    ///
+    /// One shared slider rather than four labelled ones, because `const HEIGHT`
+    /// is sized once for the whole block and four of them is 160 px of it.
+    ///
+    /// **The amount slider sits at zero between gestures and that is not a
+    /// bug.** The filter is absolute, so the amount belongs to the drag and not
+    /// to the document; leaving it at 1.0 would re-blur an already-blurred mask
+    /// the instant the next grab touched it.
+    fn mask_block(&self) -> Element<'_, Message> {
+        let verb = |label: &'static str, message: Message| {
+            button(text(label).size(theme::CAPTION_SIZE))
+                .width(Length::Fill)
+                .style(theme::tool_button)
+                .on_press(message)
+        };
+
+        let filter = |which: MaskFilter| {
+            button(text(which.label()).size(theme::CAPTION_SIZE))
+                .width(Length::Fill)
+                .style(if which == self.mask_filter {
+                    theme::tool_button_active
+                } else {
+                    theme::tool_button
+                })
+                .on_press(Message::MaskFilterChosen(which))
+        };
+
+        // A generator is a press and never a drag: unlike the four filters it
+        // has no amount, so there is nothing to hold open and nothing to commit
+        // on release. What it reads instead are the two sliders below it, which
+        // is why they sit under the row rather than one per button.
+        let generator = |which: MaskGenerator| {
+            button(text(which.label()).size(theme::CAPTION_SIZE))
+                .width(Length::Fill)
+                .style(theme::tool_button)
+                .on_press(Message::MaskGenerated(which))
+        };
+
+        let mut block = column![
+            text("Mask").size(theme::CAPTION_SIZE).color(theme::TEXT_DIM),
+            row![verb("Clear", Message::MaskCleared), verb("Invert", Message::MaskInverted)]
+                .spacing(theme::S1),
+            verb("Mask all", Message::MaskAllApplied),
+            row![filter(MaskFilter::Blur), filter(MaskFilter::Sharpen)].spacing(theme::S1),
+            row![filter(MaskFilter::Grow), filter(MaskFilter::Shrink)].spacing(theme::S1),
+            text(format!("Amount  {:.2}", self.mask_amount))
+                .size(theme::CAPTION_SIZE)
+                .color(theme::TEXT_DIM),
+            // `on_release` is what makes the whole drag ONE undo entry: every
+            // step of it re-applies from the same snapshot, and the release is
+            // where that snapshot goes into history.
+            slider(0.0..=1.0, self.mask_amount, Message::MaskAmountChanged)
+                .step(0.05_f32)
+                .on_release(Message::MaskAmountReleased),
+            // Not disabled when the tint is off: the slider is where a user who
+            // turned it off finds out what they turned off, and moving it is
+            // the obvious way to ask for it back.
+            text(format!("Tint  {:.2}", self.mask_tint))
+                .size(theme::CAPTION_SIZE)
+                .color(theme::TEXT_DIM),
+            slider(0.0..=1.0, self.mask_tint, Message::MaskTintChanged).step(0.05_f32),
+            checkbox(self.show_mask)
+                .label("Show mask")
+                .on_toggle(|_| Message::ShowMaskToggled)
+                .text_size(theme::CAPTION_SIZE),
+            text("Make one from the shape").size(theme::CAPTION_SIZE).color(theme::TEXT_DIM),
+            MaskGenerator::ALL.into_iter().fold(row![].spacing(theme::S1), |assembled, which| {
+                assembled.push(generator(which))
+            }),
+            // In MILLIMETRES, which is the whole of what makes this better than
+            // ZBrush's: its cavity masking is resolution-relative and this is
+            // not, so the number means the same thing after a resample.
+            text(format!("Feature  {:.2} mm", self.mask_feature_mm))
+                .size(theme::CAPTION_SIZE)
+                .color(theme::TEXT_DIM),
+            slider(super::MASK_FEATURE_RANGE_MM, self.mask_feature_mm, Message::MaskFeatureChanged)
+                .step(0.05_f32),
+            // In VOXELS with the millimetres beside it, and the other way round
+            // would be wrong: the ceiling is twice the narrow band, which is a
+            // property of the field and not of the model, so a millimetre
+            // slider's maximum would move under a resample.
+            text(format!(
+                "Thinner than  {} vx ({:.2} mm)",
+                self.mask_thickness_voxels,
+                self.mask_thickness_voxels as f32 * self.doc.voxel_size()
+            ))
+            .size(theme::CAPTION_SIZE)
+            .color(theme::TEXT_DIM),
+            slider(
+                1.0..=brokkr_core::MAX_THICKNESS_VOXELS as f32,
+                self.mask_thickness_voxels as f32,
+                Message::MaskThicknessChanged
+            )
+            .step(1.0_f32),
+            // Here rather than in the bodies panel's verb row, which is icons:
+            // this is a mask operation, it reads with the verbs it belongs to,
+            // and it costs no new icon and no new icon test.
+            verb("Split off the mask", Message::BodySplitMasked),
+        ]
+        .spacing(theme::S1);
+
+        if self.brush.pattern.kind != PatternKind::None {
+            block = block.push(
+                text(format!("Pattern: {}", self.brush.pattern.kind.label()))
+                    .size(theme::CAPTION_SIZE)
+                    .color(theme::TEXT_MUTE),
+            );
+        }
+
+        block.into()
+    }
+
     /// The always visible strip of brushes down the left.
     ///
     /// A strip rather than the dropdown this replaced: choosing a brush was two
@@ -1014,6 +1298,24 @@ impl Brokkr {
     /// viewport height, and it keeps the tools on the side the tablet hand is
     /// already on. The colours are still SindriCAD's tokens, so the two
     /// applications stay a family.
+    ///
+    /// # The vertical budget, and what the mask button cost to fit
+    ///
+    /// This column has to fit a 768-high window without scrolling — it is a
+    /// plain container with no `scrollable` and no clip, so anything past the
+    /// bottom is simply not there. See [`theme::ICON_TOOL`]. Adding the mask as
+    /// an eleventh button put it over, and two things were subtracted to pay
+    /// for it: the two-line "hold shift: smooth" hint, which the live Smooth
+    /// highlight beside it and the cheat sheet at the foot of the properties
+    /// panel already say twice over, and the separate CUT and MASK headings,
+    /// now one MODE heading over the two buttons that share that meaning.
+    ///
+    /// Arithmetic over the constants, and it is **arithmetic rather than a
+    /// measurement**: the mask button adds about 63 px (an 18 px icon, an 11 px
+    /// label, 10 px of button padding and an 8 px gap), the hint returned 34 and
+    /// the second heading 21, so the strip grew by roughly 8 px net over the
+    /// version that fitted. One screenshot at 768 settles it properly and none
+    /// has been taken.
     fn tool_strip(&self) -> Element<'_, Message> {
         let smoothing = self.shift;
 
@@ -1085,34 +1387,32 @@ impl Brokkr {
                 )
             });
 
-        let (cut_style, cut_ink) = theme::tool_toggle(self.cut_armed);
+        let (cut_style, cut_ink) = theme::tool_toggle(self.tool == Tool::Cut);
+        let (mask_style, mask_ink) = theme::tool_toggle(self.tool == Tool::Mask);
 
         container(
             column![
                 text("TOOL").size(theme::CAPTION_SIZE).color(theme::TEXT_MUTE),
                 brushes,
-                text(if smoothing { "shift: smoothing" } else { "hold shift: smooth" })
-                    .size(theme::CAPTION_SIZE)
-                    // The container centres this text as a block, but the block
-                    // wraps to two lines and centring it does nothing for the
-                    // lines inside it -- they stay ragged against its left
-                    // edge, under a column of centred buttons.
-                    .width(Length::Fill)
-                    .align_x(Alignment::Center)
-                    .color(if smoothing { theme::ACCENT } else { theme::TEXT_MUTE }),
                 text("MIRROR").size(theme::CAPTION_SIZE).color(theme::TEXT_MUTE),
                 mirrors,
-                text("CUT").size(theme::CAPTION_SIZE).color(theme::TEXT_MUTE),
-                // Armed state is shown in the strip, not just in the status
-                // line, because this is the one mode that changes what a left
-                // drag does and a cut is not something to discover by accident.
-                // The word stays for exactly that reason: "armed" versus
+                text("MODE").size(theme::CAPTION_SIZE).color(theme::TEXT_MUTE),
+                // The live state is shown in the strip, not just in the status
+                // line, because **these are the two modes that change what a
+                // left drag does, and only one of the two is destructive.**
+                // (That sentence used to read "this is the one mode", here and
+                // in `handoff.md`; masking made both halves false.) That
+                // asymmetry is also why Escape clears the cut and not the mask:
+                // a cut is a pending destructive thing, a mask is expensive
+                // work with no undo entry until the stroke lands.
+                //
+                // The words stay for exactly that reason: "armed" versus
                 // "plane" is a state, and an icon says which tool this is, not
                 // whether it is about to go off.
                 button(
                     column![
                         icon::icon(icon::IconName::CutPlane, theme::ICON_TOOL, cut_ink),
-                        text(if self.cut_armed { "armed" } else { "plane" })
+                        text(if self.tool == Tool::Cut { "armed" } else { "plane" })
                             .size(theme::TEXT_SIZE_SMALL),
                     ]
                     .width(Length::Fill)
@@ -1121,7 +1421,27 @@ impl Brokkr {
                 )
                 .width(Length::Fill)
                 .style(cut_style)
-                .on_press(Message::CutToggled),
+                .on_press(Message::ToolChanged(Tool::Cut)),
+                button(
+                    column![
+                        icon::icon(icon::IconName::Mask, theme::ICON_TOOL, mask_ink),
+                        // The same live substitution the brush buttons make for
+                        // Smooth: while shift is held a mask drag blurs, so the
+                        // button says what the next drag will actually do.
+                        text(match (self.tool == Tool::Mask, smoothing) {
+                            (true, true) => "blur",
+                            (true, false) => "on",
+                            (false, _) => "mask",
+                        })
+                        .size(theme::TEXT_SIZE_SMALL),
+                    ]
+                    .width(Length::Fill)
+                    .spacing(0)
+                    .align_x(Alignment::Center)
+                )
+                .width(Length::Fill)
+                .style(mask_style)
+                .on_press(Message::ToolChanged(Tool::Mask)),
             ]
             .spacing(theme::S3)
             .align_x(Alignment::Center),
@@ -1225,10 +1545,15 @@ impl Brokkr {
     }
 
     fn tools(&self) -> Element<'_, Message> {
-        let invert_hint = if self.brush.kind.is_directional() {
-            "ctrl or alt drag removes"
-        } else {
-            "no opposite: ctrl does nothing"
+        // In mask mode the modifier means something else entirely, and it means
+        // it for every brush -- the mask has no "no opposite" case, because
+        // protection always has one. Reading `brush.kind.is_directional()` here
+        // while masking would tell three of the seven brushes that ctrl does
+        // nothing, when it is the unmask gesture.
+        let invert_hint = match (self.tool, self.brush.kind.is_directional()) {
+            (Tool::Mask, _) => "ctrl or alt drag unmasks",
+            (_, true) => "ctrl or alt drag removes",
+            (_, false) => "no opposite: ctrl does nothing",
         };
 
         let radius = column![
@@ -1256,7 +1581,7 @@ impl Brokkr {
                 .size(theme::TEXT_SIZE_SMALL)
                 .color(theme::TEXT_DIM),
             slider(
-                super::MIN_STRENGTH..=super::MAX_STRENGTH,
+                super::MIN_STRENGTH..=self.max_strength(),
                 self.brush.strength,
                 Message::BrushStrengthChanged
             )
@@ -1294,9 +1619,12 @@ impl Brokkr {
         container(
             scrollable(column![
                 self.section(PanelSection::Bodies, || self.bodies_panel()),
-                text(self.brush.kind.label().to_uppercase())
-                    .size(theme::CAPTION_SIZE)
-                    .color(theme::TEXT_MUTE),
+                text(match self.tool {
+                    Tool::Mask => "MASK".to_string(),
+                    _ => self.brush.kind.label().to_uppercase(),
+                })
+                .size(theme::CAPTION_SIZE)
+                .color(theme::TEXT_MUTE),
                 text(invert_hint).size(theme::CAPTION_SIZE).color(theme::TEXT_MUTE),
                 radius,
                 strength,
@@ -1311,8 +1639,15 @@ impl Brokkr {
                 button(text("Reset sphere").size(theme::TEXT_SIZE_SMALL))
                     .style(theme::tool_button)
                     .on_press(Message::ResetSphere),
+                // `1-7`, not `1-6`: `BrushKind::ALL` has been seven since Move
+                // landed and this line was wrong before masking touched it.
+                //
+                // The ctrl line is here because the half-space mask has no
+                // button anywhere: it rides the cut's own drag, which is what
+                // makes it free, and a gesture with no control on screen is a
+                // gesture nobody finds.
                 text(
-                    "drag: sculpt\nctrl or alt drag: invert\nshift drag: smooth\nright drag: orbit\nshift right drag: pan\nwheel: zoom\n1-6: brush\nx y z: mirror\n[ ]: radius\nctrl z, ctrl shift z: undo, redo"
+                    "drag: sculpt\nctrl or alt drag: invert\nshift drag: smooth\nright drag: orbit\nshift right drag: pan\nwheel: zoom\n1-7: brush\nm: mask\nctrl + cut drag: mask that half\nhold h: show the mask\nx y z: mirror\n[ ]: radius\nctrl z, ctrl shift z: undo, redo"
                 )
                 .size(theme::CAPTION_SIZE)
                 .color(theme::TEXT_MUTE),
@@ -1639,9 +1974,6 @@ impl Brokkr {
     /// small allocation for the whole list beats one per row, and this function
     /// is already building an `Element` per visible row.
     fn bodies_panel(&self) -> Element<'_, Message> {
-        /// One row, with a thumbnail and without.
-        const ROW_H: f32 = 32.0;
-        const ROW_H_BARE: f32 = 22.0;
         /// Six rows with pictures, eight without — the same 190-odd pixels
         /// either way, so turning the pictures off buys rows rather than space.
         const VISIBLE_ROWS: f32 = 6.0;
@@ -1661,6 +1993,23 @@ impl Brokkr {
         // the same property that makes the resolver's own solo test one
         // comparison, and the reason no row has to ask the document anything.
         let scope = self.solo.and_then(|id| self.doc.subtree_of(id));
+        // The row being dragged, if one is, resolved ONCE for the whole list --
+        // one scan of at most `MAX_NODES` rows, the same shape as the two passes
+        // above and for the same reason. Everything else about the drag was
+        // worked out in `update`; see `RowDrag`.
+        //
+        // `folding` is only the row that is really being DRAGGED, which is not
+        // the same as the row that was pressed: a press is not a drag until the
+        // pointer moves, and folding on the press alone would snap a folder
+        // shut on every plain click on its row.
+        let folding = self
+            .row_drag
+            .filter(|drag| drag.under_way())
+            .and_then(|drag| self.doc.index_of(drag.id));
+        let (target, into, refusing) = match self.row_drag {
+            Some(drag) => (drag.target, drag.into, drag.said.is_some()),
+            None => (None, None, false),
+        };
 
         let mut rows = column![].spacing(1);
         // The depth below which rows belong to a collapsed subtree and are not
@@ -1668,6 +2017,12 @@ impl Brokkr {
         // command does -- which is the ZBrush failure this design is written
         // against.
         let mut skip_below: Option<u8> = None;
+        // Whether the drop line has been placed yet. It goes in front of the
+        // first DRAWN row at or after the insertion index, which is not the
+        // same as the row at that index: the gap may be behind a folded
+        // subtree, and the line still has to appear somewhere the eye can see
+        // it.
+        let mut line_placed = false;
         for (index, node) in self.doc.nodes().iter().enumerate() {
             if let Some(depth) = skip_below {
                 if node.depth() > depth {
@@ -1675,8 +2030,19 @@ impl Brokkr {
                 }
                 skip_below = None;
             }
-            if node.collapsed {
+            let folded = folding == Some(index);
+            if node.collapsed || folded {
                 skip_below = Some(node.depth());
+            }
+            // The line, in front of the first drawn row at or after the gap.
+            // One integer comparison per row, which is all a row may cost.
+            if let Some(target) = target
+                && into.is_none()
+                && !line_placed
+                && index >= target.at
+            {
+                rows = rows.push(drop_line(target.depth));
+                line_placed = true;
             }
             let holds = holds_active.get(index).copied().unwrap_or(false);
             let facts = RowFacts {
@@ -1690,12 +2056,23 @@ impl Brokkr {
                 soloable: node.id == self.doc.active() || holds,
                 soloed: self.solo == Some(node.id),
                 in_scope: scope.as_ref().is_none_or(|range| range.contains(&index)),
+                dragging: self.row_drag.is_some(),
+                refusing,
+                folded,
+                drop_into: into == Some(index),
             };
             rows = rows.push(self.body_row(index, node, facts));
         }
+        // A gap past the last drawn row: the block goes to the very bottom.
+        if let Some(target) = target
+            && into.is_none()
+            && !line_placed
+        {
+            rows = rows.push(drop_line(target.depth));
+        }
 
-        let (row_h, visible_rows) =
-            if self.thumbnails { (ROW_H, VISIBLE_ROWS) } else { (ROW_H_BARE, VISIBLE_ROWS_BARE) };
+        let row_h = self.row_height();
+        let visible_rows = if self.thumbnails { VISIBLE_ROWS } else { VISIBLE_ROWS_BARE };
 
         let verbs = row![
             button(icon::icon(icon::IconName::Plus, theme::ICON_INLINE, theme::TEXT_DIM))
@@ -1743,33 +2120,17 @@ impl Brokkr {
                 .padding(Padding { top: 2.0, bottom: 2.0, left: theme::S3, right: theme::S3 })
                 .style(theme::tool_button)
                 .on_press(Message::BodyMergedDown),
+            // Always pressable and refusing on press, for the same three
+            // reasons. Whether a split would do anything cannot be known
+            // without walking every voxel of the body, which is the one thing
+            // a row built every frame may never do -- so there is nothing to
+            // grey on, and the answer arrives as a card or as a status line.
+            button(icon::icon(icon::IconName::Split, theme::ICON_INLINE, theme::TEXT_DIM))
+                .padding(Padding { top: 2.0, bottom: 2.0, left: theme::S3, right: theme::S3 })
+                .style(theme::tool_button)
+                .on_press(Message::BodySplit),
         ]
         .spacing(theme::S2);
-
-        // **Below the scrollable and not on every row**, which is a deliberate
-        // departure from the plan's "a pick_list on the row". A `pick_list`
-        // needs an options collection built for it, so one per row is one
-        // allocation per row per frame to show six -- the exact multiplication
-        // this panel's header forbids. One instance acting on the active row
-        // costs one small `Vec` of BORROWED names, and the verb row beside it
-        // already means "the verbs that act on the active row".
-        //
-        // Increment 17 deletes this the day a drag lands.
-        //
-        // The row's CURRENT container is left out rather than offered and then
-        // refused: a destination that does nothing is a press that reports a
-        // failure, which teaches the user that the control is unreliable.
-        let parent = self.doc.parent_of(self.doc.active());
-        let mut targets = Vec::new();
-        if parent.is_some() {
-            targets.push(FolderChoice { id: None, label: "Top level" });
-        }
-        targets.extend(
-            self.doc
-                .folders()
-                .filter(|folder| parent != Some(folder.id))
-                .map(|folder| FolderChoice { id: Some(folder.id), label: folder.name.as_str() }),
-        );
 
         let mut stacked = column![
             // The pictures are session state and must not dirty the document.
@@ -1782,15 +2143,6 @@ impl Brokkr {
                 .text_size(theme::CAPTION_SIZE),
             scrollable(rows).height(Length::Fixed(row_h * visible_rows)),
             verbs,
-            // No selection ever shows: this is a verb wearing a list's clothes,
-            // and a sticky answer would read as "this body lives there" rather
-            // than as "send it there".
-            pick_list(targets, None::<FolderChoice<'_>>, |choice| Message::BodyMovedToFolder(
-                choice.id
-            ))
-            .placeholder("Move to \u{25b8}")
-            .text_size(theme::CAPTION_SIZE)
-            .width(Length::Fill),
         ]
         .spacing(theme::S2);
 
@@ -1882,8 +2234,6 @@ impl Brokkr {
         /// The folder chevron's column. A body row spends it on empty space so
         /// that the two line up.
         const DISCLOSURE: f32 = 11.0;
-        const INDENT_PER_DEPTH: f32 = 12.0;
-        const MARKER: f32 = 2.0;
 
         let active = node.id == self.doc.active();
         // Already resolved, once, by `publish_visibility`. A row must never
@@ -1906,6 +2256,11 @@ impl Brokkr {
                 .width(Length::Fixed(MARKER))
                 .height(Length::Fill)
                 .style(if facts.marked { theme::body_row_marker } else { theme::body_row },),
+            // Everything before this point, plus the spacing either side of it,
+            // is what [`row_content_x`] reproduces for the drop line. Changing
+            // the marker, this indent or the spacing below moves the line too,
+            // and `the_drop_line_starts_where_the_row_it_names_starts` is what
+            // says so.
             space().width(Length::Fixed(f32::from(node.depth()) * INDENT_PER_DEPTH)),
         ]
         .spacing(theme::S2)
@@ -1914,16 +2269,41 @@ impl Brokkr {
         if node.is_body() {
             line = line.push(space().width(Length::Fixed(DISCLOSURE)));
             if self.thumbnails {
+                // One hash lookup, which is all a row may do -- the same
+                // shape as `self.shown.get(index)` above. The cell was
+                // allocated in `update`, by `publish_visibility`; `view` only
+                // ever reads it, so nothing here can queue a render.
+                //
+                // The picture sits inside the styled well rather than
+                // replacing it, with a pixel of padding, so the well's border
+                // still frames the cell and a body with no cell to draw --
+                // past the atlas's sixty-four layers -- degrades to the flat
+                // placeholder this was before there were pictures.
+                let inner: Element<'_, Message> = match self.thumbs.cell(node.id) {
+                    Some(cell) => iced::widget::shader(ThumbnailCell::new(cell))
+                        .width(Length::Fill)
+                        .height(Length::Fill)
+                        .into(),
+                    None => space().into(),
+                };
                 line = line.push(
-                    container(space())
+                    container(inner)
                         .width(Length::Fixed(THUMBNAIL))
                         .height(Length::Fixed(THUMBNAIL))
+                        .padding(1)
                         .style(theme::body_thumbnail),
                 );
             }
         } else {
-            let chevron =
-                if node.collapsed { icon::IconName::CaretRight } else { icon::IconName::CaretDown };
+            // Folded reads as collapsed, because for the duration of the drag
+            // it IS: the rows under it are not drawn, and a chevron still
+            // pointing down over nothing would be the panel lying about its own
+            // state.
+            let chevron = if node.collapsed || facts.folded {
+                icon::IconName::CaretRight
+            } else {
+                icon::IconName::CaretDown
+            };
             line = line.push(
                 button(icon::icon(chevron, theme::ICON_INLINE, theme::TEXT_MUTE))
                     .padding(0)
@@ -2016,16 +2396,27 @@ impl Brokkr {
         // not showing is allowed -- a view mode never vetoes a structural
         // operation -- and losing the selection marker in that state would leave
         // nothing anywhere saying where the brush will land.
-        let background = match (active, facts.in_scope) {
-            (true, _) => theme::body_row_active,
-            (false, false) => theme::body_row_out_of_scope,
-            (false, true) => theme::body_row,
+        //
+        // The drop target outranks BOTH, and only while the button is down: it
+        // is the answer to "what happens if I let go now", and it is gone the
+        // instant the pointer moves off. The row it lands on is very often the
+        // active one, which is why it is an outline and not just the tint.
+        let background = match (facts.drop_into, active, facts.in_scope) {
+            (true, ..) => theme::body_row_drop_into,
+            (false, true, _) => theme::body_row_active,
+            (false, false, false) => theme::body_row_out_of_scope,
+            (false, false, true) => theme::body_row,
         };
 
-        mouse_area(
+        let row_h = self.row_height();
+        let area = mouse_area(
             container(line)
                 .padding(Padding { top: 0.0, bottom: 0.0, left: 0.0, right: theme::S1 })
                 .width(Length::Fill)
+                // Fixed, so the fraction the drag reads is a fraction of a
+                // height this panel chose rather than of whatever the content
+                // came out at. See [`ROW_H`].
+                .center_y(Length::Fixed(row_h))
                 .style(background),
         )
         .on_press(Message::BodySelected(node.id))
@@ -2047,8 +2438,42 @@ impl Brokkr {
         // rename too, where Photoshop opens layer styles. Revisit when the
         // thumbnail gains an action of its own -- increment 15 draws it, and
         // does not give it one.
-        .on_double_click(Message::BodyRenameBegan(node.id))
-        .into()
+        .on_double_click(Message::BodyRenameBegan(node.id));
+
+        if !facts.dragging {
+            // **No drag, no handler.** `on_move` takes a boxed closure, so
+            // attaching one unconditionally is a heap allocation per visible
+            // row per frame for a gesture that is not happening -- and iced
+            // would publish a message on every idle pointer move over the list.
+            return area.into();
+        }
+        // `on_enter` and `on_exit` are deliberately NOT used: the indicator is
+        // decided by the FRACTION of the way down a row the pointer is, not by
+        // crossing a row's edge, so the events that matter are the ones inside
+        // a row rather than the ones between two.
+        let area = area
+            .on_move(move |point| Message::BodyRowDragged {
+                over: index,
+                fraction: (point.y / row_h).clamp(0.0, 1.0),
+            })
+            .interaction(if facts.refusing {
+                // The third indicator, and the one every shipped tree drag gets
+                // wrong: an illegal gap draws NOTHING, so without the cursor
+                // saying so the user reads "no line yet" as "keep going".
+                iced::mouse::Interaction::NotAllowed
+            } else {
+                iced::mouse::Interaction::Grabbing
+            });
+        area.into()
+    }
+
+    /// How tall one row of the body list is laid out.
+    ///
+    /// One answer for the panel and for the drag, because the drag divides a
+    /// pointer offset by it: two copies of this number is an indicator that
+    /// drifts from the pointer down a long list.
+    fn row_height(&self) -> f32 {
+        if self.thumbnails { ROW_H } else { ROW_H_BARE }
     }
 
     /// Which rows have the active body somewhere beneath them, by node
@@ -2176,6 +2601,89 @@ impl Brokkr {
                 row![
                     answer("Merge", Message::BodyMergeConfirmed, theme::danger_button),
                     answer("Cancel", Message::BodyMergeCancelled, theme::tool_button),
+                ]
+                .spacing(theme::S3),
+            ]
+            .spacing(theme::S4)
+            .width(Length::Fixed(420.0)),
+        )
+        .padding(theme::S5)
+        .style(theme::menu_card);
+
+        modal_layer(card)
+    }
+
+    /// "This body is N loose parts. Here is what pressing Split would leave."
+    ///
+    /// **The count is the whole card**, and it is why this one is raised
+    /// unconditionally where the delete and merge cards are raised on a size.
+    /// Nothing in the panel can tell a user whether a body is one shell or four
+    /// thousand, so a split that just ran would be an operation whose result is
+    /// its own first piece of information -- on a document that now has sixty
+    /// new rows in it.
+    ///
+    /// The second line is the sweep, and it names WHICH rule did it. "The rest
+    /// are specks" and "your document has room for nine more rows" send a
+    /// reader to completely different remedies, and only the second one can be
+    /// answered by tidying up and pressing again.
+    fn split_card<'a>(&'a self, pending: &'a super::PendingSplit) -> Element<'a, Message> {
+        type ButtonStyle = fn(&iced::Theme, button::Status) -> button::Style;
+        let answer = |label: &'static str, message: Message, style: ButtonStyle| {
+            button(text(label).size(theme::TEXT_SIZE))
+                .padding(Padding {
+                    top: theme::S2,
+                    bottom: theme::S2,
+                    left: theme::S5,
+                    right: theme::S5,
+                })
+                .style(style)
+                .on_press(message)
+        };
+
+        let plan = &pending.plan;
+        let detail = if plan.has_fragments() {
+            let why = if plan.capped {
+                format!(
+                    "the document has room for only {} more bodies out of {}",
+                    plan.kept,
+                    brokkr_core::MAX_BODIES,
+                )
+            } else {
+                format!("they are all under {:.0} mm³", brokkr_core::SIGNIFICANT_MM3)
+            };
+            format!(
+                "The largest {} become bodies of their own, down to {:.1} mm³. The other {} go \
+                 into one \u{201c}{} fragments\u{201d} body, because {why}.",
+                plan.kept,
+                plan.smallest_kept_mm3(),
+                plan.swept(),
+                pending.name,
+            )
+        } else {
+            format!(
+                "Each one becomes a body of its own, the largest {:.1} mm³ and the smallest \
+                 {:.1} mm³.",
+                plan.parts.first().map_or(0.0, |part| part.mm3),
+                plan.smallest_kept_mm3(),
+            )
+        };
+
+        let card = container(
+            column![
+                text(format!("{} is {} loose parts.", pending.name, plan.found()))
+                    .size(theme::TEXT_SIZE)
+                    .color(theme::TEXT),
+                text(detail).size(theme::CAPTION_SIZE).color(theme::TEXT_MUTE),
+                text(if plan.bodies() == 1 {
+                    "One body replaces it, and one undo puts it back.".to_string()
+                } else {
+                    format!("{} bodies replace it, and one undo puts it back.", plan.bodies())
+                })
+                .size(theme::CAPTION_SIZE)
+                .color(theme::TEXT_MUTE),
+                row![
+                    answer("Split", Message::BodySplitConfirmed, theme::danger_button),
+                    answer("Cancel", Message::BodySplitCancelled, theme::tool_button),
                 ]
                 .spacing(theme::S3),
             ]
@@ -2464,4 +2972,44 @@ fn modal_layer<'a>(card: impl Into<Element<'a, Message>>) -> Element<'a, Message
             .align_y(Alignment::Center)
             .style(theme::scrim),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The drop line lands ON the depth it names, not between two depths.
+    ///
+    /// **The one thing about this panel a headless test can still check and the
+    /// eye cannot easily.** The line and the rows are laid out by different
+    /// widgets: the rows get their offset from a marker, an indent and the
+    /// `row`'s own spacing, and the line gets it from a single space. When they
+    /// disagree the failure is 6 px of ambiguity in the only signal that
+    /// distinguishes "stay in the folder" from "come out" -- exactly the
+    /// complaint section 3 of the plan is written against, and small enough to
+    /// survive a visual pass.
+    ///
+    /// The expectation is spelled out from `body_row`'s children rather than
+    /// calling [`row_content_x`] twice: this fails if either side moves.
+    #[test]
+    fn the_drop_line_starts_where_the_row_it_names_starts() {
+        for depth in 0..brokkr_core::MAX_DEPTH {
+            // `row![marker, indent].spacing(S2)`, walked left to right: the
+            // marker, the spacing after it, the indent, and the spacing before
+            // the first real column.
+            let mut row_content = MARKER;
+            row_content += theme::S2;
+            row_content += f32::from(depth) * INDENT_PER_DEPTH;
+            row_content += theme::S2;
+
+            assert_eq!(
+                row_content_x(depth),
+                row_content,
+                "the drop line at depth {depth} does not start where a depth-{depth} row does"
+            );
+        }
+
+        // And one step per level, so no two depths can draw in the same place.
+        assert_eq!(row_content_x(1) - row_content_x(0), INDENT_PER_DEPTH);
+    }
 }

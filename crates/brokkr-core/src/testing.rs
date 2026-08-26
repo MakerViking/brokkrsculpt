@@ -9,6 +9,9 @@
 //! `tests/hostile_meshes.rs` carries its own copy of [`Noise`]. That is a
 //! duplication the compilation model forces rather than one worth removing.
 
+use crate::brick::{Brick, BrickCoord};
+use crate::volume::Volume;
+
 /// A seeded xorshift.
 ///
 /// Hand rolled rather than pulled in: `rand` is not a dependency of this
@@ -39,5 +42,40 @@ impl Noise {
 
     pub fn byte(&mut self) -> u8 {
         (self.next() >> 24) as u8
+    }
+}
+
+/// Assert two volumes hold the same field, brick for brick.
+///
+/// Compared through the storage rather than by sampling every voxel,
+/// which makes it a memcmp per brick instead of a hash lookup per voxel.
+/// The representation has to match too: a brick the unskipped path made
+/// dense and then found it had not changed is rolled back to the tile it
+/// was, so a difference there would mean one path is leaving 128 KB behind.
+///
+/// Shared rather than copied because the plane cut needs exactly the
+/// comparison the brush's skipping tests need -- "bit-identical" is the same
+/// claim whichever operation is making it, and two copies of it would drift.
+pub fn assert_same_field(a: &Volume, b: &Volume, what: &str) {
+    let mut left: Vec<BrickCoord> = a.brick_coords().collect();
+    let mut right: Vec<BrickCoord> = b.brick_coords().collect();
+    left.sort();
+    right.sort();
+    assert_eq!(left, right, "{what}: different bricks are stored");
+
+    for coord in left {
+        match (a.brick(coord), b.brick(coord)) {
+            (Some(Brick::Uniform(x)), Some(Brick::Uniform(y))) => {
+                assert_eq!(x, y, "{what}: tile {coord:?} differs");
+            }
+            (Some(Brick::Dense(x)), Some(Brick::Dense(y))) => {
+                assert!(x[..] == y[..], "{what}: brick {coord:?} differs");
+            }
+            (x, y) => panic!(
+                "{what}: brick {coord:?} is stored differently: {:?} against {:?}",
+                x.map(|brick| matches!(brick, Brick::Dense(_))),
+                y.map(|brick| matches!(brick, Brick::Dense(_))),
+            ),
+        }
     }
 }

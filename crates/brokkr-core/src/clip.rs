@@ -26,13 +26,35 @@
 //! cost nothing: a brick wholly on the keep side is not touched at all, and one
 //! wholly on the cut side is dropped whatever it contained. That is the same
 //! shape `resample` uses, and for the same reason.
+//!
+//! # The mask cuts too
+//!
+//! A cut is direct manipulation -- a line drawn across what is on screen -- so
+//! it answers to the mask exactly as a brush does, and for the same reason a
+//! brush does: the user said this part is not to change.
+//!
+//! That costs the classification one arm. **[`Cut::Removes`] is all-or-nothing
+//! and cannot be masked**, because the way it removes is to drop the brick out
+//! of the map entirely, and a dropped brick has no voxels left to protect. So a
+//! brick the plane would take whole is downgraded to [`Cut::Crosses`] whenever
+//! its resolved mask fill is not uniformly free, which sends it through the per
+//! voxel path where a protected voxel gets its own value written straight back.
+//! Fully protected, that path is skipped in turn and the brick stays exactly
+//! where it is -- the whole point, since `remove_brick` would otherwise delete a
+//! masked brick and report the field bit-identical only because there is nothing
+//! left of it to compare.
+//!
+//! An unmasked body never reaches any of this: the mask is resolved once for the
+//! whole volume, and a body that protects nothing anywhere takes the same
+//! branches, and writes the same bits, as it did before masks existed.
 
 use glam::{IVec3, Vec3};
 
 use crate::body::{Document, NodeId};
 use crate::brick::{BRICK_DIM, Brick, BrickCoord, INSIDE, NARROW_BAND, OUTSIDE, brick_index};
+use crate::mask::{MaskField, UNMASKED};
 use crate::undo::{Change, Entry};
-use crate::volume::Volume;
+use crate::volume::{Freedom, Volume};
 
 /// A half-space to cut away.
 ///
@@ -70,8 +92,13 @@ impl ClipPlane {
     ///
     /// The distance is linear, so the extremes are at opposite corners and can
     /// be had from the centre and the half extent without visiting all eight.
+    ///
+    /// `pub(crate)` for [`crate::generate`]'s half-space mask, which is the
+    /// same classification writing protection instead of distance -- and
+    /// sharing it is the point: a second copy of this arithmetic would let the
+    /// mask and the cut disagree about which bricks a plane touches.
     #[inline]
-    fn range_over_box(&self, centre: Vec3, half: Vec3) -> (f32, f32) {
+    pub(crate) fn range_over_box(&self, centre: Vec3, half: Vec3) -> (f32, f32) {
         let middle = self.distance(centre);
         let reach = half.x * self.normal.x.abs()
             + half.y * self.normal.y.abs()
@@ -91,18 +118,109 @@ enum Cut {
     Crosses,
 }
 
+/// What a plane cut did to ONE body's bricks.
+///
+/// **Two counts and not one**, because a brick the mask kept whole and a brick
+/// the plane never reached are the same zero to the caller and completely
+/// different things to the user: the first means "your mask stopped this", the
+/// second means "your line missed". [`Document::clip`] carries both up so
+/// the status line can tell them apart.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ClipCounts {
+    /// Bricks whose contents changed.
+    pub changed: usize,
+    /// Bricks the mask kept WHOLE that the cut would otherwise have changed.
+    ///
+    /// Only fully protected bricks are counted, and only after checking that
+    /// the cut really had something to do in them -- see
+    /// [`cut_would_change_a_voxel`]. A brick the mask merely thinned is in
+    /// [`ClipCounts::changed`], where it belongs, and a fully protected brick
+    /// the plane only grazed is in neither, so "the mask blocked the cut" is
+    /// never said about a cut that had nothing to remove anyway.
+    pub spared_by_mask: usize,
+}
+
+/// Whether the cut would move any voxel of a brick it is not allowed to touch.
+///
+/// A read-only pass, and it is worth its cost precisely because it is the
+/// alternative to guessing: without it a fully protected brick that the plane
+/// merely grazed inside the band -- one where `max` would have changed nothing
+/// even unmasked -- would be reported as spared, and the status line would tell
+/// the user their mask stopped a cut that had nothing to stop.
+///
+/// It costs one brick's worth of reads and no allocation, against the dense
+/// promotion plus 128 KB undo record that actually writing the brick would
+/// cost, and it returns at the first voxel that moves.
+fn cut_would_change_a_voxel(
+    brick: &Brick,
+    origin: IVec3,
+    voxel_size: f32,
+    plane: ClipPlane,
+) -> bool {
+    for z in 0..BRICK_DIM {
+        for y in 0..BRICK_DIM {
+            for x in 0..BRICK_DIM {
+                let at = (origin + IVec3::new(x as i32, y as i32, z as i32)).as_vec3() * voxel_size;
+                let old = brick.get(x, y, z);
+                if cut_voxel(old, plane.distance(at) / voxel_size, 1.0) != old {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+/// One voxel's new distance: the cut, admitted by as much of itself as the mask
+/// lets through.
+///
+/// `free` is the mask factor in `0..=1` -- 1 is unprotected and 0 is fully
+/// protected -- and the blend is toward `old.max(cut)`, so the result always
+/// lies between the voxel's own value and the value an unmasked cut would have
+/// given it. A cut can therefore only ever remove less through a mask, never
+/// more and never something else.
+///
+/// **The clamp is not optional.** `cut` is `plane.distance(at) / voxel_size`
+/// and is unbounded -- a plane a metre away from a quarter millimetre voxel
+/// gives four thousand -- so without it a `free` of 1 writes a distance far
+/// outside the narrow band into the field, which the project loader then
+/// refuses on the next open.
+///
+/// # Why `free == 1` takes the plain `max` instead of the blend
+///
+/// Byte identity, not speed. `old + (m - old) * 1.0` is not `m` in binary
+/// floating point whenever `m - old` rounds: over five million random pairs
+/// with `old` in the band and the cut within a few voxels of it, 65,040 of them
+/// came out one bit different AFTER the clamp. Running an unmasked cut through
+/// the blend would therefore change the last bit of voxels in bricks nothing was
+/// masking, in every model, on the first build that shipped masking.
+#[inline]
+fn cut_voxel(old: f32, cut: f32, free: f32) -> f32 {
+    let target = old.max(cut);
+    let new = if free >= 1.0 { target } else { old + (target - old) * free };
+    new.clamp(INSIDE, OUTSIDE)
+}
+
 impl Volume {
     /// Cut away everything on the normal side of `plane`.
     ///
-    /// Returns how many bricks changed, which is zero when the plane misses the
-    /// model entirely -- worth checking, because a cut that did nothing should
-    /// not become an undo entry.
+    /// Returns how many bricks changed and how many the mask kept whole. Both
+    /// are zero when the plane misses the model entirely -- worth checking,
+    /// because a cut that did nothing should not become an undo entry.
     ///
     /// Bracket a call in [`Volume::begin_stroke`] and [`Volume::end_stroke`] to
     /// make it undoable, exactly as a brush stroke is. Only bricks that really
     /// change are recorded, so cutting a corner off a large model costs an undo
     /// entry proportional to the corner rather than to the model.
-    pub fn clip(&mut self, plane: ClipPlane) -> usize {
+    pub fn clip(&mut self, plane: ClipPlane) -> ClipCounts {
+        self.with_mask_lifted(|volume, mask| volume.clip_masked(plane, mask))
+    }
+
+    /// The cut proper, with the mask already lifted off the volume.
+    ///
+    /// Split out only so that [`Volume::with_mask_lifted`] can hold the mask
+    /// across it; everything the cut does is here.
+    fn clip_masked(&mut self, plane: ClipPlane, mask: Option<&MaskField>) -> ClipCounts {
         let voxel_size = self.voxel_size();
         let band_mm = NARROW_BAND * voxel_size;
         let brick_mm = BRICK_DIM as f32 * voxel_size;
@@ -111,7 +229,7 @@ impl Volume {
         let half = Vec3::splat(0.5 * (brick_mm - voxel_size));
 
         let coords: Vec<BrickCoord> = self.brick_coords().collect();
-        let mut changed = 0usize;
+        let mut counts = ClipCounts::default();
         let mut touched: Vec<BrickCoord> = Vec::new();
 
         for coord in coords {
@@ -119,13 +237,25 @@ impl Volume {
             let centre = origin.as_vec3() * voxel_size + half;
             let (nearest, farthest) = plane.range_over_box(centre, half);
 
-            let verdict = if nearest >= band_mm {
+            let mut verdict = if nearest >= band_mm {
                 Cut::Removes
             } else if farthest <= -band_mm {
                 Cut::Keeps
             } else {
                 Cut::Crosses
             };
+
+            // Removing is dropping the brick, which cannot be done by halves, so
+            // anything the mask has to say about this brick sends it down the
+            // per voxel path instead. `protection_fill` is the RESOLVED
+            // protection and not the stored byte, so an empty map under
+            // inversion -- which is exactly what Mask All is -- downgrades here
+            // as it must.
+            if verdict == Cut::Removes
+                && mask.is_some_and(|mask| mask.protection_fill(coord) != Some(UNMASKED))
+            {
+                verdict = Cut::Crosses;
+            }
 
             match verdict {
                 // The plane's own contribution is already saturated positive
@@ -135,16 +265,34 @@ impl Volume {
                 Cut::Removes => {
                     self.record_for_undo(coord);
                     self.remove_brick(coord);
-                    changed += 1;
+                    counts.changed += 1;
                     touched.push(coord);
                 }
                 // `max(field, plane)` is `field` everywhere in here. Touching it
                 // would cost a dense promotion and an undo entry for no change.
                 Cut::Keeps => {}
                 Cut::Crosses => {
-                    if self.brick(coord).is_none() {
-                        // Absent already reads as OUTSIDE, and `max` cannot
+                    let Some(present) = self.brick(coord) else {
+                        // Absent already reads as OUTSIDE, and no `free` can
                         // lower it, so there is nothing a cut can do here.
+                        continue;
+                    };
+                    // Resolved once for the whole brick, exactly as the brush's
+                    // `write_voxels` resolves it, so an unmasked body and a body
+                    // whose mask collapsed this brick to a tile both pay nothing
+                    // per voxel.
+                    let freedom = Freedom::resolve(mask, coord);
+                    let uniform = freedom.uniform();
+                    if uniform.is_some_and(|free| free <= 0.0) {
+                        // Fully protected. The loop below would write every
+                        // voxel back exactly as it found it, after promoting the
+                        // brick to dense and recording 128 KB of undo for it, so
+                        // the brick is left alone entirely -- which is also what
+                        // keeps a downgraded `Removes` brick present instead of
+                        // deleted.
+                        if cut_would_change_a_voxel(present, origin, voxel_size, plane) {
+                            counts.spared_by_mask += 1;
+                        }
                         continue;
                     }
                     // Recorded before the brick is taken, because the recorder
@@ -167,7 +315,11 @@ impl Volume {
                                 // the cut by a factor of the voxel size.
                                 let slot = brick_index(x, y, z);
                                 let cut = plane.distance(at) / voxel_size;
-                                data[slot] = data[slot].max(cut).clamp(INSIDE, OUTSIDE);
+                                let free = match uniform {
+                                    Some(free) => free,
+                                    None => freedom.at(slot),
+                                };
+                                data[slot] = cut_voxel(data[slot], cut, free);
                             }
                         }
                     }
@@ -181,7 +333,7 @@ impl Volume {
                         Some(value) => self.insert_brick(coord, Brick::Uniform(value)),
                         None => self.insert_brick(coord, brick),
                     }
-                    changed += 1;
+                    counts.changed += 1;
                     touched.push(coord);
                 }
             }
@@ -195,7 +347,7 @@ impl Volume {
             self.mark_dirty_voxel_range(origin, coord.max_voxel());
             let _ = origin;
         }
-        changed
+        counts
     }
 }
 
@@ -214,6 +366,22 @@ pub struct CutOutcome {
     /// Bodies the half-space reached at all, whether or not it found anything
     /// there to remove. Always at least `bodies_cut`.
     pub bodies_crossed: usize,
+    /// Bricks the mask kept whole, summed over every body.
+    ///
+    /// **This is what stops a fully masked body reporting "the cut missed the
+    /// model".** A cut the mask blocked entirely produces `bricks == 0` exactly
+    /// as a cut that went nowhere near anything does, and those two read
+    /// completely differently to whoever drew the line: one of them is a mask
+    /// doing its job and the other is a gesture to try again.
+    pub bricks_spared_by_mask: usize,
+    /// The bodies that spared at least one brick, in node order.
+    ///
+    /// A list rather than a count because the message names the body -- "the
+    /// mask on Left Ear blocked the cut" is actionable and "a mask blocked the
+    /// cut" leaves the user hunting through the panel for which one. Empty
+    /// whenever nothing was spared, so it allocates only on a cut a mask really
+    /// did block.
+    pub bodies_spared_by_mask: Vec<NodeId>,
     /// **ONE entry for the whole gesture**, or `None` when nothing changed.
     ///
     /// It is built here rather than handed back as a list of changes for the
@@ -245,8 +413,8 @@ impl Document {
     /// what keeps a cut across a two-body document from costing a full scan of
     /// the dragon sitting behind it.
     ///
-    /// [`Volume::clip`] itself is unchanged and still returns one `usize`; this
-    /// sums them.
+    /// [`Volume::clip`] itself still cuts one body; this sums what each of them
+    /// reports, both the bricks that changed and the bricks a mask kept whole.
     pub fn clip(&mut self, plane: ClipPlane, visible: &[bool]) -> CutOutcome {
         debug_assert_eq!(
             visible.len(),
@@ -273,8 +441,14 @@ impl Document {
             })
             .collect();
 
-        let mut outcome =
-            CutOutcome { bricks: 0, bodies_cut: 0, bodies_crossed: crossed.len(), entry: None };
+        let mut outcome = CutOutcome {
+            bricks: 0,
+            bodies_cut: 0,
+            bodies_crossed: crossed.len(),
+            bricks_spared_by_mask: 0,
+            bodies_spared_by_mask: Vec::new(),
+            entry: None,
+        };
         let mut changes = Vec::new();
 
         for body in crossed {
@@ -282,13 +456,20 @@ impl Document {
                 continue;
             };
             volume.begin_stroke();
-            let bricks = volume.clip(plane);
+            let counts = volume.clip(plane);
             let edit = volume.end_stroke();
+            // Counted whatever else happened in this body: a cut that removed
+            // half a body and was blocked on the other half spared bricks just
+            // as much as one that was blocked outright.
+            if counts.spared_by_mask > 0 {
+                outcome.bricks_spared_by_mask += counts.spared_by_mask;
+                outcome.bodies_spared_by_mask.push(body);
+            }
             // The recorder is the authority on whether anything changed: a
             // count with no edit behind it would push an entry that restores
             // nothing.
             if let Some(edit) = edit.filter(|edit| !edit.is_empty()) {
-                outcome.bricks += bricks;
+                outcome.bricks += counts.changed;
                 outcome.bodies_cut += 1;
                 changes.push(Change::Bricks { body, edit });
             }
@@ -321,7 +502,7 @@ mod tests {
     fn a_cut_removes_the_side_the_normal_points_at() {
         let mut volume = ball();
         let plane = ClipPlane::new(Vec3::ZERO, Vec3::X).expect("a unit normal");
-        assert!(volume.clip(plane) > 0, "the cut did nothing");
+        assert!(volume.clip(plane).changed > 0, "the cut did nothing");
 
         assert!(
             volume.sample_world(Vec3::new(10.0, 0.0, 0.0)) > 0.0,
@@ -355,7 +536,7 @@ mod tests {
     fn an_oblique_cut_is_also_watertight() {
         let mut volume = ball();
         let plane = ClipPlane::new(Vec3::new(2.0, -1.0, 3.0), Vec3::new(1.0, 2.0, -0.5)).unwrap();
-        assert!(volume.clip(plane) > 0);
+        assert!(volume.clip(plane).changed > 0);
 
         let (_, report) = volume.export_mesh();
         assert!(report.is_printable(), "an oblique cut is not printable: {}", report.summary());
@@ -388,7 +569,7 @@ mod tests {
         let before: Vec<BrickCoord> = volume.brick_coords().collect();
         let plane = ClipPlane::new(Vec3::new(500.0, 0.0, 0.0), Vec3::X).unwrap();
 
-        assert_eq!(volume.clip(plane), 0, "a plane far outside the model changed bricks");
+        assert_eq!(volume.clip(plane).changed, 0, "a plane far outside the model changed bricks");
         assert_eq!(volume.brick_coords().count(), before.len());
     }
 
@@ -482,7 +663,7 @@ mod tests {
             let point = Vec3::splat(index as f32 * 0.7 - 2.0);
             let mut volume = ball();
             let plane = ClipPlane::new(point, normal).unwrap();
-            assert!(volume.clip(plane) > 0, "plane {index} cut nothing");
+            assert!(volume.clip(plane).changed > 0, "plane {index} cut nothing");
 
             let (_, report) = volume.export_mesh();
             assert!(
@@ -713,5 +894,332 @@ mod provenance {
         );
         assert_eq!(fast_report.boundary_edges, naive_report.boundary_edges);
         assert_eq!(fast_report.triangles, naive_report.triangles);
+    }
+
+    /// An unmasked cut writes EXACTLY what the plain `max` wrote, voxel for
+    /// voxel.
+    ///
+    /// The regression this exists for is the one masking creates. The write is
+    /// now `old + (max(old, cut) - old) * free`, and at a `free` of 1 that is
+    /// **not** `max(old, cut)` in binary floating point: `max - old` rounds, and
+    /// adding `old` back does not always recover it. Measured before the branch
+    /// that avoids it was written -- over five million random pairs with `old`
+    /// in the band and the cut within a few voxels of it, 65,040 came out one
+    /// bit different after the clamp. That is a change to every model anyone
+    /// ever cut, in bricks nothing was masking, and the mesh-report comparison
+    /// above would not see a bit of it.
+    ///
+    /// Compared against `edit_voxels` running the old expression rather than
+    /// against a stored fixture, because the claim is about the arithmetic and
+    /// a fixture would also pin the brick layout, the seeding and the mesher.
+    #[test]
+    fn an_unmasked_cut_writes_exactly_what_the_plain_max_wrote() {
+        /// A cell's value however it is stored. An absent brick reads as
+        /// [`OUTSIDE`], which is what makes the two sides comparable at all:
+        /// the cut drops a brick the naive pass fills with `OUTSIDE`.
+        fn voxel(volume: &Volume, cell: IVec3) -> f32 {
+            let coord = BrickCoord::containing(cell);
+            let local = cell - coord.origin();
+            volume.brick(coord).map_or(OUTSIDE, |brick| {
+                brick.get(local.x as usize, local.y as usize, local.z as usize)
+            })
+        }
+
+        // Oblique, so the plane's distance lands on no lattice value twice and
+        // the rounding this is about actually happens.
+        let plane = ClipPlane::new(Vec3::new(2.0, -1.0, 3.0), Vec3::new(1.0, 2.0, -0.5)).unwrap();
+
+        let mut cut = Volume::new(0.5);
+        cut.seed_sphere(Vec3::ZERO, 20.0);
+        cut.mark_everything_dirty();
+        assert!(cut.clip(plane).changed > 0, "the fixture was not cut");
+
+        let mut naive = Volume::new(0.5);
+        naive.seed_sphere(Vec3::ZERO, 20.0);
+        naive.mark_everything_dirty();
+        let voxel_size = naive.voxel_size();
+        let (lo, hi) = naive.voxel_bounds(Vec3::splat(-30.0), Vec3::splat(30.0));
+        naive.edit_voxels(lo, hi, |_, position, value| {
+            value.max(plane.distance(position) / voxel_size).clamp(INSIDE, OUTSIDE)
+        });
+
+        let mut differing = 0usize;
+        let mut worst = None;
+        for z in lo.z..=hi.z {
+            for y in lo.y..=hi.y {
+                for x in lo.x..=hi.x {
+                    let cell = IVec3::new(x, y, z);
+                    let (theirs, ours) = (voxel(&naive, cell), voxel(&cut, cell));
+                    if theirs.to_bits() != ours.to_bits() {
+                        differing += 1;
+                        worst.get_or_insert((cell, theirs, ours));
+                    }
+                }
+            }
+        }
+        assert_eq!(
+            differing, 0,
+            "an unmasked cut no longer writes what the plain max wrote: {differing} voxels \
+             differ, first at {worst:?}"
+        );
+    }
+}
+
+/// The cut through a mask, which is where "direct manipulation acts on what is
+/// drawn" meets "the user said this part is not to change".
+///
+/// **Every test here is written new**, because not one of the cut's existing
+/// tests can fail under a mask bug: they all run on fixtures carrying no mask,
+/// where an inverted sense, a slab fetched for the wrong brick and the mask
+/// ignored entirely all produce identical output.
+#[cfg(test)]
+mod through_a_mask {
+    use super::*;
+    use crate::mask::PROTECTED;
+    use crate::testing::assert_same_field;
+
+    const VOXEL: f32 = 0.5;
+    const RADIUS: f32 = 20.0;
+
+    fn ball() -> Volume {
+        let mut volume = Volume::new(VOXEL);
+        volume.seed_sphere(Vec3::ZERO, RADIUS);
+        volume.mark_everything_dirty();
+        volume
+    }
+
+    /// Mask All: an empty map read inverted, which protects every voxel there
+    /// is in O(1) time and no memory at all.
+    ///
+    /// The most-used masking state there is, and the one an "absent means free"
+    /// reading of the mask cuts straight through -- so it is the state worth
+    /// testing the cut against rather than a hand-painted region.
+    fn mask_everything(volume: &mut Volume) {
+        volume.mask_mut().set_inverted(true);
+    }
+
+    /// Protection feathered along X: free below -2 mm, fully protected above
+    /// +2 mm, and a ramp in between.
+    ///
+    /// **Feathered and not a step**, which is the rule every path that writes a
+    /// mask is held to -- see [`crate::mask`]. The box covers every voxel that
+    /// can hold material, so no part of the model is protected only by accident
+    /// of where the writing stopped.
+    fn protect_the_positive_x_half(volume: &mut Volume) {
+        let voxel_size = volume.voxel_size();
+        let reach = RADIUS + 4.0;
+        let (lo, hi) = volume.voxel_bounds(Vec3::splat(-reach), Vec3::splat(reach));
+        for z in lo.z..=hi.z {
+            for y in lo.y..=hi.y {
+                for x in lo.x..=hi.x {
+                    let ramp = ((x as f32 * voxel_size + 2.0) / 4.0).clamp(0.0, 1.0);
+                    let protection = (ramp * PROTECTED as f32).round() as u8;
+                    volume.mask_mut().write(IVec3::new(x, y, z), protection);
+                }
+            }
+        }
+        volume.mask_mut().collapse();
+    }
+
+    /// The headline. A cut straight through a fully masked body leaves the
+    /// field bit-identical AND leaves every brick where it was.
+    ///
+    /// The second half is the one the classification can get wrong on its own:
+    /// `Cut::Removes` drops the brick out of the map, and a dropped brick would
+    /// make "the field is unchanged" vacuously true over the bricks that were
+    /// left. The `Removes` to `Crosses` downgrade is what stops it.
+    #[test]
+    fn a_cut_through_a_fully_masked_body_leaves_the_field_and_every_brick_alone() {
+        let plane = ClipPlane::new(Vec3::ZERO, Vec3::X).expect("a unit normal");
+
+        // The control. Without it a mask that did nothing and a cut that did
+        // nothing would look the same from here.
+        let mut unmasked = ball();
+        let plain = unmasked.clip(plane);
+        assert!(plain.changed > 0, "the fixture is not cut by this plane at all");
+        assert!(
+            unmasked.brick_count() < ball().brick_count(),
+            "the fixture has no brick this plane removes WHOLE, so the downgrade is untested"
+        );
+        assert_eq!(plain.spared_by_mask, 0, "an unmasked cut reported bricks spared by a mask");
+
+        let mut volume = ball();
+        mask_everything(&mut volume);
+        let counts = volume.clip(plane);
+
+        assert_eq!(counts.changed, 0, "a fully masked body was cut anyway");
+        assert!(counts.spared_by_mask > 0, "the mask blocked the cut and reported nothing spared");
+        assert_eq!(
+            volume.brick_count(),
+            ball().brick_count(),
+            "a masked brick was removed rather than spared"
+        );
+        assert_same_field(&volume, &ball(), "a cut straight through a fully masked body");
+    }
+
+    /// A blocked cut records no undo entry, because it promoted nothing and
+    /// wrote nothing.
+    ///
+    /// Separate from the field check on purpose: writing every voxel back as it
+    /// was would pass that one while costing a dense promotion and 128 KB of
+    /// undo per brick along the plane.
+    #[test]
+    fn a_fully_masked_cut_records_no_undo_entry_and_promotes_no_brick() {
+        let mut volume = ball();
+        let dense_before = volume.stats().dense_bricks;
+        mask_everything(&mut volume);
+
+        volume.begin_stroke();
+        volume.clip(ClipPlane::new(Vec3::ZERO, Vec3::X).unwrap());
+        let edit = volume.end_stroke();
+
+        assert!(
+            edit.is_none_or(|edit| edit.is_empty()),
+            "a cut that changed nothing recorded an undo entry"
+        );
+        assert_eq!(
+            volume.stats().dense_bricks,
+            dense_before,
+            "a blocked cut promoted bricks to dense"
+        );
+    }
+
+    /// The mask spares nothing from a cut that had nothing left to remove.
+    ///
+    /// This is what [`cut_would_change_a_voxel`] buys, and it is worth a test
+    /// because the cheap version -- count every fully protected brick the plane
+    /// crosses -- passes every other test here and then tells the user their
+    /// mask blocked a cut that would have done nothing anyway. A plane applied
+    /// twice is the exact case: `max` is idempotent, so the second cut has
+    /// nothing to do in any brick, and the bricks along the cut face are still
+    /// there for it to cross.
+    #[test]
+    fn a_mask_spares_nothing_from_a_cut_that_had_nothing_left_to_remove() {
+        let plane = ClipPlane::new(Vec3::ZERO, Vec3::X).unwrap();
+        let mut volume = ball();
+        assert!(volume.clip(plane).changed > 0, "the first cut did nothing");
+
+        mask_everything(&mut volume);
+        let again = volume.clip(plane);
+
+        assert_eq!(again.changed, 0, "cutting twice with the same plane is not idempotent");
+        assert_eq!(
+            again.spared_by_mask, 0,
+            "the mask claimed to have blocked a cut that had nothing to remove"
+        );
+    }
+
+    /// Half masked: the cut removes the unmasked half and leaves the other one,
+    /// and what it leaves behind still prints.
+    ///
+    /// The cut face is no longer a plane -- it is the plane where the mask is
+    /// free, the old surface where the mask is solid, and a curve between the
+    /// two through the feather -- which is exactly the rim that makes this worth
+    /// checking. `is_printable` and not manifoldness: an oblique cut rim
+    /// legitimately leaves a handful of four-way edges, a feathered one is more
+    /// dihedral still, and OrcaSlicer reports both as manifold.
+    #[test]
+    fn a_cut_through_a_half_masked_body_removes_only_the_unmasked_half() {
+        let mut volume = ball();
+        protect_the_positive_x_half(&mut volume);
+        // Facing +Y, so the top goes -- except where the mask says otherwise.
+        let counts = volume.clip(ClipPlane::new(Vec3::ZERO, Vec3::Y).unwrap());
+        assert!(counts.changed > 0, "the cut did nothing at all");
+
+        assert!(
+            volume.sample_world(Vec3::new(-10.0, 10.0, 0.0)) > 0.0,
+            "the unmasked half survived the cut"
+        );
+        assert!(
+            volume.sample_world(Vec3::new(10.0, 10.0, 0.0)) < 0.0,
+            "the mask did not protect its half"
+        );
+        assert!(
+            volume.sample_world(Vec3::new(0.0, -10.0, 0.0)) < 0.0,
+            "the kept side of the plane went as well"
+        );
+
+        let (mesh, report) = volume.export_mesh();
+        assert!(
+            report.is_printable(),
+            "a feathered cut rim is not printable: {} ({} triangles)",
+            report.summary(),
+            mesh.triangles.len()
+        );
+
+        // All three formats, because the rim is the input each writer is least
+        // likely to have been tried on.
+        let mut stl = Vec::new();
+        crate::export::stl::write(&mesh, &mut stl).expect("the STL writer refused a masked cut");
+        let mut obj = Vec::new();
+        crate::export::obj::write(&mesh, &mut obj).expect("the OBJ writer refused a masked cut");
+        let mut threemf = Vec::new();
+        crate::export::threemf::write(&mesh, &mut threemf)
+            .expect("the 3MF writer refused a masked cut");
+        for (format, bytes) in [("STL", stl), ("OBJ", obj), ("3MF", threemf)] {
+            assert!(!bytes.is_empty(), "the {format} writer produced nothing");
+        }
+    }
+
+    /// The mask multiplies the cut rather than replacing it, so a partly
+    /// protected voxel ends up between where it was and where the cut would
+    /// have put it -- never past either.
+    ///
+    /// The guard against the arithmetic drifting into something that
+    /// extrapolates, which is the same rule the brush weight is held to and for
+    /// the same reason.
+    #[test]
+    fn a_masked_voxel_lands_between_its_old_value_and_the_unmasked_cut() {
+        for old in [INSIDE, -1.5, 0.0, 1.5, OUTSIDE] {
+            for cut in [-9000.0, -2.0, 0.0, 2.0, 9000.0] {
+                let unmasked = cut_voxel(old, cut, 1.0);
+                for step in 0..=255u32 {
+                    let free = step as f32 / 255.0;
+                    let got = cut_voxel(old, cut, free);
+                    let (low, high) = (old.min(unmasked), old.max(unmasked));
+                    assert!(
+                        (low..=high).contains(&got),
+                        "old {old}, cut {cut}, free {free} left the band: {got} is outside \
+                         {low}..={high}"
+                    );
+                    assert!(
+                        (INSIDE..=OUTSIDE).contains(&got),
+                        "old {old}, cut {cut}, free {free} wrote {got} outside the narrow band"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Across the document: a fully masked body is CROSSED and not cut, and its
+    /// spared bricks are reported against it by name.
+    #[test]
+    fn the_document_reports_which_body_a_mask_blocked_the_cut_on() {
+        let mut first = Volume::new(VOXEL);
+        first.seed_sphere(Vec3::new(-15.0, 0.0, 0.0), 8.0);
+        first.mark_everything_dirty();
+        let mut doc = Document::from_volume(first);
+
+        let mut second = Volume::new(VOXEL);
+        second.seed_sphere(Vec3::new(15.0, 0.0, 0.0), 8.0);
+        second.mark_everything_dirty();
+        doc.add_body("Body 2", second);
+
+        let ids: Vec<NodeId> = doc.bodies().map(|(id, _)| id).collect();
+        mask_everything(doc.volume_mut(ids[1]).expect("the second body"));
+
+        let mut visible = Vec::new();
+        doc.display_visibility(None, &mut visible);
+        let outcome = doc.clip(ClipPlane::new(Vec3::ZERO, Vec3::Y).unwrap(), &visible);
+
+        assert_eq!(outcome.bodies_crossed, 2);
+        assert_eq!(outcome.bodies_cut, 1, "the masked body was cut");
+        assert!(outcome.bricks > 0, "the unmasked body was spared as well");
+        assert!(outcome.bricks_spared_by_mask > 0, "the masked body reported nothing spared");
+        assert_eq!(
+            outcome.bodies_spared_by_mask,
+            vec![ids[1]],
+            "the wrong body was named, or more than one was"
+        );
     }
 }

@@ -133,7 +133,15 @@ enum Kind {
     Mixed,
 }
 
-const DIRECTIONS: [IVec3; 6] = [
+/// The six face neighbours, in the order every face table and every face index
+/// in this crate uses: `+X, -X, +Y, -Y, +Z, -Z`.
+///
+/// **The pairing is what makes the order load-bearing**: direction `d` and
+/// direction `d ^ 1` are opposites, so a brick's face `d` touches its
+/// neighbour's face `d ^ 1` at the same slot. [`crate::split`]'s serial pass
+/// walks only the three positive directions and reads the neighbour's face as
+/// `d + 1` on the strength of that.
+pub(crate) const DIRECTIONS: [IVec3; 6] = [
     IVec3::new(1, 0, 0),
     IVec3::new(-1, 0, 0),
     IVec3::new(0, 1, 0),
@@ -147,7 +155,15 @@ const DIRECTIONS: [IVec3; 6] = [
 ///
 /// Built once. Rebuilding it per brick visit was the first version and it
 /// dominated the run time.
-fn face_tables() -> [Vec<(usize, usize)>; 6] {
+///
+/// **Shared with [`crate::split`] rather than re-derived there**, because the
+/// slot ordering inside a face is the contract between the two: entry `w` of
+/// face `d` names the voxel of this brick that touches the voxel entry `w` of
+/// face `d ^ 1` names in the neighbour. A second copy of these loops that
+/// happened to iterate `b` before `a` would connect a brick to its neighbour
+/// transposed, which joins the wrong components and no assertion here would
+/// see it.
+pub(crate) fn face_tables() -> [Vec<(usize, usize)>; 6] {
     let last = BRICK_DIM - 1;
     std::array::from_fn(|d| {
         let direction = DIRECTIONS[d];
@@ -169,7 +185,7 @@ fn face_tables() -> [Vec<(usize, usize)>; 6] {
 }
 
 /// The six in-brick neighbours of a voxel, clipped to the brick.
-fn neighbours_in_brick(voxel: usize, out: &mut Vec<usize>) {
+pub(crate) fn neighbours_in_brick(voxel: usize, out: &mut Vec<usize>) {
     let last = BRICK_DIM - 1;
     let x = voxel % BRICK_DIM;
     let y = (voxel / BRICK_DIM) % BRICK_DIM;
@@ -382,6 +398,175 @@ pub(crate) fn fill_sealed_cavities(
         volume.insert_brick(coord, brick);
     }
     filled
+}
+
+/// Which of a brick's solid voxels are thin, as [`thin_voxels`] answers.
+///
+/// Two arms and not one bitmap, because a brick wholly inside a thin wall is
+/// the common case on the models this exists for -- a scanned hair strand, a
+/// fin, a lattice -- and answering it structurally is what keeps a thin-heavy
+/// model from paying 4 KB a brick for a constant.
+pub(crate) enum ThinBrick {
+    /// Every voxel of this brick is solid and thin.
+    Every,
+    /// The ones whose bit is set.
+    Some(Mask),
+}
+
+impl ThinBrick {
+    /// Whether one voxel of this brick is solid and thin.
+    #[inline]
+    pub(crate) fn has(&self, voxel: usize) -> bool {
+        match self {
+            ThinBrick::Every => true,
+            ThinBrick::Some(bits) => get(bits, voxel),
+        }
+    }
+}
+
+/// Every solid voxel more than `rounds` voxels from material at least
+/// `-2 * seed_depth` voxels thick.
+///
+/// **The whole of "mask by thickness", and it needs no new geometry code**: the
+/// seed is a depth test the stored field already answers, and the reach is
+/// [`dilate`], including the two cheap rejections it earned the hard way. Only
+/// the polarity is new, and it is bought rather than written -- the values are
+/// copied into the grid NEGATED, so `dilate`'s fixed `>= 0` passability test
+/// reads "solid or on the surface" instead of "outside or on it", and one
+/// walker serves both directions.
+///
+/// # What it can and cannot see, and why the ceiling is hard
+///
+/// A voxel is a seed when it lies at least `-seed_depth` voxels below the
+/// surface, so a wall of full thickness `t` has seeds exactly when
+/// `t >= -2 * seed_depth`, and every voxel of a wall that thick is within
+/// `-seed_depth` rounds of one. That is the entire measurement, and it
+/// saturates with the field: past `2 * NARROW_BAND` voxels every interior
+/// sample reads [`INSIDE`] and carries no depth information at all, so no seed
+/// depth beyond the band can be asked for and the caller's slider says so.
+///
+/// Returns one entry per brick that holds a thin voxel, and nothing at all for
+/// the rest.
+///
+/// # Cost
+///
+/// A copy of every dense brick, which is the peak this walk is refused on when
+/// it will not fit, plus 4 KB of bits per brick the reach touches. The copy is
+/// what `Grid` is; it exists so the volume is not borrowed while the flood
+/// writes, and it is the same cost the sealed fill pays at import.
+pub(crate) fn thin_voxels(
+    volume: &Volume,
+    seed_depth: f32,
+    rounds: usize,
+) -> Vec<(BrickCoord, ThinBrick)> {
+    let mut coords: Vec<BrickCoord> = volume.brick_coords().collect();
+    if coords.is_empty() {
+        return Vec::new();
+    }
+    coords.sort_unstable();
+    let mut lo = coords[0].0;
+    let mut hi = coords[0].0;
+    for coord in &coords {
+        lo = lo.min(coord.0);
+        hi = hi.max(coord.0);
+    }
+    let dims = hi - lo + IVec3::ONE;
+    let count = dims.x as i64 * dims.y as i64 * dims.z as i64;
+    if count > MAX_BRICKS {
+        return Vec::new();
+    }
+    let count = count as usize;
+
+    let mut grid = Grid {
+        lo,
+        hi,
+        dims,
+        // Absent is empty space, which is not solid: the OPPOSITE of the
+        // sealed fill's default, and getting it wrong would seed the flood in
+        // the air around the model.
+        kind: vec![Kind::Blocked; count],
+        values: (0..count).map(|_| None).collect(),
+        reached: (0..count).map(|_| None).collect(),
+    };
+
+    for index in 0..count {
+        let coord = BrickCoord(grid.coord_of(index));
+        match volume.brick(coord) {
+            None => {}
+            Some(Brick::Uniform(value)) => {
+                grid.kind[index] =
+                    if *value <= OUTSIDE_OR_ON_IT { Kind::Open } else { Kind::Blocked };
+                if *value <= seed_depth {
+                    let mut bits = empty_mask();
+                    for voxel in 0..BRICK_VOXELS {
+                        set(&mut bits, voxel);
+                    }
+                    grid.reached[index] = Some(bits);
+                }
+            }
+            Some(Brick::Dense(data)) => {
+                grid.kind[index] = Kind::Mixed;
+                let copy: Box<[f32]> = data.iter().map(|value| -*value).collect();
+                grid.values[index] = Some(copy.try_into().expect("length is BRICK_VOXELS"));
+                let mut bits = empty_mask();
+                let mut any = false;
+                for (voxel, value) in data.iter().enumerate() {
+                    if *value <= seed_depth {
+                        set(&mut bits, voxel);
+                        any = true;
+                    }
+                }
+                if any {
+                    grid.reached[index] = Some(bits);
+                }
+            }
+        }
+    }
+
+    let faces = face_tables();
+    for _ in 0..rounds {
+        dilate(&mut grid, &faces);
+    }
+
+    let mut thin = Vec::new();
+    for index in 0..count {
+        let coord = BrickCoord(grid.coord_of(index));
+        match grid.kind[index] {
+            Kind::Blocked => {}
+            Kind::Open => match &grid.reached[index] {
+                None => thin.push((coord, ThinBrick::Every)),
+                Some(bits) => {
+                    let mut unreached = empty_mask();
+                    let mut any = false;
+                    for voxel in 0..BRICK_VOXELS {
+                        if !get(bits, voxel) {
+                            set(&mut unreached, voxel);
+                            any = true;
+                        }
+                    }
+                    if any {
+                        thin.push((coord, ThinBrick::Some(unreached)));
+                    }
+                }
+            },
+            Kind::Mixed => {
+                let Some(values) = grid.values[index].as_ref() else { continue };
+                let mut unreached = empty_mask();
+                let mut any = false;
+                for voxel in 0..BRICK_VOXELS {
+                    // `values` is negated, so this is `d <= 0`.
+                    if values[voxel] >= OUTSIDE_OR_ON_IT && !grid.is_reached(index, voxel) {
+                        set(&mut unreached, voxel);
+                        any = true;
+                    }
+                }
+                if any {
+                    thin.push((coord, ThinBrick::Some(unreached)));
+                }
+            }
+        }
+    }
+    thin
 }
 
 /// Run the flood to a fixed point.

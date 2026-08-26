@@ -13,8 +13,9 @@ use bytemuck::{Pod, Zeroable};
 
 use crate::frustum::Frustum;
 use crate::matcap;
-use crate::mesh_pool::{MeshPool, PoolStats, SlotKey};
+use crate::mesh_pool::{MaskPolarity, MeshPool, PoolStats, SlotKey};
 use crate::overlay::{OverlayBatch, OverlayRenderer};
+use crate::thumbnail::ThumbnailAtlas;
 
 /// Depth format. Depth32Float is universally supported and precise enough that
 /// a sculpt at arm's length shows no z fighting.
@@ -29,16 +30,59 @@ pub const OVERLAY_DEPTH_FORMAT: wgpu::TextureFormat = DEPTH_FORMAT;
 /// The layout has to match the `Uniforms` struct in `sculpt.wgsl` byte for
 /// byte. Uniform address space rounds a struct up to its largest member
 /// alignment, which the two matrices set to 16, and it aligns a `vec3` to 16
-/// as well. That is why the tail padding is three scalars on both sides rather
-/// than one vector: a `vec3<u32>` there would make the shader struct 160 bytes
-/// against this type's 144, and wgpu rejects the mismatch only at draw time.
+/// as well. That is why the tail is four scalars on both sides rather than a
+/// vector: a `vec3<u32>` there would make the shader struct 160 bytes against
+/// this type's 144, and wgpu rejects the mismatch only at draw time.
+///
+/// **The tail is four NAMED scalars and not a `[u32; 3]` padding array**, and
+/// the naming is what makes the mask flags reachable. `mask_tint` is a float
+/// while the array was `u32`, so parking it in the array would have meant a
+/// bit-cast on both sides; worse, four construction sites hardcoded
+/// `padding: [0; 3]`, so a flag put there would have been silently zero at
+/// every one of them until all four were found. Splitting the array made that
+/// a compile error instead.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Pod, Zeroable)]
 pub struct Uniforms {
     pub view_projection: [[f32; 4]; 4],
     pub view: [[f32; 4]; 4],
     pub srgb_target: u32,
-    pub padding: [u32; 3],
+    /// Non zero when protection is read inverted, which the shader applies to
+    /// the vertex attribute.
+    ///
+    /// **Resolved here rather than baked into the mesh**, which is what makes
+    /// Invert and Mask All one write of this word instead of a remesh of the
+    /// whole body -- 71 ms on the dragon and roughly 475 ms at the brick count
+    /// the pool is sized for.
+    ///
+    /// **The mask is per BODY, so one word cannot answer for a whole document,
+    /// and it does not have to.** The application publishes the ACTIVE body's
+    /// polarity here and the SET of bodies that disagree with it separately;
+    /// [`MeshPool::draw`] already walks one bucket per body, so it binds a
+    /// second group that differs only in this word for those. See
+    /// [`MaskPolarity`] and [`MeshPool::set_opposite_polarity`]. Before that
+    /// existed, a Mask All on a body that was not active drew that body's
+    /// stored zeros as free -- a fully protected body with no tint on it, which
+    /// is the failure the whole masking design is arranged around.
+    ///
+    /// The thumbnail pass draws at `mask_tint: 0.0` and so is untouched by any
+    /// of this.
+    pub mask_inverted: u32,
+    /// How strongly the mask is tinted, 0..1. Zero draws the body exactly as an
+    /// unmasked one.
+    ///
+    /// A VIEW strength and never a protection strength: 3D-Coat has to warn in
+    /// its own documentation that its Freeze Opacity "does not affect the
+    /// freezing strength of the current stroke", which is a documented
+    /// confusion in a shipping professional tool. Nothing downstream of this
+    /// word can change what a stroke does.
+    ///
+    /// It reaches zero, because the `show mask` toggle drives it there. What
+    /// keeps that safe is that the toggle governs the tint and nothing else --
+    /// the application's standing mask card is unconditional -- so "a mask is
+    /// active and nothing on screen says so" is still unreachable.
+    pub mask_tint: f32,
+    pub padding: [u32; 1],
 }
 
 const _: () = assert!(
@@ -52,7 +96,13 @@ impl Default for Uniforms {
             view_projection: glam::Mat4::IDENTITY.to_cols_array_2d(),
             view: glam::Mat4::IDENTITY.to_cols_array_2d(),
             srgb_target: 1,
-            padding: [0; 3],
+            mask_inverted: 0,
+            // Tinted, not untinted. The default has to fail in the direction
+            // where a mask that is there is visible: the failure this whole
+            // design is arranged around is a masked surface reading as a broken
+            // brush, and a defaulted-to-zero tint is exactly that.
+            mask_tint: 1.0,
+            padding: [0; 1],
         }
     }
 }
@@ -103,8 +153,32 @@ pub struct SculptRenderer {
     cube: OverlayRenderer,
     bind_group: wgpu::BindGroup,
     uniform_buffer: wgpu::Buffer,
+    /// The same uniforms with [`Uniforms::mask_inverted`] complemented, and the
+    /// group that binds them.
+    ///
+    /// **A whole second buffer rather than a dynamic offset into one**, because
+    /// the layout declares `has_dynamic_offset: false` and a 144-byte struct
+    /// would have to be padded to the 256-byte minimum alignment to use one.
+    /// Two buffers of 144 bytes is the cheaper and the plainer answer; they are
+    /// written together in [`SculptRenderer::write_uniforms`] so they cannot
+    /// drift apart. [`MeshPool::draw`] picks between them one body at a time --
+    /// see [`MaskPolarity`].
+    opposite_uniform_buffer: wgpu::Buffer,
+    opposite_bind_group: wgpu::BindGroup,
     depth: DepthBuffer,
     pool: MeshPool,
+    /// The offscreen pictures the body panel's rows blit. See
+    /// [`crate::thumbnail`], whose header is where the design lives.
+    thumbnails: ThumbnailAtlas,
+    /// **The format, kept and not merely reduced to `srgb_target`.** The
+    /// thumbnail atlas has to be created in exactly the format this renderer's
+    /// pipeline was built against: binding the pipeline in a pass whose colour
+    /// attachment differs is an `IncompatibleColorAttachment` error at
+    /// `set_pipeline`, and wgpu's default handler turns that into a dead
+    /// process. iced normally picks `Bgra8UnormSrgb` on Linux, so a hardcoded
+    /// atlas format would have been green on every test machine here and fatal
+    /// in the application.
+    format: wgpu::TextureFormat,
     srgb_target: bool,
 }
 
@@ -166,6 +240,19 @@ impl SculptRenderer {
         let uniform_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("brokkr viewport uniforms"),
             size: size_of::<Uniforms>() as u64,
+            // `COPY_SRC` so that a test can read back what is actually in here.
+            // See `SculptRenderer::read_viewport_uniforms`: the failure it
+            // guards against -- a thumbnail's camera landing in the viewport's
+            // buffer -- is invisible to every other kind of check.
+            usage: wgpu::BufferUsages::UNIFORM
+                | wgpu::BufferUsages::COPY_DST
+                | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+
+        let opposite_uniform_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("brokkr viewport uniforms, opposite polarity"),
+            size: size_of::<Uniforms>() as u64,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -218,6 +305,25 @@ impl SculptRenderer {
             ],
         });
 
+        let opposite_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("brokkr viewport bind group, opposite polarity"),
+            layout: &layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: opposite_uniform_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(&matcap_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::Sampler(&sampler),
+                },
+            ],
+        });
+
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("brokkr sculpt shader"),
             source: wgpu::ShaderSource::Wgsl(include_str!("shaders/sculpt.wgsl").into()),
@@ -236,11 +342,22 @@ impl SculptRenderer {
                 module: &shader,
                 entry_point: Some("vertex_main"),
                 compilation_options: Default::default(),
-                buffers: &[wgpu::VertexBufferLayout {
-                    array_stride: size_of::<Vertex>() as u64,
-                    step_mode: wgpu::VertexStepMode::Vertex,
-                    attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3],
-                }],
+                buffers: &[
+                    wgpu::VertexBufferLayout {
+                        array_stride: size_of::<Vertex>() as u64,
+                        step_mode: wgpu::VertexStepMode::Vertex,
+                        attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3],
+                    },
+                    // The pool's third buffer, at the same block offsets as the
+                    // first. `Unorm8x4` because a vertex buffer's stride must be
+                    // a multiple of four, so one byte would cost four anyway;
+                    // byte 0 is the mask and the rest are reserved for colour.
+                    wgpu::VertexBufferLayout {
+                        array_stride: 4,
+                        step_mode: wgpu::VertexStepMode::Vertex,
+                        attributes: &wgpu::vertex_attr_array![2 => Unorm8x4],
+                    },
+                ],
             },
             fragment: Some(wgpu::FragmentState {
                 module: &shader,
@@ -279,8 +396,19 @@ impl SculptRenderer {
             cube: OverlayRenderer::new(device, target_format, DEPTH_FORMAT),
             bind_group,
             uniform_buffer,
+            opposite_uniform_buffer,
+            opposite_bind_group,
             depth: DepthBuffer::new(device, 1, 1),
             pool: MeshPool::new(device),
+            thumbnails: ThumbnailAtlas::new(
+                device,
+                queue,
+                target_format,
+                &layout,
+                &matcap_view,
+                &sampler,
+            ),
+            format: target_format,
             srgb_target: target_format.is_srgb(),
         }
     }
@@ -351,6 +479,16 @@ impl SculptRenderer {
         self.pool.set_hidden(hidden);
     }
 
+    /// Replace the set of bodies drawn with the opposite of
+    /// [`Uniforms::mask_inverted`].
+    ///
+    /// Wholesale, from the same visibility pass that publishes the hidden set
+    /// and the uniform this is relative to. See
+    /// [`MeshPool::set_opposite_polarity`].
+    pub fn set_opposite_polarity(&mut self, opposite: &[NodeId]) {
+        self.pool.set_opposite_polarity(opposite);
+    }
+
     /// How many of one body's bricks the pool holds, for tests that have to
     /// tell "gone" from "still there but not drawn".
     pub fn body_bricks(&self, body: NodeId) -> usize {
@@ -364,8 +502,128 @@ impl SculptRenderer {
         self.pool.hidden_bodies()
     }
 
+    /// What the renderer was last told draws with the opposite polarity, for
+    /// the reason [`SculptRenderer::hidden_bodies`] exists.
+    /// See [`MeshPool::opposite_polarity_bodies`].
+    pub fn opposite_polarity_bodies(&self) -> &[NodeId] {
+        self.pool.opposite_polarity_bodies()
+    }
+
+    /// Write the frame's constants, into BOTH polarity buffers.
+    ///
+    /// The second differs in exactly one word and is written from the same
+    /// value, here and nowhere else, so the two can never disagree about the
+    /// camera. See [`SculptRenderer::opposite_uniform_buffer`] for why it is a
+    /// second buffer and not an offset.
     pub fn write_uniforms(&self, queue: &wgpu::Queue, uniforms: &Uniforms) {
         queue.write_buffer(&self.uniform_buffer, 0, bytemuck::bytes_of(uniforms));
+        let opposite =
+            Uniforms { mask_inverted: u32::from(uniforms.mask_inverted == 0), ..*uniforms };
+        queue.write_buffer(&self.opposite_uniform_buffer, 0, bytemuck::bytes_of(&opposite));
+    }
+
+    /// What the viewport's uniform buffer actually holds, read back off the GPU.
+    ///
+    /// **This exists for one test and it is worth the public method.** The
+    /// failure it guards against is that a thumbnail render writes its own
+    /// camera over the viewport's -- iced runs every `prepare` before any
+    /// `render`, so the main viewport would spend that frame drawing at an 84
+    /// pixel thumbnail's camera. Nothing else can see it: it is not a panic,
+    /// not a validation error and not a wrong pixel in any headless harness,
+    /// only one visibly wrong frame in the running application. The test lives
+    /// in `brokkr-app`, next to the drain that would cause it, so a
+    /// `#[cfg(test)]` here would not reach it.
+    ///
+    /// Blocks on the device. Never call it from a frame.
+    pub fn read_viewport_uniforms(&self, device: &wgpu::Device, queue: &wgpu::Queue) -> Uniforms {
+        let size = size_of::<Uniforms>() as u64;
+        let readback = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("brokkr uniform readback"),
+            size,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("brokkr uniform readback"),
+        });
+        encoder.copy_buffer_to_buffer(&self.uniform_buffer, 0, &readback, 0, size);
+        queue.submit([encoder.finish()]);
+
+        let slice = readback.slice(..);
+        slice.map_async(wgpu::MapMode::Read, |result| result.expect("uniform readback failed"));
+        device.poll(wgpu::PollType::wait_indefinitely()).expect("device poll failed");
+        let uniforms = *bytemuck::from_bytes::<Uniforms>(&slice.get_mapped_range());
+        readback.unmap();
+        uniforms
+    }
+
+    /// The thumbnail atlas, for the readback in the offscreen tests.
+    pub fn thumbnails(&self) -> &ThumbnailAtlas {
+        &self.thumbnails
+    }
+
+    /// Draw one body into its cell of the thumbnail atlas.
+    ///
+    /// **Its own encoder and its own `queue.submit`, because `prepare` is handed
+    /// no encoder at all.** iced builds one encoder per frame, runs every
+    /// `prepare`, then every `render`, then submits once
+    /// (`iced_wgpu-0.14.0/src/lib.rs:140-147`, `:175`), so a submission issued
+    /// from inside `prepare` executes strictly before the frame's own commands
+    /// and the row's blit later in that same frame samples fresh pixels
+    /// whatever the layer order.
+    ///
+    /// `bounds` is the body's world box; the framing is worked out from it in
+    /// [`crate::thumbnail`]. Nothing here reads the user's camera, and nothing
+    /// here touches the viewport's uniform buffer, the frustum, the overlay or
+    /// the `drawn`/`culled` counters -- see [`MeshPool::draw_body`], which
+    /// takes no frustum precisely so that the viewport's cannot be passed to it
+    /// by accident.
+    ///
+    /// A cell out of range, or a body with nothing in the pool, leaves a
+    /// correctly cleared empty picture rather than a panic: the caller's cell
+    /// bookkeeping and the pool's contents are separate pieces of state and
+    /// they are allowed to disagree for a frame.
+    pub fn render_thumbnail(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        cell: u32,
+        body: NodeId,
+        bounds: (glam::Vec3, glam::Vec3),
+    ) {
+        debug_assert_eq!(
+            self.thumbnails.format(),
+            self.format,
+            "the thumbnail atlas and the sculpt pipeline disagree about the target format, which \
+             is a validation error at set_pipeline and a dead process in the application"
+        );
+        if cell >= self.thumbnails.cells() {
+            return;
+        }
+
+        self.thumbnails.write_uniforms(queue, bounds, self.srgb_target);
+
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("brokkr thumbnail"),
+        });
+        {
+            let Some(mut pass) = self.thumbnails.begin_cell(&mut encoder, cell) else {
+                return;
+            };
+            pass.set_pipeline(&self.pipeline);
+            pass.set_bind_group(0, self.thumbnails.bind_group(), &[]);
+            self.pool.draw_body(&mut pass, body);
+        }
+        queue.submit([encoder.finish()]);
+    }
+
+    /// Blit one cell into iced's already-open render pass.
+    ///
+    /// Returns what `Primitive::draw` has to return: `true` when the row was
+    /// drawn inside the existing pass, which is the whole point -- zero extra
+    /// render passes per row.
+    pub fn blit_thumbnail(&self, pass: &mut wgpu::RenderPass<'_>, cell: u32) -> bool {
+        self.thumbnails.blit(pass, cell)
     }
 
     /// Replace this frame's overlay geometry: the brush ring and the mirror
@@ -517,7 +775,11 @@ impl SculptRenderer {
             1.0,
         );
         pass.set_scissor_rect(clip.x, clip.y, clip.width, clip.height);
-        self.pool.draw(&mut pass, frustum);
+        self.pool.draw(
+            &mut pass,
+            frustum,
+            MaskPolarity { as_published: &self.bind_group, opposite: &self.opposite_bind_group },
+        );
 
         // Last, and inside the same pass: the ring has to depth test against
         // the model it is lying on, and a mirror plane against the model it

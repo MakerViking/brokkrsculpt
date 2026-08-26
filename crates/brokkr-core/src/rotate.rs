@@ -106,6 +106,10 @@ impl Volume {
         for (coord, brick) in built {
             rotated.insert_brick(coord, brick);
         }
+        // The mask turns with the field. Its own bricks and not the field's:
+        // protection over empty space is real, and a mask brick with no brick
+        // under it would be left behind by a walk of `brick_coords`.
+        *rotated.mask_mut() = self.mask().rotated(rotation);
         rotated.mark_everything_dirty();
         rotated
     }
@@ -281,6 +285,60 @@ mod tests {
         for coord in stored {
             assert!(dirty.contains(&coord), "{coord:?} carries geometry and was not marked dirty");
         }
+    }
+
+    /// A turn moves the mask with the field, to the same world voxel.
+    ///
+    /// Its own bricks and not the field's: protection over empty space is real
+    /// -- it is what stops Draw growing material there -- so a mask brick with
+    /// no field brick under it would be left behind by a walk of the field.
+    #[test]
+    fn a_turn_carries_the_mask_to_the_same_world_voxel() {
+        use crate::{PROTECTED, UNMASKED};
+        use glam::IVec3;
+
+        let mut volume = sphere(0.5);
+        let rotation = AxisRotation::taking(Facing::Up, Facing::Front);
+        // One inside the model and one out in empty space, where no field
+        // brick exists to carry a mask that rode along with one.
+        let on_the_body = IVec3::new(3, 40, 7);
+        let in_empty_space = IVec3::new(400, 400, 400);
+        volume.mask_mut().write(on_the_body, PROTECTED);
+        volume.mask_mut().write(in_empty_space, 200);
+        assert!(volume.brick(BrickCoord::containing(in_empty_space)).is_none(), "fixture");
+
+        let turned = volume.rotated(rotation);
+
+        assert_eq!(turned.mask().at(rotation.apply_voxel(on_the_body)), PROTECTED);
+        assert_eq!(turned.mask().at(rotation.apply_voxel(in_empty_space)), 200);
+        assert_eq!(turned.mask().at(on_the_body), UNMASKED, "the mask did not turn with the body");
+    }
+
+    /// Mask All is a polarity bit over an EMPTY brick map, so for that state
+    /// the bit is the entire mask and a turn that copies no bricks carries
+    /// nothing else. Drop it and the body comes back fully unmasked, with the
+    /// next stroke sculpting straight through the protection.
+    ///
+    /// The reading assertion is the load-bearing one: `inverted()` pins the
+    /// current representation, but `at()` on a cell nothing ever wrote is what
+    /// still holds if the bool is ever refactored away.
+    #[test]
+    fn a_turn_carries_mask_all_even_though_it_moves_no_brick() {
+        use crate::PROTECTED;
+        use glam::IVec3;
+
+        let mut volume = sphere(0.5);
+        volume.mask_mut().set_inverted(true);
+        assert_eq!(volume.mask().map_bytes(), 0, "Mask All must store no bricks at all");
+
+        let turned = volume.rotated(AxisRotation::taking(Facing::Up, Facing::Front));
+
+        assert!(turned.mask().inverted(), "the turn dropped the mask's polarity");
+        assert_eq!(
+            turned.mask().at(IVec3::new(-317, 44, 900)),
+            PROTECTED,
+            "a body that was fully masked came back sculptable"
+        );
     }
 
     #[test]

@@ -27,7 +27,9 @@ pub mod brush;
 pub mod cavity;
 pub mod clip;
 pub mod export;
+pub mod generate;
 pub mod import;
+pub mod mask;
 pub mod merge;
 pub mod mesh;
 pub mod orientation;
@@ -38,6 +40,7 @@ pub mod raycast;
 pub mod region;
 pub mod resample;
 pub mod rotate;
+pub mod split;
 pub mod stroke;
 #[cfg(test)]
 mod testing;
@@ -47,20 +50,22 @@ pub mod voxelise;
 
 pub use apron::ApronBuffer;
 pub use body::{
-    Document, GrowthGuard, MAX_BODIES, MAX_DEPTH, MAX_NODES, Node, NodeId, NodeMeta,
-    resolve_visibility, subtree,
+    Document, DropRefusal, DropTarget, GrowthGuard, MAX_BODIES, MAX_DEPTH, MAX_NODES, Node, NodeId,
+    NodeMeta, drop_refusal, drop_target, resolve_visibility, subtree,
 };
 pub use brick::{
     APRON_DIM, APRON_VOXELS, BRICK_DIM, BRICK_VOXELS, Brick, BrickCoord, INSIDE, NARROW_BAND,
     OUTSIDE,
 };
 pub use brush::{
-    Brush, BrushDirection, BrushKind, BrushScratch, FalloffCurve, MirrorAxis, MoveStroke, Stamp,
-    Symmetry, lean_normal,
+    Brush, BrushDirection, BrushKind, BrushScratch, FalloffCurve, MaskOp, MirrorAxis, MoveStroke,
+    Stamp, Symmetry, lean_normal,
 };
-pub use clip::{ClipPlane, CutOutcome};
+pub use clip::{ClipCounts, ClipPlane, CutOutcome};
 pub use export::{ExportMesh, ExportedBody, MeshReport, document_verdict};
+pub use generate::{MAX_THICKNESS_VOXELS, MaskRecipe};
 pub use import::{ImportError, MESH_EXTENSIONS};
+pub use mask::{MaskBrick, MaskField, MaskFilter, MaskSlab, PROTECTED, UNMASKED};
 pub use merge::{MergeOutcome, MergePlan, MergeTarget};
 pub use mesh::{BrickMesh, MeshScratch, Vertex};
 pub use orientation::{AxisRotation, Facing, from_print_space, resting_up, to_print_space};
@@ -72,6 +77,10 @@ pub use project::{
 };
 pub use raycast::{Hit, raycast};
 pub use region::FieldRegion;
+pub use split::{
+    MASKED_ENOUGH_TO_SPLIT, MaskedSplitOutcome, Part, SIGNIFICANT_MM3, SLOW_SPLIT, SplitOutcome,
+    SplitPlan,
+};
 pub use stroke::{MAX_STAMPS_PER_EVENT, Stroke};
 pub use undo::{
     Change, DEFAULT_HISTORY_BUDGET, DEFAULT_RECLAIM_BUDGET, Entry, History, HistoryStats,

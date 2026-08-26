@@ -36,12 +36,32 @@ pub const VERTEX_CAPACITY: u64 = 11_000_000;
 /// dragon reserves 51.9 million indices against 8.65 million vertices.
 pub const INDEX_CAPACITY: u64 = 66_000_000;
 
+/// Bytes of per-vertex attributes, in the pool's THIRD buffer.
+///
+/// **Four, and it is one byte of mask plus three that are not spent yet.**
+/// `Unorm8x4` is the narrowest format that fits: a vertex buffer's
+/// `array_stride` must be a multiple of 4 and wgpu rejects anything else at
+/// pipeline creation, so a one-byte attribute would cost the same four bytes
+/// with nothing to show for it. Byte 0 is the mask, byte 1 is reserved for the
+/// painted filament slot and byte 2 for the imported one, byte 3 spare -- which
+/// is why colour, when it lands, costs the pool no capacity at all.
+///
+/// A buffer of its own rather than three more bytes on [`Vertex`], so `Vertex`
+/// stays 24 bytes and [`VERTEX_CAPACITY`] does not move. 11,000,000 x 4 =
+/// 44,000,000 B per pair, 16.4% of [`MAX_BUFFER_BYTES`].
+const ATTRIBUTE_BYTES: u64 = 4;
+
 /// How many buffer pairs the pool may grow to.
 ///
 /// Buffers are created **on demand**, so a small model pays for one pair
-/// (528 MB) and only a model that needs more allocates more. Eight pairs is
-/// 4.2 GB of VRAM at full stretch, which is the point at which refusing is
+/// (572 MB) and only a model that needs more allocates more. Eight pairs is
+/// 4.58 GB of VRAM at full stretch, which is the point at which refusing is
 /// kinder than trying on any card this application is likely to meet.
+///
+/// A "pair" is three buffers since the mask landed -- 264 MB of vertices,
+/// 264 MB of indices and 44 MB of attributes -- and the name is kept because
+/// what it means is "the set of buffers one brick's mesh must land in
+/// together".
 ///
 /// This is what lifts the ceiling that one buffer imposes. The dragon at
 /// 200 mm and 0.113 mm fills 79% of a single pair; halving the voxel from
@@ -71,6 +91,20 @@ const _: () = assert!(
 const _: () = assert!(
     INDEX_CAPACITY * size_of::<u32>() as u64 <= MAX_BUFFER_BYTES,
     "the index buffer would exceed wgpu's default max_buffer_size"
+);
+const _: () = assert!(
+    VERTEX_CAPACITY * ATTRIBUTE_BYTES <= MAX_BUFFER_BYTES,
+    "the attribute buffer would exceed wgpu's default max_buffer_size"
+);
+
+// And the mask stays in that buffer rather than on the vertex. Four more bytes
+// on `Vertex` would be 28, which is 308 MB at this capacity -- over the ceiling
+// -- so `VERTEX_CAPACITY` would have to come DOWN to about 9.5 million, and
+// every model between there and 11 million would start needing a second pair.
+// A third buffer costs 44 MB and moves nothing.
+const _: () = assert!(
+    size_of::<Vertex>() == 24,
+    "Vertex must stay 24 bytes: per-vertex data belongs in the attribute buffer"
 );
 
 /// Allocation granularity, in elements.
@@ -217,10 +251,18 @@ impl BlockAllocator {
 }
 
 /// One vertex buffer and its index buffer, with the allocators over them.
+///
+/// Three buffers rather than two since the mask landed. The attributes are
+/// suballocated at the SAME block offsets as the vertices -- they are one byte
+/// per vertex by construction -- so they need no allocator of their own and
+/// cannot drift out of step with one.
 #[derive(Debug)]
 struct BufferPair {
     vertices: wgpu::Buffer,
     indices: wgpu::Buffer,
+    /// One `Unorm8x4` per vertex: the mask in byte 0, and three bytes reserved.
+    /// See [`ATTRIBUTE_BYTES`].
+    attributes: wgpu::Buffer,
     vertex_allocator: BlockAllocator,
     index_allocator: BlockAllocator,
 }
@@ -228,7 +270,7 @@ struct BufferPair {
 impl BufferPair {
     /// The capacities are passed in rather than read from [`VERTEX_CAPACITY`]
     /// and [`INDEX_CAPACITY`] so that a test can build a pool small enough to
-    /// FILL. The real one is 4.2 GB at full stretch, which is not a thing a
+    /// FILL. The real one is 4.58 GB at full stretch, which is not a thing a
     /// test can exhaust, and what happens at the ceiling is exactly the
     /// behaviour worth pinning.
     fn new(device: &wgpu::Device, index: u16, vertices: u64, indices: u64) -> Self {
@@ -243,6 +285,12 @@ impl BufferPair {
                 label: Some("brokkr brick indices"),
                 size: indices * size_of::<u32>() as u64,
                 usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            }),
+            attributes: device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("brokkr brick attributes"),
+                size: vertices * ATTRIBUTE_BYTES,
+                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
                 mapped_at_creation: false,
             }),
             vertex_allocator: BlockAllocator::new(vertices, index),
@@ -317,6 +365,29 @@ pub struct PoolStats {
     pub hidden: usize,
 }
 
+/// The two bind groups [`MeshPool::draw`] chooses between, one body at a time.
+///
+/// **They differ in exactly one word -- [`crate::Uniforms::mask_inverted`] --
+/// and in nothing else.** The mask is per BODY and a uniform is per draw, so a
+/// document where one body has been inverted and another has not cannot be
+/// drawn correctly from a single group. Increment 24 shipped Invert and Mask
+/// All and made that reachable; before this, every body was drawn through the
+/// ACTIVE body's polarity, which drew an unmasked body fully tinted and, in the
+/// direction that matters, drew a fully PROTECTED body with no tint at all.
+///
+/// A pair of borrows in a named struct rather than two arguments, because two
+/// arguments of the same type sitting next to each other can be swapped
+/// silently and the result is the bug this exists to fix, inverted.
+#[derive(Debug, Clone, Copy)]
+pub struct MaskPolarity<'a> {
+    /// Bound for every body except those named by
+    /// [`MeshPool::set_opposite_polarity`]. Carries the uniforms exactly as the
+    /// caller wrote them.
+    pub as_published: &'a wgpu::BindGroup,
+    /// The same uniforms with `mask_inverted` complemented.
+    pub opposite: &'a wgpu::BindGroup,
+}
+
 /// The shared mesh buffers and the map from brick to slice.
 #[derive(Debug)]
 pub struct MeshPool {
@@ -371,11 +442,40 @@ pub struct MeshPool {
     /// Held as the HIDDEN set rather than the shown one because it is almost
     /// always empty, and an empty `Vec` makes the per-bucket test free.
     hidden: Vec<NodeId>,
+    /// The bodies drawn with the OPPOSITE of [`crate::Uniforms::mask_inverted`],
+    /// replaced wholesale by [`MeshPool::set_opposite_polarity`].
+    ///
+    /// **A mask is per body and a uniform is per draw, and this is how the two
+    /// are reconciled.** Increment 24 shipped Invert and Mask All, which made a
+    /// document whose bodies disagree about polarity reachable; the application
+    /// publishes the ACTIVE body's polarity in the uniform, so without this
+    /// every other body was drawn through it -- a Mask All on the head drew an
+    /// unmasked torso fully tinted, and, worse, a Mask All on a body that was
+    /// not active drew that body's stored zeros as free. A fully protected body
+    /// with no tint on it is the failure the whole masking design is arranged
+    /// around.
+    ///
+    /// Held as the set that DIFFERS rather than the set that is inverted, for
+    /// the reason `hidden` is held as the hidden set: in a document where every
+    /// body agrees -- which is every document that has not used the verbs -- it
+    /// is empty, and an empty `Vec` makes the per-bucket test free. It is
+    /// bodies rather than a bitmask for the reason `hidden` gives in full.
+    opposite: Vec<NodeId>,
     /// Counts from the last draw. Atomic because drawing takes a shared borrow
     /// and Iced requires the pipeline it owns to be `Sync`.
     drawn: AtomicUsize,
     culled: AtomicUsize,
     skipped_as_hidden: AtomicUsize,
+    /// One brick's attributes, widened from one byte per vertex to four, on
+    /// their way to the GPU.
+    ///
+    /// **Kept here so that `upload` allocates nothing**, which it must not: it
+    /// runs inside `prepare`, on the frame path. `BrickMesh::mask` is one byte
+    /// per vertex -- `brokkr-core` has no business knowing what the other three
+    /// are for -- and the buffer is four, so the widening has to happen
+    /// somewhere; it happens once into a vector that keeps its capacity, which
+    /// after the first few bricks is every brick.
+    staging: Vec<[u8; ATTRIBUTE_BYTES as usize]>,
 }
 
 impl MeshPool {
@@ -389,7 +489,7 @@ impl MeshPool {
     /// real capacities, and the tests with capacities small enough that the
     /// pool can actually be run out of. Overflow behaviour is the part of this
     /// file that has put holes in a real model, and a ceiling of
-    /// [`TOTAL_VERTEX_CAPACITY`] vertices across 4.2 GB of buffers is not one
+    /// [`TOTAL_VERTEX_CAPACITY`] vertices across 4.58 GB of buffers is not one
     /// a test can reach.
     fn with_capacities(device: &wgpu::Device, vertices: u64, indices: u64) -> Self {
         Self {
@@ -402,12 +502,14 @@ impl MeshPool {
             overflowed: 0,
             warned_about_overflow: false,
             // Never allocated again: a document holds at most `MAX_BODIES`
-            // bodies, so the set of hidden ones can never outgrow this and
-            // `set_hidden` runs on the frame path.
+            // bodies, so neither of these sets can outgrow this and both
+            // `set_hidden` and `set_opposite_polarity` run on the frame path.
             hidden: Vec::with_capacity(brokkr_core::MAX_BODIES),
+            opposite: Vec::with_capacity(brokkr_core::MAX_BODIES),
             drawn: AtomicUsize::new(0),
             culled: AtomicUsize::new(0),
             skipped_as_hidden: AtomicUsize::new(0),
+            staging: Vec::new(),
         }
     }
 
@@ -445,7 +547,8 @@ impl MeshPool {
             index + 1,
             (index as u64 + 1)
                 * (self.vertex_capacity * size_of::<Vertex>() as u64
-                    + self.index_capacity * size_of::<u32>() as u64)
+                    + self.index_capacity * size_of::<u32>() as u64
+                    + self.vertex_capacity * ATTRIBUTE_BYTES)
                 / (1024 * 1024)
         );
         self.buffers.push(BufferPair::new(
@@ -594,6 +697,17 @@ impl MeshPool {
             }
         };
 
+        debug_assert_eq!(
+            mesh.mask.len(),
+            mesh.vertices.len(),
+            "one mask byte per vertex, or the tail of this brick reads the previous tenant's \
+             attributes"
+        );
+        // Widened into the kept buffer before anything else is borrowed, so
+        // that the three writes below can share `&self`. See `staging`.
+        self.staging.clear();
+        self.staging.extend(mesh.mask.iter().map(|byte| [*byte, 0, 0, 0]));
+
         let pair = &self.buffers[slot.vertices.buffer as usize];
         queue.write_buffer(
             &pair.vertices,
@@ -604,6 +718,14 @@ impl MeshPool {
             &pair.indices,
             slot.indices.offset * size_of::<u32>() as u64,
             bytemuck::cast_slice(&mesh.indices),
+        );
+        // The same block offset as the vertices, in the same order: the
+        // attribute buffer is suballocated by the vertex allocator and has none
+        // of its own.
+        queue.write_buffer(
+            &pair.attributes,
+            slot.vertices.offset * ATTRIBUTE_BYTES,
+            bytemuck::cast_slice(&self.staging),
         );
 
         self.triangles += mesh.indices.len() / 3;
@@ -643,7 +765,21 @@ impl MeshPool {
     /// remesh, and would make the eye a thing that can lose geometry. It also
     /// means hiding buys no pool headroom, which is why the overflow message
     /// above says so.
-    pub fn draw(&self, pass: &mut wgpu::RenderPass<'_>, frustum: &Frustum) {
+    ///
+    /// # Polarity is per bucket, and that is what makes the mask per body
+    ///
+    /// A bucket is exactly one body, so the bind group is chosen here rather
+    /// than once for the whole pass; see [`MaskPolarity`] and the `opposite`
+    /// field. The group is bound only when it CHANGES, so a document where
+    /// every body agrees -- which is every document that has not touched Invert
+    /// or Mask All -- pays one `set_bind_group` for the whole draw, the same as
+    /// before.
+    pub fn draw(
+        &self,
+        pass: &mut wgpu::RenderPass<'_>,
+        frustum: &Frustum,
+        polarity: MaskPolarity<'_>,
+    ) {
         self.drawn.store(0, Ordering::Relaxed);
         self.culled.store(0, Ordering::Relaxed);
         self.skipped_as_hidden.store(0, Ordering::Relaxed);
@@ -659,6 +795,15 @@ impl MeshPool {
         let mut drawn = 0;
         let mut culled = 0;
         let mut hidden = 0;
+        // `None` until the first bucket that actually draws, so this loop binds
+        // the polarity it wants rather than trusting whatever the caller left
+        // bound. After that it rebinds only on a change: a document where every
+        // body agrees -- which is every document that has not touched Invert or
+        // Mask All -- binds exactly once, and a mixed one binds at worst once
+        // per bucket, since the map's order is arbitrary and the two polarities
+        // are not grouped. That ceiling is `pairs x bodies`, which is the same
+        // order as the hidden test above.
+        let mut bound_polarity: Option<bool> = None;
         for (&(index, body), bucket) in &self.buckets {
             // Per bucket rather than per slot: a bucket is exactly one body, so
             // the test runs at most `pairs x bodies` times a frame instead of
@@ -668,6 +813,7 @@ impl MeshPool {
                 continue;
             }
             let pair = &self.buffers[index as usize];
+            let opposite = self.opposite.contains(&body);
             let mut bound = false;
             for slot in bucket.values() {
                 if slot.index_count == 0 {
@@ -678,7 +824,16 @@ impl MeshPool {
                     continue;
                 }
                 if !bound {
+                    // Inside the frustum test, so a body entirely off screen
+                    // binds nothing at all -- including its polarity.
+                    if bound_polarity != Some(opposite) {
+                        let group =
+                            if opposite { polarity.opposite } else { polarity.as_published };
+                        pass.set_bind_group(0, group, &[]);
+                        bound_polarity = Some(opposite);
+                    }
                     pass.set_vertex_buffer(0, pair.vertices.slice(..));
+                    pass.set_vertex_buffer(1, pair.attributes.slice(..));
                     pass.set_index_buffer(pair.indices.slice(..), wgpu::IndexFormat::Uint32);
                     bound = true;
                 }
@@ -716,6 +871,28 @@ impl MeshPool {
         );
         self.hidden.clear();
         self.hidden.extend_from_slice(hidden);
+    }
+
+    /// Replace the set of bodies drawn with the opposite of
+    /// [`crate::Uniforms::mask_inverted`].
+    ///
+    /// **Wholesale, every time, for the reason [`MeshPool::set_hidden`] gives
+    /// in full**: it is a pure function of the document and of which body is
+    /// active, worked out in one place -- the application's visibility pass --
+    /// and a second owner of it here is how the picture comes to disagree with
+    /// the protection under it. Never allocates, for the same reason.
+    ///
+    /// It is relative to the uniform rather than absolute so that
+    /// `Uniforms::mask_inverted` stays exactly what it says it is, and so that
+    /// a document where every body agrees publishes an empty set.
+    pub fn set_opposite_polarity(&mut self, opposite: &[NodeId]) {
+        debug_assert!(
+            opposite.len() <= brokkr_core::MAX_BODIES,
+            "{} bodies of opposite polarity, which is more than a document can hold",
+            opposite.len()
+        );
+        self.opposite.clear();
+        self.opposite.extend_from_slice(opposite);
     }
 
     /// Drop every slot one body owns, and give its space back.
@@ -809,6 +986,17 @@ impl MeshPool {
         &self.hidden
     }
 
+    /// What the pool was last told draws with the opposite polarity.
+    ///
+    /// The same justification as [`MeshPool::hidden_bodies`], word for word:
+    /// polarity is a bind-group choice at draw time, so it moves no counter,
+    /// and a test that asserted on the application's own field would be
+    /// asserting on the thing that SENDS the answer rather than on the answer
+    /// that arrived.
+    pub fn opposite_polarity_bodies(&self) -> &[NodeId] {
+        &self.opposite
+    }
+
     /// Draw every brick of ONE body, with no culling at all.
     ///
     /// **There is deliberately no frustum parameter, and the absence is the
@@ -853,6 +1041,7 @@ impl MeshPool {
                 }
                 if !bound {
                     pass.set_vertex_buffer(0, pair.vertices.slice(..));
+                    pass.set_vertex_buffer(1, pair.attributes.slice(..));
                     pass.set_index_buffer(pair.indices.slice(..), wgpu::IndexFormat::Uint32);
                     bound = true;
                 }
@@ -1075,7 +1264,7 @@ mod tests {
     // a real buffer and there is no way to reserve one without creating them.
     // They build the pool through `with_capacities` with room for two bricks
     // per pair, which is the only way to reach the ceiling: the real pool is
-    // 4.2 GB at full stretch.
+    // 4.58 GB at full stretch.
 
     /// A device, or `None` when this machine has no adapter.
     fn open_device() -> Option<(wgpu::Device, wgpu::Queue)> {
@@ -1124,11 +1313,17 @@ mod tests {
 
     /// A mesh of the requested size. The geometry is meaningless -- these tests
     /// are about which slice a brick lands in, not about what is in it.
+    ///
+    /// The mask is a run of zeros of the right LENGTH, which is the part that
+    /// matters here: `upload` writes one attribute per vertex, so a mesh with a
+    /// short mask would leave the tail of the slice reading whatever the
+    /// previous tenant wrote.
     fn mesh_of(vertices: usize, indices: usize) -> BrickMesh {
         BrickMesh {
             vertices: vec![Vertex { position: [0.0; 3], normal: [0.0, 1.0, 0.0] }; vertices],
             indices: (0..indices as u32).map(|index| index % vertices.max(1) as u32).collect(),
             cells: Vec::new(),
+            mask: vec![0; vertices],
         }
     }
 
@@ -1381,6 +1576,42 @@ mod tests {
         pool.upload(&device, &queue, key(2, 0), &small);
         assert_eq!(pool.body_bricks(NodeId(2)), 1);
         assert_eq!(pool.stats().overflowed, 0);
+    }
+
+    /// A mask-only remesh reuses the slice it already had and touches no free
+    /// list.
+    ///
+    /// Painting a mask does not move a vertex -- it is a read-only multiplier on
+    /// what a brush may do -- so the brick comes back with exactly the same
+    /// counts and only its attributes changed. `upload`'s "still fits" arm is
+    /// what makes that free; without it, every mask stamp would hand its blocks
+    /// back and take new ones, which is how the allocator fragments (see
+    /// [`BlockAllocator`]) and is a cost the mask has no reason to pay.
+    #[test]
+    fn a_mask_only_remesh_keeps_the_slice_it_had_and_returns_nothing_to_the_free_list() {
+        let Some((device, queue)) = device_or_skip("mesh pool mask remesh") else {
+            return;
+        };
+
+        let mut pool = MeshPool::with_capacities(&device, GRANULARITY * 16, GRANULARITY * 16);
+        let mesh = mesh_of(GRANULARITY as usize, GRANULARITY as usize - 1);
+        pool.upload(&device, &queue, key(1, 0), &mesh);
+        let (_, before) = pool.find(key(1, 0)).expect("the brick has a slot");
+        let stats = pool.stats();
+
+        // The same geometry, a different mask: what a mask stamp produces.
+        let masked = BrickMesh { mask: vec![200; mesh.vertices.len()], ..mesh.clone() };
+        pool.upload(&device, &queue, key(1, 0), &masked);
+
+        let (_, after) = pool.find(key(1, 0)).expect("the brick still has a slot");
+        assert_eq!(after.vertices.offset, before.vertices.offset, "it was given a new slice");
+        assert_eq!(after.indices.offset, before.indices.offset);
+        assert_eq!(after.vertex_count, before.vertex_count);
+        let now = pool.stats();
+        assert_eq!(now.vertices_reserved, stats.vertices_reserved, "space was handed back");
+        assert_eq!(now.vertices_watermark, stats.vertices_watermark, "the bump pointer moved");
+        assert_eq!(now.triangles, stats.triangles);
+        assert_eq!(now.bricks, stats.bricks);
     }
 
     /// **Hiding is a draw-time skip and nothing else**, and this is the

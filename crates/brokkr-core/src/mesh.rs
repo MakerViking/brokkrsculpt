@@ -48,6 +48,25 @@ pub struct BrickMesh {
     /// they straddle a boundary. That happened to about one vertex in a hundred
     /// and left hundreds of holes in an otherwise closed model.
     pub cells: Vec<IVec3>,
+    /// The mask's STORED byte at each vertex's own lattice cell, one per vertex.
+    ///
+    /// **Stored, with the polarity NOT applied**, because the polarity is
+    /// resolved in the shader from a uniform: that is what makes Invert and
+    /// Mask All one `u32` write instead of a remesh of the whole body. See
+    /// [`crate::MaskField::byte_at`], whose own documentation names this as one
+    /// of its two legitimate callers.
+    ///
+    /// Sampled by the vertex's CELL and not by its position, which is what
+    /// makes the tint continuous across a brick seam: two bricks that both emit
+    /// a vertex at a shared seam derive that cell from the same world
+    /// coordinate (see [`BrickMesh::cells`]), so they look up the same voxel
+    /// and get the same byte, bit for bit.
+    ///
+    /// **Always the same length as `vertices`**, including for an unmasked
+    /// body, where it is a run of zeros. The pool writes it into a vertex
+    /// buffer of its own, so a short one would leave the tail of a brick
+    /// reading whatever the previous tenant of that slice left behind.
+    pub mask: Vec<u8>,
 }
 
 impl BrickMesh {
@@ -57,6 +76,7 @@ impl BrickMesh {
         self.vertices.clear();
         self.indices.clear();
         self.cells.clear();
+        self.mask.clear();
     }
 
     #[inline]
