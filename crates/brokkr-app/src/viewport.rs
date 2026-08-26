@@ -1561,7 +1561,7 @@ mod apply_tests {
         let painted = cell_bytes(&renderer, &device, &queue, SHARED_CELL);
         let background = brokkr_gpu::background_texel(wgpu::TextureFormat::Rgba8UnormSrgb);
         assert!(
-            painted.chunks_exact(4).any(|texel| texel != background),
+            painted.as_chunks::<4>().0.iter().any(|texel| *texel != background),
             "the fixture drew nothing into the cell, so the comparison below would pass for a \
              cleared cell too"
         );

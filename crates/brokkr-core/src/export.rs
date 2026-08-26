@@ -371,7 +371,7 @@ impl Volume {
                 remap.push(index);
             }
 
-            for triangle in brick.indices.chunks_exact(3) {
+            for triangle in brick.indices.as_chunks::<3>().0 {
                 let a = remap[triangle[0] as usize];
                 let b = remap[triangle[1] as usize];
                 let c = remap[triangle[2] as usize];

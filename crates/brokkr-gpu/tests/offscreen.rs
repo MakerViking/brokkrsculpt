@@ -272,7 +272,9 @@ fn coverage(pixels: &[u8]) -> (usize, [u32; 4]) {
 /// One bool per pixel: was anything drawn there at all.
 fn mask(pixels: &[u8]) -> Vec<bool> {
     pixels
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .map(|pixel| pixel[0] as u32 + pixel[1] as u32 + pixel[2] as u32 > LIT)
         .collect()
 }
@@ -282,7 +284,7 @@ fn dump(name: &str, pixels: &[u8]) {
         return;
     };
     let mut ppm = format!("P6\n{WIDTH} {HEIGHT}\n255\n").into_bytes();
-    for pixel in pixels.chunks_exact(4) {
+    for pixel in pixels.as_chunks::<4>().0.iter() {
         ppm.extend_from_slice(&pixel[..3]);
     }
     let path = std::path::Path::new(&directory).join(format!("{name}.ppm"));
@@ -493,8 +495,13 @@ fn the_sculpt_loop_renders_and_responds_to_a_stroke() {
     let after = harness.frame(&renderer);
     dump("after", &after);
 
-    let changed =
-        before.chunks_exact(4).zip(after.chunks_exact(4)).filter(|(a, b)| a[..3] != b[..3]).count();
+    let changed = before
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .zip(after.as_chunks::<4>().0.iter())
+        .filter(|(a, b)| a[..3] != b[..3])
+        .count();
     assert!(
         changed > 200,
         "only {changed} pixels changed after a stroke, so the edit never reached the screen"
@@ -598,8 +605,10 @@ fn every_brush_leaves_a_visible_mark() {
         dump(&format!("brush-{}", kind.label().to_lowercase()), &after);
 
         let changed = before
-            .chunks_exact(4)
-            .zip(after.chunks_exact(4))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .zip(after.as_chunks::<4>().0.iter())
             .filter(|(a, b)| a[..3] != b[..3])
             .count();
         assert!(
@@ -659,8 +668,10 @@ fn a_leaned_stroke_looks_different_from_an_upright_one() {
     }
 
     let changed = frames[0]
-        .chunks_exact(4)
-        .zip(frames[1].chunks_exact(4))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .zip(frames[1].as_chunks::<4>().0.iter())
         .filter(|(a, b)| a[..3] != b[..3])
         .count();
     assert!(
@@ -732,8 +743,10 @@ fn every_pattern_leaves_a_visible_and_distinct_mark() {
 
         if kind != PatternKind::None {
             let changed = before
-                .chunks_exact(4)
-                .zip(after.chunks_exact(4))
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .zip(after.as_chunks::<4>().0.iter())
                 .filter(|(a, b)| a[..3] != b[..3])
                 .count();
             assert!(changed > 200, "{kind} left almost nothing on screen: {changed} pixels");
@@ -747,8 +760,10 @@ fn every_pattern_leaves_a_visible_and_distinct_mark() {
     for (index, (kind, frame)) in frames.iter().enumerate() {
         for (other_kind, other) in &frames[index + 1..] {
             let differing = frame
-                .chunks_exact(4)
-                .zip(other.chunks_exact(4))
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .zip(other.as_chunks::<4>().0.iter())
                 .filter(|(a, b)| a[..3] != b[..3])
                 .count();
             assert!(
@@ -810,8 +825,13 @@ fn overlay_geometry_draws_in_front_and_is_hidden_behind() {
     let front = harness.frame(&renderer);
     dump("overlay-in-front", &front);
 
-    let changed =
-        bare.chunks_exact(4).zip(front.chunks_exact(4)).filter(|(a, b)| a[..3] != b[..3]).count();
+    let changed = bare
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .zip(front.as_chunks::<4>().0.iter())
+        .filter(|(a, b)| a[..3] != b[..3])
+        .count();
     assert!(changed > 2_000, "an overlay in front of the model barely drew: {changed} pixels");
 
     // --- behind the model: must be hidden --------------------------------
@@ -820,8 +840,13 @@ fn overlay_geometry_draws_in_front_and_is_hidden_behind() {
     let hidden = harness.frame(&renderer);
     dump("overlay-behind", &hidden);
 
-    let leaked =
-        bare.chunks_exact(4).zip(hidden.chunks_exact(4)).filter(|(a, b)| a[..3] != b[..3]).count();
+    let leaked = bare
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .zip(hidden.as_chunks::<4>().0.iter())
+        .filter(|(a, b)| a[..3] != b[..3])
+        .count();
     // Not zero: the quad is wider than the sphere is at that depth, so its rim
     // legitimately shows past the silhouette. What must not happen is it
     // painting over the model itself.
@@ -875,8 +900,13 @@ fn overlay_geometry_draws_in_front_and_is_hidden_behind() {
     let ringed = harness.frame(&renderer);
     dump("overlay-ring", &ringed);
 
-    let ring_pixels =
-        bare.chunks_exact(4).zip(ringed.chunks_exact(4)).filter(|(a, b)| a[..3] != b[..3]).count();
+    let ring_pixels = bare
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .zip(ringed.as_chunks::<4>().0.iter())
+        .filter(|(a, b)| a[..3] != b[..3])
+        .count();
     assert!(ring_pixels > 200, "the ring barely drew: {ring_pixels} pixels");
     // A ring is a rim, not a disc: it must cover far less than a filled quad.
     assert!(ring_pixels < changed, "the ring covered as much as a filled quad");
@@ -1177,7 +1207,12 @@ fn hiding_a_body_removes_exactly_that_body_from_the_picture() {
 /// is why the tint was designed to leave that range rather than to be a shade
 /// of it -- and why this, rather than luminance, is what these tests measure.
 fn chroma(pixels: &[u8]) -> Vec<i32> {
-    pixels.chunks_exact(4).map(|pixel| i32::from(pixel[2]) - i32::from(pixel[0])).collect()
+    pixels
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|pixel| i32::from(pixel[2]) - i32::from(pixel[0]))
+        .collect()
 }
 
 /// Fully protect every voxel of the model, or the half of it at x below zero.
@@ -1278,8 +1313,10 @@ fn a_masked_body_is_tinted_beyond_anything_the_unmasked_one_can_be() {
     // measures 23.6%. Anything below 15% means the tint is failing to reach
     // most of the mask; anything above 35% means it is bleeding off it.
     let unchanged = bare
-        .chunks_exact(4)
-        .zip(masked.chunks_exact(4))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .zip(masked.as_chunks::<4>().0.iter())
         .zip(&before)
         .filter(|((one, other), drawn)| **drawn && one == other)
         .count();
@@ -1654,9 +1691,9 @@ fn a_body_renders_into_its_own_cell_and_leaves_the_others_alone() {
 
         let background = background_texel(format);
         let placeholder = harness.cell(&renderer, UNTOUCHED);
-        for (index, texel) in placeholder.chunks_exact(4).enumerate() {
+        for (index, texel) in placeholder.as_chunks::<4>().0.iter().enumerate() {
             assert_eq!(
-                texel, background,
+                *texel, background,
                 "{format:?}: texel {index} of an unrendered cell is {texel:?}, not the \
                  placeholder colour {background:?}"
             );
@@ -1665,7 +1702,8 @@ fn a_body_renders_into_its_own_cell_and_leaves_the_others_alone() {
         renderer.render_thumbnail(&harness.device, &harness.queue, DRAWN, BODY, bounds);
         let drawn = harness.cell(&renderer, DRAWN);
 
-        let lit = drawn.chunks_exact(4).filter(|texel| texel[..3] != background[..3]).count();
+        let lit =
+            drawn.as_chunks::<4>().0.iter().filter(|texel| texel[..3] != background[..3]).count();
         let total = (THUMBNAIL_SIZE * THUMBNAIL_SIZE) as usize;
         assert!(
             lit > total / 8,
@@ -1680,7 +1718,9 @@ fn a_body_renders_into_its_own_cell_and_leaves_the_others_alone() {
 
         // A picture, not a flat fill: the matcap has to be shading it.
         let shades: std::collections::HashSet<[u8; 3]> = drawn
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .map(|texel| [texel[0], texel[1], texel[2]])
             .filter(|texel| texel[..] != background[..3])
             .collect();
@@ -1747,15 +1787,15 @@ fn a_request_for_a_body_the_pool_does_not_hold_clears_the_cell_rather_than_keepi
     let background = background_texel(TARGET_FORMAT);
     let with_body = harness.cell(&renderer, CELL);
     assert!(
-        with_body.chunks_exact(4).any(|texel| texel[..3] != background[..3]),
+        with_body.as_chunks::<4>().0.iter().any(|texel| texel[..3] != background[..3]),
         "the fixture drew nothing, so this test proves nothing"
     );
 
     renderer.render_thumbnail(&harness.device, &harness.queue, CELL, GHOST, bounds);
     let after = harness.cell(&renderer, CELL);
-    for (index, texel) in after.chunks_exact(4).enumerate() {
+    for (index, texel) in after.as_chunks::<4>().0.iter().enumerate() {
         assert_eq!(
-            texel, background,
+            *texel, background,
             "texel {index} still holds the previous body: the pass loaded instead of clearing, \
              so a deleted body's picture would stay in a cell that now belongs to another one"
         );
@@ -1826,7 +1866,8 @@ fn a_cell_blits_into_a_row_unflipped_and_with_the_srgb_round_trip_cancelling() {
         // The control, without which a comparison of two flat fills would pass
         // over a blit that drew nothing at all.
         let background = background_texel(format);
-        let lit = cell.chunks_exact(4).filter(|texel| texel[..3] != background[..3]).count();
+        let lit =
+            cell.as_chunks::<4>().0.iter().filter(|texel| texel[..3] != background[..3]).count();
         assert!(lit > 400, "{format:?}: the fixture cell holds only {lit} lit texels");
 
         // A row, one to one with the cell, drawn the way iced draws one: an
@@ -1879,8 +1920,10 @@ fn a_cell_blits_into_a_row_unflipped_and_with_the_srgb_round_trip_cancelling() {
 
         let blitted = read_back(&harness, &row);
         let close = blitted
-            .chunks_exact(4)
-            .zip(cell.chunks_exact(4))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .zip(cell.as_chunks::<4>().0.iter())
             .filter(|(a, b)| a[..3].iter().zip(&b[..3]).all(|(x, y)| x.abs_diff(*y) <= 1))
             .count();
         let total = (THUMBNAIL_SIZE * THUMBNAIL_SIZE) as usize;

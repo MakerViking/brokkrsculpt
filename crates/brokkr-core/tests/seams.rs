@@ -64,7 +64,7 @@ fn edge_use_counts(
 
     for &coord in coords {
         volume.mesh_brick(coord, &mut scratch, &mut mesh);
-        for triangle in mesh.indices.chunks_exact(3) {
+        for triangle in mesh.indices.as_chunks::<3>().0 {
             let v: Vec<WeldedVertex> =
                 triangle.iter().map(|i| weld(&mesh.vertices[*i as usize])).collect();
             // A degenerate triangle contributes no surface and no real edges.

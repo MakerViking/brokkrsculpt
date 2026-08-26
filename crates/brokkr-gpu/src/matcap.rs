@@ -106,7 +106,7 @@ mod tests {
     fn the_image_is_the_expected_size_and_fully_opaque() {
         let pixels = clay();
         assert_eq!(pixels.len(), (MATCAP_SIZE * MATCAP_SIZE * 4) as usize);
-        assert!(pixels.chunks_exact(4).all(|pixel| pixel[3] == 255));
+        assert!(pixels.as_chunks::<4>().0.iter().all(|pixel| pixel[3] == 255));
     }
 
     #[test]

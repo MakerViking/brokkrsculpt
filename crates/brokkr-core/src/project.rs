@@ -1589,8 +1589,8 @@ fn read_bricks(
                 let mut values = vec![0.0f32; BRICK_VOXELS];
                 let mut bytes = vec![0u8; BRICK_BYTES];
                 input.read_exact(&mut bytes)?;
-                for (slot, chunk) in values.iter_mut().zip(bytes.chunks_exact(4)) {
-                    let value = f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+                for (slot, chunk) in values.iter_mut().zip(bytes.as_chunks::<4>().0) {
+                    let value = f32::from_le_bytes(*chunk);
                     *slot = checked_distance(value)?;
                 }
                 let boxed: Box<[f32; BRICK_VOXELS]> = values
