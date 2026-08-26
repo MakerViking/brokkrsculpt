@@ -2,3 +2,6 @@
 **/*.rs.bk
 *.pdb
 .DS_Store
+
+# Internal session-handoff doc — kept locally, never shipped
+handoff.md
