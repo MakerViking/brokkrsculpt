@@ -1257,7 +1257,7 @@ impl MaskField {
             // The forward image of a box, by the same eight-corner argument
             // [`Similarity::inverse_bounds`] makes for the backward one --
             // which is what `inverse().inverse_bounds(..)` says.
-            let (low, high) = by.inverse().inverse_bounds(source_low, source_high);
+            let (low, high) = crate::transform::forward_bounds(by, source_low, source_high);
             let low = BrickCoord::containing((low / voxel_size).floor().as_ivec3() - IVec3::ONE).0;
             let high = BrickCoord::containing((high / voxel_size).ceil().as_ivec3() + IVec3::ONE).0;
             for bz in low.z..=high.z {
@@ -1269,7 +1269,6 @@ impl MaskField {
             }
         }
 
-        let inverse = by.inverse();
         let coords: Vec<BrickCoord> = wanted.into_iter().collect();
         let built: Vec<(BrickCoord, MaskBrick)> = coords
             .par_iter()
@@ -1283,7 +1282,7 @@ impl MaskField {
                             let world = (origin + IVec3::new(x as i32, y as i32, z as i32))
                                 .as_vec3()
                                 * voxel_size;
-                            let source = inverse.transform_point(world) / voxel_size;
+                            let source = by.inverse_transform_point(world) / voxel_size;
                             data[brick_index(x, y, z)] = self.byte_at(source.round().as_ivec3());
                         }
                     }

@@ -2269,7 +2269,29 @@ impl Brokkr {
                     None => base.shifted(voxel_offset),
                 }
             }
-            brokkr_core::Bake::Resample => base.warped(gizmo.placement),
+            brokkr_core::Bake::Resample => {
+                let mut warped = base.warped(gizmo.placement);
+                // **A per-axis scale leaves a field that is no longer a
+                // distance field, and this is where that is repaired.**
+                // `Volume::warped` multiplies the sampled distance by
+                // `min_scale`, which keeps the zero set exact and
+                // underestimates everywhere else -- sound for a sphere trace,
+                // wrong for everything that reads a gradient. The drift is
+                // `s_min/s_max` and it would compound across bakes with
+                // nothing to reset it, which is the whole reason
+                // `similarity.rs` refused a per-axis scale until this pass
+                // existed.
+                //
+                // Skipped when the scale is uniform, where the field is exactly
+                // the transformed solid and the pass would be work with no
+                // customer. `redistance` gates itself again on the measured
+                // drift, so a rotation that happens to leave the gradient
+                // alone costs one read-only sweep and no writes.
+                if !gizmo.placement.is_uniform_scale() {
+                    warped.redistance();
+                }
+                warped
+            }
         };
         // The bricks the outgoing field occupied, marked in the INCOMING one:
         // without this the renderer keeps drawing triangles nothing will ever
@@ -2325,8 +2347,20 @@ impl Brokkr {
         if degrees.abs() > 0.05 {
             what.push(format!("turned {:.0}°", degrees.abs()));
         }
-        if (placement.scale - 1.0).abs() > 1.0e-4 {
-            what.push(format!("scaled to {:.0}%", placement.scale * 100.0));
+        if (placement.scale - glam::Vec3::ONE).abs().max_element() > 1.0e-4 {
+            // Named per axis when they differ, because "scaled to 60%" over a
+            // squash that only touched Z is the status line telling the user
+            // something that did not happen.
+            if placement.is_uniform_scale() {
+                what.push(format!("scaled to {:.0}%", placement.scale.x * 100.0));
+            } else {
+                what.push(format!(
+                    "resized to {:.0}/{:.0}/{:.0}%",
+                    placement.scale.x * 100.0,
+                    placement.scale.y * 100.0,
+                    placement.scale.z * 100.0
+                ));
+            }
         }
         if what.is_empty() {
             what.push("put back where it started".to_string());
@@ -4101,8 +4135,8 @@ impl Brokkr {
         // **The clamp says so.** A preview box that stops growing under the
         // pointer with nothing said reads as the gizmo having lost the drag.
         // Naming the ceiling is what turns it into an answer.
-        let capped = handle == gizmo::Handle::Uniform
-            && placement.scale >= gizmo.max_scale - 1.0e-3
+        let capped = matches!(handle, gizmo::Handle::Uniform | gizmo::Handle::Scale(_))
+            && placement.scale.max_element() >= gizmo.max_scale - 1.0e-3
             && gizmo.max_scale < gizmo::MAX_SCALE;
         if capped {
             self.status = format!(
@@ -19128,13 +19162,59 @@ mod gizmo_tests {
     }
 
     /// A free-angle drag round a ring, from `+u` toward `+v`.
+    /// **A per-axis scale, through the real pointer path.**
+    ///
+    /// The handle is easy to ship dead: the variant existed for one build with
+    /// nothing constructing it, which the compiler said out loud, and then the
+    /// hit-test that constructed it swallowed every ring press instead. So this
+    /// drives a press on the box, asserts the press was TAKEN as that handle,
+    /// and then asserts the body actually changed shape rather than size.
+    #[test]
+    fn a_per_axis_drag_squashes_one_axis_and_leaves_the_others() {
+        let mut app = app();
+        arm(&mut app);
+        let gizmo = app.gizmo.expect("armed");
+        let origin = gizmo.origin();
+        let scale = crate::gizmo::world_per_pixel(&app.camera, origin, SIZE.y);
+
+        // The X box, at SCALE_BOX_PX along X.
+        let axis = Vec3::X;
+        let at = project(&app, origin + axis * (92.0 * scale));
+        assert_eq!(
+            crate::gizmo::pick(&app.camera, Vec2::new(SIZE.x, SIZE.y), &gizmo, at),
+            Some(crate::gizmo::Handle::Scale(0)),
+            "the press did not land on the per-axis box, so this tests nothing"
+        );
+
+        let before = app.doc.active_volume().world_bounds().expect("a body");
+        // Inward along the axis: a squash.
+        let to = project(&app, origin + axis * (46.0 * scale));
+        gesture(&mut app, at, &[to]);
+        let after = app.doc.active_volume().world_bounds().expect("a body");
+
+        let span = |b: (Vec3, Vec3)| b.1 - b.0;
+        let (was, now) = (span(before), span(after));
+        assert!(now.x < was.x - app.doc.voxel_size(), "x did not squash: {was:?} then {now:?}");
+        assert!(
+            (now.y - was.y).abs() < was.y * 0.15 && (now.z - was.z).abs() < was.z * 0.15,
+            "a per-axis scale changed the other two axes: {was:?} then {now:?}"
+        );
+        assert!(
+            app.status.contains("resized"),
+            "the status line called a per-axis scale something else: {}",
+            app.status
+        );
+    }
+
     fn turn_a_ring(app: &mut Brokkr, radians: f32) {
         let gizmo = app.gizmo.expect("armed");
         let origin = gizmo.origin();
         let scale = crate::gizmo::world_per_pixel(&app.camera, origin, SIZE.y);
         // The Y ring, whose plane is the one the default camera looks most
         // squarely at, so both its ends project well clear of the middle.
-        let radius = 104.0 * scale;
+        // From the constant, not a literal: the ring moved once already and a
+        // stale copy here would silently aim this at empty space.
+        let radius = crate::gizmo::RING_PX * scale;
         let from = project(app, origin + Vec3::Z * radius);
         let to =
             project(app, origin + (Vec3::Z * radians.cos() + Vec3::X * radians.sin()) * radius);
@@ -19608,12 +19688,12 @@ mod gizmo_tests {
             gesture(&mut app, from, &[from + Vec2::new(320.0, 0.0)]);
             let scale = app.gizmo.expect("armed").placement.scale;
             assert!(
-                scale <= ceiling + 1.0e-3,
+                scale.max_element() <= ceiling + 1.0e-3,
                 "round {round} composed to {scale}, past a ceiling of {ceiling}"
             );
         }
         assert!(
-            app.gizmo.expect("armed").placement.scale > 1.0,
+            app.gizmo.expect("armed").placement.scale.max_element() > 1.0,
             "the fixture never grew the body, so it proves nothing"
         );
 
