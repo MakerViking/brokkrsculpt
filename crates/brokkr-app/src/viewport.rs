@@ -153,6 +153,10 @@ pub struct SharedFrame {
     /// Bodies that have left the document and whose pool slots must go with
     /// them. See [`SharedFrame::forget_body`].
     forget: Mutex<Vec<NodeId>>,
+    /// Bodies whose slots must go but which are STILL IN THE DOCUMENT, because
+    /// their geometry has moved and is about to be uploaded again. See
+    /// [`SharedFrame::release_body`].
+    release: Mutex<Vec<NodeId>>,
     /// Bodies the renderer must not draw. See [`SharedFrame::set_hidden`].
     hidden: Mutex<Vec<NodeId>>,
     /// Bodies drawn with the opposite of [`MaskView::inverted`]. See
@@ -321,6 +325,27 @@ impl SharedFrame {
         self.forget.lock().expect("shared frame poisoned").push(body);
     }
 
+    /// Drop a body's slots because its geometry MOVED, not because the body
+    /// went away.
+    ///
+    /// **Distinct from [`SharedFrame::forget_body`], and conflating the two
+    /// makes a body vanish permanently.** A forget means "this body has left
+    /// the document", so `apply` drops every queued upload and the pending
+    /// thumbnail that name it -- otherwise a delete leaves a ghost sliver drawn
+    /// for ever. A transform needs the first half and must not have the second:
+    /// the old slots are stale because the bricks are at new coordinates now,
+    /// but the new meshes are queued in the SAME frame and dropping them leaves
+    /// nothing to draw at all.
+    ///
+    /// That is exactly what shipped: a gizmo move called `forget_body`, the
+    /// re-mesh that followed was discarded by the forget filter, and the body
+    /// disappeared from the viewport with a black thumbnail while its field sat
+    /// intact in the document, the status line reporting an exact move. The
+    /// data was never in danger and that is what made it hard to see.
+    pub fn release_body(&self, body: NodeId) {
+        self.release.lock().expect("shared frame poisoned").push(body);
+    }
+
     /// Replace the set of bodies the renderer must not draw.
     ///
     /// **Wholesale on every change, never mutated one body at a time.** The set
@@ -413,6 +438,13 @@ impl SharedFrame {
         std::mem::take(&mut *self.forget.lock().expect("shared frame poisoned"))
     }
 
+    /// The released list, for the same reason and with the same swap semantics
+    /// as [`SharedFrame::take_forgotten_for_tests`].
+    #[cfg(test)]
+    pub fn take_released_for_tests(&self) -> Vec<NodeId> {
+        std::mem::take(&mut *self.release.lock().expect("shared frame poisoned"))
+    }
+
     /// Ask for one body's picture to be redrawn on the next frame the pool is
     /// quiet.
     ///
@@ -487,6 +519,19 @@ impl SharedFrame {
             std::mem::take(&mut *forget)
         };
         for body in &forgotten {
+            renderer.forget_body(*body);
+        }
+
+        // Released bodies free their slots in the same position as a forget --
+        // before the uploads, so a stale slot at an old brick coordinate cannot
+        // survive and draw the body twice -- but they are deliberately NOT
+        // added to `forgotten`, so the meshes queued behind them in this very
+        // frame still land. See `SharedFrame::release_body`.
+        let released: Vec<NodeId> = {
+            let mut release = self.release.lock().expect("shared frame poisoned");
+            std::mem::take(&mut *release)
+        };
+        for body in &released {
             renderer.forget_body(*body);
         }
 

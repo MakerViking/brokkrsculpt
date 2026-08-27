@@ -2280,13 +2280,22 @@ impl Brokkr {
         self.doc.replace_volume(body, baked);
         self.gizmo_base = Some(base);
 
-        // The one-body version of the unit `apply_merge` documents: the slots
-        // the old field held are in nobody's dirty set now, so `forget_body`
-        // releases them, and the whole-document remesh is the other half --
-        // freeing pool space without re-offering everything takes the
-        // pool-full warning down and leaves the geometry that was refused
-        // missing.
-        self.shared.forget_body(body);
+        // The slots the old field held are in nobody's dirty set now -- the
+        // bricks are at new coordinates -- so they have to be let go, and the
+        // whole-document remesh is the other half: freeing pool space without
+        // re-offering everything takes the pool-full warning down and leaves
+        // the geometry that was refused missing.
+        //
+        // **`release_body` and NOT `forget_body`, and that distinction is the
+        // whole of a bug that shipped.** A forget means the body has left the
+        // document, so `SharedFrame::apply` drops every queued upload and the
+        // pending thumbnail naming it. Here the body is still very much in the
+        // document and its new meshes are queued in the same frame, so a forget
+        // threw them away: the cube disappeared from the viewport, its
+        // thumbnail went black, and the status line said "moved 50.63 mm --
+        // exact". The field was never touched, which is why nothing in the
+        // document looked wrong.
+        self.shared.release_body(body);
         self.doc.mark_everything_dirty();
         self.refresh_model_radius();
         self.remesh_dirty();
@@ -2412,7 +2421,7 @@ impl Brokkr {
         }
         restored.mark_everything_dirty();
         self.doc.replace_volume(body, *restored);
-        self.shared.forget_body(body);
+        self.shared.release_body(body);
         self.doc.mark_everything_dirty();
         self.refresh_model_radius();
         self.remesh_dirty();
@@ -7816,7 +7825,33 @@ impl Brokkr {
                 // stays open after a press that was refused reads as a press
                 // that never landed.
                 self.adding = false;
+                let before = self.doc.body_count();
                 self.add_primitive(kind);
+
+                // **A primitive arrives with its gizmo already on it**, which
+                // is ZBrush's behaviour and the reason Thomas asked for it: you
+                // add a cube in order to put it somewhere and give it a shape,
+                // so making that the default saves reaching for the tool every
+                // single time. It also puts the thing you just made under an
+                // obvious handle, which is the clearest possible answer to
+                // "where did it go" -- a primitive is placed clear of the
+                // model, so it can arrive outside the view.
+                //
+                // Only when a body was actually added: `add_primitive` refuses
+                // on the body ceiling and on the mesh pool, and arming a gizmo
+                // over a refusal would light a mode for a body that does not
+                // exist. And only from Sculpt, so adding a primitive mid-mask
+                // or with a cut armed does not silently change what the next
+                // drag does.
+                if self.doc.body_count() > before && self.tool == Tool::Sculpt {
+                    if let Err(why) = self.arm_gizmo() {
+                        // Not a failure of the add, so the add's own status
+                        // line survives and this is only logged.
+                        log::info!("the new primitive kept the sculpt tool: {why}");
+                    } else {
+                        self.swap_strength(|app| app.tool = Tool::Transform);
+                    }
+                }
             }
             Message::BodyDeleted => self.delete_active_body(),
             Message::BodyDuplicated => self.duplicate_active_body(),
@@ -18955,6 +18990,45 @@ mod gizmo_tests {
         // has to know how big the widget is before the first one.
         app.viewport_size = Vec2::new(SIZE.x, SIZE.y);
         app
+    }
+
+    /// **A transform must not tell the renderer the body has gone.**
+    ///
+    /// `SharedFrame::apply` drops every queued upload and the pending thumbnail
+    /// naming a FORGOTTEN body, which is right for a delete and catastrophic
+    /// for a move: the new meshes are queued in the same frame, so forgetting
+    /// throws away the very geometry that replaces what was released. That
+    /// shipped. Thomas moved a cube, the status line said "moved 50.63 mm --
+    /// exact", and the cube vanished from the viewport with a black thumbnail
+    /// while its field sat intact in the document.
+    ///
+    /// The old test asserted `world_bounds()` had changed -- that the DATA
+    /// moved -- and passed the whole time, which is this project's oldest
+    /// failure wearing a new hat. This asserts what the RENDERER was told.
+    #[test]
+    fn a_transform_releases_the_body_rather_than_forgetting_it() {
+        let mut app = app();
+        update(&mut app, Message::PrimitiveAdded(brokkr_core::PrimitiveKind::Cube));
+        let body = app.doc.active();
+        let _ = app.shared.take_forgotten_for_tests();
+        let _ = app.shared.take_released_for_tests();
+
+        arm(&mut app);
+        drag_the_x_arrow(&mut app, 120.0);
+
+        let forgotten = app.shared.take_forgotten_for_tests();
+        let released = app.shared.take_released_for_tests();
+        assert!(
+            !forgotten.contains(&body),
+            "the moved body was FORGOTTEN, so its re-meshed bricks and its thumbnail              are dropped by SharedFrame::apply and it disappears from the screen"
+        );
+        assert!(
+            released.contains(&body),
+            "the moved body's stale slots were never released, so it draws at both              its old and its new position: forgotten {forgotten:?} released {released:?}"
+        );
+        // And the field is untouched by any of this, which is what made the bug
+        // invisible from the document's side.
+        assert!(app.doc.active_volume().stats().dense_bricks > 0, "the move emptied the body");
     }
 
     fn arm(app: &mut Brokkr) {

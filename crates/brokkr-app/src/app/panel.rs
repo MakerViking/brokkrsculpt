@@ -1392,81 +1392,95 @@ impl Brokkr {
         let (move_style, move_ink) = theme::tool_toggle(self.tool == Tool::Transform);
 
         container(
-            column![
-                text("TOOL").size(theme::CAPTION_SIZE).color(theme::TEXT_MUTE),
-                brushes,
-                text("MIRROR").size(theme::CAPTION_SIZE).color(theme::TEXT_MUTE),
-                mirrors,
-                text("MODE").size(theme::CAPTION_SIZE).color(theme::TEXT_MUTE),
-                // The live state is shown in the strip, not just in the status
-                // line, because **these are the two modes that change what a
-                // left drag does, and only one of the two is destructive.**
-                // (That sentence used to read "this is the one mode", here and
-                // in `handoff.md`; masking made both halves false.) That
-                // asymmetry is also why Escape clears the cut and not the mask:
-                // a cut is a pending destructive thing, a mask is expensive
-                // work with no undo entry until the stroke lands.
-                //
-                // The words stay for exactly that reason: "armed" versus
-                // "plane" is a state, and an icon says which tool this is, not
-                // whether it is about to go off.
-                button(
-                    column![
-                        icon::icon(icon::IconName::CutPlane, theme::ICON_TOOL, cut_ink),
-                        text(if self.tool == Tool::Cut { "armed" } else { "plane" })
+            scrollable(
+                column![
+                    text("TOOL").size(theme::CAPTION_SIZE).color(theme::TEXT_MUTE),
+                    brushes,
+                    text("MIRROR").size(theme::CAPTION_SIZE).color(theme::TEXT_MUTE),
+                    mirrors,
+                    text("MODE").size(theme::CAPTION_SIZE).color(theme::TEXT_MUTE),
+                    // The live state is shown in the strip, not just in the status
+                    // line, because **these are the two modes that change what a
+                    // left drag does, and only one of the two is destructive.**
+                    // (That sentence used to read "this is the one mode", here and
+                    // in `handoff.md`; masking made both halves false.) That
+                    // asymmetry is also why Escape clears the cut and not the mask:
+                    // a cut is a pending destructive thing, a mask is expensive
+                    // work with no undo entry until the stroke lands.
+                    //
+                    // The words stay for exactly that reason: "armed" versus
+                    // "plane" is a state, and an icon says which tool this is, not
+                    // whether it is about to go off.
+                    button(
+                        column![
+                            icon::icon(icon::IconName::CutPlane, theme::ICON_TOOL, cut_ink),
+                            text(if self.tool == Tool::Cut { "armed" } else { "plane" })
+                                .size(theme::TEXT_SIZE_SMALL),
+                        ]
+                        .width(Length::Fill)
+                        .spacing(0)
+                        .align_x(Alignment::Center)
+                    )
+                    .width(Length::Fill)
+                    .style(cut_style)
+                    .on_press(Message::ToolChanged(Tool::Cut)),
+                    button(
+                        column![
+                            icon::icon(icon::IconName::Mask, theme::ICON_TOOL, mask_ink),
+                            // The same live substitution the brush buttons make for
+                            // Smooth: while shift is held a mask drag blurs, so the
+                            // button says what the next drag will actually do.
+                            text(match (self.tool == Tool::Mask, smoothing) {
+                                (true, true) => "blur",
+                                (true, false) => "on",
+                                (false, _) => "mask",
+                            })
                             .size(theme::TEXT_SIZE_SMALL),
-                    ]
+                        ]
+                        .width(Length::Fill)
+                        .spacing(0)
+                        .align_x(Alignment::Center)
+                    )
                     .width(Length::Fill)
-                    .spacing(0)
-                    .align_x(Alignment::Center)
-                )
-                .width(Length::Fill)
-                .style(cut_style)
-                .on_press(Message::ToolChanged(Tool::Cut)),
-                button(
-                    column![
-                        icon::icon(icon::IconName::Mask, theme::ICON_TOOL, mask_ink),
-                        // The same live substitution the brush buttons make for
-                        // Smooth: while shift is held a mask drag blurs, so the
-                        // button says what the next drag will actually do.
-                        text(match (self.tool == Tool::Mask, smoothing) {
-                            (true, true) => "blur",
-                            (true, false) => "on",
-                            (false, _) => "mask",
-                        })
-                        .size(theme::TEXT_SIZE_SMALL),
-                    ]
+                    .style(mask_style)
+                    .on_press(Message::ToolChanged(Tool::Mask)),
+                    // The third mode that changes what a left drag does. The word
+                    // under it says whether the next release will cost the surface
+                    // anything, which is the one thing about this tool a user
+                    // cannot see by looking at the model.
+                    button(
+                        column![
+                            icon::icon(icon::IconName::Gizmo, theme::ICON_TOOL, move_ink),
+                            text(match self.tool == Tool::Transform {
+                                true if smoothing => "free",
+                                true => "snap",
+                                false => "move",
+                            })
+                            .size(theme::TEXT_SIZE_SMALL),
+                        ]
+                        .width(Length::Fill)
+                        .spacing(0)
+                        .align_x(Alignment::Center)
+                    )
                     .width(Length::Fill)
-                    .spacing(0)
-                    .align_x(Alignment::Center)
-                )
-                .width(Length::Fill)
-                .style(mask_style)
-                .on_press(Message::ToolChanged(Tool::Mask)),
-                // The third mode that changes what a left drag does. The word
-                // under it says whether the next release will cost the surface
-                // anything, which is the one thing about this tool a user
-                // cannot see by looking at the model.
-                button(
-                    column![
-                        icon::icon(icon::IconName::Gizmo, theme::ICON_TOOL, move_ink),
-                        text(match self.tool == Tool::Transform {
-                            true if smoothing => "free",
-                            true => "snap",
-                            false => "move",
-                        })
-                        .size(theme::TEXT_SIZE_SMALL),
-                    ]
-                    .width(Length::Fill)
-                    .spacing(0)
-                    .align_x(Alignment::Center)
-                )
-                .width(Length::Fill)
-                .style(move_style)
-                .on_press(Message::ToolChanged(Tool::Transform)),
-            ]
-            .spacing(theme::S3)
-            .align_x(Alignment::Center),
+                    .style(move_style)
+                    .on_press(Message::ToolChanged(Tool::Transform)),
+                ]
+                .spacing(theme::S3)
+                .align_x(Alignment::Center),
+            )
+            // **The strip outgrew the window and the last button was clipped to
+            // a sliver.** Its own doc comment above predicted this -- "one
+            // screenshot at 768 settles it properly and none has been taken" --
+            // and then the gizmo added a fourth mode button and the prediction
+            // came true: Thomas found the tool only by noticing the sliver.
+            //
+            // Scrollable rather than smaller, for the same reason the
+            // properties panel is: shrinking type or dropping the words under
+            // the icons would bet the tool picker on telling clay from draw at
+            // eighteen pixels, which the brush buttons above explicitly refuse
+            // to do. The scrollbar is only reachable when it is needed.
+            .height(Length::Fill),
         )
         .padding(theme::S3)
         .width(Length::Fixed(76.0))
