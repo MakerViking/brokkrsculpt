@@ -37,6 +37,7 @@ pub mod pattern;
 pub mod primitive;
 pub mod project;
 pub mod raycast;
+pub mod redistance;
 pub mod region;
 pub mod resample;
 pub mod rotate;
