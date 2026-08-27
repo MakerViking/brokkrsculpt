@@ -4431,14 +4431,77 @@ impl Brokkr {
     /// which is a user action; see
     /// [`Brokkr::refuse_mirrors_the_body_does_not_straddle`].
     fn apply_view(&mut self, view: &brokkr_core::View) {
-        self.camera = OrbitCamera {
+        // **The near and far planes come from the body being restored, never
+        // from the default sphere, and getting that wrong poisons the file it
+        // is later saved to.**
+        //
+        // This used to spread `framing(Vec3::ZERO, MODEL_RADIUS_MM)` -- the
+        // 30 mm starting ball -- which set `near` to 0.03 and therefore pinned
+        // `zoom_by`'s floor at `near * 10.0` = 0.3 mm whatever was actually in
+        // the file. On a 133 mm model the floor should be 1.33 mm, so the first
+        // scroll inwards drove the camera to 0.3 and left it there: zooming in
+        // did nothing, and zooming out moved 12% of 0.3 mm, which is 0.036 mm a
+        // notch. Pan and orbit both scale with `distance`, so THE SPACEMOUSE,
+        // THE SCROLL WHEEL AND THE NAVIGATION CUBE ALL LOOKED DEAD AT ONCE --
+        // which is the shape of the report, and the reason it read as a broken
+        // file rather than a broken clamp. Saving then wrote 0.3 into the
+        // container, so the damage outlived the session that caused it.
+        let radius =
+            self.doc.active_volume().content_radius().unwrap_or(MODEL_RADIUS_MM).max(1.0e-3);
+        let centre = self
+            .doc
+            .active_volume()
+            .world_bounds()
+            .map_or(Vec3::ZERO, |(low, high)| (low + high) * 0.5);
+        let framed = OrbitCamera::framing(centre, radius);
+
+        let mut camera = OrbitCamera {
             target: view.camera_target,
             distance: view.camera_distance,
             yaw: view.camera_yaw,
             pitch: view.camera_pitch,
             roll: view.camera_roll,
-            ..OrbitCamera::framing(Vec3::ZERO, MODEL_RADIUS_MM)
+            ..framed
         };
+
+        // **A file written before that fix carries the bad numbers, so the
+        // restore has to be able to recover one rather than merely stop making
+        // them.** Two ways a saved view can be unusable, and both are checked
+        // against the body rather than against a constant:
+        //
+        // The target may sit outside the model's bounding sphere, in which case
+        // the camera is aimed at empty space and no amount of orbiting brings
+        // the model back -- orbiting turns about the target, so the model stays
+        // exactly as far off screen as it was. The real file that prompted this
+        // had a target 435 mm from a model of radius 133 mm.
+        //
+        // And the distance may be outside what `zoom_by` will now admit, which
+        // is what a floor computed from the wrong radius leaves behind.
+        //
+        // The angles are kept in both cases. They are the part of a saved view
+        // that is still meaningful when the rest of it is not, and re-framing
+        // without them would spin a model the user had deliberately turned.
+        let lost_target = !camera.target.is_finite() || camera.target.distance(centre) > radius;
+        let lost_distance = !camera.distance.is_finite()
+            || camera.distance < framed.near * 10.0
+            || camera.distance > framed.far;
+        if lost_target {
+            camera.target = framed.target;
+        }
+        if lost_distance {
+            camera.distance = framed.distance;
+        }
+        if lost_target || lost_distance {
+            // Said out loud rather than fixed silently: the view really is not
+            // the one the file asked for, and a user who had framed a detail
+            // deliberately should be told why it moved.
+            self.status = format!(
+                "{} — the saved view could not see the model, so it was re-framed",
+                self.status
+            );
+        }
+
+        self.camera = camera;
         self.brush.radius = view.brush_radius.clamp(MIN_RADIUS_MM, self.max_radius());
         self.brush.strength = view.brush_strength.clamp(MIN_STRENGTH, MAX_STRENGTH);
         self.symmetry = MirrorAxis::ALL
@@ -7626,6 +7689,81 @@ mod tests {
 
     /// ZBrush calls this Dynamic. Without it a brush tuned on one model is the
     /// wrong size the moment the model changes scale.
+    /// **A saved view that cannot see the model is re-framed rather than
+    /// restored, and the near plane comes from the body rather than from the
+    /// starting ball.**
+    ///
+    /// This is the regression for a real file. `Brokkr.brokkr` -- a 133 mm
+    /// model centred on the origin -- was saved carrying `target` 435 mm away
+    /// and `distance` 0.3 mm, and reported as "I cannot navigate in this file:
+    /// not the SpaceMouse, not the scroll wheel, not the navigation cube."
+    /// All three at once is the tell that nothing was wrong with any of them:
+    /// pan, zoom and orbit all scale with `distance`, and 0.3 mm makes every
+    /// one of them move by nothing you can see.
+    ///
+    /// 0.3 is exactly `near * 10.0` for a 30 mm ball, which is what
+    /// `apply_view` used to spread over every restore regardless of what was
+    /// in the file. So the clamp that should have stopped at 1.33 mm let the
+    /// camera inside the model and then pinned it there, and the next save
+    /// wrote that back to disk.
+    ///
+    /// Both halves are asserted, because either alone leaves the file unusable:
+    /// the floor has to follow the body, and a poisoned view already on disk
+    /// has to recover.
+    #[test]
+    fn a_saved_view_that_cannot_see_the_model_is_re_framed() {
+        let mut app = app();
+        app.doc.active_volume_mut().seed_sphere(Vec3::ZERO, 133.0);
+        app.rebuild_everything();
+
+        let poisoned = brokkr_core::View {
+            camera_target: Vec3::new(-435.18, -12.09, 95.65),
+            camera_distance: 0.3,
+            camera_yaw: 42.6,
+            camera_pitch: -0.05,
+            ..brokkr_core::View::default()
+        };
+        app.apply_view(&poisoned);
+
+        let radius = app.doc.active_volume().content_radius().expect("the ball has bounds");
+        assert!(
+            app.camera.near * 10.0 > 1.0,
+            "the zoom floor is {} -- it came from the 30 mm ball, not from a {radius} mm model",
+            app.camera.near * 10.0
+        );
+        assert!(
+            app.camera.target.distance(Vec3::ZERO) <= radius,
+            "the camera is still aimed {} mm from a model of radius {radius}",
+            app.camera.target.distance(Vec3::ZERO)
+        );
+        assert!(
+            app.camera.distance >= app.camera.near * 10.0,
+            "the restored distance {} is below its own floor {}",
+            app.camera.distance,
+            app.camera.near * 10.0
+        );
+        assert!(
+            (app.camera.yaw - 42.6).abs() < 1.0e-3,
+            "re-framing threw away the angles the user had set"
+        );
+
+        // And the recovery is visible rather than silent.
+        assert!(
+            app.status.contains("re-framed"),
+            "the view moved and nothing said so: {}",
+            app.status
+        );
+
+        // The whole point: a scroll now moves the camera by something you can see.
+        let before = app.camera.distance;
+        app.camera.zoom(1.0);
+        assert!(
+            (app.camera.distance - before).abs() > 1.0,
+            "one notch of scroll moved {} mm",
+            (app.camera.distance - before).abs()
+        );
+    }
+
     /// The whole point of the format: sculpt, save, reopen, and get the same
     /// thing back. Driven through the application's own open and save rather
     /// than through the format directly, because the interesting failures are
@@ -17079,5 +17217,43 @@ mod mask_generator_tests {
         assert_eq!(app.doc.body_count(), bodies, "an unmasked body was split anyway");
         assert!(app.status.contains("no mask"), "the refusal does not say why: {}", app.status);
         assert!(!app.unsaved, "a refusal marked the document unsaved");
+    }
+}
+
+#[cfg(test)]
+mod real_file_check {
+    use super::*;
+
+    #[test]
+    #[ignore]
+    fn the_dragonstone_project_opens_on_a_camera_that_can_move() {
+        let path = std::path::Path::new(
+            "/home/thomash/Downloads/Meshy_AI_Dragonstone_Carver_0823214323_generate_obj/Brokkr.brokkr",
+        );
+        if !path.exists() {
+            println!("absent, skipping");
+            return;
+        }
+        let mut app = Brokkr::with_tablet(crate::tablet::Tablet::inert());
+        app.open_project(path);
+        let c = app.camera;
+        println!("status: {}", app.status);
+        println!(
+            "target {:?}  distance {:.3}  floor {:.3}  far {:.1}",
+            c.target,
+            c.distance,
+            c.near * 10.0,
+            c.far
+        );
+        let before = app.camera.distance;
+        app.camera.zoom(1.0);
+        println!(
+            "one scroll notch: {:.3} -> {:.3}  (moved {:.3} mm)",
+            before,
+            app.camera.distance,
+            (app.camera.distance - before).abs()
+        );
+        assert!((app.camera.distance - before).abs() > 1.0, "scroll still does nothing");
+        assert!(app.camera.target.distance(Vec3::ZERO) < 200.0, "still aimed at empty space");
     }
 }
