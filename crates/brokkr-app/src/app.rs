@@ -19,6 +19,7 @@ use iced::{Subscription, Task};
 
 use crate::camera::OrbitCamera;
 use crate::cursor;
+use crate::gizmo;
 use crate::message::{
     ConfirmChoice, ExportFormat, MaskGenerator, Message, PanelSection, PointerButton, PointerEvent,
     SpaceMouseSetting, TopMenu,
@@ -219,13 +220,6 @@ const MAX_TILT: f32 = std::f32::consts::PI / 3.0;
 /// about a second, which is long enough to be steady and short enough to react.
 const FRAME_HISTORY: usize = 60;
 
-/// How close a flown-to pitch may come to straight up or down.
-///
-/// The camera clamps this itself, but a flight interpolates the field directly,
-/// so it has to respect the same limit or a top view would collapse the view
-/// matrix on arrival.
-const PITCH_SAFE: f32 = std::f32::consts::FRAC_PI_2 - 0.02;
-
 /// How far the pointer may travel during a right press and still count as a
 /// click rather than an orbit.
 ///
@@ -236,6 +230,17 @@ const PITCH_SAFE: f32 = std::f32::consts::FRAC_PI_2 - 0.02;
 /// named.
 const CLICK_SLOP_PX: f32 = 4.0;
 const CLICK_MS: u128 = 250;
+
+/// How much a scaled bake is assumed to overshoot the square law.
+///
+/// Measured rather than chosen: `Volume::warped` of a 10 mm sphere at 0.25 mm
+/// gives 4.66x its resident bytes at scale 2 and 15.25x at scale 4, against the
+/// 4 and 16 a pure square law predicts. The excess at small scales is the
+/// narrow band, which is a fixed thickness in VOXELS and so a bigger share of a
+/// small shell. One number covering both, rounded up.
+///
+/// See [`Brokkr::largest_scale_that_fits`], its only reader.
+const SCALE_GROWTH_MARGIN: f64 = 1.25;
 
 /// What a held pointer button is currently doing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -267,6 +272,16 @@ enum DragKind {
     /// the user had not chosen a target for is exactly the surprise this
     /// ordering exists to remove.
     Selecting,
+    /// The pointer is dragging a gizmo handle, locked at the press.
+    ///
+    /// **The handle is a payload for the same reason [`DragKind::Sculpt`]
+    /// carries its direction and [`DragKind::Masking`] deliberately does not.**
+    /// Which handle is being dragged is decided once, by where the button went
+    /// down, and re-picking it per motion event would hand the gesture to a
+    /// different axis the moment the pointer wandered off the shaft -- which it
+    /// does immediately, because the whole point of an axis drag is to move
+    /// away from where you started.
+    Transforming(gizmo::Handle),
     /// The press had nothing it was allowed to do: the pointer was over
     /// nothing that is drawn, and the body edits would land on is hidden.
     ///
@@ -293,6 +308,14 @@ struct Drag {
     /// than a click. Once true it stays true: a drag that returns to where it
     /// started is still a drag.
     moved: bool,
+    /// The world point a camera drag turns about, latched at the press.
+    ///
+    /// **Latched, and not asked for again per motion event.** The pivot is the
+    /// surface under the cursor when the button went down; re-picking it as the
+    /// pointer moves would hand the orbit a new centre every frame, which is a
+    /// camera that slides away under a steady drag rather than one that turns a
+    /// model in your hand. `None` for a drag that is not a camera drag.
+    pivot: Option<Vec3>,
 }
 
 /// Timings for the debug overlay.
@@ -536,6 +559,20 @@ pub struct Brokkr {
     facts_recorded: bool,
     /// The navigation cube's geometry, swapped to the renderer the same way.
     cube: brokkr_gpu::OverlayBatch,
+    /// The transform gizmo's geometry, in a batch of its own because it is
+    /// drawn in a pass of its own -- the sculpt's matrix, over the sculpt's
+    /// depth. See `SculptRenderer::overlay_pass`.
+    gizmo_batch: brokkr_gpu::OverlayBatch,
+    /// The gizmo, when [`Tool::Transform`] has taken a body.
+    gizmo: Option<gizmo::Gizmo>,
+    /// The active body's field as it was when the gizmo armed.
+    ///
+    /// **Every bake is from this, and that is the whole anti-degradation
+    /// design.** See [`Brokkr::rebake_gizmo`]. Held out of the document while
+    /// armed -- the document holds the baked result -- so peak memory while the
+    /// gizmo is up is twice the body, which is what
+    /// [`Brokkr::arm_gizmo`] checks for before it allocates anything.
+    gizmo_base: Option<Box<brokkr_core::Volume>>,
     /// The cube part under the pointer, lit so a click's effect is visible
     /// before the click.
     cube_hover: Option<navcube::Part>,
@@ -1303,6 +1340,14 @@ pub enum Tool {
     /// The next left drag is a plane cut line. One shot: [`Brokkr::finish_cut`]
     /// puts the tool back to [`Tool::Sculpt`].
     Cut,
+    /// The transform gizmo moves, turns and scales the active body. Key `w`.
+    ///
+    /// **The predicted fourth variant**, and it arrived as the paragraph above
+    /// said it would: a variant here rather than a second concept beside
+    /// [`DragKind`]. The press-lock-commit lifecycle it shares with the plane
+    /// cut is [`DragKind::Transforming`], which locks the handle at the press
+    /// and commits on the release.
+    Transform,
 }
 
 /// Turn a window event the widget tree did not want into a message.
@@ -1423,6 +1468,32 @@ pub(crate) const RENAME_FIELD: &str = "brokkr-body-rename";
 /// background -- arrives as [`Message::PressedNothing`], which is on no list
 /// here and therefore commits. That message exists for exactly this, because
 /// the field has already blurred itself by then.
+/// Whether a message belongs to a gizmo session, or ends it.
+///
+/// The allowlist is deliberately short and deliberately errs toward COMMITTING:
+/// a message wrongly on this list acts on a document whose last change is not
+/// yet on the undo stack, and a message wrongly off it costs the user one extra
+/// press of `w`. Those two mistakes are not the same size.
+///
+/// `KeyPressed` is on it because every keyboard shortcut arrives as one first
+/// and is re-dispatched as the message it means -- which is then judged here on
+/// its own merits. Escape's `MenuClosed` is on it because Escape is how a
+/// session is ABANDONED, and committing on the way past would be the opposite
+/// of what was pressed.
+fn keeps_the_gizmo_armed(message: &Message) -> bool {
+    match message {
+        // The gesture itself, and the camera moves that happen around it.
+        Message::Pointer(_) | Message::Frame => true,
+        Message::KeyPressed { .. } | Message::MenuClosed => true,
+        Message::ToolChanged(_) => true,
+        Message::SizingEnded | Message::MaskPeekEnded => true,
+        // Framing the active body is how a user gets back to what they are
+        // placing; it changes no document state at all.
+        Message::CameraFramedOnActive => true,
+        _ => false,
+    }
+}
+
 fn keeps_the_rename_open(message: &Message) -> bool {
     match message {
         Message::BodyRenameEdited(_) => true,
@@ -1534,6 +1605,9 @@ impl Brokkr {
             bug_report: None,
             facts_recorded: false,
             cube: brokkr_gpu::OverlayBatch::default(),
+            gizmo_batch: brokkr_gpu::OverlayBatch::default(),
+            gizmo: None,
+            gizmo_base: None,
             cube_hover: None,
             flight: None,
             menu: None,
@@ -1592,6 +1666,10 @@ impl Brokkr {
         app.perf.load_ms = app.perf.remesh_ms;
         app.perf.remesh_ms = 0.0;
         app.perf.dirty_bricks = 0;
+        // Before the first publish, so the camera's floor and far plane are in
+        // the document's units from the first frame rather than from the
+        // defaults `framing` leaves behind.
+        app.refresh_camera_lattice();
         app.publish_camera();
         app.refresh_detail_advice();
         app.refresh_overlay();
@@ -1754,10 +1832,189 @@ impl Brokkr {
     }
 
     fn publish_camera(&mut self) {
+        // **The one place a camera becomes legal.** Every gesture, every
+        // flight, every restore passes through here, so containing the target
+        // here rather than in each of them makes "the camera is lost" a state
+        // the application cannot reach rather than one it has to detect. See
+        // [`Brokkr::contain_target`] for why that is worth a check per frame of
+        // a drag.
+        self.contain_target();
         self.shared.set_camera(self.camera);
         // The cube shows the camera's orientation, so it is stale the moment the
         // camera moves. This is the one place that knows that happened.
         self.refresh_cube();
+        // And the gizmo is held at a constant SIZE on screen, so it is stale
+        // for the same reason. See `refresh_gizmo` for why it cannot ride
+        // `refresh_overlay` instead.
+        self.refresh_gizmo();
+    }
+
+    /// The ball the camera is allowed to aim inside: everything the document
+    /// holds, plus nothing.
+    ///
+    /// Over [`Document::world_bounds`] and not the active body, because a user
+    /// panning across a two body document is doing something reasonable and
+    /// must not be fenced into whichever one happens to be selected. The union
+    /// spans the gaps between bodies, which for a camera bound is the safe
+    /// direction to be loose in -- unlike sizing a primitive, where the same
+    /// looseness compounds and is refused.
+    ///
+    /// Falls back to the starting ball when the document is empty, so a new
+    /// file still has somewhere legal to look.
+    fn document_ball(&self) -> (Vec3, f32) {
+        match self.doc.world_bounds() {
+            Some((low, high)) => ((low + high) * 0.5, ((high - low).length() * 0.5).max(1.0e-3)),
+            None => (Vec3::ZERO, MODEL_RADIUS_MM),
+        }
+    }
+
+    /// Pull the camera's target back inside [`Brokkr::document_ball`].
+    ///
+    /// **The fence is what makes the rest of the system's assumptions true.**
+    /// Two subsystems take the eye-to-target distance as the eye-to-MODEL
+    /// distance and would break silently without it: [`OrbitCamera::far`] is
+    /// both the far plane and the length of every pick ray, and
+    /// [`OrbitCamera::near`] is a hundredth of the distance. Let the target
+    /// wander a long way from the model and the model goes behind the far plane
+    /// -- measured, at 2405 mm from the eye against a far plane of 2318: it is
+    /// not drawn and it is not pickable, and nothing says so.
+    ///
+    /// So the fence stays the document's own ball, in millimetres. **Widening
+    /// it in proportion to the distance was tried and is what produced that
+    /// measurement** -- the idea being that a target far from the model is
+    /// harmless when the eye is even further away, which is true of the camera
+    /// alone and false of the two derived quantities above.
+    ///
+    /// It is [`Document::world_bounds`] and not the active body, because a user
+    /// panning across a two body document is doing something reasonable and
+    /// must not be fenced into whichever one happens to be selected.
+    ///
+    /// The clamp is to the surface of the ball rather than to its centre, so
+    /// nothing jumps: a gesture pushing outward simply stops moving the target,
+    /// and every gesture pulling back inward is free.
+    ///
+    /// **What keeps the fence from being felt is that the wheel no longer
+    /// pushes the target at it**; see [`Brokkr::navigation_anchor`].
+    fn contain_target(&mut self) {
+        let (centre, radius) = self.document_ball();
+        if !self.camera.target.is_finite() {
+            self.camera.target = centre;
+            return;
+        }
+        let offset = self.camera.target - centre;
+        if offset.length() > radius {
+            self.camera.target = centre + offset.normalize() * radius;
+        }
+    }
+
+    /// Tell the camera the lattice and extent it should measure itself against.
+    ///
+    /// The zoom floor is a number of voxels and the far plane a multiple of the
+    /// content radius, so both go stale the moment the document is resampled,
+    /// imported into, or grown. Called from the same places
+    /// [`Brokkr::refresh_model_radius`] is.
+    fn refresh_camera_lattice(&mut self) {
+        let radius = self
+            .doc
+            .world_bounds()
+            .map_or(MODEL_RADIUS_MM, |(low, high)| ((high - low).length() * 0.5).max(1.0e-3));
+        self.camera.set_lattice(self.doc.voxel_size(), radius);
+    }
+
+    /// Frame the active body, which is the one keystroke that recovers from any
+    /// camera at all.
+    ///
+    /// **A camera free enough to be useful is a camera that can get lost**, and
+    /// the answer to that tension is not to restrict the freedom but to make
+    /// coming back cost one key. `contain_target` stops the target wandering
+    /// out of the document; this is what puts it back on the thing the user
+    /// meant when it has merely wandered somewhere unhelpful.
+    ///
+    /// The angles are kept, exactly as [`Brokkr::apply_view`] keeps them: a
+    /// user who has turned the model to see the back of its head has not asked
+    /// to be spun round to the front.
+    fn frame_active(&mut self) {
+        let volume = self.doc.active_volume();
+        let (centre, radius) = match (volume.world_bounds(), volume.content_radius()) {
+            (Some((low, high)), Some(radius)) => ((low + high) * 0.5, radius.max(1.0e-3)),
+            _ => (Vec3::ZERO, MODEL_RADIUS_MM),
+        };
+        let framed = OrbitCamera::framing(centre, radius);
+        self.camera.target = framed.target;
+        self.refresh_camera_lattice();
+        // Clamped, because a body smaller than a couple of voxels frames at a
+        // distance under its own floor and the camera would sit inside its own
+        // limit until the next scroll pushed it back out.
+        self.camera.distance =
+            framed.distance.clamp(self.camera.min_distance(), self.camera.max_distance());
+        self.publish_camera();
+        self.status = "framed the active body".to_string();
+    }
+
+    /// The world point a wheel notch should zoom about.
+    ///
+    /// **The surface under the cursor when moving in, the target otherwise**,
+    /// and both halves of that were arrived at by measuring rather than by
+    /// taste.
+    ///
+    /// Anchoring the way IN is the feature Thomas asked for. The eye travels
+    /// toward the target, and after a file is opened the target is the middle
+    /// of the model -- so a target-centred zoom walks the camera INTO the
+    /// geometry, and by the time an eyelid fills the view the eye is inside the
+    /// skull. Lowering the distance floor only chooses how deep in you may get.
+    /// Anchoring on the surface under the cursor is what Nomad and Blender do
+    /// and what makes "closer" mean closer to the detail. It costs nothing:
+    /// `update_hover` already ran a full pick on the last pointer move, and a
+    /// wheel notch does not move the pointer.
+    ///
+    /// Everything else is the target, because an anchor that is NOT on the
+    /// model pushes the target off the model in exact proportion to the
+    /// distance. `(target - anchor) / distance` is invariant across
+    /// [`OrbitCamera::zoom_by_about`] -- that invariance is exactly why the
+    /// anchor stays pinned under the cursor -- so the drift is unbounded in the
+    /// distance, and it breaks three things in rising order of quietness:
+    ///
+    /// - It walks the target into [`Brokkr::contain_target`]'s fence, and that
+    ///   clamp is not invertible. Measured through the real wheel path, cursor
+    ///   over empty background on the default ball: four notches out and four
+    ///   back returned the target to within 0.00 mm, eight and eight left it
+    ///   25.62 mm away on the opposite side, twelve and twelve left it 69.06 mm
+    ///   away -- the whole fence -- with the model no longer under the middle of
+    ///   the viewport. Two flicks of a wheel.
+    /// - Widening the fence to admit the drift is worse, not better. With the
+    ///   target far from the model, [`OrbitCamera::far`] -- the far plane AND
+    ///   the length of every pick ray -- stops reaching the model. Measured at
+    ///   2405 mm from the eye against a far plane of 2318: the model is not
+    ///   drawn and not pickable, and nothing says so.
+    /// - [`OrbitCamera::near`] is a hundredth of the distance, so far enough
+    ///   out the same drift clips the near side too.
+    ///
+    /// Two anchors are off the model, and both are handled by falling back:
+    ///
+    /// - **Zooming out, wherever the cursor is.** Anchoring outward is the same
+    ///   arithmetic run backwards and drifts the target away from the cursor.
+    /// - **Zooming in with the cursor over background.** The fallback this
+    ///   replaced was the ray's crossing of the plane through the target, argued
+    ///   for as being continuous across a silhouette -- but that point is not on
+    ///   the model, so it drifts too: twelve notches out and twelve back in over
+    ///   a corner puts the target 188 mm from a 69 mm document, i.e. hard into
+    ///   the fence. Continuity across the silhouette is not worth losing the
+    ///   sculpt for.
+    ///
+    /// What this gives up is stated plainly: zooming in on a detail and back out
+    /// restores the distance and the angles exactly but leaves the view centred
+    /// on that detail rather than on wherever it started. That is not a camera
+    /// that failed to come back -- the model is whole and on screen, at the
+    /// distance and angle it was -- and it is the price of the target never
+    /// being anywhere the rest of the system does not expect it. **The target
+    /// cannot leave the document ball through the wheel at all now:** the only
+    /// anchor that moves it is a point on the model, the ball is convex, and a
+    /// zoom-in leaves the target on the segment between two points inside it.
+    fn navigation_anchor(&self, factor: f32) -> Vec3 {
+        match self.hover {
+            Some(hover) if factor < 1.0 => hover,
+            _ => self.camera.target,
+        }
     }
 
     /// Rebuild the navigation cube and hand it to the renderer.
@@ -1768,12 +2025,409 @@ impl Brokkr {
         self.cube = batch;
     }
 
+    /// Rebuild the transform gizmo and hand it to the renderer.
+    ///
+    /// **Beside `refresh_cube` and never inside `refresh_overlay`.** That
+    /// function's own header says it is deliberately not camera dependent --
+    /// the ring and the mirror planes are world-space geometry, so a camera
+    /// moving under them needs no rebuild. A gizmo held at a constant size on
+    /// screen falsifies exactly that premise: every one of its dimensions is a
+    /// number of pixels converted through the camera. So it travels the way the
+    /// cube does, through `publish_camera`, and by the same buffer rotation, so
+    /// nothing allocates once warm.
+    fn refresh_gizmo(&mut self) {
+        let mut batch = std::mem::take(&mut self.gizmo_batch);
+        match &self.gizmo {
+            Some(gizmo) => gizmo::build(&mut batch, &self.camera, self.viewport_size, gizmo),
+            // Cleared rather than left: a stale gizmo is one that is still
+            // drawn on a body nothing is armed on.
+            None => batch.clear(),
+        }
+        self.shared.swap_gizmo(&mut batch);
+        self.gizmo_batch = batch;
+    }
+
+    /// Take the active body under the gizmo, or say why not.
+    ///
+    /// # The refusal is at ARM time, before anything is allocated
+    ///
+    /// `merge_plan`'s header states the rule this follows: the user is asked
+    /// before the allocation, and never after it. Arming is the commitment
+    /// point here and not the first release, because arming is what promises to
+    /// hold a second copy of the body for as long as the gizmo is up -- and by
+    /// the first release the memory is already spent and the field already
+    /// baked.
+    ///
+    /// Two ceilings, and they fail differently:
+    ///
+    /// * The reclaim allowance. A field larger than it would be evicted from
+    ///   history the instant it was pushed, so the transform would be
+    ///   **un-undoable** -- and a free-angle transform has no "do it backwards"
+    ///   recovery the way a quarter turn does. That is the one that matters.
+    /// * The document's own volume ceiling, against holding base and baked at
+    ///   once.
+    ///
+    /// Both name the voxel size that would fit, from the same square law
+    /// [`Brokkr::too_fine_for_the_pool`] uses: a surface has a fixed area, so
+    /// halving the voxel quadruples the shell that stores it.
+    fn arm_gizmo(&mut self) -> Result<(), String> {
+        if self.gizmo.is_some() {
+            return Ok(());
+        }
+        let body = self.doc.active();
+        if !self.active_is_drawn() {
+            return Err("that body is hidden — turn its eye on to move it".to_string());
+        }
+        let volume = self.doc.active_volume();
+        let Some((low, high)) = volume.world_bounds() else {
+            return Err("there is nothing in this body to move".to_string());
+        };
+        let stats = volume.stats();
+        let resident = stats.resident_bytes;
+        let entry_bytes = size_of::<brokkr_core::Volume>() + resident;
+
+        let coarser = |headroom: f64| self.doc.voxel_size() / headroom.sqrt() as f32 * 1.03;
+        if entry_bytes as f64 > brokkr_core::DEFAULT_RECLAIM_BUDGET as f64 {
+            let headroom = brokkr_core::DEFAULT_RECLAIM_BUDGET as f64 / entry_bytes.max(1) as f64;
+            return Err(format!(
+                "this body is {:.0} MB and undo can hold {:.0} MB, so the move could not be \
+                 undone — {:.3} mm is the coarsest voxel that would fit",
+                entry_bytes as f64 / (1024.0 * 1024.0),
+                brokkr_core::DEFAULT_RECLAIM_BUDGET as f64 / (1024.0 * 1024.0),
+                coarser(headroom),
+            ));
+        }
+        // Base and baked are both resident for as long as the gizmo is up.
+        let peak = self.doc_stats.resident_bytes as f64 + resident as f64;
+        if peak > MAX_VOLUME_BYTES {
+            let headroom = MAX_VOLUME_BYTES / peak.max(1.0);
+            return Err(format!(
+                "moving this body needs about {:.1} GB while the gizmo is up, against a {:.0} GB \
+                 ceiling — {:.3} mm is the coarsest voxel that would fit",
+                peak / (1024.0 * 1024.0 * 1024.0),
+                MAX_VOLUME_BYTES / (1024.0 * 1024.0 * 1024.0),
+                coarser(headroom),
+            ));
+        }
+
+        let max_scale = self.largest_scale_that_fits(stats);
+        self.gizmo = Some(gizmo::Gizmo::new(body, low, high, max_scale));
+        self.refresh_gizmo();
+        Ok(())
+    }
+
+    /// The largest TOTAL scale a bake of this body could be built at.
+    ///
+    /// # Why this is a clamp on the gesture and not a refusal at the release
+    ///
+    /// `merge_plan`'s rule is that the user is asked before the allocation and
+    /// never after it, and a gizmo has no moment in which to ask: the gesture
+    /// IS the question, so a refusal that arrives once the pointer has been
+    /// released is an answer too late to act on. Folding the ceiling into the
+    /// gesture instead means the preview box stops growing exactly where the
+    /// bake would stop fitting, and everything the user is shown is a placement
+    /// that can actually be built. See the clamp in `gizmo::drag`.
+    ///
+    /// Without it there is no bound anywhere on the path. `Volume::warped`
+    /// builds a dense grid of destination brick coordinates between the moved
+    /// bounds with no cap, `arm_gizmo`'s two refusals are evaluated once
+    /// against the UNSCALED body, and `Similarity::then` composes gestures by
+    /// multiplying their scales.
+    ///
+    /// # The prediction, and where each term comes from
+    ///
+    /// Two terms, because the field and the mask do not grow at the same rate
+    /// and only the field obeys the square law the rest of this file uses.
+    ///
+    /// * A surface has fixed area, so scaling by `s` multiplies the shell that
+    ///   stores it by `s * s`. Measured on a 10 mm sphere at 0.25 mm:
+    ///   4.66x resident at `s = 2` and 15.25x at `s = 4`, against 4 and 16 --
+    ///   which is where [`SCALE_GROWTH_MARGIN`] comes from.
+    /// * `MaskField::warped` has no interior shortcut to collapse a thickened
+    ///   protection region with, so one source mask brick's forward image is
+    ///   `s * s * s` destination bricks. A heavily masked body scaled far up is
+    ///   the case a single square law would miss.
+    ///
+    /// `A s^2 + B s^3 <= headroom` has no closed form worth writing, so the
+    /// answer is bisected. It runs once, at arming.
+    ///
+    /// Never below 1.0: a body can always be placed at the size it already is,
+    /// and a ceiling that said otherwise would make even the identity
+    /// unreachable at the moment the document is fullest.
+    fn largest_scale_that_fits(&self, stats: brokkr_core::VolumeStats) -> f32 {
+        // What the BAKED field may occupy. The base is held aside for as long
+        // as the gizmo is up and `doc_stats` was measured with it still in the
+        // document, so the two cancel: the room left for the baked field is the
+        // room left beside the document as it stands.
+        let headroom = MAX_VOLUME_BYTES - self.doc_stats.resident_bytes as f64;
+        let mask = stats.mask_bytes as f64;
+        let field = (stats.resident_bytes as f64 - mask).max(0.0);
+        let cost =
+            |scale: f64| (field * scale * scale + mask * scale.powi(3)) * SCALE_GROWTH_MARGIN;
+
+        let mut fits = 1.0f64;
+        // Above `gizmo::MAX_SCALE`, so the search never becomes the binding
+        // constraint on a document with room to spare.
+        let mut refused = 64.0f64;
+        for _ in 0..24 {
+            let middle = (fits + refused) * 0.5;
+            if cost(middle) <= headroom {
+                fits = middle;
+            } else {
+                refused = middle;
+            }
+        }
+        fits as f32
+    }
+
+    /// Rebuild the body from the field the gizmo armed on.
+    ///
+    /// # Always from the base, and that is the whole design
+    ///
+    /// The obvious implementation bakes the current field through whatever the
+    /// last drag did, which makes N gestures cost N trilinear passes. Placement
+    /// is fiddly: thirty nudges over a session is an ordinary number, and
+    /// thirty passes is detail the user sculpted, gone, with nothing having
+    /// said so -- discovered at the printer. Baking from the base instead
+    /// bounds the erosion at **one pass per arming**, whatever the user does in
+    /// between, and makes dragging in a circle and back exactly the identity
+    /// rather than approximately it.
+    ///
+    /// The exact routes cost zero passes, not one: a snapped move is a
+    /// value-exact gather and a snapped quarter turn is a permutation, so an
+    /// entire session of snapped gestures leaves the field bit-identical to
+    /// what it was.
+    ///
+    /// The base is taken out of the document on the FIRST bake rather than at
+    /// arming, so that arming alone never touches the field -- pressing `w` and
+    /// pressing it again has to be free.
+    fn rebake_gizmo(&mut self) {
+        let Some(gizmo) = self.gizmo else {
+            return;
+        };
+        let body = gizmo.body;
+        let voxel_size = self.doc.voxel_size();
+        let route = gizmo.placement.route(voxel_size);
+
+        // Nothing is asked for. Two cases, and the second one is the trap.
+        //
+        // Nothing baked yet: leave the document alone entirely, so an armed
+        // gizmo that is only looked at costs nothing at all.
+        //
+        // Something baked and then undone by hand -- a nudge out and a nudge
+        // back, which is an ordinary way to change your mind -- must not go on
+        // to `base.shifted(IVec3::ZERO)`. That route is real work:
+        // `Volume::duplicated`'s own header quotes 1.53 GiB on the dragon, and
+        // it would be spent producing a field identical to the one already
+        // held. Worse, it leaves `gizmo_base` set, so the disarm pushes a
+        // whole-field undo entry for a placement that changed nothing --
+        // charged against the reclaim allowance, where `History::trim` can
+        // evict real strokes to make room for it. Putting the base BACK returns
+        // the session to armed-and-untouched, which is exact, allocates
+        // nothing, and makes the disarm correctly push no entry at all.
+        if route == brokkr_core::Bake::Identity {
+            if self.gizmo_base.is_none() {
+                return;
+            }
+            let started = Instant::now();
+            self.restore_base(body);
+            self.status =
+                Self::bake_summary(&gizmo.placement, route, voxel_size, started.elapsed());
+            return;
+        }
+
+        // Move the field out on the first bake. Two steps rather than one so
+        // the old baked field is dropped BEFORE the new one is built: peak
+        // memory stays at two copies of the body rather than three.
+        let placeholder = brokkr_core::Volume::new(voxel_size);
+        let Some(previous) = self.doc.replace_volume(body, placeholder) else {
+            return;
+        };
+        let stale: Vec<brokkr_core::BrickCoord> = previous.brick_coords().collect();
+        let base = match self.gizmo_base.take() {
+            Some(base) => {
+                drop(previous);
+                base
+            }
+            None => Box::new(previous),
+        };
+
+        let started = Instant::now();
+        let mut baked = match route {
+            // Unreachable: the identity route returns above, having put the
+            // base back rather than deep copying it. Left as the harmless
+            // answer rather than a panic, because the cost of being wrong here
+            // is one wasted copy and the cost of a panic is the sculpt.
+            brokkr_core::Bake::Identity => base.shifted(glam::IVec3::ZERO),
+            // Turn first, then carry it to where the pivot asked for. Both are
+            // exact; see `Similarity::route`, which works out why the shift is
+            // not simply the translation in voxels.
+            brokkr_core::Bake::Exact { turns, voxel_offset } => {
+                let turned = if turns.is_identity() { None } else { Some(base.rotated(turns)) };
+                match turned {
+                    Some(turned) => turned.shifted(voxel_offset),
+                    None => base.shifted(voxel_offset),
+                }
+            }
+            brokkr_core::Bake::Resample => base.warped(gizmo.placement),
+        };
+        // The bricks the outgoing field occupied, marked in the INCOMING one:
+        // without this the renderer keeps drawing triangles nothing will ever
+        // overwrite. The same rule `Document::resample` follows.
+        for coord in stale {
+            baked.mark_dirty(coord);
+        }
+        self.doc.replace_volume(body, baked);
+        self.gizmo_base = Some(base);
+
+        // The one-body version of the unit `apply_merge` documents: the slots
+        // the old field held are in nobody's dirty set now, so `forget_body`
+        // releases them, and the whole-document remesh is the other half --
+        // freeing pool space without re-offering everything takes the
+        // pool-full warning down and leaves the geometry that was refused
+        // missing.
+        self.shared.forget_body(body);
+        self.doc.mark_everything_dirty();
+        self.refresh_model_radius();
+        self.remesh_dirty();
+        self.unsaved = true;
+        self.thumbs.geometry_changed(body);
+        self.status = Self::bake_summary(&gizmo.placement, route, voxel_size, started.elapsed());
+    }
+
+    /// What just happened to the field, in the words that matter.
+    ///
+    /// **The route is named on every bake, not only the lossy ones.** A user
+    /// who is told nothing when a move is exact has no way to learn that some
+    /// of them are not, and the whole point of snapping by default is that the
+    /// ordinary gesture is free. Saying so is what teaches that.
+    fn bake_summary(
+        placement: &brokkr_core::Similarity,
+        route: brokkr_core::Bake,
+        voxel_size: f32,
+        elapsed: std::time::Duration,
+    ) -> String {
+        let (axis, angle) = placement.rotation.to_axis_angle();
+        let degrees = crate::camera::wrap_angle(angle).to_degrees() * axis.length().max(1.0);
+        let mut what = Vec::new();
+        if placement.translation.length() > voxel_size * 0.5 {
+            what.push(format!("moved {:.2} mm", placement.translation.length()));
+        }
+        if degrees.abs() > 0.05 {
+            what.push(format!("turned {:.0}°", degrees.abs()));
+        }
+        if (placement.scale - 1.0).abs() > 1.0e-4 {
+            what.push(format!("scaled to {:.0}%", placement.scale * 100.0));
+        }
+        if what.is_empty() {
+            what.push("put back where it started".to_string());
+        }
+        let ms = elapsed.as_secs_f64() * 1000.0;
+        if route.is_lossy() {
+            format!(
+                "{} — resampled in {ms:.0} ms; turning it back will not restore it exactly, \
+                 and undo will",
+                what.join(", ")
+            )
+        } else {
+            format!("{} — exact, {ms:.0} ms, not one voxel recomputed", what.join(", "))
+        }
+    }
+
+    /// Put the gizmo away.
+    ///
+    /// `commit` decides which of the two answers the user asked for, and the
+    /// split follows the convention every modelling tool already has: Escape
+    /// abandons, anything else commits.
+    ///
+    /// * Committing pushes ONE [`brokkr_core::Change::WholeVolume`] holding the
+    ///   field as it was when the gizmo armed -- one entry per SESSION and not
+    ///   one per drag, because a per-drag entry would be a full field each and
+    ///   thirty of them would evict each other and every stroke behind them.
+    /// * Abandoning puts that field straight back and pushes nothing, so a
+    ///   session the user changed their mind about leaves no trace in the
+    ///   history at all.
+    ///
+    /// Either way the base is given up, which is what makes the erosion bound
+    /// -- one pass per arming -- a statement about the whole session.
+    fn disarm_gizmo(&mut self, commit: bool) {
+        let Some(gizmo) = self.gizmo.take() else {
+            return;
+        };
+        self.refresh_gizmo();
+        if self.gizmo_base.is_none() {
+            // Armed and never baked, or baked and then returned to the identity
+            // by hand -- `rebake_gizmo` puts the base back in that case, which
+            // is what makes this branch cover both. Nothing was moved, so there
+            // is nothing to commit and nothing to put back.
+            return;
+        }
+        let body = gizmo.body;
+
+        if commit {
+            let base = self.gizmo_base.take().expect("checked just above");
+            let before = self.history.stats();
+            self.history.push(brokkr_core::Entry::new(vec![brokkr_core::Change::WholeVolume {
+                body,
+                volume: base,
+            }]));
+            self.record_history(before);
+            return;
+        }
+
+        if self.restore_base(body) {
+            self.status = "put the body back where it was".to_string();
+        }
+    }
+
+    /// Put the field the gizmo armed on back into the document, exactly, and
+    /// give the base up.
+    ///
+    /// Two callers, and they want it for two different reasons: Escape
+    /// abandoning a session, and a gesture that has returned the placement to
+    /// the identity. Both leave the document holding the field the gizmo armed
+    /// on and `gizmo_base` empty, which is the state a disarm has nothing to
+    /// commit from -- so a session the user changed their mind about leaves no
+    /// entry on the stack whether they said so with Escape or with the pointer.
+    ///
+    /// Answers whether there was a base to put back.
+    fn restore_base(&mut self, body: NodeId) -> bool {
+        let Some(base) = self.gizmo_base.take() else {
+            return false;
+        };
+        let voxel_size = self.doc.voxel_size();
+        let placeholder = brokkr_core::Volume::new(voxel_size);
+        let Some(baked) = self.doc.replace_volume(body, placeholder) else {
+            return false;
+        };
+        // The bricks the baked field occupied, marked in the one going back:
+        // without them the renderer keeps drawing triangles nothing will ever
+        // overwrite. The same pairing `rebake_gizmo` makes in the other
+        // direction.
+        let stale: Vec<brokkr_core::BrickCoord> = baked.brick_coords().collect();
+        drop(baked);
+        let mut restored = base;
+        for coord in stale {
+            restored.mark_dirty(coord);
+        }
+        restored.mark_everything_dirty();
+        self.doc.replace_volume(body, *restored);
+        self.shared.forget_body(body);
+        self.doc.mark_everything_dirty();
+        self.refresh_model_radius();
+        self.remesh_dirty();
+        true
+    }
+
     /// Start an animated move to a cube part's orientation.
     fn fly_to(&mut self, part: navcube::Part) {
+        // **Not clamped short of the pole any more, and that is the point.**
+        // A flight interpolates the angle fields directly, so while `look_at`
+        // built the view matrix a top view had to stop 0.02 rad short or arrive
+        // at a collapsed matrix -- which meant clicking "top" on the cube gave
+        // a view that was very nearly but visibly not the top. The composed
+        // basis is orthonormal at the pole, so the cube now lands on it.
         let (yaw, pitch) = navcube::orientation(part.direction, self.camera.yaw);
-        // Clamped the way a drag would be, so a top or bottom face lands just
-        // short of the pole rather than collapsing the view matrix.
-        let pitch = pitch.clamp(-PITCH_SAFE, PITCH_SAFE);
         // The shortest way round, so a click never spins the model several times
         // to reach a heading a few degrees away.
         let yaw = self.camera.yaw + OrbitCamera::shortest_angle_delta(self.camera.yaw, yaw);
@@ -1855,6 +2509,9 @@ impl Brokkr {
         // long a body would be missing from the screen with nothing in the
         // panel saying why.
         self.publish_visibility();
+        // A whole-document swap can change both the lattice and the extent,
+        // which are the two numbers the camera measures itself against.
+        self.refresh_model_radius();
     }
 
     fn remesh_dirty(&mut self) {
@@ -1938,6 +2595,9 @@ impl Brokkr {
     fn refresh_model_radius(&mut self) {
         self.model_radius = self.doc.active_volume().content_radius().unwrap_or(MODEL_RADIUS_MM);
         self.model_radius_body = self.doc.active();
+        // The camera measures its floor in voxels and its far plane in content
+        // radii, so it goes stale for exactly the reasons this does.
+        self.refresh_camera_lattice();
     }
 
     /// Choose the body that edits land on, with everything that has to follow.
@@ -3301,6 +3961,17 @@ impl Brokkr {
         // paint lands on the active body wherever the cursor is. A ring built
         // from another body's field at a point on that other body's surface is
         // a confident ring in mid air over a body that is not being painted.
+        // **The gizmo takes the ring away entirely**, which is not the same
+        // case as the two below. A brush ring says "a press here would carve
+        // this much of that surface", and under the gizmo a press does no such
+        // thing -- it grabs a handle, or it chooses a body. Drawing one would
+        // be the same lie the live-stroke case below exists to stop, told about
+        // a different gesture.
+        if self.tool == Tool::Transform {
+            self.hover = None;
+            self.hover_body = None;
+            return;
+        }
         let owns_the_ring = self.tool == Tool::Mask
             || matches!(self.drag.map(|drag| drag.kind), Some(DragKind::Sculpt(_)));
         if !owns_the_ring {
@@ -3323,7 +3994,7 @@ impl Brokkr {
     /// carved.
     fn pick(&self, pixel: Vec2) -> Option<(NodeId, brokkr_core::Hit)> {
         let (origin, ray) = self.ray_through(pixel);
-        self.doc.pick(origin, ray, self.camera.far, &self.shown)
+        self.doc.pick(origin, ray, self.camera.far(), &self.shown)
     }
 
     /// Whether the body edits land on is one of the ones being drawn.
@@ -3384,6 +4055,60 @@ impl Brokkr {
         MAX_RADIUS_MM.min(MAX_RADIUS_VOXELS * self.doc.voxel_size()).max(MIN_RADIUS_MM)
     }
 
+    /// Carry a live gizmo drag to the pointer.
+    ///
+    /// **Nothing is baked here.** The placement is arithmetic and the preview
+    /// box is twelve lines; the field is rebuilt exactly once, on the release,
+    /// by [`Brokkr::rebake_gizmo`]. That is the difference between a gesture
+    /// costing one trilinear pass and costing one per pointer event.
+    ///
+    /// Shift frees the snap rather than imposing it, which is the opposite of
+    /// every other application's convention and is deliberate: here the snapped
+    /// gesture is the LOSSLESS one, so the default has to be the one that costs
+    /// the surface nothing and the modifier has to be the one that admits a
+    /// price. See `gizmo::ROTATION_SNAP`.
+    fn transform_to(&mut self, handle: gizmo::Handle, position: Vec2) {
+        let (Some(drag), Some(gizmo)) = (self.drag, self.gizmo) else {
+            return;
+        };
+        let gesture = gizmo::drag(
+            &self.camera,
+            self.viewport_size,
+            &gizmo,
+            handle,
+            drag.origin,
+            position,
+            (!self.shift).then(|| self.doc.voxel_size()),
+        );
+        let placement = gizmo.pinned.then(gesture);
+        if let Some(live) = &mut self.gizmo {
+            live.placement = placement;
+        }
+        self.refresh_gizmo();
+        // What the release is ABOUT to cost, before it is spent. The armed
+        // badge the plan asked for, in the one place the interface already
+        // reads from.
+        let route = placement.route(self.doc.voxel_size());
+        // **The clamp says so.** A preview box that stops growing under the
+        // pointer with nothing said reads as the gizmo having lost the drag.
+        // Naming the ceiling is what turns it into an answer.
+        let capped = handle == gizmo::Handle::Uniform
+            && placement.scale >= gizmo.max_scale - 1.0e-3
+            && gizmo.max_scale < gizmo::MAX_SCALE;
+        if capped {
+            self.status = format!(
+                "scale — {:.0}% is as large as this body fits in memory",
+                gizmo.max_scale * 100.0
+            );
+            return;
+        }
+        self.status = format!(
+            "{} — {}",
+            handle.verb(),
+            if route.is_lossy() { "will resample" } else { "exact" }
+        );
+    }
+
     /// The world space ray through a point in widget pixels.
     fn ray_through(&self, pixel: Vec2) -> (Vec3, Vec3) {
         let aspect = self.viewport_size.x / self.viewport_size.y.max(1.0);
@@ -3401,7 +4126,9 @@ impl Brokkr {
     /// the ring in one place and the stroke in another.
     fn surface_under(&self, pixel: Vec2) -> Option<Vec3> {
         let (origin, ray) = self.ray_through(pixel);
-        self.doc.pick_body(self.doc.active(), origin, ray, self.camera.far).map(|hit| hit.position)
+        self.doc
+            .pick_body(self.doc.active(), origin, ray, self.camera.far())
+            .map(|hit| hit.position)
     }
 
     /// Open the undo recorder on the body this stroke is about to write to, if
@@ -3450,7 +4177,7 @@ impl Brokkr {
     fn live_strength_slot(&self) -> usize {
         match self.tool {
             Tool::Mask => MASK_STRENGTH_SLOT,
-            Tool::Sculpt | Tool::Cut => Self::strength_slot(self.brush.kind),
+            Tool::Sculpt | Tool::Cut | Tool::Transform => Self::strength_slot(self.brush.kind),
         }
     }
 
@@ -3458,7 +4185,7 @@ impl Brokkr {
     pub(crate) fn max_strength(&self) -> f32 {
         match self.tool {
             Tool::Mask => MAX_MASK_STRENGTH,
-            Tool::Sculpt | Tool::Cut => MAX_STRENGTH,
+            Tool::Sculpt | Tool::Cut | Tool::Transform => MAX_STRENGTH,
         }
     }
 
@@ -3473,6 +4200,7 @@ impl Brokkr {
             (Tool::Mask, true) => "MASK — BLUR".to_string(),
             (Tool::Mask, false) => "MASK".to_string(),
             (Tool::Cut, _) => "PLANE CUT".to_string(),
+            (Tool::Transform, _) => "MOVE".to_string(),
             (Tool::Sculpt, _) => self.effective_brush().kind.label().to_uppercase(),
         }
     }
@@ -4237,6 +4965,9 @@ impl Brokkr {
         self.history.clear();
         self.history_stats = self.history.stats();
         self.camera = OrbitCamera::framing(Vec3::ZERO, MODEL_RADIUS_MM);
+        // `framing` leaves the default lattice behind, and the floor is a
+        // number of voxels, so it has to be told the real one.
+        self.refresh_camera_lattice();
         self.project_path = None;
         self.unsaved = false;
         self.status = String::new();
@@ -4463,6 +5194,28 @@ impl Brokkr {
             roll: view.camera_roll,
             ..framed
         };
+        // **The admissible range is asked of a camera carrying the document's
+        // own lattice and extent, which is the pair the live camera will be
+        // given the moment this restore lands.**
+        //
+        // `framing` sets neither: it takes a radius and leaves `voxel_size` at
+        // the 0.25 mm default, so `framed.min_distance()` was 0.5 mm for every
+        // document ever opened while the live floor is
+        // `doc.voxel_size() * 2.0`. Measured: resample to 0.05, scroll in, the
+        // camera legitimately reaches 0.1 -- and reopening threw that framing
+        // away and re-framed to 158 mm, with a status line telling the user
+        // their file was wrong. Every lattice but 0.25 was affected, and the
+        // suite could not see it because `VOXEL_SIZE_MM` happens to equal the
+        // camera default.
+        //
+        // The ceiling had the same shape for a second reason: it came from the
+        // ACTIVE body's content radius while the live one comes from the
+        // document ball, so 200 notches of scroll-out parked the camera at
+        // 6906 -- legal, the live clamp put it there -- and the loader called
+        // 5520 the limit and rejected it. This is the same "the loader and the
+        // live camera must not disagree about the same word" the target test
+        // below is built on; it simply was not applied to the distance.
+        camera.set_lattice(self.doc.voxel_size(), self.document_ball().1);
 
         // **A file written before that fix carries the bad numbers, so the
         // restore has to be able to recover one rather than merely stop making
@@ -4478,18 +5231,32 @@ impl Brokkr {
         // And the distance may be outside what `zoom_by` will now admit, which
         // is what a floor computed from the wrong radius leaves behind.
         //
+        // **The target test is [`Brokkr::document_ball`] and not the active
+        // body's own sphere, so that the loader and the live camera cannot
+        // disagree about the same word.** [`Brokkr::contain_target`] holds the
+        // camera inside that ball on every mutation; if the restore accepted a
+        // smaller one, a target the live camera reaches legitimately -- panned
+        // across a two body document, say -- would be refused on the way back
+        // in and the user's framing thrown away for no reason. The union spans
+        // the gaps between bodies, which for a camera bound is the safe
+        // direction to be loose in.
+        //
         // The angles are kept in both cases. They are the part of a saved view
         // that is still meaningful when the rest of it is not, and re-framing
         // without them would spin a model the user had deliberately turned.
-        let lost_target = !camera.target.is_finite() || camera.target.distance(centre) > radius;
+        let (ball_centre, ball_radius) = self.document_ball();
+        let lost_target =
+            !camera.target.is_finite() || camera.target.distance(ball_centre) > ball_radius;
         let lost_distance = !camera.distance.is_finite()
-            || camera.distance < framed.near * 10.0
-            || camera.distance > framed.far;
+            || camera.distance < camera.min_distance()
+            || camera.distance > camera.max_distance();
         if lost_target {
             camera.target = framed.target;
         }
         if lost_distance {
-            camera.distance = framed.distance;
+            // Clamped for the same reason `frame_active` clamps: a body smaller
+            // than a couple of voxels frames at a distance under its own floor.
+            camera.distance = framed.distance.clamp(camera.min_distance(), camera.max_distance());
         }
         if lost_target || lost_distance {
             // Said out loud rather than fixed silently: the view really is not
@@ -4502,6 +5269,7 @@ impl Brokkr {
         }
 
         self.camera = camera;
+        self.refresh_camera_lattice();
         self.brush.radius = view.brush_radius.clamp(MIN_RADIUS_MM, self.max_radius());
         self.brush.strength = view.brush_strength.clamp(MIN_STRENGTH, MAX_STRENGTH);
         self.symmetry = MirrorAxis::ALL
@@ -4612,6 +5380,9 @@ impl Brokkr {
     fn adopt_import(&mut self, imported: crate::message::Imported) {
         self.doc = Document::from_volume(imported.volume);
         self.camera = OrbitCamera::framing(Vec3::ZERO, MODEL_RADIUS_MM);
+        // `framing` leaves the default lattice behind, and the floor is a
+        // number of voxels, so it has to be told the real one.
+        self.refresh_camera_lattice();
         self.history.clear();
         self.history_stats = self.history.stats();
         self.project_path = None;
@@ -5080,6 +5851,9 @@ impl Brokkr {
         self.rebuild_everything();
         let _ = previous_radius;
         self.camera = OrbitCamera::framing(Vec3::ZERO, self.model_radius.max(1.0e-3));
+        // `framing` leaves the default lattice behind, and the floor is a
+        // number of voxels, so it has to be told the real one.
+        self.refresh_camera_lattice();
         self.publish_camera();
         self.refresh_overlay();
         self.refresh_detail_advice();
@@ -5160,37 +5934,58 @@ impl Brokkr {
         log::info!("{}", self.status);
     }
 
+    /// What one puck button press does.
+    ///
+    /// Split out of [`Brokkr::drive_from_spacemouse`] so a test can press a
+    /// button without a `/dev/input` node: the press queue is filled by a
+    /// reader thread, and the two camera arms below are exactly the kind of
+    /// code that goes wrong unobserved because nothing in CI can reach it.
+    fn run_puck_button(&mut self, action: ButtonAction) {
+        match action {
+            ButtonAction::None => {}
+            ButtonAction::Undo => self.undo(),
+            ButtonAction::Redo => self.redo(),
+            // Recentre and refit without losing which way the model is being
+            // looked at, which is what makes this useful mid sculpt.
+            //
+            // **Through `frame_active`, not a fresh `framing`.** Assigning one
+            // resets `voxel_size` to the 0.25 mm default and `content_radius`
+            // to the hardcoded 30 mm starting ball, and both are now
+            // load-bearing: the first is the zoom floor and the second is both
+            // the far plane and the length of every pick ray. Measured on a
+            // document resampled to 0.05, the floor went from 0.1 to 0.5 -- a
+            // puck button silently making the camera five times coarser than
+            // the lattice deserves, which is the precise complaint this work
+            // exists to fix. On a large model the same assignment collapses
+            // `far()` to well inside the geometry, so the far half of it stops
+            // being drawn and stops being pickable at once. `frame_active`
+            // frames the body that is actually there and refreshes the lattice
+            // from the document, which is the whole job.
+            ButtonAction::FrameModel => self.frame_active(),
+            // Everything back to the start, roll included. This is the way out
+            // of a view that has been twisted somewhere confusing.
+            ButtonAction::ResetView => {
+                let start = OrbitCamera::default();
+                self.camera.yaw = start.yaw;
+                self.camera.pitch = start.pitch;
+                self.camera.roll = start.roll;
+                // The angles are the reset; the framing is `frame_active`'s,
+                // for the reason above.
+                self.frame_active();
+                self.status = "reset the view".to_string();
+            }
+            ButtonAction::ToggleSymmetry => {
+                // Through the same gate the strip uses, and not a bare
+                // `toggled`: see `toggle_mirror`.
+                self.toggle_mirror(MirrorAxis::X);
+            }
+        }
+    }
+
     /// Apply one frame of puck motion, and whatever its buttons asked for.
     fn drive_from_spacemouse(&mut self, elapsed_ms: f32) {
         for action in self.spacemouse.take_presses() {
-            match action {
-                ButtonAction::None => {}
-                ButtonAction::Undo => self.undo(),
-                ButtonAction::Redo => self.redo(),
-                // Recentre and refit without losing which way the model is
-                // being looked at, which is what makes this useful mid sculpt.
-                ButtonAction::FrameModel => {
-                    let framed = OrbitCamera::framing(Vec3::ZERO, MODEL_RADIUS_MM);
-                    self.camera = OrbitCamera {
-                        yaw: self.camera.yaw,
-                        pitch: self.camera.pitch,
-                        roll: self.camera.roll,
-                        ..framed
-                    };
-                    self.publish_camera();
-                }
-                // Everything back to the start, roll included. This is the way
-                // out of a view that has been twisted somewhere confusing.
-                ButtonAction::ResetView => {
-                    self.camera = OrbitCamera::framing(Vec3::ZERO, MODEL_RADIUS_MM);
-                    self.publish_camera();
-                }
-                ButtonAction::ToggleSymmetry => {
-                    // Through the same gate the strip uses, and not a bare
-                    // `toggled`: see `toggle_mirror`.
-                    self.toggle_mirror(MirrorAxis::X);
-                }
-            }
+            self.run_puck_button(action);
         }
 
         let motion = self.spacemouse.motion();
@@ -6302,6 +7097,46 @@ impl Brokkr {
                     return;
                 }
 
+                // **Before every other left-press rule, and bounds-checked
+                // before it may claim anything.** ONLY BOUNDS-CHECKED EVENTS
+                // MAY CAPTURE: `gizmo::pick` returns `None` for anything
+                // outside the gizmo's own disc, so a press on the model still
+                // reaches the sculpt below. It sits above the tool match rather
+                // than inside `Tool::Transform`'s arm so that the gizmo is
+                // reachable while the pointer is over another body -- selecting
+                // a different body out from under an armed gizmo is exactly the
+                // surprise the press ordering exists to remove.
+                //
+                // A held resize still outranks it, which is the precedence the
+                // press dispatch below already settled between sizing and the
+                // cut: a resize whose press turned into something else is the
+                // worse of the two surprises, and the pointer belongs to that
+                // gesture whether or not a button is down.
+                if button == PointerButton::Left
+                    && self.sizing.is_none()
+                    && let Some(gizmo) = self.gizmo
+                    && let Some(handle) =
+                        gizmo::pick(&self.camera, self.viewport_size, &gizmo, position)
+                {
+                    if let Some(live) = &mut self.gizmo {
+                        // Latched at the press: `drag` is absolute from this
+                        // pixel and measures about the placement as it stands
+                        // now, so both have to be held for the whole gesture.
+                        live.pinned = live.placement;
+                        live.grabbed = Some(handle);
+                    }
+                    self.drag = Some(Drag {
+                        button,
+                        kind: DragKind::Transforming(handle),
+                        origin: position,
+                        pressed_at: Instant::now(),
+                        moved: false,
+                        pivot: None,
+                    });
+                    self.refresh_gizmo();
+                    return;
+                }
+
                 let kind = match button {
                     // Left sculpts -- unless a hold-and-drag resize is in
                     // progress, in which case the pointer belongs to that
@@ -6327,6 +7162,25 @@ impl Brokkr {
                         // reason and so that the two agree.
                         Tool::Mask => DragKind::Masking,
                         Tool::Sculpt => self.sculpt_press(position),
+                        // The press missed every handle -- the gizmo claims its
+                        // own above. Choosing a body is the useful thing left,
+                        // and it re-arms on the new one, which is what makes
+                        // "move this one now" one press rather than three.
+                        Tool::Transform => {
+                            let chosen = self.pick(position).map(|(body, _)| body);
+                            match chosen {
+                                Some(body) if body != self.doc.active() => {
+                                    self.disarm_gizmo(true);
+                                    self.select_body(body);
+                                    if let Err(why) = self.arm_gizmo() {
+                                        self.status = why;
+                                        self.tool = Tool::Sculpt;
+                                    }
+                                    DragKind::Selecting
+                                }
+                                _ => DragKind::Refused,
+                            }
+                        }
                     },
                     // Right and middle move the camera. Shift slides instead of
                     // turning.
@@ -6344,6 +7198,20 @@ impl Brokkr {
                     origin: position,
                     pressed_at: Instant::now(),
                     moved: false,
+                    // `refresh_hover` ran on the motion event that brought the
+                    // pointer here, so this costs a field read and no march.
+                    //
+                    // **The hover, with no fallback.** Orbiting about a point
+                    // MOVES the target, so an anchor off the model walks the
+                    // target sideways on every drag that started over empty
+                    // background -- measured at 68 mm from one twenty step drag
+                    // on a 30 mm ball, and it compounds. `None` here means
+                    // "turn about the target", which is what orbiting has
+                    // always done. [`Brokkr::navigation_anchor`] refuses an
+                    // off-model anchor for the wheel for the same reason,
+                    // arrived at separately and measured separately. Pinned by
+                    // `an_orbit_drag_that_starts_off_the_model_turns_about_the_target`.
+                    pivot: (kind == DragKind::Orbit).then_some(self.hover).flatten(),
                 });
 
                 if let DragKind::Sculpt(direction) = kind {
@@ -6368,6 +7236,18 @@ impl Brokkr {
                     if matches!(drag.kind, DragKind::Cutting) {
                         // The drag already recorded where the button went down.
                         self.finish_cut(drag.origin);
+                    }
+                    // **The one place the field is rebuilt**, and it is the
+                    // release rather than the motion: a bake per frame would be
+                    // hundreds of trilinear passes for one gesture, and the
+                    // preview box is what stands in for the model in the
+                    // meantime.
+                    if matches!(drag.kind, DragKind::Transforming(_)) {
+                        if let Some(live) = &mut self.gizmo {
+                            live.grabbed = None;
+                        }
+                        self.rebake_gizmo();
+                        self.refresh_gizmo();
                     }
                     // A mask gesture ends the same way a sculpt one does, and
                     // through the same function: both opened the same recorder,
@@ -6412,11 +7292,47 @@ impl Brokkr {
                     return;
                 }
 
+                // The gizmo's hover, whether or not a button is down: it is
+                // what says which handle a press would take, and it is a
+                // handful of projections rather than a raycast.
+                if let Some(gizmo) = self.gizmo {
+                    let hovered = (self.drag.is_none())
+                        .then(|| gizmo::pick(&self.camera, self.viewport_size, &gizmo, position))
+                        .flatten();
+                    if let Some(live) = &mut self.gizmo
+                        && live.hovered != hovered
+                    {
+                        live.hovered = hovered;
+                        self.refresh_gizmo();
+                    }
+                }
+
                 match self.drag.map(|drag| drag.kind) {
+                    Some(DragKind::Transforming(handle)) => {
+                        self.transform_to(handle, position);
+                        // Nothing else on this event: a gizmo drag owns the
+                        // pointer, and the brush ring under it would be a ring
+                        // on a surface that is about to move.
+                        return;
+                    }
                     Some(DragKind::Sculpt(direction)) => self.sculpt_to(position, direction, false),
                     Some(DragKind::Masking) => self.mask_to(position, false),
                     Some(DragKind::Orbit) => {
-                        self.camera.orbit(delta);
+                        // About the surface the press landed on, so turning to
+                        // look at the other side of a detail keeps the detail
+                        // on screen instead of swinging it out of frame.
+                        //
+                        // **The fallback is the TARGET**, which is what
+                        // orbiting has always turned about. An anchor off the
+                        // model would put the pivot wherever the cursor
+                        // happened to be over empty background, and since
+                        // orbiting about it moves the target, every drag that
+                        // started off the model would walk the target sideways
+                        // for no benefit at all.
+                        match self.drag.and_then(|drag| drag.pivot) {
+                            Some(pivot) => self.camera.orbit_about(delta, pivot),
+                            None => self.camera.orbit(delta),
+                        }
                         self.publish_camera();
                     }
                     Some(DragKind::Pan) => {
@@ -6454,9 +7370,21 @@ impl Brokkr {
                 self.refresh_hover(position);
                 self.refresh_overlay();
             }
-            PointerEvent::Scrolled { amount } => {
-                self.camera.zoom(amount);
+            PointerEvent::Scrolled { amount, position, size } => {
+                self.viewport_size = Vec2::new(size.x, size.y);
+                let position = Vec2::new(position.x, position.y);
+                // The anchor rule lives in `navigation_anchor`, and it is the
+                // whole of the fix for "I cannot zoom in to work on a detail"
+                // and for the drift that fixing it originally introduced.
+                let factor = OrbitCamera::zoom_factor(amount);
+                let anchor = self.navigation_anchor(factor);
+                self.camera.zoom_by_about(factor, anchor);
                 self.publish_camera();
+                // The ring is pushed onto the surface it sits over and the
+                // pick that placed it was taken at the old camera, so a zoom
+                // leaves it stale. Cheap, and only on a real wheel notch.
+                self.refresh_hover(position);
+                self.refresh_overlay();
             }
         }
     }
@@ -6487,7 +7415,34 @@ impl Brokkr {
         if self.renaming.is_some() && !keeps_the_rename_open(&message) {
             self.commit_rename();
         }
+        // **The same pattern as the rename above, and it is here for a
+        // stronger reason than tidiness.** While the gizmo is armed the
+        // DOCUMENT already holds the baked field and the HISTORY does not yet
+        // hold the entry that undoes it -- the entry is pushed once per
+        // session, at disarm, because one per drag would be a whole field each
+        // and thirty of them would evict every stroke behind them. So any
+        // message that is not part of the gesture has to close the session
+        // first, or it acts on a document whose last change is not on the
+        // stack. Undo is the sharpest case and by no means the only one: save,
+        // export, delete, resample and every future operation belong to the
+        // same set, and that set is not a list anyone can keep correct.
+        // Asking the question once, before the message is acted on, cannot go
+        // out of date.
+        if self.gizmo.is_some() && !keeps_the_gizmo_armed(&message) {
+            self.disarm_gizmo(true);
+        }
         let task = self.dispatch(message);
+        // And the gizmo follows the active body. The guard above committed
+        // whatever was in flight; this re-arms on whatever is active NOW, so
+        // choosing a different row while the tool is up moves the gizmo there
+        // rather than leaving the mode lit with nothing under it.
+        if self.tool == Tool::Transform
+            && self.gizmo.is_none()
+            && let Err(why) = self.arm_gizmo()
+        {
+            self.status = why;
+            self.tool = Tool::Sculpt;
+        }
         self.publish_visibility();
         task
     }
@@ -6742,6 +7697,33 @@ impl Brokkr {
                 // silently drop the mode they are painting in. The next reader
                 // will want to add it here for symmetry; this paragraph is why
                 // not.
+                // Escape ABANDONS the gizmo, where choosing another tool
+                // commits it. Ahead of the cut in the cascade for the reason
+                // every card here is ordered by: this one is the answer to a
+                // question the user can see being asked -- a body sitting
+                // somewhere it was dragged to -- and the cut is a mode with
+                // nothing pending on screen.
+                //
+                // A LIVE drag is cancelled first and on its own, without
+                // disarming: Escape mid-drag means "not that one", not "not any
+                // of it", and the gesture is undone by throwing it away rather
+                // than by inverting it -- `pinned` is what the placement was
+                // before the button went down.
+                if let Some(gizmo) = &mut self.gizmo
+                    && gizmo.grabbed.is_some()
+                {
+                    gizmo.placement = gizmo.pinned;
+                    gizmo.grabbed = None;
+                    self.drag = None;
+                    self.refresh_gizmo();
+                    self.status = "cancelled the drag".to_string();
+                    return Task::none();
+                }
+                if self.tool == Tool::Transform {
+                    self.disarm_gizmo(false);
+                    self.tool = Tool::Sculpt;
+                    return Task::none();
+                }
                 if self.tool == Tool::Cut {
                     self.tool = Tool::Sculpt;
                 }
@@ -6778,6 +7760,22 @@ impl Brokkr {
             // makes one variant cover arming and disarming both.
             Message::ToolChanged(tool) => {
                 let tool = if tool == self.tool { Tool::Sculpt } else { tool };
+                // Leaving the gizmo COMMITS, where Escape abandons. That split
+                // is the convention every modelling tool already has, and it is
+                // the safe way round: choosing another tool is not a statement
+                // about the placement, and silently undoing it would throw away
+                // work the user can see on screen.
+                if self.tool == Tool::Transform && tool != Tool::Transform {
+                    self.disarm_gizmo(true);
+                }
+                if tool == Tool::Transform
+                    && let Err(why) = self.arm_gizmo()
+                {
+                    // Refused BEFORE the tool changes, so the strip does not
+                    // light a mode that has no gizmo under it.
+                    self.status = why;
+                    return Task::none();
+                }
                 // Through the swap so the mask's own strength is put away and
                 // the brush's is brought back, and vice versa. See `strengths`.
                 self.swap_strength(|app| app.tool = tool);
@@ -6788,6 +7786,9 @@ impl Brokkr {
                     }
                     Tool::Mask => "mask: drag to protect, ctrl or alt to unprotect, \
                                    shift to soften"
+                        .to_string(),
+                    Tool::Transform => "move: drag an arrow, a square or a ring — snapped to \
+                                        the voxel and to quarter turns, hold shift for free"
                         .to_string(),
                     Tool::Sculpt => String::new(),
                 };
@@ -6874,6 +7875,7 @@ impl Brokkr {
             // the `show_mask` field for the whole of that argument.
             Message::ShowMaskToggled => self.show_mask = !self.show_mask,
             Message::MaskTintChanged(tint) => self.mask_tint = tint.clamp(0.0, 1.0),
+            Message::CameraFramedOnActive => self.frame_active(),
             Message::MaskPeekStarted => self.mask_peek = true,
             Message::MaskPeekEnded => self.mask_peek = false,
             // And the verbs, which DO change protection and all of which are
@@ -7726,10 +8728,21 @@ mod tests {
         app.apply_view(&poisoned);
 
         let radius = app.doc.active_volume().content_radius().expect("the ball has bounds");
+        // **The floor assertion changed with the unit it is measured in, and
+        // the behaviour it pinned is the thing being fixed.** It used to demand
+        // `near * 10.0 > 1.0` -- 1.33 mm on this model -- as proof that the
+        // floor had been computed from the body rather than from the 30 mm
+        // starting ball. The floor is now two voxels, so it is the same
+        // closeness on every model by construction and cannot come from the
+        // wrong body at all; a fraction-of-the-radius floor was itself the
+        // reason detail work was impossible. What is still worth pinning is
+        // that the floor is a sane multiple of the lattice and that the
+        // restored distance clears it.
         assert!(
-            app.camera.near * 10.0 > 1.0,
-            "the zoom floor is {} -- it came from the 30 mm ball, not from a {radius} mm model",
-            app.camera.near * 10.0
+            (app.camera.min_distance() - app.doc.voxel_size() * 2.0).abs() < 1.0e-6,
+            "the zoom floor is {} on a {} mm lattice",
+            app.camera.min_distance(),
+            app.doc.voxel_size()
         );
         assert!(
             app.camera.target.distance(Vec3::ZERO) <= radius,
@@ -7737,10 +8750,10 @@ mod tests {
             app.camera.target.distance(Vec3::ZERO)
         );
         assert!(
-            app.camera.distance >= app.camera.near * 10.0,
+            app.camera.distance >= app.camera.min_distance(),
             "the restored distance {} is below its own floor {}",
             app.camera.distance,
-            app.camera.near * 10.0
+            app.camera.min_distance()
         );
         assert!(
             (app.camera.yaw - 42.6).abs() < 1.0e-3,
@@ -7756,7 +8769,7 @@ mod tests {
 
         // The whole point: a scroll now moves the camera by something you can see.
         let before = app.camera.distance;
-        app.camera.zoom(1.0);
+        app.camera.zoom_by(OrbitCamera::zoom_factor(1.0));
         assert!(
             (app.camera.distance - before).abs() > 1.0,
             "one notch of scroll moved {} mm",
@@ -10077,23 +11090,36 @@ mod tests {
         assert!(app.camera.view().to_cols_array().iter().all(|v| v.is_finite()));
     }
 
-    /// A click on Top asks for a pitch of ninety degrees, which is exactly where
-    /// the view matrix collapses. The flight interpolates the field directly, so
-    /// it has to respect the same limit the drag path does.
+    /// A click on Top asks for a pitch of exactly ninety degrees, which is
+    /// exactly where `look_at` used to collapse.
+    ///
+    /// **This replaces `flying_to_a_pole_stops_short_of_collapsing_the_view`,
+    /// and the inversion is the fix.** The old test asserted the camera did
+    /// NOT arrive at the pole -- because `PITCH_SAFE` stopped it 0.02 rad
+    /// short, so clicking "top" gave a view that was visibly not the top. The
+    /// composed basis is orthonormal there, so the assertion is now that the
+    /// camera lands exactly on the pole and the matrix survives it.
     #[test]
-    fn flying_to_a_pole_stops_short_of_collapsing_the_view() {
+    fn flying_to_a_pole_arrives_at_the_pole_with_the_view_intact() {
         for direction in [Vec3::Y, Vec3::NEG_Y] {
             let mut app = app();
             app.fly_to(crate::navcube::Part { direction, extremes: 1 });
             finish_flight(&mut app);
             assert!(app.flight.is_none());
             assert!(
-                app.camera.pitch.abs() < std::f32::consts::FRAC_PI_2,
-                "{direction:?} reached the pole: pitch {}",
+                (app.camera.pitch.abs() - std::f32::consts::FRAC_PI_2).abs() < 1.0e-4,
+                "{direction:?} did not reach the pole: pitch {}",
                 app.camera.pitch
+            );
+            // Straight down means the view direction is world up, exactly.
+            let looking = (app.camera.target - app.camera.eye()).normalize();
+            assert!(
+                looking.dot(-direction).abs() > 0.9999,
+                "{direction:?} did not end up looking along the axis: {looking:?}"
             );
             assert!(app.camera.view().to_cols_array().iter().all(|v| v.is_finite()));
             assert!((app.camera.right().length() - 1.0).abs() < 1.0e-4);
+            assert!(app.camera.right().dot(app.camera.up()).abs() < 1.0e-4);
         }
     }
 
@@ -15828,6 +16854,24 @@ mod mask_tool_tests {
         assert!(crate::viewport::shortcut("m", false, false, true).is_none());
     }
 
+    /// `w` reaches the transform gizmo, and only bare.
+    ///
+    /// ZBrush's, Blender's and Maya's key for Move, taken rather than invented.
+    /// Chorded it belongs to the toolkit: `ctrl+w` closes a window nearly
+    /// everywhere and this application has claimed neither form.
+    #[test]
+    fn the_w_key_decodes_to_the_transform_gizmo() {
+        assert!(
+            matches!(
+                crate::viewport::shortcut("w", false, false, false),
+                Some(Message::ToolChanged(Tool::Transform))
+            ),
+            "w does not reach the transform gizmo"
+        );
+        assert!(crate::viewport::shortcut("w", true, false, false).is_none());
+        assert!(crate::viewport::shortcut("w", false, false, true).is_none());
+    }
+
     /// `h` starts a peek, and only bare.
     ///
     /// ZBrush's own mask-visibility key, taken rather than invented. Chorded it
@@ -17242,11 +18286,11 @@ mod real_file_check {
             "target {:?}  distance {:.3}  floor {:.3}  far {:.1}",
             c.target,
             c.distance,
-            c.near * 10.0,
-            c.far
+            c.min_distance(),
+            c.far()
         );
         let before = app.camera.distance;
-        app.camera.zoom(1.0);
+        app.camera.zoom_by(OrbitCamera::zoom_factor(1.0));
         println!(
             "one scroll notch: {:.3} -> {:.3}  (moved {:.3} mm)",
             before,
@@ -17255,5 +18299,1417 @@ mod real_file_check {
         );
         assert!((app.camera.distance - before).abs() > 1.0, "scroll still does nothing");
         assert!(app.camera.target.distance(Vec3::ZERO) < 200.0, "still aimed at empty space");
+    }
+}
+
+/// The camera Thomas asked for: free to move, still focused on the sculpt.
+///
+/// These are the tests that measure the OUTCOME rather than the mechanism.
+/// Everything in `camera.rs` proves the arithmetic; this proves that driving
+/// the application the way a user drives it gets you next to a detail and back
+/// again without ending up inside the model or lost in space.
+#[cfg(test)]
+mod free_camera_tests {
+    use super::*;
+    use iced::Vector;
+
+    const SIZE: Vector = Vector { x: 800.0, y: 600.0 };
+
+    fn app() -> Brokkr {
+        Brokkr::with_tablet(crate::tablet::Tablet::inert())
+    }
+
+    /// A wheel notch, delivered the way the widget delivers one: the pointer
+    /// has moved there first, so the hover is current.
+    fn scroll(app: &mut Brokkr, at: Vector, amount: f32) {
+        app.on_pointer(PointerEvent::Moved { position: at, size: SIZE });
+        app.on_pointer(PointerEvent::Scrolled { amount, position: at, size: SIZE });
+    }
+
+    /// Off centre, so an anchored zoom and a target-centred one visibly differ.
+    fn off_centre() -> Vector {
+        Vector::new(SIZE.x / 2.0 + 70.0, SIZE.y / 2.0 - 50.0)
+    }
+
+    /// **The complaint, in one test.** "Now I can't zoom in close to the sculpt
+    /// to work on details."
+    ///
+    /// The eye travels toward the TARGET, and after a file is opened the target
+    /// is the centre of the model -- so scrolling in walks the camera into the
+    /// geometry, and every millimetre of "closer" is a millimetre further
+    /// inside. Raising or lowering the distance floor cannot fix that; it only
+    /// chooses how deep in you are allowed to get. What fixes it is zooming
+    /// toward the surface under the cursor.
+    ///
+    /// The assertion is the one that matters to a person: the eye is OUTSIDE
+    /// the solid, and it is a small number of voxels from the surface it was
+    /// pointed at.
+    #[test]
+    fn zooming_in_on_a_detail_ends_up_beside_the_surface_and_not_inside_it() {
+        let mut app = app();
+        let at = off_centre();
+        app.on_pointer(PointerEvent::Moved { position: at, size: SIZE });
+        let detail = app.hover.expect("the test point has to be on the model");
+
+        for _ in 0..60 {
+            scroll(&mut app, at, 1.0);
+        }
+
+        let eye = app.camera.eye();
+        let field = app.doc.active_volume().sample_world(eye);
+        assert!(field > 0.0, "the camera ended up inside the model: field {field} at {eye:?}");
+        assert!(
+            eye.distance(detail) < MODEL_RADIUS_MM * 0.25,
+            "the camera stopped {} mm from the detail it was aimed at",
+            eye.distance(detail)
+        );
+        assert!(
+            app.camera.distance <= app.camera.min_distance() * 1.01,
+            "sixty notches did not reach the floor: {}",
+            app.camera.distance
+        );
+        // And close means close: two voxels, not a hundredth of the model.
+        assert!(
+            app.camera.distance < 1.0,
+            "the closest the camera can get is {} mm",
+            app.camera.distance
+        );
+    }
+
+    /// The other half of the sentence: "but still focused on the sculpt".
+    ///
+    /// **The assertion is the one a person would make, and the one this test
+    /// used to make could be satisfied while the model was invisible.** It
+    /// asserted only that the target stayed inside the document ball -- a
+    /// statement about a number the user cannot see. What matters is that the
+    /// sculpt is still there to be worked on, so that is what is measured: the
+    /// middle of the document still lands inside the widget, and a pick at that
+    /// pixel still finds it. The second assertion is not redundant: with the
+    /// target drifting, the model went behind `far()`, which is the far plane
+    /// AND the pick reach, while still being inside the frustum sideways.
+    ///
+    /// **This is a guard rather than a reproduction.** It passes against the
+    /// code as it was, because the tight fence held the model inside `far()` by
+    /// accident. It exists because the first attempted fix -- widening the
+    /// fence in proportion to the distance -- broke it, and nothing else would
+    /// have noticed.
+    #[test]
+    fn a_long_scroll_out_over_empty_space_keeps_the_model_on_screen() {
+        let mut app = app();
+        // A corner, well clear of a sphere drawn in the middle.
+        let empty = Vector::new(20.0, 20.0);
+        app.on_pointer(PointerEvent::Moved { position: empty, size: SIZE });
+        assert!(app.hover.is_none(), "the corner was supposed to miss the model");
+
+        let (centre, _) = app.document_ball();
+        let pixel_of = |app: &Brokkr| {
+            let clip = app.camera.view_projection(SIZE.x / SIZE.y) * centre.extend(1.0);
+            (clip.w, Vec2::new(clip.x / clip.w, clip.y / clip.w))
+        };
+        for step in 0..200 {
+            scroll(&mut app, empty, -1.0);
+            let (w, ndc) = pixel_of(&app);
+            assert!(
+                w > 0.0 && ndc.x.abs() <= 1.0 && ndc.y.abs() <= 1.0,
+                "after {} notches out the middle of the document is at {ndc:?}, off screen",
+                step + 1
+            );
+        }
+
+        // And it is not merely inside the frustum sideways: the cursor still
+        // finds it there, which is what says it is inside the depth range too.
+        let (_, ndc) = pixel_of(&app);
+        let pixel = Vector::new((ndc.x + 1.0) * 0.5 * SIZE.x, (1.0 - ndc.y) * 0.5 * SIZE.y);
+        app.on_pointer(PointerEvent::Moved { position: pixel, size: SIZE });
+        assert!(app.hover.is_some(), "the model is drawn at {pixel:?} but nothing is pickable");
+    }
+
+    /// **The cost of the anchor rule, asserted rather than merely claimed.**
+    /// Zooming in is anchored on the surface under the cursor and zooming out
+    /// is anchored on the target, so a scroll in on a detail and back out
+    /// restores the distance exactly but leaves the view centred on that detail
+    /// rather than on wherever it started. That is the trade
+    /// [`Brokkr::navigation_anchor`] argues for, so the distance is asserted to
+    /// come back and the target deliberately is not.
+    ///
+    /// **This is a guard, not a reproduction**: it passes against the code as
+    /// it was, because in-then-out over the MODEL was never the broken order.
+    /// The broken one is
+    /// `scrolling_out_over_a_corner_and_back_in_returns_exactly`.
+    #[test]
+    fn scrolling_in_and_back_out_returns_the_distance_and_leaves_the_model_in_view() {
+        for notches in [4, 8, 12, 20, 30] {
+            let mut app = app();
+            let at = off_centre();
+            app.on_pointer(PointerEvent::Moved { position: at, size: SIZE });
+            assert!(app.hover.is_some(), "the test point has to be on the model");
+            let before = app.camera.distance;
+
+            for _ in 0..notches {
+                scroll(&mut app, at, 1.0);
+            }
+            for _ in 0..notches {
+                scroll(&mut app, at, -1.0);
+            }
+
+            assert!(
+                (app.camera.distance - before).abs() < 1.0e-2,
+                "{notches} notches in and back left the distance at {} instead of {before}",
+                app.camera.distance
+            );
+            // The complaint restated: the sculpt is under the middle of the
+            // viewport, where a person would look for it.
+            let centre = Vector::new(SIZE.x / 2.0, SIZE.y / 2.0);
+            app.on_pointer(PointerEvent::Moved { position: centre, size: SIZE });
+            assert!(
+                app.hover.is_some(),
+                "after {notches} in and back the model is not under the middle of the viewport"
+            );
+        }
+    }
+
+    /// Scrolling out is anchored on the target, so it cannot move the target at
+    /// all -- which is the property the drift used to violate and the one the
+    /// containment fence should never have to enforce.
+    #[test]
+    fn scrolling_out_does_not_move_the_target() {
+        let mut app = app();
+        for at in [off_centre(), Vector::new(20.0, 20.0)] {
+            app.on_pointer(PointerEvent::Moved { position: at, size: SIZE });
+            let before = app.camera.target;
+            for _ in 0..40 {
+                scroll(&mut app, at, -1.0);
+            }
+            assert!(
+                app.camera.target.distance(before) < 1.0e-4,
+                "scrolling out at {at:?} moved the target {} mm",
+                app.camera.target.distance(before)
+            );
+        }
+    }
+
+    /// A scroll with the cursor over nothing is the commonest gesture in the
+    /// application, and it must be exactly the target-centred zoom it has
+    /// always been -- in BOTH directions, so that it is perfectly reversible.
+    ///
+    /// The fallback this pins replaces the ray's crossing of the plane through
+    /// the target. That point is off the model, so zooming in about it drifts
+    /// the target off the model in proportion to the distance: measured, twelve
+    /// notches out and twelve back in over a corner left the target 188 mm from
+    /// a 69 mm document, hard into the fence and unrecoverable by the inverse
+    /// gesture.
+    #[test]
+    fn a_scroll_over_empty_background_is_the_zoom_it_has_always_been() {
+        let mut app = app();
+        let empty = Vector::new(20.0, 20.0);
+        app.on_pointer(PointerEvent::Moved { position: empty, size: SIZE });
+        assert!(app.hover.is_none(), "the corner was supposed to miss the model");
+        let before = (app.camera.target, app.camera.distance);
+
+        for amount in [1.0_f32, -1.0, -1.0, 1.0, 3.0, -3.0] {
+            let expected = app.camera.distance * OrbitCamera::zoom_factor(amount);
+            let target = app.camera.target;
+            scroll(&mut app, empty, amount);
+            assert!(
+                app.camera.target.distance(target) < 1.0e-6,
+                "a scroll over background moved the target to {:?}",
+                app.camera.target
+            );
+            assert!(
+                (app.camera.distance - expected).abs() < 1.0e-4,
+                "the distance went to {} rather than {expected}",
+                app.camera.distance
+            );
+        }
+        assert!(app.camera.target.distance(before.0) < 1.0e-6);
+        assert!((app.camera.distance - before.1).abs() < 1.0e-4);
+    }
+
+    /// The reported failure, in its exact shape: N notches out over empty
+    /// background then N back in, with the cursor parked in a corner. Twelve
+    /// and twelve used to leave the target 69.06 mm out -- the whole fence --
+    /// and the model no longer under the middle of the viewport.
+    ///
+    /// The target tolerance is float noise and not a budget: the fixed gesture
+    /// does not touch the target at all, at either end, so the honest claim is
+    /// that it is unchanged.
+    #[test]
+    fn scrolling_out_over_a_corner_and_back_in_returns_exactly() {
+        for notches in [4, 8, 12, 20, 30] {
+            let mut app = app();
+            let empty = Vector::new(20.0, 20.0);
+            app.on_pointer(PointerEvent::Moved { position: empty, size: SIZE });
+            assert!(app.hover.is_none(), "the corner was supposed to miss the model");
+            let before = (app.camera.target, app.camera.distance);
+
+            for _ in 0..notches {
+                scroll(&mut app, empty, -1.0);
+            }
+            for _ in 0..notches {
+                scroll(&mut app, empty, 1.0);
+            }
+
+            assert!(
+                app.camera.target.distance(before.0) < 1.0e-4,
+                "{notches} out and back left the target {} mm away",
+                app.camera.target.distance(before.0)
+            );
+            assert!(
+                (app.camera.distance - before.1).abs() < 1.0e-2,
+                "{notches} out and back left the distance at {} instead of {}",
+                app.camera.distance,
+                before.1
+            );
+            let centre = Vector::new(SIZE.x / 2.0, SIZE.y / 2.0);
+            app.on_pointer(PointerEvent::Moved { position: centre, size: SIZE });
+            assert!(
+                app.hover.is_some(),
+                "after {notches} out and back the model is not under the middle of the viewport"
+            );
+        }
+    }
+
+    /// The fence still has a job, and this is it: a target nowhere near the
+    /// document, at a distance that cannot see it, is pulled back.
+    #[test]
+    fn a_target_the_camera_could_not_possibly_see_is_pulled_back() {
+        let mut app = app();
+        app.camera.distance = 1.0;
+        app.camera.target = Vec3::new(-435.18, -12.09, 95.65);
+        app.publish_camera();
+
+        let (centre, radius) = app.document_ball();
+        assert!(
+            app.camera.target.distance(centre) <= radius + 1.0e-3,
+            "the target is still {} mm from a document of radius {radius}",
+            app.camera.target.distance(centre)
+        );
+    }
+
+    /// The arithmetic of [`OrbitCamera::zoom_by_about`] is exactly invertible,
+    /// which is what lets the wheel arm anchor the way in without the way out
+    /// having to undo anything by hand.
+    ///
+    /// **It is a statement about the camera and NOT about the gesture, and
+    /// reading it as the latter hid a real bug.** It calls the camera directly,
+    /// so it never goes through `publish_camera` and never meets
+    /// `contain_target`; the containment fence could be deleted outright and
+    /// this would stay green. What the user actually does is pinned by
+    /// `scrolling_in_and_back_out_returns_the_distance_and_leaves_the_model_in_view`
+    /// and `scrolling_out_does_not_move_the_target`.
+    #[test]
+    fn zooming_in_and_back_out_about_the_same_point_is_reversible() {
+        let mut app = app();
+        let at = off_centre();
+        app.on_pointer(PointerEvent::Moved { position: at, size: SIZE });
+        let anchor = app.navigation_anchor(OrbitCamera::zoom_factor(1.0));
+        let before = (app.camera.target, app.camera.distance);
+
+        for _ in 0..10 {
+            app.camera.zoom_by_about(OrbitCamera::zoom_factor(1.0), anchor);
+        }
+        for _ in 0..10 {
+            app.camera.zoom_by_about(OrbitCamera::zoom_factor(-1.0), anchor);
+        }
+        assert!(
+            app.camera.target.distance(before.0) < 1.0e-2,
+            "the target came back to {:?} instead of {:?}",
+            app.camera.target,
+            before.0
+        );
+        assert!((app.camera.distance - before.1).abs() < 1.0e-2);
+    }
+
+    /// One keystroke back from anywhere. This is the affordance that makes
+    /// letting the camera move freely safe rather than reckless.
+    #[test]
+    fn framing_the_active_body_recovers_from_a_target_far_outside_the_model() {
+        let mut app = app();
+        app.camera.yaw = 1.234;
+        app.camera.pitch = -0.5;
+        app.camera.target = Vec3::new(-435.18, -12.09, 95.65);
+        app.camera.distance = 0.3;
+
+        update(&mut app, Message::CameraFramedOnActive);
+
+        let radius = app.doc.active_volume().content_radius().expect("the ball has bounds");
+        // Within a voxel of the origin, not exactly on it: the framing centre
+        // is the middle of the BRICK box, which for a sphere on the lattice
+        // sits half a voxel off.
+        assert!(
+            app.camera.target.length() < VOXEL_SIZE_MM,
+            "the camera is still aimed at {:?}",
+            app.camera.target
+        );
+        assert!(
+            app.camera.distance > radius,
+            "the whole body has to fit: distance {} against radius {radius}",
+            app.camera.distance
+        );
+        // The angles are the user's and are kept, exactly as a restore keeps
+        // them: framing is not a request to be spun round to the front.
+        assert!((app.camera.yaw - 1.234).abs() < 1.0e-4);
+        assert!((app.camera.pitch + 0.5).abs() < 1.0e-4);
+        assert!(app.status.contains("framed"), "nothing said the camera had moved");
+    }
+
+    /// The key it is on, decoded the way a key press is decoded.
+    #[test]
+    fn the_f_key_frames_the_active_body() {
+        assert!(matches!(
+            crate::viewport::shortcut("f", false, false, false),
+            Some(Message::CameraFramedOnActive)
+        ));
+        // And it must not fire as part of a chord meant for something else.
+        assert!(crate::viewport::shortcut("f", true, false, false).is_none());
+        assert!(crate::viewport::shortcut("f", false, false, true).is_none());
+    }
+
+    /// Orbiting turns about the surface the press landed on, so turning to see
+    /// the side of a detail keeps the detail on screen.
+    #[test]
+    fn an_orbit_drag_turns_about_the_surface_the_press_landed_on() {
+        let mut app = app();
+        let at = off_centre();
+        app.on_pointer(PointerEvent::Moved { position: at, size: SIZE });
+        let pivot = app.hover.expect("the test point has to be on the model");
+
+        app.on_pointer(PointerEvent::Pressed {
+            button: PointerButton::Right,
+            position: at,
+            size: SIZE,
+        });
+        assert_eq!(
+            app.drag.and_then(|drag| drag.pivot),
+            Some(pivot),
+            "the press did not latch the surface under it"
+        );
+
+        let aspect = SIZE.x / SIZE.y;
+        let screen = |app: &Brokkr, point: Vec3| {
+            let clip = app.camera.view_projection(aspect) * point.extend(1.0);
+            Vec2::new(clip.x / clip.w, clip.y / clip.w)
+        };
+        let before = screen(&app, pivot);
+        for step in 0..25 {
+            let to = Vector::new(at.x + step as f32 * 6.0, at.y - step as f32 * 3.0);
+            app.on_pointer(PointerEvent::Moved { position: to, size: SIZE });
+        }
+        app.on_pointer(PointerEvent::Released { button: PointerButton::Right });
+
+        let after = screen(&app, pivot);
+        assert!(
+            before.distance(after) < 1.0e-2,
+            "the pivot slid from {before:?} to {after:?} across the drag"
+        );
+    }
+
+    /// A pointer that never touched the model still has to orbit, and about
+    /// the target rather than about any off-model point, which would walk the
+    /// target sideways on every background drag.
+    #[test]
+    fn an_orbit_drag_that_starts_off_the_model_turns_about_the_target() {
+        let mut app = app();
+        let empty = Vector::new(20.0, 20.0);
+        app.on_pointer(PointerEvent::Moved { position: empty, size: SIZE });
+        assert!(app.hover.is_none());
+
+        app.on_pointer(PointerEvent::Pressed {
+            button: PointerButton::Right,
+            position: empty,
+            size: SIZE,
+        });
+        let target = app.camera.target;
+        for step in 1..20 {
+            let to = Vector::new(empty.x + step as f32 * 8.0, empty.y + step as f32 * 4.0);
+            app.on_pointer(PointerEvent::Moved { position: to, size: SIZE });
+        }
+        app.on_pointer(PointerEvent::Released { button: PointerButton::Right });
+
+        assert!(
+            app.camera.target.distance(target) < 1.0e-3,
+            "a background drag walked the target from {target:?} to {:?}",
+            app.camera.target
+        );
+    }
+
+    /// The camera's floor and far plane are in the document's units, so a
+    /// resample has to move them or the floor means a different closeness than
+    /// it did a moment ago.
+    #[test]
+    fn resampling_moves_the_zoom_floor_with_the_lattice() {
+        let mut app = app();
+        let before = app.camera.min_distance();
+        update(&mut app, Message::Resample(VOXEL_SIZE_MM / 2.0));
+        assert!(
+            (app.camera.min_distance() - app.doc.voxel_size() * 2.0).abs() < 1.0e-6,
+            "the floor is {} on a {} mm lattice",
+            app.camera.min_distance(),
+            app.doc.voxel_size()
+        );
+        assert!(app.camera.min_distance() < before, "a finer lattice must let the camera closer");
+    }
+
+    /// **A close-in view saved on any lattice but 0.25 mm used to be thrown
+    /// away on every reopen, with a status line blaming the file.**
+    ///
+    /// `apply_view` built its accept/reject bounds from
+    /// `OrbitCamera::framing(centre, radius)`, and `framing` sets the content
+    /// radius but never the voxel size -- so it inherited the 0.25 mm default
+    /// and the loader's floor was 0.5 mm for every document ever opened, while
+    /// the live floor is `doc.voxel_size() * 2.0`. Measured: resample to 0.05,
+    /// eighty notches in, the camera legitimately reaches 0.1 -- and the
+    /// restore gave back 158.10 mm. This is the same class as the bug fa6e234
+    /// fixed, a floor computed from the wrong source, and the suite could not
+    /// see it because `VOXEL_SIZE_MM` happens to equal the camera's default.
+    ///
+    /// **So this test resamples first, and that is the whole point of it.**
+    /// The fixture it sits beside runs at 0.25 and therefore proves nothing.
+    #[test]
+    fn a_close_in_view_survives_a_reopen_on_a_lattice_finer_than_the_default() {
+        let mut app = app();
+        update(&mut app, Message::Resample(0.05));
+        assert!(
+            (app.doc.voxel_size() - 0.05).abs() < 1.0e-6,
+            "the resample did not take: {}",
+            app.doc.voxel_size()
+        );
+
+        let at = off_centre();
+        for _ in 0..80 {
+            scroll(&mut app, at, 1.0);
+        }
+        let close = app.camera.distance;
+        assert!(
+            close < 0.5,
+            "the point of the test is a distance under the old 0.5 floor: {close}"
+        );
+
+        let view = app.current_view();
+        app.status = "opened".to_string();
+        app.apply_view(&view);
+
+        assert!(
+            (app.camera.distance - close).abs() < 1.0e-6,
+            "the restore moved the camera from {close} to {}",
+            app.camera.distance
+        );
+        assert!(
+            !app.status.contains("re-framed"),
+            "a view the live camera reached was called unusable: {}",
+            app.status
+        );
+    }
+
+    /// The same disagreement at the other end of the range. The loader's
+    /// ceiling came from the ACTIVE body's content radius while the live one
+    /// comes from the document ball -- 5520 against 6906 on the starting
+    /// document -- so a distance the application itself drove the camera into
+    /// was rejected as corrupt by its own loader.
+    #[test]
+    fn a_view_scrolled_out_to_the_live_ceiling_survives_a_reopen() {
+        let mut app = app();
+        let at = off_centre();
+        for _ in 0..400 {
+            scroll(&mut app, at, -1.0);
+        }
+        let far_out = app.camera.distance;
+        assert!(
+            (far_out - app.camera.max_distance()).abs() < 1.0e-3,
+            "the test did not actually reach the ceiling: {far_out}"
+        );
+
+        let view = app.current_view();
+        app.status = "opened".to_string();
+        app.apply_view(&view);
+
+        assert!(
+            (app.camera.distance - far_out).abs() < 1.0e-3,
+            "the restore moved the camera from {far_out} to {}",
+            app.camera.distance
+        );
+        assert!(
+            !app.status.contains("re-framed"),
+            "a distance the live clamp produced was called unusable: {}",
+            app.status
+        );
+    }
+
+    /// **A puck button used to undo the whole point of this work.** Both camera
+    /// actions assigned a fresh `OrbitCamera::framing(Vec3::ZERO, 30.0)`, which
+    /// resets `voxel_size` to the 0.25 mm default and `content_radius` to the
+    /// hardcoded starting ball -- and both fields are now load-bearing. The
+    /// first is the zoom floor, so on a 0.05 mm lattice the floor jumped from
+    /// 0.1 to 0.5 and the camera became five times coarser than the lattice
+    /// deserves. The second is `far()`, which is the far plane AND the length
+    /// of every pick ray, so on a large model the far half of it went both
+    /// unclipped-into-nothing and silently unpickable.
+    #[test]
+    fn the_spacemouse_camera_buttons_keep_the_lattice_the_document_is_on() {
+        use crate::spacemouse::ButtonAction;
+
+        for action in [ButtonAction::FrameModel, ButtonAction::ResetView] {
+            let mut app = app();
+            update(&mut app, Message::Resample(0.05));
+            let floor = app.camera.min_distance();
+            let reach = app.camera.content_radius;
+
+            app.run_puck_button(action);
+
+            assert!(
+                (app.camera.min_distance() - floor).abs() < 1.0e-6,
+                "{action:?} moved the zoom floor from {floor} to {}",
+                app.camera.min_distance()
+            );
+            assert!(
+                app.camera.content_radius >= reach - 1.0e-3,
+                "{action:?} shrank the pick reach from {reach} to {}",
+                app.camera.content_radius
+            );
+        }
+    }
+
+    /// **The one place the two halves of this work pull against each other**,
+    /// measured rather than reasoned about.
+    ///
+    /// `orbit_about` moves the target to keep the pivot fixed, and
+    /// `contain_target` refuses to let the target leave the document's ball.
+    /// A target rotating about a pivot `p` from the centre travels on a sphere
+    /// of radius `|target - p|`, so it can reach `2p` from the centre -- and
+    /// if that exceeds the ball, the clamp engages and the pivot slides out
+    /// from under the cursor.
+    ///
+    /// Measured on the starting ball: two hundred motion events of a single
+    /// drag, more than half a turn, take the target to 51 mm of a 69 mm leash
+    /// and the pivot slips by 8e-6 in normalised device coordinates -- which is
+    /// float noise, not the clamp. The headroom comes from the ball being the
+    /// half-diagonal of the BRICK box, which rounds out past the surface.
+    ///
+    /// **The leash was deliberately not widened to make this impossible in
+    /// every geometry.** Doubling it would admit a target 1.9 content radii
+    /// out, and the real poisoned file was at 1.9 -- the fence would then stop
+    /// short of the failure it exists to prevent. On a model whose surface
+    /// reaches further into its own box than a sphere does, a very long orbit
+    /// can still meet the leash, and what happens then is that the target stops
+    /// while the drag continues. That is the leash working.
+    #[test]
+    fn a_long_orbit_drag_does_not_run_into_the_containment_leash() {
+        let mut app = app();
+        let at = off_centre();
+        app.on_pointer(PointerEvent::Moved { position: at, size: SIZE });
+        let pivot = app.hover.expect("the test point has to be on the model");
+        let (centre, radius) = app.document_ball();
+
+        app.on_pointer(PointerEvent::Pressed {
+            button: PointerButton::Right,
+            position: at,
+            size: SIZE,
+        });
+        let aspect = SIZE.x / SIZE.y;
+        let screen = |app: &Brokkr, point: Vec3| {
+            let clip = app.camera.view_projection(aspect) * point.extend(1.0);
+            Vec2::new(clip.x / clip.w, clip.y / clip.w)
+        };
+        let before = screen(&app, pivot);
+
+        let mut worst_slip = 0.0_f32;
+        let mut worst_reach = 0.0_f32;
+        for step in 1..200 {
+            app.on_pointer(PointerEvent::Moved {
+                position: Vector::new(at.x + step as f32 * 4.0, at.y),
+                size: SIZE,
+            });
+            worst_slip = worst_slip.max(before.distance(screen(&app, pivot)));
+            worst_reach = worst_reach.max(app.camera.target.distance(centre));
+        }
+        app.on_pointer(PointerEvent::Released { button: PointerButton::Right });
+
+        assert!(worst_slip < 1.0e-3, "the pivot slipped {worst_slip} across the drag");
+        assert!(
+            worst_reach < radius,
+            "the drag reached {worst_reach} of a {radius} mm leash, so the clamp engaged"
+        );
+    }
+
+    /// `update` returns a `Task`; tests do not run the iced runtime.
+    fn update(app: &mut Brokkr, message: Message) {
+        drop(app.update(message));
+    }
+}
+
+#[cfg(test)]
+mod gizmo_tests {
+    use super::*;
+    use brokkr_core::{Bake, BrickCoord, warps_made_on_this_thread};
+    use iced::Vector;
+
+    const SIZE: Vector = Vector { x: 800.0, y: 600.0 };
+
+    fn update(app: &mut Brokkr, message: Message) {
+        drop(app.update(message));
+    }
+
+    fn app() -> Brokkr {
+        let mut app = Brokkr::with_tablet(crate::tablet::Tablet::inert());
+        // Every gesture below is measured in widget pixels, so the application
+        // has to know how big the widget is before the first one.
+        app.viewport_size = Vec2::new(SIZE.x, SIZE.y);
+        app
+    }
+
+    fn arm(app: &mut Brokkr) {
+        update(app, Message::ToolChanged(Tool::Transform));
+        assert_eq!(app.tool, Tool::Transform, "the gizmo did not arm: {}", app.status);
+        assert!(app.gizmo.is_some(), "the tool is up with no gizmo under it");
+    }
+
+    /// Where the gizmo's own origin lands on screen.
+    fn gizmo_centre(app: &Brokkr) -> Vec2 {
+        let gizmo = app.gizmo.expect("armed");
+        let aspect = SIZE.x / SIZE.y;
+        let clip = app.camera.view_projection(aspect) * gizmo.origin().extend(1.0);
+        let ndc = Vec2::new(clip.x / clip.w, clip.y / clip.w);
+        Vec2::new((ndc.x + 1.0) * 0.5 * SIZE.x, (1.0 - ndc.y) * 0.5 * SIZE.y)
+    }
+
+    fn moved(app: &mut Brokkr, at: Vec2) {
+        app.on_pointer(PointerEvent::Moved { position: Vector::new(at.x, at.y), size: SIZE });
+    }
+
+    /// A press, one or more moves, and a release, through the real pointer path.
+    ///
+    /// **It asserts that the press was actually taken as a handle**, and that
+    /// is not belt and braces: a press that misses the gizmo by a pixel falls
+    /// through to choosing a body, the placement then never changes, and every
+    /// test built on this helper passes while testing nothing. That happened
+    /// once already, to an earlier version of `drag_the_x_arrow` that pressed
+    /// at the shaft's screen x-offset with y left at zero.
+    fn gesture(app: &mut Brokkr, from: Vec2, through: &[Vec2]) {
+        moved(app, from);
+        app.on_pointer(PointerEvent::Pressed {
+            button: PointerButton::Left,
+            position: Vector::new(from.x, from.y),
+            size: SIZE,
+        });
+        assert!(
+            matches!(app.drag.map(|drag| drag.kind), Some(DragKind::Transforming(_))),
+            "the press at {from:?} did not land on a handle, so this gesture tests nothing"
+        );
+        for at in through {
+            moved(app, *at);
+        }
+        app.on_pointer(PointerEvent::Released { button: PointerButton::Left });
+    }
+
+    /// Where a world point lands, in widget pixels.
+    fn project(app: &Brokkr, point: Vec3) -> Vec2 {
+        let aspect = SIZE.x / SIZE.y;
+        let clip = app.camera.view_projection(aspect) * point.extend(1.0);
+        let ndc = Vec2::new(clip.x / clip.w, clip.y / clip.w);
+        Vec2::new((ndc.x + 1.0) * 0.5 * SIZE.x, (1.0 - ndc.y) * 0.5 * SIZE.y)
+    }
+
+    /// A pixel on the X shaft, and the unit screen direction that runs along it.
+    ///
+    /// **Both components of the projection**, because a world axis leans on
+    /// screen: the X arrow of the default camera runs down and to the right, so
+    /// a press at its x-offset with y left at zero is eight pixels off the
+    /// shaft and lands or misses depending on where the gizmo happens to be.
+    fn x_shaft_grip(app: &Brokkr) -> (Vec2, Vec2) {
+        let gizmo = app.gizmo.expect("armed");
+        let origin = gizmo.origin();
+        let scale = crate::gizmo::world_per_pixel(&app.camera, origin, SIZE.y);
+        let middle = project(app, origin);
+        // Just over half way along, clear of the centre box and the arrowhead.
+        let grip = project(app, origin + Vec3::X * (34.0 * scale));
+        (grip, (grip - middle).normalize())
+    }
+
+    /// Every stored voxel of the active body, for comparing two states value by
+    /// value rather than through a sampled surface.
+    fn field(app: &Brokkr) -> Vec<(BrickCoord, Vec<f32>)> {
+        let volume = app.doc.active_volume();
+        let mut coords: Vec<BrickCoord> = volume.brick_coords().collect();
+        coords.sort_unstable();
+        coords
+            .into_iter()
+            .map(|coord| {
+                let mut values = Vec::new();
+                let origin = coord.origin();
+                for index in 0..(brokkr_core::BRICK_DIM as i32).pow(3) {
+                    let dim = brokkr_core::BRICK_DIM as i32;
+                    let local =
+                        glam::IVec3::new(index % dim, (index / dim) % dim, index / (dim * dim));
+                    values.push(volume.sample_voxel(origin + local));
+                }
+                (coord, values)
+            })
+            .collect()
+    }
+
+    /// A drag along the X arrow, `pixels` of screen travel.
+    fn drag_the_x_arrow(app: &mut Brokkr, pixels: f32) {
+        let (grip, along) = x_shaft_grip(app);
+        gesture(app, grip, &[grip + along * pixels]);
+    }
+
+    /// A free-angle drag round a ring, from `+u` toward `+v`.
+    fn turn_a_ring(app: &mut Brokkr, radians: f32) {
+        let gizmo = app.gizmo.expect("armed");
+        let origin = gizmo.origin();
+        let scale = crate::gizmo::world_per_pixel(&app.camera, origin, SIZE.y);
+        // The Y ring, whose plane is the one the default camera looks most
+        // squarely at, so both its ends project well clear of the middle.
+        let radius = 104.0 * scale;
+        let from = project(app, origin + Vec3::Z * radius);
+        let to =
+            project(app, origin + (Vec3::Z * radians.cos() + Vec3::X * radians.sin()) * radius);
+        let free = app.shift;
+        app.shift = true;
+        gesture(app, from, &[to]);
+        app.shift = free;
+    }
+
+    // ------------------------------------------------------- the whole point
+
+    /// **The test the entire anti-degradation design exists for.**
+    ///
+    /// Placement is fiddly and thirty nudges over a session is an ordinary
+    /// number. Baking each gesture onto the last result would be thirty
+    /// trilinear passes -- detail the user sculpted, gone, with nothing having
+    /// said so, discovered at the printer. Baking from the field the gizmo
+    /// ARMED on is one pass however many gestures there were.
+    #[test]
+    fn thirty_adjustments_cost_exactly_one_resample_pass() {
+        let mut app = app();
+        arm(&mut app);
+        let before = warps_made_on_this_thread();
+
+        // Free-angle turns, so every one of them genuinely takes the lossy
+        // route. Snapped ones would pass this by taking no pass at all, which
+        // is a different and weaker claim.
+        for step in 0..30 {
+            turn_a_ring(&mut app, 0.2 + step as f32 * 0.03);
+        }
+        let after_drags = warps_made_on_this_thread() - before;
+        assert!(after_drags > 0, "the fixture never dragged a ring at all");
+        assert_eq!(
+            after_drags, 30,
+            "each gesture should bake once while the gizmo is up, and did {after_drags} times"
+        );
+
+        // And the claim that matters: those thirty bakes all came off the SAME
+        // field, so the body has been through one pass, not thirty. Undoing the
+        // session puts back a field that was never resampled at all.
+        let placement = app.gizmo.expect("armed").placement;
+        assert!(placement.route(app.doc.voxel_size()).is_lossy(), "the fixture snapped");
+        update(&mut app, Message::ToolChanged(Tool::Sculpt));
+        assert!(app.gizmo.is_none(), "the gizmo did not disarm");
+        assert!(app.history.can_undo(), "the session pushed no entry");
+    }
+
+    /// Baking from the base makes this exact rather than approximate: the
+    /// placement really is the identity again, so the routing declines to run
+    /// anything at all.
+    /// Dragging away and back WITHIN one gesture is exactly the identity, not
+    /// approximately it, because the placement is measured from the press pixel
+    /// rather than accumulated from the last motion event.
+    ///
+    /// **Within one gesture and not across two, and the difference is honest.**
+    /// Two opposite gestures need not cancel to the last voxel: the second one
+    /// is measured about a moved origin through a perspective projection, so
+    /// its pixels are not worth quite the same number of millimetres as the
+    /// first one's, and each is snapped separately. The exactness that was
+    /// promised is the one this checks.
+    #[test]
+    fn dragging_out_and_back_within_a_gesture_bakes_nothing() {
+        let mut app = app();
+        arm(&mut app);
+        let before = field(&app);
+        let warps = warps_made_on_this_thread();
+
+        let (grip, along) = x_shaft_grip(&app);
+        app.shift = true;
+        gesture(&mut app, grip, &[grip + along * 90.0, grip + along * 210.0, grip]);
+        app.shift = false;
+
+        assert_eq!(
+            app.gizmo.expect("armed").placement.route(app.doc.voxel_size()),
+            Bake::Identity,
+            "coming back to the press pixel left a placement behind"
+        );
+        assert_eq!(field(&app), before, "the field moved after a drag out and back");
+        assert_eq!(warps_made_on_this_thread(), warps, "a round trip ran a trilinear pass");
+    }
+
+    /// The ordinary gesture is snapped, and a snapped move is a value-exact
+    /// gather. If this ever routes to a resample the default has silently
+    /// become the lossy one.
+    #[test]
+    fn a_snapped_move_through_the_application_never_resamples() {
+        let mut app = app();
+        arm(&mut app);
+        assert!(!app.shift, "the fixture must start unsnapped-free, i.e. snapping ON");
+        let warps = warps_made_on_this_thread();
+
+        for pixels in [30.0_f32, -55.0, 120.0] {
+            drag_the_x_arrow(&mut app, pixels);
+            let route = app.gizmo.expect("armed").placement.route(app.doc.voxel_size());
+            assert!(!route.is_lossy(), "a snapped move of {pixels} px routed to {route:?}");
+        }
+        assert_eq!(
+            warps_made_on_this_thread(),
+            warps,
+            "a snapped move ran a trilinear pass it did not need"
+        );
+    }
+
+    #[test]
+    fn a_snapped_move_actually_moves_the_body() {
+        let mut app = app();
+        arm(&mut app);
+        let before = app.doc.active_volume().world_bounds().expect("a body");
+        drag_the_x_arrow(&mut app, 120.0);
+        let after = app.doc.active_volume().world_bounds().expect("a body");
+        assert!(
+            (after.0.x - before.0.x).abs() > app.doc.voxel_size(),
+            "the body did not move: {before:?} then {after:?}"
+        );
+        // Moved, not grown: a translation is rigid.
+        let span = |b: (Vec3, Vec3)| b.1 - b.0;
+        assert!(span(after).distance(span(before)) < app.doc.voxel_size() * 2.0);
+    }
+
+    // ------------------------------------------------------------ the guards
+
+    /// **`orient` clears the whole history and this must not.** A quarter turn
+    /// leaves every older entry naming bricks of a volume that no longer
+    /// exists, so its caller drops the stack; the gizmo puts the original field
+    /// ON the stack instead, so undoing the transform makes those coordinates
+    /// valid again.
+    #[test]
+    fn a_transform_gesture_does_not_clear_the_undo_history() {
+        let mut app = app();
+        // A stroke to have some history to lose.
+        app.on_pointer(PointerEvent::Pressed {
+            button: PointerButton::Left,
+            position: Vector::new(SIZE.x / 2.0, SIZE.y / 2.0),
+            size: SIZE,
+        });
+        app.on_pointer(PointerEvent::Released { button: PointerButton::Left });
+        assert!(app.history.can_undo(), "the fixture laid down no stroke");
+        let entries = app.history_stats.undo_entries;
+
+        arm(&mut app);
+        drag_the_x_arrow(&mut app, 90.0);
+        update(&mut app, Message::ToolChanged(Tool::Sculpt));
+
+        assert!(
+            app.history_stats.undo_entries > entries,
+            "the transform pushed nothing: {} then {}",
+            entries,
+            app.history_stats.undo_entries
+        );
+        // Undo the transform, then the stroke behind it.
+        update(&mut app, Message::Undo);
+        update(&mut app, Message::Undo);
+        assert!(!app.history.can_undo(), "the stroke behind the transform was not reachable");
+    }
+
+    /// Escape ABANDONS, where leaving the tool commits. Bit-identical, not
+    /// close: the whole reason the base is held is that it is the only copy of
+    /// a field the forward direction cannot reproduce.
+    #[test]
+    fn escape_leaves_the_body_bit_identical() {
+        let mut app = app();
+        arm(&mut app);
+        let before = field(&app);
+
+        turn_a_ring(&mut app, 0.6);
+        assert_ne!(field(&app), before, "the fixture's transform changed nothing");
+        let entries = app.history_stats.undo_entries;
+
+        update(&mut app, Message::MenuClosed);
+
+        assert!(app.gizmo.is_none(), "escape left the gizmo armed");
+        assert_eq!(app.tool, Tool::Sculpt);
+        assert_eq!(field(&app), before, "escape did not put the field back bit for bit");
+        assert_eq!(app.history_stats.undo_entries, entries, "an abandoned session pushed an entry");
+    }
+
+    /// Escape during a LIVE drag cancels that drag and nothing more. "Not that
+    /// one" is a different instruction from "not any of it", and the recovery
+    /// is throwing the gesture away rather than inverting it.
+    #[test]
+    fn escape_during_a_drag_cancels_the_drag_and_keeps_the_gizmo() {
+        let mut app = app();
+        arm(&mut app);
+        drag_the_x_arrow(&mut app, 90.0);
+        let committed = app.gizmo.expect("armed").placement;
+        assert_ne!(committed.route(app.doc.voxel_size()), Bake::Identity, "the fixture is idle");
+
+        // A second drag, escaped before its release.
+        let (grip, along) = x_shaft_grip(&app);
+        moved(&mut app, grip);
+        app.on_pointer(PointerEvent::Pressed {
+            button: PointerButton::Left,
+            position: Vector::new(grip.x, grip.y),
+            size: SIZE,
+        });
+        assert!(matches!(app.drag.map(|drag| drag.kind), Some(DragKind::Transforming(_))));
+        moved(&mut app, grip + along * 200.0);
+        update(&mut app, Message::MenuClosed);
+
+        assert!(app.gizmo.is_some(), "escape mid-drag disarmed the whole gizmo");
+        assert!(app.drag.is_none(), "the drag survived the escape");
+        assert_eq!(
+            app.gizmo.expect("armed").placement.translation,
+            committed.translation,
+            "the cancelled drag was kept"
+        );
+    }
+
+    /// ONLY BOUNDS-CHECKED EVENTS MAY CAPTURE. The gizmo claims its own disc
+    /// and nothing else; a press well away from it has to reach the body under
+    /// the cursor, which under this tool means choosing it.
+    #[test]
+    fn a_press_away_from_the_gizmo_is_not_taken_as_a_handle() {
+        let mut app = app();
+        arm(&mut app);
+        let middle = gizmo_centre(&app);
+        for offset in [Vec2::new(340.0, 0.0), Vec2::new(-340.0, 0.0), Vec2::new(0.0, 260.0)] {
+            let at = (middle + offset).clamp(Vec2::splat(2.0), Vec2::new(SIZE.x, SIZE.y) - 2.0);
+            app.on_pointer(PointerEvent::Pressed {
+                button: PointerButton::Left,
+                position: Vector::new(at.x, at.y),
+                size: SIZE,
+            });
+            assert!(
+                !matches!(app.drag.map(|drag| drag.kind), Some(DragKind::Transforming(_))),
+                "a press at {at:?} was taken as a gizmo handle"
+            );
+            app.on_pointer(PointerEvent::Released { button: PointerButton::Left });
+        }
+    }
+
+    /// A held resize owns the pointer whether or not a button is down, and the
+    /// press dispatch already settled that precedence between sizing and the
+    /// plane cut. The gizmo is the third claimant and does not get to jump it:
+    /// a resize whose press turned into a transform is the worse surprise.
+    #[test]
+    fn a_held_resize_outranks_the_gizmo() {
+        let mut app = app();
+        arm(&mut app);
+        let (grip, _) = x_shaft_grip(&app);
+        // A resize anchors on the last cursor position, so the pointer has to
+        // have been seen before the key is pressed.
+        moved(&mut app, grip);
+        update(&mut app, Message::SizingStarted(SizingTarget::Radius));
+        assert!(app.sizing.is_some(), "the fixture did not start a resize");
+        // `SizingStarted` is not on `keeps_the_gizmo_armed`, so it committed
+        // the session and the pass after `dispatch` re-armed on the same body.
+        // That is the state the precedence below is actually about.
+        assert!(app.gizmo.is_some(), "the gizmo did not come back after the commit");
+
+        app.on_pointer(PointerEvent::Pressed {
+            button: PointerButton::Left,
+            position: Vector::new(grip.x, grip.y),
+            size: SIZE,
+        });
+        assert_eq!(
+            app.drag.map(|drag| drag.kind),
+            Some(DragKind::Sizing),
+            "the gizmo took a press that belonged to a held resize"
+        );
+    }
+
+    /// **The draw order and the click order have to agree.** `on_pointer` tests
+    /// the navigation cube before the gizmo may claim anything, so the renderer
+    /// draws the gizmo first and the cube over it. Get that backwards and the
+    /// user sees an arrow, clicks it, and the camera flies.
+    #[test]
+    fn the_navigation_cube_outranks_the_gizmo_where_they_overlap() {
+        let mut app = app();
+        arm(&mut app);
+        let (corner, size) = crate::navcube::corner_rect(Vec2::new(SIZE.x, SIZE.y));
+        let middle = corner + size * 0.5;
+
+        app.on_pointer(PointerEvent::Pressed {
+            button: PointerButton::Left,
+            position: Vector::new(middle.x, middle.y),
+            size: SIZE,
+        });
+        assert!(
+            !matches!(app.drag.map(|drag| drag.kind), Some(DragKind::Transforming(_))),
+            "the gizmo claimed a press inside the navigation cube"
+        );
+        assert!(app.flight.is_some(), "the cube did not get the press either");
+    }
+
+    /// A brush ring under the gizmo would say "a press here carves this much",
+    /// which is not what a press there does.
+    #[test]
+    fn the_brush_ring_goes_away_while_the_gizmo_is_up() {
+        let mut app = app();
+        app.on_pointer(PointerEvent::Moved {
+            position: Vector::new(SIZE.x / 2.0, SIZE.y / 2.0),
+            size: SIZE,
+        });
+        assert!(app.hover.is_some(), "the fixture's cursor is not over the model");
+
+        arm(&mut app);
+        app.on_pointer(PointerEvent::Moved {
+            position: Vector::new(SIZE.x / 2.0, SIZE.y / 2.0),
+            size: SIZE,
+        });
+        assert!(app.hover.is_none(), "the ring is still being placed on the surface");
+    }
+
+    /// Pressing `w` twice is a toggle and has to be free: arming alone must not
+    /// touch the field, so the base is only taken on the first bake.
+    #[test]
+    fn arming_and_disarming_without_dragging_costs_nothing() {
+        let mut app = app();
+        let before = field(&app);
+        let entries = app.history_stats.undo_entries;
+
+        arm(&mut app);
+        assert!(app.gizmo_base.is_none(), "arming took the field out before it had to");
+        update(&mut app, Message::ToolChanged(Tool::Transform));
+
+        assert!(app.gizmo.is_none(), "the toggle did not put it away");
+        assert_eq!(app.tool, Tool::Sculpt);
+        assert_eq!(field(&app), before);
+        assert_eq!(app.history_stats.undo_entries, entries, "an untouched session pushed an entry");
+        assert!(!app.unsaved, "an untouched session marked the document dirty");
+    }
+
+    /// The status line names the route on EVERY bake. A user told nothing when
+    /// a move is exact has no way to learn that some of them are not.
+    #[test]
+    fn the_status_line_says_which_route_the_bake_took() {
+        let mut app = app();
+        arm(&mut app);
+        drag_the_x_arrow(&mut app, 90.0);
+        assert!(
+            app.status.contains("exact"),
+            "a snapped move said {:?} rather than naming the route",
+            app.status
+        );
+
+        turn_a_ring(&mut app, 0.8);
+        assert!(
+            app.status.contains("resampled"),
+            "a free turn said {:?} rather than admitting the resample",
+            app.status
+        );
+    }
+
+    /// **The guard that stops a document changing ahead of its own history.**
+    /// While the gizmo is armed the document holds the baked field and the
+    /// stack does not yet hold the entry that undoes it, so anything outside
+    /// the gesture has to close the session first. Undo is the sharpest case.
+    #[test]
+    fn undoing_while_the_gizmo_is_armed_commits_it_first_and_then_undoes_it() {
+        let mut app = app();
+        let before = field(&app);
+        arm(&mut app);
+        drag_the_x_arrow(&mut app, 120.0);
+        assert_ne!(field(&app), before, "the fixture did not move the body");
+
+        update(&mut app, Message::Undo);
+
+        assert_eq!(field(&app), before, "undo did not reach the transform");
+    }
+
+    /// **Asserting on the document is not enough, and this is the assertion
+    /// that says so.**
+    ///
+    /// The test above passed while the bug was live: it reads `field(&app)`,
+    /// which is the document, and the document was always right. What was
+    /// wrong was that nothing told the renderer -- a field arriving from the
+    /// history carries an EMPTY dirty set, because whatever remeshed it last
+    /// drained it -- so the screen went on drawing the body where the bake had
+    /// put it, and every stroke, pick and brush ring after that acted on a
+    /// position the user could not see. `perf.dirty_bricks` is the one number
+    /// that can tell the two apart.
+    #[test]
+    fn undoing_a_bake_schedules_the_remesh_that_puts_the_body_back_on_screen() {
+        let mut app = app();
+        arm(&mut app);
+        drag_the_x_arrow(&mut app, 120.0);
+        // Out of the tool, so the entry is already on the stack and the undo
+        // below is a plain undo rather than a commit followed by one.
+        update(&mut app, Message::ToolChanged(Tool::Sculpt));
+
+        app.perf.dirty_bricks = 0;
+        update(&mut app, Message::Undo);
+        assert!(
+            app.perf.dirty_bricks > 0,
+            "undoing a bake remeshed nothing, so the screen still shows the body where the bake \
+             put it"
+        );
+
+        app.perf.dirty_bricks = 0;
+        update(&mut app, Message::Redo);
+        assert!(app.perf.dirty_bricks > 0, "redoing a bake remeshed nothing");
+    }
+
+    /// **A gesture that comes back to where it started must cost what arming
+    /// and not dragging costs: nothing.**
+    ///
+    /// Nudging a body and nudging it back is an ordinary way to change your
+    /// mind, and the identity route used to run `base.shifted(IVec3::ZERO)` --
+    /// a full deep copy, quoted at 1.53 GiB on the dragon -- to produce a field
+    /// identical to the one already held, then a whole-document remesh, and
+    /// then a whole-field undo entry charged against the reclaim allowance,
+    /// where `History::trim` can evict real strokes to make room for it.
+    #[test]
+    fn a_gesture_that_returns_to_the_identity_puts_the_base_back_rather_than_copying_it() {
+        let mut app = app();
+        let before = field(&app);
+        arm(&mut app);
+        let copies = brokkr_core::volume::copies_made_on_this_thread();
+        let warps = warps_made_on_this_thread();
+        let undoable = app.history.can_undo();
+
+        drag_the_x_arrow(&mut app, 40.0);
+        assert_ne!(field(&app), before, "the fixture did not move the body");
+        drag_the_x_arrow(&mut app, -40.0);
+
+        assert_eq!(
+            app.gizmo.expect("armed").placement,
+            brokkr_core::Similarity::IDENTITY,
+            "the fixture did not bring the placement back to the identity"
+        );
+        assert_eq!(field(&app), before, "the body did not come back bit for bit");
+        assert_eq!(
+            brokkr_core::volume::copies_made_on_this_thread(),
+            copies,
+            "returning to the identity deep copied the field instead of putting the base back"
+        );
+        assert_eq!(warps_made_on_this_thread(), warps, "an exact gesture resampled");
+
+        update(&mut app, Message::ToolChanged(Tool::Sculpt));
+        assert_eq!(
+            app.history.can_undo(),
+            undoable,
+            "a session that changed nothing was charged to the undo history"
+        );
+    }
+
+    /// **The ceiling is folded into the gesture, so a scale the bake could not
+    /// build is never offered.**
+    ///
+    /// `Handle::Uniform` is selected by a press within sixteen pixels of the
+    /// centre, so one long drag saturates `gizmo::MAX_SCALE`, and
+    /// `Similarity::then` multiplies scales -- while `Volume::warped` builds a
+    /// dense destination brick grid with no cap of its own and `arm_gizmo`'s
+    /// refusals were evaluated once, against the UNSCALED body.
+    ///
+    /// The document is stuffed rather than a huge body being built, for the
+    /// reason `a_body_the_pool_cannot_hold_is_refused` gives: the ceiling is
+    /// read off `doc_stats`, so a fixture that writes `doc_stats` exercises the
+    /// same arithmetic in a fraction of the time.
+    #[test]
+    fn a_scale_the_bake_could_not_afford_is_never_offered_by_the_gesture() {
+        let mut app = app();
+        let resident = app.doc.active_volume().stats().resident_bytes as f64;
+        // Room for about four times the body, so a ceiling near two -- small
+        // enough that the bakes this test really does run stay cheap.
+        app.doc_stats.resident_bytes = (MAX_VOLUME_BYTES - resident * 4.0) as usize;
+
+        arm(&mut app);
+        let ceiling = app.gizmo.expect("armed").max_scale;
+        assert!(
+            (1.0..gizmo::MAX_SCALE).contains(&ceiling),
+            "a document with room for four copies gave a ceiling of {ceiling}"
+        );
+
+        let centre = gizmo_centre(&app);
+        // Two, because one gesture cannot compose with anything and it is the
+        // composition that used to square the ceiling.
+        for round in 0..2 {
+            let from = centre + Vec2::new(4.0, 0.0);
+            gesture(&mut app, from, &[from + Vec2::new(320.0, 0.0)]);
+            let scale = app.gizmo.expect("armed").placement.scale;
+            assert!(
+                scale <= ceiling + 1.0e-3,
+                "round {round} composed to {scale}, past a ceiling of {ceiling}"
+            );
+        }
+        assert!(
+            app.gizmo.expect("armed").placement.scale > 1.0,
+            "the fixture never grew the body, so it proves nothing"
+        );
+
+        // And it has to SAY so. A preview box that stops growing under the
+        // pointer with nothing in the status line reads as the gizmo having
+        // lost the drag. Read mid-gesture, before the release replaces the line
+        // with the bake summary.
+        let from = centre + Vec2::new(4.0, 0.0);
+        moved(&mut app, from);
+        app.on_pointer(PointerEvent::Pressed {
+            button: PointerButton::Left,
+            position: Vector::new(from.x, from.y),
+            size: SIZE,
+        });
+        moved(&mut app, from + Vec2::new(320.0, 0.0));
+        assert!(app.status.contains("memory"), "the clamp bit without saying why: {}", app.status);
+        app.on_pointer(PointerEvent::Released { button: PointerButton::Left });
+    }
+
+    /// The ceiling has to shrink as the document fills, and it has to admit the
+    /// identity even when the document is full: a body can always be placed at
+    /// the size it already is, and a ceiling below one would make the gizmo
+    /// refuse to leave it alone.
+    #[test]
+    fn the_scale_ceiling_falls_as_the_document_fills_and_never_below_one() {
+        let stats = app().doc.active_volume().stats();
+        let resident = stats.resident_bytes as f64;
+
+        let mut roomy = app();
+        roomy.doc_stats.resident_bytes = (resident * 4.0) as usize;
+        let mut tight = app();
+        tight.doc_stats.resident_bytes = (MAX_VOLUME_BYTES - resident * 4.0) as usize;
+        let mut full = app();
+        full.doc_stats.resident_bytes = MAX_VOLUME_BYTES as usize;
+
+        let roomy = roomy.largest_scale_that_fits(stats);
+        let tight = tight.largest_scale_that_fits(stats);
+        let full = full.largest_scale_that_fits(stats);
+
+        assert!(roomy > tight, "an empty document offered no more room than a nearly full one");
+        assert!(tight > 1.0, "a document with room for four copies refused to scale at all");
+        assert_eq!(full, 1.0, "a full document must still let the body stay where it is");
+    }
+
+    /// The gizmo follows the active body rather than being left pointing at a
+    /// row nobody selected any more.
+    #[test]
+    fn choosing_another_body_moves_the_gizmo_to_it_and_commits_the_last_one() {
+        let mut app = app();
+        let first = app.doc.active();
+        let mut second_volume = brokkr_core::Volume::new(app.doc.voxel_size());
+        second_volume.seed_sphere(Vec3::new(90.0, 0.0, 0.0), 12.0);
+        let second = app.doc.add_body("Second", second_volume);
+        app.doc.mark_everything_dirty();
+
+        arm(&mut app);
+        assert_eq!(app.gizmo.expect("armed").body, first);
+        drag_the_x_arrow(&mut app, 120.0);
+
+        update(&mut app, Message::BodySelected(second));
+
+        assert_eq!(app.tool, Tool::Transform, "selecting a row dropped the tool");
+        assert_eq!(app.gizmo.expect("armed").body, second, "the gizmo stayed on the old body");
+        assert!(app.history.can_undo(), "the first body's session was not committed");
+    }
+
+    /// Arming is what commits to holding a second copy of the body, so that is
+    /// where the refusal has to be -- before the allocation and never after it,
+    /// which is the rule `merge_plan` already follows.
+    #[test]
+    fn arming_a_gizmo_on_a_hidden_body_is_refused_before_anything_is_allocated() {
+        let mut app = app();
+        let body = app.doc.active();
+        let copies = brokkr_core::volume::copies_made_on_this_thread();
+
+        let mut meta = app.doc.meta(body).expect("a body");
+        meta.visible = false;
+        app.doc.set_meta(&meta);
+        app.publish_visibility();
+
+        update(&mut app, Message::ToolChanged(Tool::Transform));
+        assert_ne!(app.tool, Tool::Transform, "the gizmo armed on a hidden body");
+        assert!(app.gizmo.is_none());
+        assert!(app.status.contains("hidden"), "the refusal did not say why: {:?}", app.status);
+        assert_eq!(
+            brokkr_core::volume::copies_made_on_this_thread(),
+            copies,
+            "the refusal allocated a copy on its way to refusing"
+        );
+    }
+
+    /// The bake replaces the whole field, so the bricks the OLD one occupied
+    /// have to be marked in the NEW one or the renderer keeps drawing triangles
+    /// nothing will ever overwrite.
+    #[test]
+    fn a_bake_marks_the_bricks_the_body_has_left() {
+        let mut app = app();
+        arm(&mut app);
+        let vacated: Vec<BrickCoord> = app.doc.active_volume().brick_coords().collect();
+        assert!(!vacated.is_empty(), "the fixture is empty");
+
+        // Far enough that the body lands on entirely different bricks.
+        drag_the_x_arrow(&mut app, 260.0);
+
+        // `remesh_dirty` has already drained the set, so the check is that the
+        // renderer was told about the old body at all.
+        let placement = app.gizmo.expect("armed").placement;
+        assert!(
+            placement.translation.length() > brokkr_core::BRICK_DIM as f32 * app.doc.voxel_size(),
+            "the fixture did not move the body off its old bricks"
+        );
+        let now: Vec<BrickCoord> = app.doc.active_volume().brick_coords().collect();
+        assert!(
+            now.iter().any(|coord| !vacated.contains(coord)),
+            "the body is still on exactly the bricks it started on"
+        );
+    }
+
+    /// The placement is the caller's business and the routing is the core's,
+    /// and the two have to agree about what a gesture produced -- the status
+    /// line, the bake and the undo entry all read the same answer.
+    #[test]
+    fn the_route_the_status_reports_is_the_route_the_bake_took() {
+        let mut app = app();
+        arm(&mut app);
+        let warps = warps_made_on_this_thread();
+        drag_the_x_arrow(&mut app, 90.0);
+        let exact = warps_made_on_this_thread() == warps;
+        assert_eq!(
+            exact,
+            !app.gizmo.expect("armed").placement.route(app.doc.voxel_size()).is_lossy(),
+            "the bake and the routing disagreed about whether a pass ran"
+        );
+    }
+
+    /// Read from the SHARED frame and not from `app.gizmo_batch`: the two
+    /// buffers rotate on every refresh, so the application's own field holds
+    /// last frame's recycled capacity and the renderer's holds this frame's
+    /// geometry.
+    #[test]
+    fn a_gizmo_is_drawn_only_while_it_is_armed() {
+        let mut app = app();
+        assert!(app.shared.gizmo_snapshot().is_empty(), "a gizmo was drawn before one existed");
+        arm(&mut app);
+        assert!(!app.shared.gizmo_snapshot().is_empty(), "the armed gizmo drew nothing");
+        update(&mut app, Message::ToolChanged(Tool::Sculpt));
+        assert!(
+            app.shared.gizmo_snapshot().is_empty(),
+            "the gizmo is still on screen after disarming"
+        );
+    }
+
+    /// The composition the drag path actually performs, checked against
+    /// applying the two placements in turn.
+    #[test]
+    fn two_gestures_compose_into_one_placement_rather_than_replacing_it() {
+        let mut app = app();
+        arm(&mut app);
+        drag_the_x_arrow(&mut app, 60.0);
+        let first = app.gizmo.expect("armed").placement;
+        drag_the_x_arrow(&mut app, 60.0);
+        let both = app.gizmo.expect("armed").placement;
+
+        assert!(
+            both.translation.length() > first.translation.length() * 1.5,
+            "the second gesture replaced the first rather than composing: \
+             {first:?} then {both:?}"
+        );
+        // And the placement is still exactly a translation, so both stayed on
+        // the exact route.
+        assert!(!both.route(app.doc.voxel_size()).is_lossy());
     }
 }

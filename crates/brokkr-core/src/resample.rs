@@ -36,7 +36,7 @@ const MAX_GATHERED_SAMPLES: i64 = 4 << 20;
 
 /// What the old volume holds over some region.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Coverage {
+pub(crate) enum Coverage {
     /// Nothing but empty space, so the new brick can stay absent.
     Empty,
     /// Nothing but the inside of a solid, so the new brick is a tile.
@@ -48,7 +48,7 @@ enum Coverage {
 impl Volume {
     /// What this volume holds over an inclusive world space box, answered from
     /// the brick structure without sampling.
-    fn coverage(&self, minimum: Vec3, maximum: Vec3) -> Coverage {
+    pub(crate) fn coverage(&self, minimum: Vec3, maximum: Vec3) -> Coverage {
         let (v_min, v_max) = self.voxel_bounds(minimum, maximum);
         let b_min = BrickCoord::containing(v_min).0;
         let b_max = BrickCoord::containing(v_max).0;

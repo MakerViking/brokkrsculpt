@@ -135,6 +135,10 @@ pub struct SharedFrame {
     /// The navigation cube's geometry, in its own batch because it is drawn in
     /// its own pass with its own matrix.
     cube: Mutex<OverlayBatch>,
+    /// The transform gizmo's geometry. In its own batch because it is drawn in
+    /// its own pass -- the sculpt's matrix, but over the sculpt's depth so a
+    /// gizmo on a body's centroid is reachable rather than buried inside it.
+    gizmo: Mutex<OverlayBatch>,
     /// Which GPU and backend iced actually chose, recorded the first time the
     /// pipeline is built. The application cannot ask wgpu directly -- iced owns
     /// the adapter -- and it is the first thing a bug report needs.
@@ -210,6 +214,11 @@ impl SharedFrame {
         std::mem::swap(&mut *self.cube.lock().expect("shared frame poisoned"), batch);
     }
 
+    /// The same hand off for the transform gizmo.
+    pub fn swap_gizmo(&self, batch: &mut OverlayBatch) {
+        std::mem::swap(&mut *self.gizmo.lock().expect("shared frame poisoned"), batch);
+    }
+
     /// The overlay geometry currently waiting for the renderer.
     ///
     /// The application swaps its buffer in here rather than keeping it, so this
@@ -217,6 +226,12 @@ impl SharedFrame {
     #[cfg(test)]
     pub fn overlay_snapshot(&self) -> OverlayBatch {
         self.overlay.lock().expect("shared frame poisoned").clone()
+    }
+
+    /// The same, for the transform gizmo.
+    #[cfg(test)]
+    pub fn gizmo_snapshot(&self) -> OverlayBatch {
+        self.gizmo.lock().expect("shared frame poisoned").clone()
     }
 
     /// The GPU iced chose, for diagnostics. "unknown" until the first frame.
@@ -654,6 +669,13 @@ pub(crate) fn shortcut(character: &str, command: bool, shift: bool, alt: bool) -
         // field. Pressed while masking it goes back to sculpting, which
         // `Message::ToolChanged` does for every tool.
         "m" => Some(Message::ToolChanged(Tool::Mask)),
+        // The transform gizmo. `w` is ZBrush's, Blender's and Maya's key for
+        // Move, taken rather than invented so muscle memory carries over --
+        // and one key rather than three, because this is one gizmo with move,
+        // turn and scale handles on it rather than three modes. Pressed while
+        // it is up it goes back to sculpting, which `Message::ToolChanged`
+        // does for every tool.
+        "w" => Some(Message::ToolChanged(Tool::Transform)),
         // Hold to see the mask, whatever the `show mask` toggle says. ZBrush's
         // own mask-visibility key is H, taken rather than invented so muscle
         // memory carries over, and held rather than latched because that is the
@@ -661,6 +683,10 @@ pub(crate) fn shortcut(character: &str, command: bool, shift: bool, alt: bool) -
         // without a second press. The release is decoded in `key_event`
         // alongside the sizing keys -- this function only ever sees presses.
         "h" => Some(Message::MaskPeekStarted),
+        // Blender's and Nomad's own key for this, taken rather than invented.
+        // It is the one keystroke that recovers ANY camera, however lost, and
+        // it is the other half of letting the camera move freely at all.
+        "f" => Some(Message::CameraFramedOnActive),
         "x" => Some(Message::SymmetryAxisToggled(MirrorAxis::X)),
         "y" => Some(Message::SymmetryAxisToggled(MirrorAxis::Y)),
         "z" => Some(Message::SymmetryAxisToggled(MirrorAxis::Z)),
@@ -728,12 +754,13 @@ fn route_pointer(
         }
         iced::Event::Mouse(mouse::Event::WheelScrolled { delta }) => {
             cursor.position_in(bounds)?;
+            let (position, size) = pointer_position(bounds, cursor)?;
             let amount = match delta {
                 mouse::ScrollDelta::Lines { y, .. } => *y,
                 // Pixel deltas are far larger per notch than line deltas.
                 mouse::ScrollDelta::Pixels { y, .. } => *y / 40.0,
             };
-            (PointerEvent::Scrolled { amount }, true)
+            (PointerEvent::Scrolled { amount, position, size }, true)
         }
         iced::Event::Keyboard(iced::keyboard::Event::ModifiersChanged(modifiers)) => (
             PointerEvent::Modifiers {
@@ -884,6 +911,13 @@ impl shader::Primitive for SculptPrimitive {
             let cube = shared.cube.lock().expect("shared frame poisoned");
             pipeline.renderer.write_cube(device, queue, &cube, navcube::view_projection(&camera));
         }
+        {
+            // The SCULPT's matrix, not one of the gizmo's own: it is world
+            // space geometry sitting on the body it moves, and only its size is
+            // held constant on screen.
+            let gizmo = shared.gizmo.lock().expect("shared frame poisoned");
+            pipeline.renderer.write_gizmo(device, queue, &gizmo, view_projection);
+        }
         // The cube's corner box is defined in logical pixels so it stays the
         // same physical size at any scale factor, but a render pass wants
         // physical ones. Worked out here because `render` sees neither the
@@ -964,6 +998,23 @@ impl shader::Primitive for SculptPrimitive {
         let y = clip_bounds.y + cube.y;
         let width = cube.width.min(clip_bounds.width.saturating_sub(cube.x));
         let height = cube.height.min(clip_bounds.height.saturating_sub(cube.y));
+        // **The gizmo BEFORE the cube, and the order is decided by the press
+        // dispatch rather than by taste.** Both clear depth, so whichever draws
+        // last wins the pixels they share -- and `Brokkr::on_pointer` tests the
+        // navigation cube before it lets the gizmo claim anything. Drawing them
+        // the other way round would show a gizmo arrow over the cube that,
+        // clicked, flew the camera: the two would disagree about what is on top,
+        // and the one the user can see would be the one that is wrong.
+        pipeline.renderer.render_gizmo(
+            encoder,
+            target,
+            PixelRect {
+                x: clip_bounds.x,
+                y: clip_bounds.y,
+                width: clip_bounds.width,
+                height: clip_bounds.height,
+            },
+        );
         pipeline.renderer.render_cube(encoder, target, PixelRect { x, y, width, height });
     }
 }

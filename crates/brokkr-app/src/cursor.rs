@@ -29,7 +29,7 @@ use brokkr_core::{Brush, BrushDirection, FalloffCurve, MaskOp, MirrorAxis, Symme
 use brokkr_gpu::OverlayBatch;
 use glam::Vec3;
 
-use crate::theme;
+use crate::theme::{self, linear};
 
 /// Segments in a ring. Sixty four is smooth at any size the interface offers
 /// and is still only 128 line vertices.
@@ -89,16 +89,6 @@ pub enum CursorMood {
     /// because they really are two things; these two are one thing and its
     /// inverse.
     Unmasking,
-}
-
-/// Convert a theme colour to the linear space the overlay shader expects.
-///
-/// The tokens in [`crate::theme`] are sRGB, because they came from SindriCAD's
-/// CSS. Handing those straight to the shader would draw every overlay too
-/// bright, and inconsistently with the model beside it.
-fn linear(colour: iced::Color, alpha: f32) -> [f32; 4] {
-    let to_linear = |c: f32| c.powf(2.2);
-    [to_linear(colour.r), to_linear(colour.g), to_linear(colour.b), alpha]
 }
 
 /// The distance, as a fraction of the radius, at which a falloff curve has
