@@ -74,7 +74,7 @@ const SCALE_EPSILON: f32 = 1.0e-5;
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Similarity {
     pub rotation: Quat,
-    pub scale: f32,
+    pub scale: Vec3,
     pub translation: Vec3,
 }
 
@@ -113,14 +113,14 @@ impl Bake {
 
 impl Similarity {
     pub const IDENTITY: Self =
-        Self { rotation: Quat::IDENTITY, scale: 1.0, translation: Vec3::ZERO };
+        Self { rotation: Quat::IDENTITY, scale: Vec3::ONE, translation: Vec3::ZERO };
 
     /// A placement about a pivot: turn and scale about `pivot`, then move by
     /// `offset`.
     ///
     /// This is the form every gizmo handle produces, because a handle turns the
     /// body about the gizmo's own origin and not about the world's.
-    pub fn about(pivot: Vec3, rotation: Quat, scale: f32, offset: Vec3) -> Self {
+    pub fn about(pivot: Vec3, rotation: Quat, scale: Vec3, offset: Vec3) -> Self {
         // p |-> pivot + offset + rotation * (scale * (p - pivot))
         let translation = pivot + offset - rotation * (scale * pivot);
         Self { rotation, scale, translation }
@@ -128,7 +128,7 @@ impl Similarity {
 
     /// A pure translation.
     pub fn moving(offset: Vec3) -> Self {
-        Self { rotation: Quat::IDENTITY, scale: 1.0, translation: offset }
+        Self { rotation: Quat::IDENTITY, scale: Vec3::ONE, translation: offset }
     }
 
     pub fn transform_point(self, point: Vec3) -> Vec3 {
@@ -155,14 +155,35 @@ impl Similarity {
     /// scale, so composing the two is the identity to within one float
     /// division. This is the direction the bake actually walks: a destination
     /// voxel asks where it came FROM.
-    pub fn inverse(self) -> Self {
-        let inverse_rotation = self.rotation.inverse();
-        let inverse_scale = 1.0 / self.scale;
-        Self {
-            rotation: inverse_rotation,
-            scale: inverse_scale,
-            translation: -(inverse_rotation * (inverse_scale * self.translation)),
-        }
+    /// Where a point came FROM, which is the direction the bake walks.
+    ///
+    /// **This replaced an `inverse()` that returned another `Similarity`, and
+    /// it had to.** With a per-axis scale the inverse of `R S p + t` is
+    /// `S_inv R_inv (p - t)` -- scale on the OUTSIDE of the rotation -- and
+    /// that is not expressible in this struct's `R S p + t` shape at all. For a
+    /// uniform scale the two commute and it was, which is why the old form
+    /// worked right up until the day the scale became a vector. Returning the
+    /// mapped point instead sidesteps the representation entirely and is exact.
+    pub fn inverse_transform_point(self, point: Vec3) -> Vec3 {
+        (self.rotation.inverse() * (point - self.translation)) / self.scale
+    }
+
+    /// The smallest of the three scale factors.
+    ///
+    /// **What a distance has to be multiplied by after a per-axis scale.**
+    /// `s_min * d(T_inverse(p))` keeps the zero set exactly and UNDERESTIMATES
+    /// the true distance everywhere else, which is the sound direction for a
+    /// sphere trace: it steps short, never through. The overestimate would put
+    /// the ray through the surface.
+    pub fn min_scale(self) -> f32 {
+        self.scale.x.abs().min(self.scale.y.abs()).min(self.scale.z.abs())
+    }
+
+    /// Whether all three axes scale alike, so the field stays a true distance
+    /// field and [`crate::Volume::redistance`] has nothing to do.
+    pub fn is_uniform_scale(self) -> bool {
+        let s = self.scale;
+        (s.x - s.y).abs() <= SCALE_EPSILON && (s.y - s.z).abs() <= SCALE_EPSILON
     }
 
     /// Whether this map is close enough to the identity to be worth nothing.
@@ -189,7 +210,6 @@ impl Similarity {
     /// their bounding box is exact for the parallelepiped and loose only by
     /// the amount the parallelepiped is not axis aligned.
     pub fn inverse_bounds(self, low: Vec3, high: Vec3) -> (Vec3, Vec3) {
-        let inverse = self.inverse();
         let mut result_low = Vec3::splat(f32::INFINITY);
         let mut result_high = Vec3::splat(f32::NEG_INFINITY);
         for corner in 0..8 {
@@ -198,7 +218,7 @@ impl Similarity {
                 if corner & 2 == 0 { low.y } else { high.y },
                 if corner & 4 == 0 { low.z } else { high.z },
             );
-            let source = inverse.transform_point(point);
+            let source = self.inverse_transform_point(point);
             result_low = result_low.min(source);
             result_high = result_high.max(source);
         }
@@ -235,7 +255,7 @@ impl Similarity {
         if !voxel_size.is_finite() || voxel_size <= 0.0 {
             return Bake::Resample;
         }
-        if (self.scale - 1.0).abs() > SCALE_EPSILON {
+        if (self.scale - Vec3::ONE).abs().max_element() > SCALE_EPSILON {
             return Bake::Resample;
         }
         let Some(turns) = quarter_turn(self.rotation) else {
@@ -308,14 +328,17 @@ mod tests {
     fn a_placement_about_a_pivot_leaves_the_pivot_where_it_was() {
         let pivot = Vec3::new(12.0, -3.0, 4.5);
         for (rotation, scale) in [
-            (Quat::from_rotation_y(0.7), 1.0),
-            (Quat::IDENTITY, 2.5),
-            (Quat::from_rotation_x(-1.3), 0.4),
+            (Quat::from_rotation_y(0.7), Vec3::ONE),
+            (Quat::IDENTITY, Vec3::splat(2.5)),
+            (Quat::from_rotation_x(-1.3), Vec3::splat(0.4)),
+            // A per-axis scale, which the type could not hold until the
+            // redistancing pass made one sound.
+            (Quat::from_rotation_z(0.3), Vec3::new(1.0, 0.5, 2.0)),
         ] {
             let placement = Similarity::about(pivot, rotation, scale, Vec3::ZERO);
             assert!(
                 placement.transform_point(pivot).distance(pivot) < 1.0e-4,
-                "the pivot moved under rotation {rotation:?} scale {scale}"
+                "the pivot moved under rotation {rotation:?} scale {scale:?}"
             );
         }
     }
@@ -325,12 +348,11 @@ mod tests {
         let placement = Similarity::about(
             Vec3::new(-2.0, 5.0, 1.0),
             Quat::from_euler(glam::EulerRot::YXZ, 0.9, -0.4, 2.1),
-            1.7,
+            Vec3::splat(1.7),
             Vec3::new(4.0, 0.5, -9.0),
         );
-        let inverse = placement.inverse();
         for point in [Vec3::ZERO, Vec3::new(30.0, -12.0, 7.0), Vec3::splat(-100.0)] {
-            let round_trip = inverse.transform_point(placement.transform_point(point));
+            let round_trip = placement.inverse_transform_point(placement.transform_point(point));
             assert!(round_trip.distance(point) < 1.0e-3, "{point:?} came back as {round_trip:?}");
         }
     }
@@ -342,12 +364,11 @@ mod tests {
         let placement = Similarity::about(
             Vec3::new(1.0, 2.0, 3.0),
             Quat::from_euler(glam::EulerRot::YXZ, 0.6, 1.1, -0.3),
-            0.8,
+            Vec3::splat(0.8),
             Vec3::new(-4.0, 2.0, 6.0),
         );
         let (low, high) = (Vec3::new(-5.0, -6.0, -7.0), Vec3::new(9.0, 4.0, 3.0));
         let (source_low, source_high) = placement.inverse_bounds(low, high);
-        let inverse = placement.inverse();
 
         // Every corner, which is what the bound is built from...
         for corner in 0..8 {
@@ -356,7 +377,7 @@ mod tests {
                 if corner & 2 == 0 { low.y } else { high.y },
                 if corner & 4 == 0 { low.z } else { high.z },
             );
-            let source = inverse.transform_point(point);
+            let source = placement.inverse_transform_point(point);
             assert!(source.cmpge(source_low).all() && source.cmple(source_high).all());
         }
         // ...and a scatter of interior points, which is the claim that actually
@@ -365,7 +386,7 @@ mod tests {
             let t = step as f32 / 39.0;
             let point = low.lerp(high, t) + Vec3::new(t, 1.0 - t, t * t) * (high - low) * 0.25;
             let point = point.clamp(low, high);
-            let source = inverse.transform_point(point);
+            let source = placement.inverse_transform_point(point);
             assert!(
                 source.cmpge(source_low - Vec3::splat(1.0e-4)).all()
                     && source.cmple(source_high + Vec3::splat(1.0e-4)).all(),
@@ -381,13 +402,13 @@ mod tests {
         let first = Similarity::about(
             Vec3::new(2.0, -1.0, 4.0),
             Quat::from_rotation_y(0.7),
-            1.4,
+            Vec3::splat(1.4),
             Vec3::new(3.0, 0.0, -2.0),
         );
         let second = Similarity::about(
             Vec3::new(-5.0, 3.0, 0.0),
             Quat::from_rotation_x(-1.1),
-            0.6,
+            Vec3::splat(0.6),
             Vec3::new(0.0, 8.0, 1.0),
         );
         let composed = first.then(second);
@@ -403,10 +424,11 @@ mod tests {
 
     #[test]
     fn composing_with_the_identity_changes_nothing() {
-        let placement = Similarity::about(Vec3::ONE, Quat::from_rotation_z(0.3), 2.0, Vec3::X);
+        let placement =
+            Similarity::about(Vec3::ONE, Quat::from_rotation_z(0.3), Vec3::splat(2.0), Vec3::X);
         for combined in [placement.then(Similarity::IDENTITY), Similarity::IDENTITY.then(placement)]
         {
-            assert!((combined.scale - placement.scale).abs() < 1.0e-6);
+            assert!((combined.scale - placement.scale).abs().max_element() < 1.0e-6);
             assert!(combined.translation.distance(placement.translation) < 1.0e-5);
         }
     }
@@ -443,7 +465,7 @@ mod tests {
             (Vec3::Z, std::f32::consts::PI),
         ] {
             let rotation = Quat::from_axis_angle(axis, angle);
-            let placement = Similarity::about(pivot, rotation, 1.0, Vec3::ZERO);
+            let placement = Similarity::about(pivot, rotation, Vec3::ONE, Vec3::ZERO);
             let Bake::Exact { turns, voxel_offset } = placement.route(VOXEL) else {
                 panic!("a quarter turn about a lattice pivot should be exact: {placement:?}");
             };
@@ -470,7 +492,7 @@ mod tests {
     fn a_rotation_just_off_a_quarter_turn_is_not_called_exact() {
         for offset in [0.02_f32, 0.005, 0.001] {
             let rotation = Quat::from_rotation_y(FRAC_PI_2 + offset);
-            let placement = Similarity::about(Vec3::ZERO, rotation, 1.0, Vec3::ZERO);
+            let placement = Similarity::about(Vec3::ZERO, rotation, Vec3::ONE, Vec3::ZERO);
             assert_eq!(
                 placement.route(VOXEL),
                 Bake::Resample,
@@ -513,7 +535,7 @@ mod tests {
             };
             let scale = if snapped { 1.0 } else { 0.5 + next() };
 
-            let placement = Similarity::about(pivot, rotation, scale, offset);
+            let placement = Similarity::about(pivot, rotation, Vec3::splat(scale), offset);
             let Bake::Exact { turns, voxel_offset } = placement.route(VOXEL) else {
                 continue;
             };
@@ -535,7 +557,8 @@ mod tests {
     #[test]
     fn any_scale_at_all_is_a_resample() {
         for scale in [0.5_f32, 0.999, 1.001, 2.0] {
-            let placement = Similarity::about(Vec3::ZERO, Quat::IDENTITY, scale, Vec3::ZERO);
+            let placement =
+                Similarity::about(Vec3::ZERO, Quat::IDENTITY, Vec3::splat(scale), Vec3::ZERO);
             assert_eq!(placement.route(VOXEL), Bake::Resample, "scale {scale}");
         }
     }

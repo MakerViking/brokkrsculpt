@@ -67,8 +67,26 @@ const HEAD_RADIUS_PX: f32 = 6.0;
 /// Half-width of the shaft ribbon.
 const SHAFT_HALF_PX: f32 = 1.6;
 /// Radius of the rotation rings. Clear of the arrowheads, which end at
-/// `SHAFT_PX + HEAD_PX`, so the two never compete for the same pixel.
-const RING_PX: f32 = 104.0;
+/// Where the per-axis scale box sits along its axis, in pixels.
+///
+/// Between the move arrow's head and the rotation ring, so the three handles on
+/// one axis never compete for a pixel: the arrow ends at `SHAFT_PX + HEAD_PX`
+/// (80), this box is centred at 92, and the ring is at 104.
+const SCALE_BOX_PX: f32 = 92.0;
+
+/// Half the scale box's side, in pixels. Its grab region is this plus GRAB_PX.
+const SCALE_BOX_HALF_PX: f32 = 5.0;
+
+/// The rotation ring's radius, in pixels.
+///
+/// **Moved out from 104 to make room for the per-axis scale box**, and the
+/// reason is worth keeping: at 104 the ring's PROJECTION passed over the box at
+/// 92 even though the two are twelve pixels apart in world terms. A ring is a
+/// circle seen at an angle, so its screen distance from a point on the axis is
+/// not its world distance, and reasoning about the gap in world pixels said
+/// they were clear when they were not. A test caught it -- a press aimed at the
+/// box came back `Ring(1)`.
+pub const RING_PX: f32 = 128.0;
 /// Half-width of a ring's band.
 const RING_HALF_PX: f32 = 2.0;
 /// How many segments a ring is drawn and picked with.
@@ -138,6 +156,8 @@ pub enum Handle {
     Plane(u8),
     Ring(u8),
     Uniform,
+    /// Squash or stretch along ONE axis. What `Uniform` is not.
+    Scale(u8),
 }
 
 impl Handle {
@@ -147,6 +167,7 @@ impl Handle {
             Handle::Axis(_) | Handle::Plane(_) => "move",
             Handle::Ring(_) => "turn",
             Handle::Uniform => "scale",
+            Handle::Scale(_) => "resize",
         }
     }
 }
@@ -391,6 +412,23 @@ pub fn pick(camera: &OrbitCamera, viewport: Vec2, gizmo: &Gizmo, at: Vec2) -> Op
         }
     }
 
+    // **After the rings and before the shafts, and the order is arithmetic
+    // rather than taste.** The box is centred at SCALE_BOX_PX (92) and grabs
+    // within SCALE_BOX_HALF_PX + GRAB_PX (13), so it reaches 79..105 -- which
+    // overlaps the ring at RING_PX (104) at one end and the arrow head ending
+    // at SHAFT_PX + HEAD_PX (80) at the other. Testing it first swallowed every
+    // ring press, and a test caught it: a free turn reported an exact move.
+    // Giving the ring first refusal costs the box nothing, because a press that
+    // the ring wanted was never meant for the box.
+    for index in 0..3u8 {
+        let box_centre = origin + axis_of(index) * (SCALE_BOX_PX * scale);
+        if let Some(pixel) = to_pixels(camera, viewport, box_centre)
+            && at.distance(pixel) <= SCALE_BOX_HALF_PX + GRAB_PX
+        {
+            return Some(Handle::Scale(index));
+        }
+    }
+
     None
 }
 
@@ -504,7 +542,7 @@ pub fn drag(
             if angle == 0.0 {
                 return Similarity::IDENTITY;
             }
-            Similarity::about(origin, Quat::from_axis_angle(normal, angle), 1.0, Vec3::ZERO)
+            Similarity::about(origin, Quat::from_axis_angle(normal, angle), Vec3::ONE, Vec3::ZERO)
         }
         Handle::Uniform => {
             let Some(centre) = to_pixels(camera, viewport, origin) else {
@@ -530,7 +568,7 @@ pub fn drag(
             // drag that comes back to the pixel it started on must be exactly
             // the identity, and a clamp that could exclude it would make a
             // gesture uncancellable by hand.
-            let pinned = gizmo.pinned.scale.max(f32::MIN_POSITIVE);
+            let pinned = gizmo.pinned.scale.max_element().max(f32::MIN_POSITIVE);
             let highest = (gizmo.max_scale / pinned).clamp(1.0, MAX_SCALE);
             let lowest = MIN_SCALE.max(MIN_SCALE / pinned).min(1.0);
             let mut scale = (centre.distance(to) / started).clamp(lowest, highest);
@@ -540,6 +578,50 @@ pub fn drag(
             if scale == 1.0 {
                 return Similarity::IDENTITY;
             }
+            Similarity::about(origin, Quat::IDENTITY, Vec3::splat(scale), Vec3::ZERO)
+        }
+        Handle::Scale(index) => {
+            // **Per-axis scale: the same screen measure as `Uniform`, applied
+            // to ONE component.** Measured along the projected axis rather than
+            // radially, because a squash reads as "pull this end" and a radial
+            // measure would grow it when the pointer moved sideways.
+            let axis = axis_of(index);
+            let Some(centre) = to_pixels(camera, viewport, origin) else {
+                return Similarity::IDENTITY;
+            };
+            // A screen direction for this axis, from the body's own extent so
+            // it is long enough to project stably. Only the DIRECTION is used
+            // -- the length cancels in the ratio below -- so any positive
+            // world length would do, and a large one keeps the projection out
+            // of the noise.
+            let span = (gizmo.base_high - gizmo.base_low).length().max(1.0);
+            let Some(tip) = to_pixels(camera, viewport, origin + axis * span) else {
+                return Similarity::IDENTITY;
+            };
+            let along = tip - centre;
+            let length = along.length();
+            if length < 1.0 {
+                // The axis points at the eye, so there is no screen direction
+                // to measure along and any answer would be noise.
+                return Similarity::IDENTITY;
+            }
+            let direction = along / length;
+            let started = (from - centre).dot(direction);
+            if started.abs() < 1.0 {
+                return Similarity::IDENTITY;
+            }
+            let pinned = gizmo.pinned.scale[index as usize].max(f32::MIN_POSITIVE);
+            let highest = (gizmo.max_scale / pinned).clamp(1.0, MAX_SCALE);
+            let lowest = MIN_SCALE.max(MIN_SCALE / pinned).min(1.0);
+            let mut factor = ((to - centre).dot(direction) / started).clamp(lowest, highest);
+            if snap.is_some() {
+                factor = ((factor / SCALE_SNAP).round() * SCALE_SNAP).clamp(lowest, highest);
+            }
+            if factor == 1.0 {
+                return Similarity::IDENTITY;
+            }
+            let mut scale = Vec3::ONE;
+            scale[index as usize] = factor;
             Similarity::about(origin, Quat::IDENTITY, scale, Vec3::ZERO)
         }
     }
@@ -630,6 +712,29 @@ pub fn build(batch: &mut OverlayBatch, camera: &OrbitCamera, viewport: Vec2, giz
             let b = ring_point(tip, scale, index, HEAD_RADIUS_PX, step + 1);
             batch.push_triangle(apex, a, b, shaft_colour);
             batch.push_triangle(tip, b, a, shaft_colour);
+        }
+
+        // The per-axis scale box, past the arrow head. A cube rather than
+        // another cone, because a second cone on the same axis reads as a
+        // longer arrow and the two handles do different things -- this is the
+        // one that squashes.
+        let box_colour = colour(Handle::Scale(index));
+        let box_centre = origin + axis * (SCALE_BOX_PX * scale);
+        let half = SCALE_BOX_HALF_PX * scale;
+        let (u, v) = other_axes(index);
+        for face in 0..3usize {
+            let normal = [axis, u, v][face];
+            let (a, b) = ([u, v, axis][face], [v, axis, u][face]);
+            for sign in [-1.0f32, 1.0] {
+                let middle = box_centre + normal * (half * sign);
+                batch.push_quad(
+                    middle - a * half - b * half,
+                    middle + a * half - b * half,
+                    middle + a * half + b * half,
+                    middle - a * half + b * half,
+                    box_colour,
+                );
+            }
         }
 
         // The plane handle.
@@ -1065,9 +1170,9 @@ mod tests {
             middle + Vec2::new(80.0, 0.0),
             Some(VOXEL),
         );
-        assert!(out.scale > 1.5, "the fixture did not grow: {}", out.scale);
+        assert!(out.scale.max_element() > 1.5, "the fixture did not grow: {:?}", out.scale);
         let back = drag(&camera, VIEWPORT, &gizmo, Handle::Uniform, from, from, Some(VOXEL));
-        assert_eq!(back.scale, 1.0);
+        assert_eq!(back.scale, Vec3::ONE);
     }
 
     /// **The bound is on the total, and one gesture cannot see the total.**
@@ -1102,13 +1207,13 @@ mod tests {
             gizmo.placement = gizmo.pinned.then(gesture);
             gizmo.pinned = gizmo.placement;
             assert!(
-                gizmo.placement.scale <= 6.0 + 1.0e-4,
+                gizmo.placement.scale.max_element() <= 6.0 + 1.0e-4,
                 "round {round} composed to {}, past a ceiling of 6",
                 gizmo.placement.scale
             );
         }
         assert!(
-            gizmo.placement.scale > 1.0,
+            gizmo.placement.scale.max_element() > 1.0,
             "the fixture never grew the body at all, so it proves nothing"
         );
     }
@@ -1128,13 +1233,13 @@ mod tests {
             gizmo.placement = gizmo.pinned.then(gesture);
             gizmo.pinned = gizmo.placement;
             assert!(
-                gizmo.placement.scale >= MIN_SCALE - 1.0e-6,
+                gizmo.placement.scale.min_element() >= MIN_SCALE - 1.0e-6,
                 "round {round} composed down to {}, under a floor of {MIN_SCALE}",
                 gizmo.placement.scale
             );
         }
         assert!(
-            gizmo.placement.scale < 1.0,
+            gizmo.placement.scale.min_element() < 1.0,
             "the fixture never shrank the body at all, so it proves nothing"
         );
     }
@@ -1147,7 +1252,7 @@ mod tests {
         let camera = camera();
         let mut gizmo = gizmo();
         gizmo.max_scale = 1.0;
-        gizmo.pinned = Similarity::about(gizmo.origin(), Quat::IDENTITY, 1.0, Vec3::ZERO);
+        gizmo.pinned = Similarity::about(gizmo.origin(), Quat::IDENTITY, Vec3::ONE, Vec3::ZERO);
         let from = centre(&camera, &gizmo) + Vec2::new(30.0, 0.0);
 
         for snap in [Some(VOXEL), None] {

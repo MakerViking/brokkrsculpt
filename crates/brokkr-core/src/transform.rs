@@ -78,6 +78,28 @@ pub fn warps_made_on_this_thread() -> usize {
     WARPS_MADE.with(std::cell::Cell::get)
 }
 
+/// The destination box for a source box: the eight corners forward.
+///
+/// Replaces `by.inverse().inverse_bounds(..)`, which no longer type-checks and
+/// could not be made to: with a per-axis scale the inverse of this map is not
+/// itself expressible as one. Same eight-corner argument, same conservative
+/// direction.
+pub(crate) fn forward_bounds(by: Similarity, low: Vec3, high: Vec3) -> (Vec3, Vec3) {
+    let mut result_low = Vec3::splat(f32::INFINITY);
+    let mut result_high = Vec3::splat(f32::NEG_INFINITY);
+    for corner in 0..8 {
+        let point = Vec3::new(
+            if corner & 1 == 0 { low.x } else { high.x },
+            if corner & 2 == 0 { low.y } else { high.y },
+            if corner & 4 == 0 { low.z } else { high.z },
+        );
+        let moved = by.transform_point(point);
+        result_low = result_low.min(moved);
+        result_high = result_high.max(moved);
+    }
+    (result_low, result_high)
+}
+
 impl Volume {
     /// This field moved by a whole number of VOXELS.
     ///
@@ -179,13 +201,13 @@ impl Volume {
         let Some((world_min, world_max)) = self.world_bounds() else {
             return warped;
         };
-        if !by.scale.is_finite() || by.scale <= 0.0 {
+        if !by.scale.is_finite() || by.scale.min_element() <= 0.0 {
             return warped;
         }
 
         // Where the content is GOING. The forward image of the source box, by
         // the same eight-corner argument `inverse_bounds` makes backwards.
-        let (moved_min, moved_max) = by.inverse().inverse_bounds(world_min, world_max);
+        let (moved_min, moved_max) = forward_bounds(by, world_min, world_max);
         // Room either side for the new surface's narrow band, and the band is
         // measured on the destination lattice.
         let margin = Vec3::splat(NARROW_BAND * voxel_size * 2.0);
@@ -203,7 +225,6 @@ impl Volume {
             }
         }
 
-        let inverse = by.inverse();
         let dim = BRICK_DIM as i32;
         let built: Vec<(BrickCoord, Brick)> = coords
             .par_iter()
@@ -230,12 +251,18 @@ impl Volume {
                         for x in 0..BRICK_DIM {
                             let voxel = origin + IVec3::new(x as i32, y as i32, z as i32);
                             let world = voxel.as_vec3() * voxel_size;
-                            // `d'(p) = s * d(T_inverse(p))`, which for a
-                            // similarity is EXACTLY the field of the
-                            // transformed solid rather than an approximation
-                            // of it. See `crate::similarity`.
-                            let value =
-                                self.sample_world(inverse.transform_point(world)) * by.scale;
+                            // `d'(p) = s * d(T_inverse(p))`. For a UNIFORM
+                            // scale that is exactly the field of the
+                            // transformed solid. For a per-axis one it is
+                            // `s_min` -- the zero set stays exact and every
+                            // other distance is underestimated, which is the
+                            // sound direction for a sphere trace: it steps
+                            // short, never through. `Volume::redistance` is
+                            // what puts the magnitudes back afterwards, and
+                            // `Similarity::is_uniform_scale` is how the caller
+                            // knows whether it has to. See `crate::similarity`.
+                            let value = self.sample_world(by.inverse_transform_point(world))
+                                * by.min_scale();
                             data[brick_index(x, y, z)] = value.clamp(INSIDE, OUTSIDE);
                         }
                     }
@@ -469,7 +496,7 @@ mod tests {
         let warped = volume.warped(Similarity::about(
             Vec3::ZERO,
             Quat::from_rotation_x(std::f32::consts::FRAC_PI_2),
-            1.0,
+            Vec3::ONE,
             Vec3::ZERO,
         ));
 
@@ -503,7 +530,7 @@ mod tests {
         let turn = Similarity::about(
             Vec3::ZERO,
             Quat::from_rotation_y(std::f32::consts::FRAC_PI_4),
-            1.0,
+            Vec3::ONE,
             Vec3::ZERO,
         );
         let turned = volume.warped(turn);
@@ -521,8 +548,12 @@ mod tests {
     fn a_uniform_scale_makes_the_model_that_much_bigger() {
         let volume = sphere(0.5);
         for scale in [0.5_f32, 2.0] {
-            let scaled =
-                volume.warped(Similarity::about(Vec3::ZERO, Quat::IDENTITY, scale, Vec3::ZERO));
+            let scaled = volume.warped(Similarity::about(
+                Vec3::ZERO,
+                Quat::IDENTITY,
+                Vec3::splat(scale),
+                Vec3::ZERO,
+            ));
             let measured = measured_radius(&scaled, Vec3::ZERO);
             assert!(
                 (measured - RADIUS * scale).abs() < 1.0,
@@ -543,7 +574,12 @@ mod tests {
     #[test]
     fn a_scaled_field_is_still_a_distance_field() {
         let volume = sphere(0.5);
-        let scaled = volume.warped(Similarity::about(Vec3::ZERO, Quat::IDENTITY, 1.7, Vec3::ZERO));
+        let scaled = volume.warped(Similarity::about(
+            Vec3::ZERO,
+            Quat::IDENTITY,
+            Vec3::splat(1.7),
+            Vec3::ZERO,
+        ));
         let expected = RADIUS * 1.7;
 
         // Along the surface, a little outside it, where the field is not
@@ -585,7 +621,7 @@ mod tests {
         let placement = Similarity::about(
             Vec3::ZERO,
             Quat::from_euler(glam::EulerRot::YXZ, 0.4, 0.3, 0.0),
-            1.3,
+            Vec3::splat(1.3),
             Vec3::new(3.0, -2.0, 1.0),
         );
         let (_, report) = volume.warped(placement).export_mesh();
@@ -625,7 +661,7 @@ mod tests {
         for scale in [0.0_f32, -1.0, f32::NAN] {
             let warped = volume.warped(Similarity {
                 rotation: Quat::IDENTITY,
-                scale,
+                scale: Vec3::splat(scale),
                 translation: Vec3::ZERO,
             });
             assert_eq!(warped.brick_count(), 0, "scale {scale}");

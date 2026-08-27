@@ -1956,8 +1956,12 @@ mod tests {
             .collect();
 
         // A free-angle turn, so the forward direction really is destructive.
-        let placement =
-            crate::Similarity::about(Vec3::ZERO, glam::Quat::from_rotation_y(0.4), 1.0, Vec3::ZERO);
+        let placement = crate::Similarity::about(
+            Vec3::ZERO,
+            glam::Quat::from_rotation_y(0.4),
+            Vec3::ONE,
+            Vec3::ZERO,
+        );
         let baked = doc.volume(body).expect("a body").warped(placement);
         let previous = doc.replace_volume(body, baked).expect("the body is in the document");
 
