@@ -151,6 +151,15 @@ pub struct SculptRenderer {
     /// extra pipeline objects at startup and saves plumbing a slot index through
     /// every call. Nothing here is hot enough for that trade to matter.
     cube: OverlayRenderer,
+    /// A third overlay for the transform gizmo.
+    ///
+    /// A whole instance again, for the reason `cube` gives, and it earns it for
+    /// a second reason: the gizmo is drawn in the SCULPT's matrix but over the
+    /// sculpt's depth, so it can share neither the cube's matrix nor the
+    /// ring's pass. What it does share is the mechanism -- see
+    /// [`SculptRenderer::overlay_pass`], which the cube's own pass was
+    /// generalised into rather than copied.
+    gizmo: OverlayRenderer,
     bind_group: wgpu::BindGroup,
     uniform_buffer: wgpu::Buffer,
     /// The same uniforms with [`Uniforms::mask_inverted`] complemented, and the
@@ -394,6 +403,7 @@ impl SculptRenderer {
             pipeline,
             overlay: OverlayRenderer::new(device, target_format, DEPTH_FORMAT),
             cube: OverlayRenderer::new(device, target_format, DEPTH_FORMAT),
+            gizmo: OverlayRenderer::new(device, target_format, DEPTH_FORMAT),
             bind_group,
             uniform_buffer,
             opposite_uniform_buffer,
@@ -641,7 +651,7 @@ impl SculptRenderer {
 
     /// Overlay vertices drawn last frame, for the debug readout.
     pub fn overlay_vertices(&self) -> usize {
-        self.overlay.vertex_count() + self.cube.vertex_count()
+        self.overlay.vertex_count() + self.cube.vertex_count() + self.gizmo.vertex_count()
     }
 
     /// Replace the navigation cube's geometry and the matrix it is drawn with.
@@ -655,29 +665,64 @@ impl SculptRenderer {
         self.cube.upload(device, queue, batch, view_projection);
     }
 
-    /// Draw the navigation cube into its corner.
+    /// Replace the transform gizmo's geometry.
     ///
-    /// A pass of its own, because the cube has to be depth tested against
-    /// itself and nothing else: it is drawn over the model wherever it sits, and
-    /// the sculpt's depth values in that corner would otherwise clip it.
+    /// The SCULPT's matrix, not one of its own: the gizmo sits on the body it
+    /// moves, in world space, and only its SIZE is held constant on screen --
+    /// which `brokkr-app` does by scaling the geometry it builds, so that the
+    /// draw and the hit test cannot disagree about how big it is.
+    pub fn write_gizmo(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        batch: &OverlayBatch,
+        view_projection: glam::Mat4,
+    ) {
+        self.gizmo.upload(device, queue, batch, view_projection);
+    }
+
+    /// Draw an overlay OVER the sculpt, in a pass with a depth buffer of its
+    /// own.
     ///
-    /// The depth clear covers the whole attachment rather than the scissor rect,
-    /// which is how wgpu defines it. That is a full screen clear for a 92 pixel
-    /// box, and it is still cheaper and far less fragile than the alternatives
-    /// (a second depth texture cannot be used, since every attachment in a pass
-    /// must share the colour attachment's size).
-    pub fn render_cube(
+    /// **The one always-on-top mechanism, and the reason it is one rather than
+    /// two.** All three of `overlay.rs`'s pipelines compare `Less` against the
+    /// sculpt's depth, which is right for a ring lying on a surface and wrong
+    /// for anything that has to be reachable while buried: the navigation cube
+    /// is drawn over whatever is behind it, and a gizmo on a body's centroid is
+    /// *inside* the mesh. Clearing depth and keeping `Less` is what buys both,
+    /// and it buys correct self-occlusion with it -- an arrowhead over its own
+    /// shaft, three rings crossing -- for nothing. A `depth_compare: Always`
+    /// variant would need the geometry sorted back to front on the CPU every
+    /// time the camera moved.
+    ///
+    /// The cube's pass was generalised into this rather than copied for it,
+    /// which is what `overlay.rs`'s "do not add a fourth mechanism for the next
+    /// overlay" asks for: the next overlay uses the third one.
+    ///
+    /// The depth clear covers the whole attachment rather than the scissor
+    /// rect, which is how wgpu defines it. That is a full screen clear for a 92
+    /// pixel box, and it is still cheaper and far less fragile than the
+    /// alternatives (a second depth texture cannot be used, since every
+    /// attachment in a pass must share the colour attachment's size).
+    ///
+    /// **Correct only while nothing depth-tested is scheduled after it.** Two
+    /// of these run per frame now, and a future pass added below them would
+    /// draw against a cleared buffer with no test to catch it.
+    fn overlay_pass(
         &self,
         encoder: &mut wgpu::CommandEncoder,
         target: &wgpu::TextureView,
         clip: PixelRect,
+        label: &str,
+        overlay: &OverlayRenderer,
+        solid_surfaces: bool,
     ) {
-        if clip.width == 0 || clip.height == 0 || self.cube.vertex_count() == 0 {
+        if clip.width == 0 || clip.height == 0 || overlay.vertex_count() == 0 {
             return;
         }
 
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-            label: Some("brokkr navigation cube pass"),
+            label: Some(label),
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                 view: target,
                 depth_slice: None,
@@ -705,9 +750,33 @@ impl SculptRenderer {
             1.0,
         );
         pass.set_scissor_rect(clip.x, clip.y, clip.width, clip.height);
+        overlay.draw(&mut pass, solid_surfaces);
+    }
+
+    /// Draw the navigation cube into its corner.
+    pub fn render_cube(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        target: &wgpu::TextureView,
+        clip: PixelRect,
+    ) {
         // Solid: the cube is opaque and convex, so it must occlude its own far
         // faces rather than blending with them.
-        self.cube.draw(&mut pass, true);
+        self.overlay_pass(encoder, target, clip, "brokkr navigation cube pass", &self.cube, true);
+    }
+
+    /// Draw the transform gizmo over the whole viewport.
+    ///
+    /// Solid for the same reason the cube is: an arrowhead is an opaque cone
+    /// and a ring is an opaque band, and both have to occlude their own far
+    /// side rather than blending through it.
+    pub fn render_gizmo(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        target: &wgpu::TextureView,
+        clip: PixelRect,
+    ) {
+        self.overlay_pass(encoder, target, clip, "brokkr gizmo pass", &self.gizmo, true);
     }
 
     /// Make sure the depth buffer matches the render target.

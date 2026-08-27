@@ -101,6 +101,55 @@ pub const MASK: Color = rgb(0x58, 0x87, 0xf0);
 /// lightnesses rather than two hues.
 pub const MASK_PALE: Color = rgb(0xa8, 0xc4, 0xf8);
 
+/// The transform gizmo's three axes: X, Y, Z, in that order.
+///
+/// # Why these are authored rather than taken from what is already here
+///
+/// The palette above holds no triad. [`ERROR`] is the obvious red for X and is
+/// exactly the wrong choice: it already means "this stroke removes material" on
+/// the brush ring, and a red arrow beside a red ring on the same surface would
+/// make one of the two lie. [`OK`] and [`MASK`] are similarly spoken for.
+///
+/// So these are the industry triad -- red X, green Y, blue Z, which every
+/// modelling tool a user of this one has touched already uses -- shifted away
+/// from the tokens they would otherwise collide with: the X is a rose rather
+/// than [`ERROR`]'s alarm red, and the Z is a cyan rather than [`MASK`]'s
+/// indigo. Against the warm clay matcap all three read as instrument colours
+/// rather than as material.
+pub const AXIS_X: Color = rgb(0xf0, 0x5a, 0x76);
+pub const AXIS_Y: Color = rgb(0x6a, 0xd8, 0x62);
+pub const AXIS_Z: Color = rgb(0x4a, 0xa8, 0xf0);
+
+/// The same three when the pointer is over them.
+///
+/// **Less saturated, not brighter.** Brightening a saturated colour to say
+/// "hovered" runs it past the top of the channel it is already at -- Godot's
+/// gizmo went through this (PR #50597) and ended up with a hover state that
+/// glowed white on the axis you could least afford to lose track of. Washing
+/// toward white keeps the hue readable and still reads as lit.
+pub const AXIS_X_HOVER: Color = rgb(0xff, 0xa8, 0xb6);
+pub const AXIS_Y_HOVER: Color = rgb(0xb4, 0xf0, 0xae);
+pub const AXIS_Z_HOVER: Color = rgb(0xa6, 0xd6, 0xff);
+
+/// The three axis colours and their hover variants, indexed by axis.
+pub const AXIS: [Color; 3] = [AXIS_X, AXIS_Y, AXIS_Z];
+pub const AXIS_HOVER: [Color; 3] = [AXIS_X_HOVER, AXIS_Y_HOVER, AXIS_Z_HOVER];
+
+/// Convert a theme colour to the linear space the overlay shader expects.
+///
+/// The tokens in this module are sRGB, because they came from SindriCAD's CSS.
+/// Handing those straight to the shader would draw every overlay too bright,
+/// and inconsistently with the model beside it.
+///
+/// **Here rather than at the call site**, because it was written out verbatim
+/// in `cursor.rs` and again in `navcube.rs`, and the gizmo would have been the
+/// third copy. Three copies of a colour-space conversion is three chances for
+/// one overlay to end up in a different space from the one beside it.
+pub fn linear(colour: Color, alpha: f32) -> [f32; 4] {
+    let to_linear = |c: f32| c.powf(2.2);
+    [to_linear(colour.r), to_linear(colour.g), to_linear(colour.b), alpha]
+}
+
 // Radii, from `--r-sm` through `--r-lg`.
 pub const RADIUS_SM: f32 = 6.0;
 pub const RADIUS_MD: f32 = 8.0;

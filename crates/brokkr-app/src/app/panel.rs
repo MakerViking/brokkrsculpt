@@ -1389,6 +1389,7 @@ impl Brokkr {
 
         let (cut_style, cut_ink) = theme::tool_toggle(self.tool == Tool::Cut);
         let (mask_style, mask_ink) = theme::tool_toggle(self.tool == Tool::Mask);
+        let (move_style, move_ink) = theme::tool_toggle(self.tool == Tool::Transform);
 
         container(
             column![
@@ -1442,6 +1443,27 @@ impl Brokkr {
                 .width(Length::Fill)
                 .style(mask_style)
                 .on_press(Message::ToolChanged(Tool::Mask)),
+                // The third mode that changes what a left drag does. The word
+                // under it says whether the next release will cost the surface
+                // anything, which is the one thing about this tool a user
+                // cannot see by looking at the model.
+                button(
+                    column![
+                        icon::icon(icon::IconName::Gizmo, theme::ICON_TOOL, move_ink),
+                        text(match self.tool == Tool::Transform {
+                            true if smoothing => "free",
+                            true => "snap",
+                            false => "move",
+                        })
+                        .size(theme::TEXT_SIZE_SMALL),
+                    ]
+                    .width(Length::Fill)
+                    .spacing(0)
+                    .align_x(Alignment::Center)
+                )
+                .width(Length::Fill)
+                .style(move_style)
+                .on_press(Message::ToolChanged(Tool::Transform)),
             ]
             .spacing(theme::S3)
             .align_x(Alignment::Center),

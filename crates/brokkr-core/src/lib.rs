@@ -40,10 +40,12 @@ pub mod raycast;
 pub mod region;
 pub mod resample;
 pub mod rotate;
+pub mod similarity;
 pub mod split;
 pub mod stroke;
 #[cfg(test)]
 mod testing;
+pub mod transform;
 pub mod undo;
 pub mod volume;
 pub mod voxelise;
@@ -77,11 +79,13 @@ pub use project::{
 };
 pub use raycast::{Hit, raycast};
 pub use region::FieldRegion;
+pub use similarity::{Bake, Similarity};
 pub use split::{
     MASKED_ENOUGH_TO_SPLIT, MaskedSplitOutcome, Part, SIGNIFICANT_MM3, SLOW_SPLIT, SplitOutcome,
     SplitPlan,
 };
 pub use stroke::{MAX_STAMPS_PER_EVENT, Stroke};
+pub use transform::warps_made_on_this_thread;
 pub use undo::{
     Change, DEFAULT_HISTORY_BUDGET, DEFAULT_RECLAIM_BUDGET, Entry, History, HistoryStats,
     StrokeEdit, UndoOutcome,

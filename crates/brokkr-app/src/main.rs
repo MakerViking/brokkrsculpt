@@ -6,6 +6,7 @@ mod app;
 mod breadcrumbs;
 mod camera;
 mod cursor;
+mod gizmo;
 #[cfg(target_os = "linux")]
 mod icon;
 mod input_watch;

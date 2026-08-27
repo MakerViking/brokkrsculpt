@@ -2,10 +2,11 @@
 
 //! Flat coloured geometry drawn over the sculpt.
 //!
-//! Three consumers share this one pipeline: the brush cursor ring, the mirror
-//! planes, and the navigation cube. Building a mechanism each would have been
-//! three places to get depth and blending wrong, which is the part of this that
-//! is actually difficult — the geometry is a handful of circles and quads.
+//! Four consumers share this one pipeline set: the brush cursor ring, the
+//! mirror planes, the navigation cube, and the transform gizmo. Building a
+//! mechanism each would have been four places to get depth and blending wrong,
+//! which is the part of this that is actually difficult — the geometry is a
+//! handful of circles and quads.
 //!
 //! # Where the geometry comes from
 //!
@@ -26,6 +27,13 @@
 //!   drawn after it and self-occlude where it folds.
 //! * Solids — the navigation cube is opaque and convex and must occlude its own
 //!   far faces, so it both tests and writes depth in its own pass.
+//!
+//! **Still three, and the gizmo is why that sentence is worth keeping.** It was
+//! the fourth consumer and it needed a fourth behaviour — always on top, in the
+//! sculpt's own matrix, self-occluding — and it got it by GENERALISING the
+//! third rather than adding to this list: the cube's own pass became
+//! `SculptRenderer::overlay_pass`, which clears depth and draws solids, and the
+//! gizmo is a second caller of it. The next overlay should do the same.
 
 use glam::Mat4;
 
@@ -81,6 +89,19 @@ impl OverlayBatch {
         colour: [f32; 4],
     ) {
         for point in [a, b, c, a, c, d] {
+            self.surfaces.push(OverlayVertex::new(point, colour));
+        }
+    }
+
+    /// One triangle.
+    ///
+    /// **Not a convenience over [`OverlayBatch::push_quad`], and the gizmo is
+    /// why it exists.** An arrowhead cone and a ring segment are triangle fans,
+    /// and faking a fan out of quads by repeating a vertex emits zero-area
+    /// triangles -- which cost vertices, are invisible, and hide a winding
+    /// mistake because nothing is drawn either way.
+    pub fn push_triangle(&mut self, a: glam::Vec3, b: glam::Vec3, c: glam::Vec3, colour: [f32; 4]) {
+        for point in [a, b, c] {
             self.surfaces.push(OverlayVertex::new(point, colour));
         }
     }
