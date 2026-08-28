@@ -611,30 +611,57 @@ impl Brokkr {
                 ]
                 .spacing(theme::S2);
                 for article in articles {
+                    // **The picture and the headline, and no summary.** The
+                    // summary is what made this a wall of text: four articles
+                    // of prose in a column beside three buttons reads as
+                    // something to get past rather than something to look at.
+                    // The page this mirrors shows a thumbnail, a title and a
+                    // date, and that is the whole row.
+                    let words = column![
+                        text(article.title.clone()).size(theme::TEXT_SIZE).color(theme::TEXT),
+                        text(article.date.clone())
+                            .size(theme::CAPTION_SIZE)
+                            .color(theme::TEXT_MUTE),
+                    ]
+                    .spacing(2)
+                    .width(Length::Fill);
+
+                    let inside: Element<'_, Message> = match &article.thumbnail {
+                        Some(thumb) => row![
+                            container(
+                                iced::widget::image(iced::widget::image::Handle::from_rgba(
+                                    thumb.width,
+                                    thumb.height,
+                                    thumb.rgba.clone(),
+                                ))
+                                .width(Length::Fixed(THUMB_PX))
+                                .content_fit(iced::ContentFit::Cover),
+                            )
+                            .clip(true)
+                            .width(Length::Fixed(THUMB_PX))
+                            .height(Length::Fixed(THUMB_PX * 9.0 / 16.0)),
+                            words,
+                        ]
+                        .spacing(theme::S3)
+                        .align_y(Alignment::Center)
+                        .into(),
+                        // No picture is an ordinary outcome, so the row simply
+                        // has none rather than a placeholder that would draw
+                        // the eye to what is missing.
+                        None => words.into(),
+                    };
+
                     list = list.push(
-                        button(
-                            column![
-                                text(article.title.clone())
-                                    .size(theme::TEXT_SIZE)
-                                    .color(theme::TEXT),
-                                text(article.summary.clone())
-                                    .size(theme::CAPTION_SIZE)
-                                    .color(theme::TEXT_DIM),
-                                text(article.date.clone())
-                                    .size(theme::CAPTION_SIZE)
-                                    .color(theme::TEXT_MUTE),
-                            ]
-                            .spacing(2),
-                        )
-                        .width(Length::Fill)
-                        .padding(Padding {
-                            top: theme::S2,
-                            bottom: theme::S2,
-                            left: theme::S3,
-                            right: theme::S3,
-                        })
-                        .style(theme::tool_button)
-                        .on_press(Message::ArticleOpened(article.link.clone())),
+                        button(inside)
+                            .width(Length::Fill)
+                            .padding(Padding {
+                                top: theme::S2,
+                                bottom: theme::S2,
+                                left: theme::S2,
+                                right: theme::S3,
+                            })
+                            .style(theme::tool_button)
+                            .on_press(Message::ArticleOpened(article.link.clone())),
                     );
                 }
                 list.into()
@@ -3241,6 +3268,12 @@ impl Brokkr {
 ///
 /// The window's resize strips are stacked *above* the card in `view`, so they
 /// keep working: reverse traversal reaches them first.
+/// How wide an article thumbnail is drawn, in logical pixels.
+///
+/// Half what the server is asked for, so the picture still has pixels to spare
+/// on a HiDPI output. See `articles::THUMB_WIDTH`.
+const THUMB_PX: f32 = 120.0;
+
 /// Cut a path down so it cannot push a column wider than it was given.
 ///
 /// **iced has no ellipsis and a `Length::Fixed` column does not clip its

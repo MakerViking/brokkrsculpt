@@ -28,7 +28,8 @@ glam.workspace = true
 # fill_quad is axis-aligned rectangles only, which a 24px stroke icon with
 # circles and diagonals cannot be made of. A whole icon set is what earns the
 # six. See `icon.rs`.
-iced = { workspace = true, features = ["advanced", "wgpu", "debug", "canvas"] }
+iced = { workspace = true, features = ["advanced", "wgpu", "debug", "canvas", "image-without-codecs"] }
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
 log.workspace = true
 rfd.workspace = true
 serde_json = "1.0.151"

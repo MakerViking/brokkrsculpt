@@ -33,6 +33,7 @@
 //! screen off also turns this off**, with no second setting to find, and the
 //! tick that does it is on the screen itself.
 
+use std::io::Read;
 use std::time::Duration;
 
 /// Where the feed lives.
@@ -50,6 +51,26 @@ const TIMEOUT: Duration = Duration::from_secs(6);
 /// records as the one that must keep working.
 pub const MAX_SHOWN: usize = 4;
 
+/// A decoded thumbnail, ready to hand to iced.
+///
+/// Decoded once when the feed is fetched rather than per frame, which is the
+/// difference between a still panel and one that decodes four JPEGs sixty times
+/// a second.
+#[derive(Clone, PartialEq, Eq)]
+pub struct Thumbnail {
+    pub width: u32,
+    pub height: u32,
+    pub rgba: Vec<u8>,
+}
+
+/// Hand-written so a `Message` that carries one can still be printed. The
+/// derived form would dump 130 KB of pixels into a log line.
+impl std::fmt::Debug for Thumbnail {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Thumbnail({}x{}, {} bytes)", self.width, self.height, self.rgba.len())
+    }
+}
+
 /// One article, reduced to what a link needs.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Article {
@@ -60,6 +81,13 @@ pub struct Article {
     /// type: nothing here does arithmetic on it, and a date format that fails
     /// to parse should still be shown rather than swallowed.
     pub date: String,
+    /// The picture beside it, when there was one and it decoded.
+    ///
+    /// `None` is an ordinary outcome and not an error: an article may have no
+    /// image, the host may be slow, the bytes may be a format this does not
+    /// decode. The row is drawn either way -- a missing picture must not cost
+    /// the headline.
+    pub thumbnail: Option<Thumbnail>,
 }
 
 /// What the welcome screen has to draw.
@@ -93,7 +121,17 @@ pub fn fetch() -> Result<Vec<Article>, String> {
         .body_mut()
         .read_to_string()
         .map_err(|why| format!("the feed could not be read ({why})"))?;
-    parse(&body)
+
+    // Pictures after the list, so a slow image host costs the panel time and
+    // never the headlines: a thumbnail that does not arrive leaves its article
+    // drawn without one.
+    Ok(parse_items(&body)?
+        .into_iter()
+        .map(|(mut article, picture)| {
+            article.thumbnail = picture.as_deref().and_then(fetch_thumbnail);
+            article
+        })
+        .collect())
 }
 
 /// Pull the items out of an RSS document.
@@ -103,7 +141,22 @@ pub fn fetch() -> Result<Vec<Article>, String> {
 /// not blank the panel. A document that is not XML at all IS an error -- that
 /// is a captive portal or an error page, and saying "no articles" for it would
 /// be a lie about what happened.
+/// Test-only, and it wraps the real parser rather than duplicating it: what
+/// production runs is [`parse_items`], and a test that exercised anything else
+/// would be checking a second implementation nobody uses. CI builds with
+/// `-D warnings`, so this cannot simply be left `pub` and unused.
+#[cfg(test)]
 pub fn parse(xml: &str) -> Result<Vec<Article>, String> {
+    Ok(parse_items(xml)?.into_iter().map(|(article, _)| article).collect())
+}
+
+/// The items, each with the URL of its picture if it has a usable one.
+///
+/// **Separate from [`parse`] so that parsing is pure.** Fetching thumbnails
+/// from inside the parser meant the unit tests only avoided the network by
+/// accident -- their fixtures happen to carry no `<enclosure>`, and the first
+/// one that did would have started making real requests from `cargo test`.
+fn parse_items(xml: &str) -> Result<Vec<(Article, Option<String>)>, String> {
     let document =
         roxmltree::Document::parse(xml).map_err(|why| format!("the feed is not XML ({why})"))?;
 
@@ -129,18 +182,86 @@ pub fn parse(xml: &str) -> Result<Vec<Article>, String> {
         if !link.starts_with("https://tinkeratlas.com/") {
             continue;
         }
-        articles.push(Article {
-            title,
-            link,
-            summary: shorten(&child("description")),
-            date: date_only(&child("pubDate")),
-        });
+        let picture = item
+            .children()
+            .find(|node| node.has_tag_name("enclosure"))
+            .and_then(|node| node.attribute("url"))
+            .and_then(thumbnail_url);
+        articles.push((
+            Article {
+                title,
+                link,
+                summary: shorten(&child("description")),
+                date: date_only(&child("pubDate")),
+                thumbnail: None,
+            },
+            picture,
+        ));
         if articles.len() == MAX_SHOWN {
             break;
         }
     }
     Ok(articles)
 }
+
+/// How wide a thumbnail is asked for, in pixels.
+///
+/// The panel draws them at half this, so the extra is for a HiDPI output. See
+/// [`thumbnail_url`] for why the size is asked of the server at all.
+const THUMB_WIDTH: u32 = 240;
+const THUMB_HEIGHT: u32 = 135;
+
+/// Turn a stored-object URL into a resized one, or refuse it.
+///
+/// **The size is asked of the server rather than taken locally**, and it is the
+/// difference between a panel that costs 17 KB and one that costs half a
+/// megabyte: the article images are full size, 113 KB each, and Supabase's
+/// render endpoint returns the same picture at 240 wide for 4 KB. Downloading
+/// the big one to shrink it here would be four times the bytes and all of the
+/// decode.
+///
+/// Only ever the storage host, over TLS. These bytes are fed to a decoder, so
+/// where they come from is a security question and not a tidiness one.
+fn thumbnail_url(enclosure: &str) -> Option<String> {
+    const PREFIX: &str = "https://api.tinkeratlas.com/storage/v1/object/public/";
+    const RENDER: &str = "https://api.tinkeratlas.com/storage/v1/render/image/public/";
+    let rest = enclosure.strip_prefix(PREFIX)?;
+    // A query of its own would be appended to ours and could override the size.
+    if rest.contains('?') {
+        return None;
+    }
+    Some(format!(
+        "{RENDER}{rest}?width={THUMB_WIDTH}&height={THUMB_HEIGHT}&resize=cover&quality=70"
+    ))
+}
+
+/// Fetch and decode one thumbnail. `None` on any failure, which is ordinary.
+///
+/// A picture that will not arrive or will not decode must not cost the article
+/// its headline, so every failure here is a `None` and never an error that
+/// propagates. The one thing it will not do is decode something enormous: the
+/// server was asked for 240 pixels, and anything far larger than that is not
+/// the picture that was requested.
+fn fetch_thumbnail(url: &str) -> Option<Thumbnail> {
+    let mut response = ureq::get(url).config().timeout_global(Some(TIMEOUT)).build().call().ok()?;
+    let mut bytes = Vec::new();
+    response.body_mut().as_reader().take(MAX_THUMB_BYTES).read_to_end(&mut bytes).ok()?;
+
+    let decoded = image::load_from_memory(&bytes).ok()?;
+    let (width, height) = (decoded.width(), decoded.height());
+    if width == 0 || height == 0 || width > THUMB_WIDTH * 4 || height > THUMB_HEIGHT * 4 {
+        return None;
+    }
+    Some(Thumbnail { width, height, rgba: decoded.into_rgba8().into_raw() })
+}
+
+/// A ceiling on what will be read for one thumbnail.
+///
+/// The request asks for a 240-pixel picture and the answer should be a few
+/// kilobytes. This is not a tuning constant, it is a refusal to let a
+/// misbehaving or hostile host stream unbounded bytes into memory while a modal
+/// waits on it.
+const MAX_THUMB_BYTES: u64 = 512 * 1024;
 
 /// The day out of an RFC-822 date, without the time or the zone.
 ///
