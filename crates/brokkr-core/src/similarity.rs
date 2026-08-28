@@ -195,6 +195,29 @@ impl Similarity {
         matches!(self.route(voxel_size), Bake::Identity)
     }
 
+    /// Whether two placements would bake to the same field.
+    ///
+    /// **Not `==`.** A gizmo drag recomputes its placement through
+    /// [`Similarity::then`] on every pointer event, and that arithmetic is not
+    /// bit-reproducible: a press and release on one pixel gives a translation
+    /// and a scale that are exactly equal and a rotation that differs in the
+    /// last bits. An exact comparison therefore never fires, and the caller
+    /// that wanted to skip a re-bake pays for one anyway.
+    ///
+    /// Expressed in the same epsilons [`Similarity::route`] uses, and that is
+    /// the point of it living here: the question is "would baking this again
+    /// produce the field we already have", which is the routing question, and
+    /// an app-side copy with its own tolerances can silently stop agreeing with
+    /// the router it exists to short-circuit. They are far below anything a
+    /// real gesture produces -- one pixel of drag moves the translation by a
+    /// whole `world_per_pixel` -- so this cannot swallow a deliberate nudge.
+    pub fn same_bake(self, other: Self, voxel_size: f32) -> bool {
+        let voxel = if voxel_size.is_finite() && voxel_size > 0.0 { voxel_size } else { 1.0 };
+        (self.translation - other.translation).length() <= voxel * VOXEL_EPSILON
+            && (self.scale - other.scale).abs().max_element() <= SCALE_EPSILON
+            && self.rotation.dot(other.rotation).abs() >= 1.0 - AXIS_EPSILON
+    }
+
     /// A conservative source box for a destination box: the eight corners
     /// through the inverse.
     ///

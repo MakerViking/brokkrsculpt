@@ -266,19 +266,12 @@ pub(crate) fn configured(from: Option<&std::path::Path>) -> Option<Printer> {
     let text = std::fs::read_to_string(from?).ok()?;
     let mut host = None;
     let mut port = MOONRAKER_PORT;
-    for line in text.lines() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        let Some((key, value)) = line.split_once('=') else {
-            continue;
-        };
-        match key.trim() {
-            "host" => host = Some(value.trim().to_string()),
+    for (key, value) in crate::paths::entries(&text) {
+        match key {
+            "host" => host = Some(value.to_string()),
             // An unparseable port leaves the default rather than failing the
             // whole file: the same forgiveness the spacemouse config gives.
-            "port" => port = value.trim().parse().unwrap_or(MOONRAKER_PORT),
+            "port" => port = value.parse().unwrap_or(MOONRAKER_PORT),
             _ => {}
         }
     }

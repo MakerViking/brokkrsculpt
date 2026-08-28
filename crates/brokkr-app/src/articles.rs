@@ -49,49 +49,37 @@ const TIMEOUT: Duration = Duration::from_secs(6);
 /// How many to show. The column holds about this many before the card grows
 /// taller than a 768-high window, which is the size `tool_strip`'s own header
 /// records as the one that must keep working.
-pub const MAX_SHOWN: usize = 4;
-
-/// A decoded thumbnail, ready to hand to iced.
-///
-/// Decoded once when the feed is fetched rather than per frame, which is the
-/// difference between a still panel and one that decodes four JPEGs sixty times
-/// a second.
-#[derive(Clone, PartialEq, Eq)]
-pub struct Thumbnail {
-    pub width: u32,
-    pub height: u32,
-    pub rgba: Vec<u8>,
-}
-
-/// Hand-written so a `Message` that carries one can still be printed. The
-/// derived form would dump 130 KB of pixels into a log line.
-impl std::fmt::Debug for Thumbnail {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "Thumbnail({}x{}, {} bytes)", self.width, self.height, self.rgba.len())
-    }
-}
+const MAX_SHOWN: usize = 4;
 
 /// One article, reduced to what a link needs.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct Article {
     pub title: String,
     pub link: String,
-    pub summary: String,
     /// As the feed wrote it, trimmed to the date. Not parsed into a calendar
     /// type: nothing here does arithmetic on it, and a date format that fails
     /// to parse should still be shown rather than swallowed.
     pub date: String,
     /// The picture beside it, when there was one and it decoded.
     ///
+    /// **An iced handle and not the pixels**, built once here rather than in
+    /// the view. `Handle::from_rgba` stamps a fresh `Id::unique()` on every
+    /// call, and the renderer's atlas is keyed on that id -- so building one
+    /// per frame is a cache miss per frame, which uploads every thumbnail to
+    /// the GPU again and drops last frame's. Four 240x135 images is 518 KB of
+    /// memcpy and 518 KB of upload, sixty times a second, for pictures that
+    /// never change. Cloning a handle is a refcount bump and keeps the id, so
+    /// the atlas entry survives.
+    ///
     /// `None` is an ordinary outcome and not an error: an article may have no
     /// image, the host may be slow, the bytes may be a format this does not
     /// decode. The row is drawn either way -- a missing picture must not cost
     /// the headline.
-    pub thumbnail: Option<Thumbnail>,
+    pub thumbnail: Option<iced::widget::image::Handle>,
 }
 
 /// What the welcome screen has to draw.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Default)]
 pub enum Feed {
     /// Not asked for yet.
     #[default]
@@ -105,18 +93,21 @@ pub enum Feed {
 
 /// Fetch and parse the feed. Blocking: call it off the interface thread.
 pub fn fetch() -> Result<Vec<Article>, String> {
-    // Same shape as `report.rs`'s send, which is the only other place this
-    // workspace touches the network.
-    let mut response =
-        ureq::get(FEED_URL).config().timeout_global(Some(TIMEOUT)).build().call().map_err(
-            |why| match why {
-                ureq::Error::StatusCode(code) => format!("tinkeratlas.com answered {code}"),
-                // Everything else is the network: no route, DNS, TLS, timeout.
-                // Worth saying differently from a rejection, because the answer is
-                // "try again" rather than "something is wrong with the request".
-                other => format!("could not reach tinkeratlas.com ({other})"),
-            },
-        )?;
+    // **One agent for all five requests.** `ureq::get` is documented as running
+    // on a use-once agent, so a bare call per request builds a fresh rustls
+    // config, opens a fresh connection and pays a fresh TLS handshake -- and
+    // all four thumbnails come from one host, so four of those five handshakes
+    // would be pure waste.
+    let agent: ureq::Agent =
+        ureq::Agent::config_builder().timeout_global(Some(TIMEOUT)).build().into();
+
+    let mut response = agent.get(FEED_URL).call().map_err(|why| match why {
+        ureq::Error::StatusCode(code) => format!("tinkeratlas.com answered {code}"),
+        // Everything else is the network: no route, DNS, TLS, timeout.
+        // Worth saying differently from a rejection, because the answer is
+        // "try again" rather than "something is wrong with the request".
+        other => format!("could not reach tinkeratlas.com ({other})"),
+    })?;
     let body = response
         .body_mut()
         .read_to_string()
@@ -128,19 +119,12 @@ pub fn fetch() -> Result<Vec<Article>, String> {
     Ok(parse_items(&body)?
         .into_iter()
         .map(|(mut article, picture)| {
-            article.thumbnail = picture.as_deref().and_then(fetch_thumbnail);
+            article.thumbnail = picture.as_deref().and_then(|url| fetch_thumbnail(&agent, url));
             article
         })
         .collect())
 }
 
-/// Pull the items out of an RSS document.
-///
-/// Deliberately tolerant: an item missing a title or a link is skipped rather
-/// than failing the whole feed, because one malformed entry on the site should
-/// not blank the panel. A document that is not XML at all IS an error -- that
-/// is a captive portal or an error page, and saying "no articles" for it would
-/// be a lie about what happened.
 /// Test-only, and it wraps the real parser rather than duplicating it: what
 /// production runs is [`parse_items`], and a test that exercised anything else
 /// would be checking a second implementation nobody uses. CI builds with
@@ -156,6 +140,13 @@ pub fn parse(xml: &str) -> Result<Vec<Article>, String> {
 /// from inside the parser meant the unit tests only avoided the network by
 /// accident -- their fixtures happen to carry no `<enclosure>`, and the first
 /// one that did would have started making real requests from `cargo test`.
+/// Pull the items out of an RSS document.
+///
+/// Deliberately tolerant: an item missing a title or a link is skipped rather
+/// than failing the whole feed, because one malformed entry on the site should
+/// not blank the panel. A document that is not XML at all IS an error -- that
+/// is a captive portal or an error page, and saying "no articles" for it would
+/// be a lie about what happened.
 fn parse_items(xml: &str) -> Result<Vec<(Article, Option<String>)>, String> {
     let document =
         roxmltree::Document::parse(xml).map_err(|why| format!("the feed is not XML ({why})"))?;
@@ -188,13 +179,7 @@ fn parse_items(xml: &str) -> Result<Vec<(Article, Option<String>)>, String> {
             .and_then(|node| node.attribute("url"))
             .and_then(thumbnail_url);
         articles.push((
-            Article {
-                title,
-                link,
-                summary: shorten(&child("description")),
-                date: date_only(&child("pubDate")),
-                thumbnail: None,
-            },
+            Article { title, link, date: date_only(&child("pubDate")), thumbnail: None },
             picture,
         ));
         if articles.len() == MAX_SHOWN {
@@ -242,8 +227,8 @@ fn thumbnail_url(enclosure: &str) -> Option<String> {
 /// propagates. The one thing it will not do is decode something enormous: the
 /// server was asked for 240 pixels, and anything far larger than that is not
 /// the picture that was requested.
-fn fetch_thumbnail(url: &str) -> Option<Thumbnail> {
-    let mut response = ureq::get(url).config().timeout_global(Some(TIMEOUT)).build().call().ok()?;
+fn fetch_thumbnail(agent: &ureq::Agent, url: &str) -> Option<iced::widget::image::Handle> {
+    let mut response = agent.get(url).call().ok()?;
     let mut bytes = Vec::new();
     response.body_mut().as_reader().take(MAX_THUMB_BYTES).read_to_end(&mut bytes).ok()?;
 
@@ -252,7 +237,7 @@ fn fetch_thumbnail(url: &str) -> Option<Thumbnail> {
     if width == 0 || height == 0 || width > THUMB_WIDTH * 4 || height > THUMB_HEIGHT * 4 {
         return None;
     }
-    Some(Thumbnail { width, height, rgba: decoded.into_rgba8().into_raw() })
+    Some(iced::widget::image::Handle::from_rgba(width, height, decoded.into_rgba8().into_raw()))
 }
 
 /// A ceiling on what will be read for one thumbnail.
@@ -281,21 +266,6 @@ fn date_only(pub_date: &str) -> String {
         return pub_date.trim().to_string();
     }
     words[..4].join(" ")
-}
-
-/// Cut a summary to something that fits beside the actions without growing the
-/// card. See `panel.rs`'s `shorten`, which does the same job for paths and
-/// records why a fixed-width column does not clip its own children.
-fn shorten(text: &str) -> String {
-    const MAX_CHARS: usize = 110;
-    let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
-    if flat.chars().count() <= MAX_CHARS {
-        return flat;
-    }
-    let cut: String = flat.chars().take(MAX_CHARS - 1).collect();
-    // Back off to a word boundary so the ellipsis does not land mid-word.
-    let trimmed = cut.rsplit_once(' ').map(|(head, _)| head).unwrap_or(&cut);
-    format!("{trimmed}…")
 }
 
 /// Hand a link to whatever the desktop opens links with.
@@ -367,8 +337,6 @@ mod tests {
         assert_eq!(articles[0].title, "Your Sketch Went Red");
         assert_eq!(articles[0].link, "https://tinkeratlas.com/site-posts/your-sketch-went-red");
         assert_eq!(articles[0].date, "Thu, 27 Aug 2026", "the time of day is not worth the width");
-        assert!(articles[0].summary.ends_with('…'), "a long summary was not cut");
-        assert_eq!(articles[1].summary, "Short one.", "a short summary was cut anyway");
     }
 
     /// **A link is handed to the browser, so it may only ever go one place.**

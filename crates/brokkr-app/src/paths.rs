@@ -46,6 +46,31 @@ pub fn state_file(name: &str) -> Option<PathBuf> {
     Some(base("XDG_STATE_HOME", ".local/state")?.join(APPLICATION).join(name))
 }
 
+/// The `key = value` pairs in one of this application's flat config files.
+///
+/// Blank lines and `#` comments are skipped, a line with no `=` is skipped, and
+/// both halves are trimmed. What a key MEANS, and what to do about one that is
+/// unknown or unparseable, is the caller's business and differs per file --
+/// `printer.rs` falls back to a default port, `spacemouse.rs` leaves the
+/// binding alone, `welcome.rs` treats anything but `false` as yes.
+///
+/// **Extracted at the third copy and not before.** `printer.rs` and
+/// `spacemouse.rs` each grew this loop independently and each documented that
+/// it matched the other; `welcome.rs` made three, which is where duplication
+/// stops being cheaper than an abstraction. Only the scanning is shared: a
+/// "config file" type that also owned the defaults would have to know all three
+/// schemas, which is the wrong abstraction rather than a missing one.
+pub fn entries(text: &str) -> impl Iterator<Item = (&str, &str)> {
+    text.lines().filter_map(|line| {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            return None;
+        }
+        let (key, value) = line.split_once('=')?;
+        Some((key.trim(), value.trim()))
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

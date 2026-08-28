@@ -29,6 +29,12 @@ glam.workspace = true
 # circles and diagonals cannot be made of. A whole icon set is what earns the
 # six. See `icon.rs`.
 iced = { workspace = true, features = ["advanced", "wgpu", "debug", "canvas", "image-without-codecs"] }
+# The welcome screen's article thumbnails. `default-features = false` is the
+# whole point: iced's own `image` feature is `image-without-codecs` PLUS
+# `image/default`, and it is the second half that brings AVIF, EXR, AV1 grain
+# synthesis and fax decoding -- measured against this lockfile, +72 crates.
+# The widget alone is +6 and these two decoders are +9. Both are needed: the
+# feed carries JPEG and PNG, and the render endpoint keeps a PNG a PNG.
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
 log.workspace = true
 rfd.workspace = true

@@ -627,15 +627,16 @@ impl Brokkr {
                     .width(Length::Fill);
 
                     let inside: Element<'_, Message> = match &article.thumbnail {
-                        Some(thumb) => row![
+                        // Cloning the HANDLE and not the pixels: it is
+                        // refcounted and keeps its id, so the renderer's atlas
+                        // entry survives the frame. Building a handle here
+                        // instead would mint a new id every frame and re-upload
+                        // every thumbnail. See `articles::Article::thumbnail`.
+                        Some(handle) => row![
                             container(
-                                iced::widget::image(iced::widget::image::Handle::from_rgba(
-                                    thumb.width,
-                                    thumb.height,
-                                    thumb.rgba.clone(),
-                                ))
-                                .width(Length::Fixed(THUMB_PX))
-                                .content_fit(iced::ContentFit::Cover),
+                                iced::widget::image(handle.clone())
+                                    .width(Length::Fixed(THUMB_PX))
+                                    .content_fit(iced::ContentFit::Cover),
                             )
                             .clip(true)
                             .width(Length::Fixed(THUMB_PX))
@@ -677,7 +678,7 @@ impl Brokkr {
         .width(Length::Fixed(340.0));
 
         let foot = row![
-            checkbox(crate::welcome::on_startup())
+            checkbox(self.welcome_on_startup)
                 .label("Show this screen on startup")
                 .on_toggle(Message::WelcomeOnStartupSet)
                 .text_size(theme::TEXT_SIZE_SMALL),
@@ -3244,30 +3245,6 @@ impl Brokkr {
     }
 }
 
-/// Centre a modal card on a layer that dims the application and swallows the
-/// presses that would otherwise reach it.
-///
-/// # The dimming was never the part that made it modal
-///
-/// Every one of the three cards used to build this shape itself, with a
-/// comment saying the scrim "swallows presses". It did not. `theme::scrim` is
-/// a `container` *style*, and `container::update`
-/// (`iced_widget-0.14.2/src/container.rs:298`) forwards the event to its child
-/// and returns — it never calls `shell.capture_event`, so a press over the
-/// dimmed area travelled straight on to the shader widget underneath and
-/// sculpted the model the card was asking about. `iced::widget::opaque` is the
-/// piece that was missing: it captures mouse presses inside its bounds
-/// (`helpers.rs:577`), and `Stack::update` walks its children topmost-first and
-/// stops at the first capture (`stack.rs:249-264`), so the layers below never
-/// see it.
-///
-/// This is a legal capture under the rule the viewport is written to: **only
-/// bounds-checked events may capture**. `opaque` captures presses only, only
-/// when the cursor is over it — never a move and never a release, so a drag
-/// that started before the card appeared still ends properly.
-///
-/// The window's resize strips are stacked *above* the card in `view`, so they
-/// keep working: reverse traversal reaches them first.
 /// How wide an article thumbnail is drawn, in logical pixels.
 ///
 /// Half what the server is asked for, so the picture still has pixels to spare
@@ -3295,6 +3272,30 @@ fn shorten(text: &str) -> String {
     format!("…{tail}")
 }
 
+/// Centre a modal card on a layer that dims the application and swallows the
+/// presses that would otherwise reach it.
+///
+/// # The dimming was never the part that made it modal
+///
+/// Every one of the three cards used to build this shape itself, with a
+/// comment saying the scrim "swallows presses". It did not. `theme::scrim` is
+/// a `container` *style*, and `container::update`
+/// (`iced_widget-0.14.2/src/container.rs:298`) forwards the event to its child
+/// and returns — it never calls `shell.capture_event`, so a press over the
+/// dimmed area travelled straight on to the shader widget underneath and
+/// sculpted the model the card was asking about. `iced::widget::opaque` is the
+/// piece that was missing: it captures mouse presses inside its bounds
+/// (`helpers.rs:577`), and `Stack::update` walks its children topmost-first and
+/// stops at the first capture (`stack.rs:249-264`), so the layers below never
+/// see it.
+///
+/// This is a legal capture under the rule the viewport is written to: **only
+/// bounds-checked events may capture**. `opaque` captures presses only, only
+/// when the cursor is over it — never a move and never a release, so a drag
+/// that started before the card appeared still ends properly.
+///
+/// The window's resize strips are stacked *above* the card in `view`, so they
+/// keep working: reverse traversal reaches them first.
 fn modal_layer<'a>(card: impl Into<Element<'a, Message>>) -> Element<'a, Message> {
     opaque(
         container(card)
