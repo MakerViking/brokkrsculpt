@@ -1302,6 +1302,15 @@ mod apply_tests {
         }
     }
 
+    /// Publish over a chosen span of coordinates, so a body can be re-published
+    /// somewhere it was not before -- which is what a MOVE does and what
+    /// [`publish`] cannot express.
+    fn publish_over(shared: &SharedFrame, body: NodeId, span: std::ops::Range<i32>) {
+        for brick in span {
+            shared.publish(body, BrickCoord::new(brick, 0, 0), mesh());
+        }
+    }
+
     /// A mesh that actually covers pixels, for the one test whose claim is
     /// about what is in a cell rather than about which slots exist.
     ///
@@ -1434,6 +1443,78 @@ mod apply_tests {
             assert_eq!(after.bricks, before.bricks, "the pool grew for a body that was deleted");
             assert_eq!(after.triangles, before.triangles);
             assert_eq!(renderer.body_bricks(KEPT), 3, "the surviving body lost bricks");
+        }
+    }
+
+    /// **A RELEASED body's new meshes must reach the pool in the same frame.**
+    ///
+    /// This is the second meaning of "the body's old slots are finished with",
+    /// and the distinction between it and a forget is a bug that shipped: a
+    /// gizmo move called `forget_body`, `SharedFrame::apply` dropped every
+    /// queued upload naming it, and the cube vanished with a black thumbnail
+    /// while its field sat intact in the document and the status line said
+    /// "moved 50.63 mm -- exact".
+    ///
+    /// **The test that missed it asserted `world_bounds()` had changed** --
+    /// the DATA, which was never in danger -- and nothing asserted what the
+    /// RENDERER had been told. Nothing in the GPU module exercised
+    /// `release_body` at all: it had exactly two call sites and no test.
+    ///
+    /// The body is re-published at coordinates it did NOT occupy before,
+    /// because that is what a move produces and it is the case that does not
+    /// heal itself. `rebake_gizmo` marks the outgoing coordinates dirty in the
+    /// incoming field, so those slots are handed back by `upload`'s
+    /// empty-indices arm; what is not covered is the halo, since the outgoing
+    /// list is stored bricks only while the remesh covers stored bricks plus
+    /// their 26 neighbours. Those neighbour slots are in the pool, in nobody's
+    /// dirty set, and they are what draws at the old position.
+    #[test]
+    fn a_released_bodys_new_meshes_reach_the_pool_in_the_same_frame() {
+        let Some((device, queue)) = device_or_skip("shared frame release") else {
+            return;
+        };
+
+        const MOVED: NodeId = NodeId(1);
+        const STILL: NodeId = NodeId(2);
+
+        // Both orders, for the same reason the forget test takes both: `apply`
+        // does not record when anything was pushed and cannot tell them apart.
+        for release_first in [false, true] {
+            let mut renderer = renderer(&device, &queue);
+            let shared = SharedFrame::new();
+
+            publish_over(&shared, MOVED, 0..5);
+            publish_over(&shared, STILL, 100..103);
+            shared.apply(&mut renderer, &device, &queue);
+            assert_eq!(renderer.body_bricks(MOVED), 5, "the fixture published nothing");
+            assert_eq!(renderer.body_bricks(STILL), 3, "the fixture published no second body");
+
+            // The move: released and re-published somewhere else, one frame.
+            if release_first {
+                shared.release_body(MOVED);
+                publish_over(&shared, MOVED, 20..23);
+            } else {
+                publish_over(&shared, MOVED, 20..23);
+                shared.release_body(MOVED);
+            }
+            shared.apply(&mut renderer, &device, &queue);
+
+            // The assertion that pins a deleted release loop: a release must
+            // not swallow the uploads queued alongside it.
+            assert!(
+                renderer.body_bricks(MOVED) > 0,
+                "a released body has no slots at all, so the release ate the meshes queued \
+                 with it -- which is a forget wearing a release's name (released {})",
+                if release_first { "before publishing" } else { "after publishing" },
+            );
+            assert_eq!(
+                renderer.body_bricks(MOVED),
+                3,
+                "a released body holds {} slots against the 3 it was re-published with, so the \
+                 old position is still in the pool and still drawing",
+                renderer.body_bricks(MOVED),
+            );
+            assert_eq!(renderer.body_bricks(STILL), 3, "an untouched body lost slots");
         }
     }
 

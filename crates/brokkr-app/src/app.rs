@@ -36,7 +36,7 @@ use crate::viewport::{SharedFrame, ThumbRequest};
 ///
 /// A 60 mm ball at a quarter millimetre voxel is 240 voxels across, which is
 /// the 256 cubed effective volume the milestones are measured against.
-const MODEL_RADIUS_MM: f32 = 30.0;
+pub(crate) const MODEL_RADIUS_MM: f32 = 30.0;
 const VOXEL_SIZE_MM: f32 = 0.25;
 
 /// The point every enabled mirror plane passes through: the lattice origin.
@@ -573,6 +573,21 @@ pub struct Brokkr {
     /// gizmo is up is twice the body, which is what
     /// [`Brokkr::arm_gizmo`] checks for before it allocates anything.
     gizmo_base: Option<Box<brokkr_core::Volume>>,
+    /// The placement [`Brokkr::rebake_gizmo`] last actually baked.
+    ///
+    /// A press and release that moves nothing still reaches the Released arm,
+    /// and the bake always restarts from `gizmo_base`, so without this it
+    /// reproduces a bit-identical field at full price -- 159 ms of warp and
+    /// 7.1 s of repair on the largest arm-able body, for an accidental click.
+    /// `Bake::Identity` does not cover it: after any earlier transform in the
+    /// same session the placement is not the identity, it is merely the same
+    /// one that was baked a moment ago.
+    ///
+    /// Deliberately NOT gated on `Drag::moved`, which is only set past
+    /// `CLICK_SLOP_PX` while `transform_to` runs on every `Moved` event -- a
+    /// sub-slop drag really does change the placement, and dropping it would be
+    /// silently discarding something the user asked for.
+    gizmo_baked: Option<brokkr_core::Similarity>,
     /// The cube part under the pointer, lit so a click's effect is visible
     /// before the click.
     cube_hover: Option<navcube::Part>,
@@ -1608,6 +1623,7 @@ impl Brokkr {
             gizmo_batch: brokkr_gpu::OverlayBatch::default(),
             gizmo: None,
             gizmo_base: None,
+            gizmo_baked: None,
             cube_hover: None,
             flight: None,
             menu: None,
@@ -1840,6 +1856,37 @@ impl Brokkr {
         // a drag.
         self.contain_target();
         self.shared.set_camera(self.camera);
+
+        // **A live transform drag has to be re-pinned when the camera moves.**
+        //
+        // `gizmo::drag` rebuilds both rays from the CURRENT camera, so moving
+        // the camera under a held handle re-interprets the pixel the button
+        // went down on and the body walks with nothing touching the pointer.
+        // Measured on the standard fixture with a stationary pointer: the
+        // X-axis offset drifted 5.4696 mm to 6.5737 mm for a 0.4 radian yaw
+        // nudge. Three paths reach this without a second button going down --
+        // the SpaceMouse, the scroll wheel, and a navigation-cube flight still
+        // in the air when the drag started -- so guarding the pointer handler
+        // would have missed all three. This is the one place a camera becomes
+        // legal, so it is the one place that has to know.
+        //
+        // Re-pinned rather than frozen: the gesture stays continuous and the
+        // two-handed SpaceMouse-and-stylus workflow the application is built
+        // around survives. Freezing the puck mid-drag is a larger behavioural
+        // change than the bug.
+        let repin = self.cursor.filter(|_| {
+            self.drag.is_some_and(|drag| matches!(drag.kind, DragKind::Transforming(_)))
+                && self.gizmo.is_some_and(|gizmo| gizmo.grabbed.is_some())
+        });
+        if let Some(cursor) = repin {
+            if let Some(drag) = self.drag.as_mut() {
+                drag.origin = cursor;
+            }
+            if let Some(live) = self.gizmo.as_mut() {
+                live.pinned = live.placement;
+            }
+        }
+
         // The cube shows the camera's orientation, so it is stale the moment the
         // camera moves. This is the one place that knows that happened.
         self.refresh_cube();
@@ -1919,6 +1966,30 @@ impl Brokkr {
             .world_bounds()
             .map_or(MODEL_RADIUS_MM, |(low, high)| ((high - low).length() * 0.5).max(1.0e-3));
         self.camera.set_lattice(self.doc.voxel_size(), radius);
+
+        // **The bounds moved, so the distance has to be brought inside them.**
+        //
+        // `set_lattice` writes the two figures the floor and the ceiling are
+        // derived from and never re-checks the distance against them, so a
+        // camera already sitting on the old floor is left UNDER the new one.
+        // One press of "coarser" from 0.25 mm takes the floor from 0.500 to
+        // 2.000 with the camera still at 0.500, and the next wheel notch INWARD
+        // then jumps it out to 2.000 and drags the target four times away from
+        // whatever it was anchored on -- a zoom in that flies backwards.
+        //
+        // The clamp alone would be incomplete in the way this project has been
+        // bitten before: neither `resample` nor `remove_body` publishes a
+        // camera, and `Message::Frame` only publishes when a flight is running,
+        // so the corrected distance would sit in `self.camera` while
+        // `SharedFrame` still held the old one. `publish_camera` is what closes
+        // that, and it is safe to call from here because it does not itself
+        // call back into this function.
+        let clamped =
+            self.camera.distance.clamp(self.camera.min_distance(), self.camera.max_distance());
+        if clamped != self.camera.distance {
+            self.camera.distance = clamped;
+            self.publish_camera();
+        }
     }
 
     /// Frame the active body, which is the one keystroke that recovers from any
@@ -2074,6 +2145,8 @@ impl Brokkr {
         if self.gizmo.is_some() {
             return Ok(());
         }
+        // A fresh session has baked nothing, whatever the last one baked.
+        self.gizmo_baked = None;
         let body = self.doc.active();
         if !self.active_is_drawn() {
             return Err("that body is hidden — turn its eye on to move it".to_string());
@@ -2201,6 +2274,29 @@ impl Brokkr {
     /// The base is taken out of the document on the FIRST bake rather than at
     /// arming, so that arming alone never touches the field -- pressing `w` and
     /// pressing it again has to be free.
+    /// Whether two placements would bake to the same field.
+    ///
+    /// **Not `==`, and that was tried first.** `transform_to` recomputes the
+    /// placement through `Similarity::then` on every `Moved` event, and that
+    /// arithmetic is not bit-reproducible: a press and release on a single
+    /// pixel produces a placement whose translation and scale deltas are
+    /// EXACTLY zero and whose quaternion differs in the last bits. An exact
+    /// comparison therefore never fired once, and the re-bake it was meant to
+    /// skip went on happening.
+    ///
+    /// The tolerances sit far below anything a real gesture can produce -- one
+    /// pixel of drag moves the translation by `world_per_pixel`, which is
+    /// millimetres on an ordinary camera, against a thousandth of a voxel here
+    /// -- so this cannot swallow a sub-slop drag the user meant. That matters:
+    /// `Drag::moved` is only set past `CLICK_SLOP_PX` while `transform_to` runs
+    /// on every event, so gating on `moved` instead would silently discard a
+    /// small deliberate nudge.
+    fn same_bake(a: brokkr_core::Similarity, b: brokkr_core::Similarity, voxel_size: f32) -> bool {
+        (a.translation - b.translation).length() <= voxel_size * 1.0e-3
+            && (a.scale - b.scale).abs().max_element() <= 1.0e-5
+            && a.rotation.dot(b.rotation).abs() >= 1.0 - 1.0e-6
+    }
+
     fn rebake_gizmo(&mut self) {
         let Some(gizmo) = self.gizmo else {
             return;
@@ -2233,6 +2329,15 @@ impl Brokkr {
             self.restore_base(body);
             self.status =
                 Self::bake_summary(&gizmo.placement, route, voxel_size, started.elapsed());
+            self.gizmo_baked = None;
+            return;
+        }
+
+        // Already baked, and nothing has moved since. Covers a press and
+        // release on a handle with no motion, and a drag out and back across
+        // two presses.
+        if self.gizmo_baked.is_some_and(|baked| Self::same_bake(baked, gizmo.placement, voxel_size))
+        {
             return;
         }
 
@@ -2282,14 +2387,22 @@ impl Brokkr {
                 // `similarity.rs` refused a per-axis scale until this pass
                 // existed.
                 //
-                // Skipped when the scale is uniform, where the field is exactly
-                // the transformed solid and the pass would be work with no
-                // customer. `redistance` gates itself again on the measured
-                // drift, so a rotation that happens to leave the gradient
-                // alone costs one read-only sweep and no writes.
-                if !gizmo.placement.is_uniform_scale() {
-                    warped.redistance();
-                }
+                // Run on EVERY resample, uniform scale included. The tempting
+                // reading is that a uniform scale leaves the field exactly the
+                // transformed solid and so needs nothing -- that is true of the
+                // measured distances and false of the band. `Volume::warped`
+                // writes the saturation plateau back at the band edge rather
+                // than scaling it, which is a deliberate cliff, and this pass
+                // is what re-solves the band outward from the interface and
+                // removes it. Skipping it for a uniform scale left one drag of
+                // the centre handle with a field whose plateau had been carried
+                // from 3.0 voxels down to 0.15 and nothing to put it back.
+                //
+                // Costing nothing when it is not needed is `redistance`'s own
+                // job: it gates on measured drift and returns `None` after one
+                // read-only sweep, which is the cost the rotation-only case
+                // already accepts a few lines above.
+                warped.redistance();
                 warped
             }
         };
@@ -2301,6 +2414,7 @@ impl Brokkr {
         }
         self.doc.replace_volume(body, baked);
         self.gizmo_base = Some(base);
+        self.gizmo_baked = Some(gizmo.placement);
 
         // The slots the old field held are in nobody's dirty set now -- the
         // bricks are at new coordinates -- so they have to be let go, and the
@@ -2408,6 +2522,7 @@ impl Brokkr {
         let body = gizmo.body;
 
         if commit {
+            self.gizmo_baked = None;
             let base = self.gizmo_base.take().expect("checked just above");
             let before = self.history.stats();
             self.history.push(brokkr_core::Entry::new(vec![brokkr_core::Change::WholeVolume {
@@ -2435,6 +2550,7 @@ impl Brokkr {
     ///
     /// Answers whether there was a base to put back.
     fn restore_base(&mut self, body: NodeId) -> bool {
+        self.gizmo_baked = None;
         let Some(base) = self.gizmo_base.take() else {
             return false;
         };
@@ -3922,6 +4038,19 @@ impl Brokkr {
         } else {
             self.status = self.mirror_refusal(axis, "refused");
         }
+        // **The planes are part of what the overlay draws, so changing them has
+        // to rebuild it.** `refresh_overlay`'s own doc already lists "a brush or
+        // mirror setting" among its callers and this was not one of them, so the
+        // planes lagged a toggle behind: whatever the last refresh had built
+        // stayed on screen until some unrelated pointer motion rebuilt it.
+        // Turning X OFF left its plane drawn, and turning it back ON drew
+        // nothing until the next interaction. Observed by driving the running
+        // application; no test could see it, because the assertion everyone
+        // writes is on `self.symmetry`, which was right the whole time.
+        //
+        // Here rather than at the two call sites, so the keyboard and the strip
+        // cannot drift apart.
+        self.refresh_overlay();
     }
 
     /// Rebuild the brush ring and mirror planes and hand them to the renderer.
@@ -6163,8 +6292,9 @@ impl Brokkr {
     /// under-prompting costs the sculpt.
     fn undo(&mut self) {
         let shown = self.saved_nodes();
+        let before = self.body_ids();
         match self.history.undo(&mut self.doc, &shown) {
-            UndoOutcome::Applied(_) => self.after_history_step(),
+            UndoOutcome::Applied(_) => self.after_history_step(&before),
             UndoOutcome::Refused(node) => self.refuse_history_step("undo", node),
             UndoOutcome::Nothing => {}
         }
@@ -6172,11 +6302,18 @@ impl Brokkr {
 
     fn redo(&mut self) {
         let shown = self.saved_nodes();
+        let before = self.body_ids();
         match self.history.redo(&mut self.doc, &shown) {
-            UndoOutcome::Applied(_) => self.after_history_step(),
+            UndoOutcome::Applied(_) => self.after_history_step(&before),
             UndoOutcome::Refused(node) => self.refuse_history_step("redo", node),
             UndoOutcome::Nothing => {}
         }
+    }
+
+    /// Every body the document currently holds, for comparing across a history
+    /// step. Bodies only -- a folder owns no slots in the mesh pool.
+    fn body_ids(&self) -> Vec<NodeId> {
+        self.doc.nodes().iter().filter(|node| node.is_body()).map(|node| node.id).collect()
     }
 
     /// Which rows the FILE would keep, indexed by node position.
@@ -6968,11 +7105,46 @@ impl Brokkr {
     /// planes are built from the field: sixteen other sites already refresh
     /// them, and undo not doing so has been a staleness bug the whole time
     /// there has been one body to see it on.
-    fn after_history_step(&mut self) {
+    fn after_history_step(&mut self, bodies_before: &[NodeId]) {
+        // **A body the step REMOVED has to be forgotten, or it is drawn for
+        // ever.** Undoing an added primitive applies `Change::NodeAdded`, which
+        // takes the node back out of the document -- and its bricks are then in
+        // nobody's dirty set, so `remesh_dirty` below never touches them and
+        // the pool goes on drawing a body the BODIES list no longer shows.
+        // Reported from the running application: add a primitive, ctrl+Z, and
+        // the cube leaves the list and stays on screen.
+        //
+        // `remove_body` has always done this; the history had no equivalent
+        // because `UndoOutcome::Applied` names only the FIRST node an entry
+        // touched, which is not the same question.
+        //
+        // **Diffed against the document rather than read off the `Change`s**,
+        // deliberately. A match on `Change::NodeAdded` would cover the reported
+        // case and quietly miss redo-of-a-delete, an entry mixing removals with
+        // other changes, and whatever the next variant is; the diff is a
+        // function of what actually happened and cannot drift from the enum.
+        // It is a walk over at most 128 nodes, once per keystroke.
+        let mut forgot = false;
+        for id in bodies_before {
+            if self.doc.node(*id).is_none() {
+                self.shared.forget_body(*id);
+                forgot = true;
+            }
+        }
+        if forgot {
+            // The other half, for the reason `remove_body` records: freeing
+            // pool space without re-offering everything takes the pool-full
+            // banner down while leaving the geometry it refused missing.
+            self.doc.mark_everything_dirty();
+        }
+
         self.history_stats = self.history.stats();
         self.unsaved = true;
         self.remesh_dirty();
         self.refresh_overlay();
+        if forgot {
+            self.refresh_model_radius();
+        }
     }
 
     /// Say which body is in the way, and change nothing else.
@@ -7103,6 +7275,39 @@ impl Brokkr {
                 self.viewport_size = Vec2::new(size.x, size.y);
                 let position = Vec2::new(position.x, position.y);
                 self.cursor = Some(position);
+
+                // **A second button down during a live transform abandons it.**
+                //
+                // There was no `self.drag.is_some()` guard here, so a right or
+                // middle press assigned an Orbit or Pan drag straight over a
+                // live `Transforming` one while `gizmo.grabbed` and the partial
+                // `placement` survived. The right release then took the Orbit
+                // arm, so the Transforming arm never ran and the left release
+                // found no drag at all: the handle stayed lit, the preview box
+                // went on drawing, and the gizmo visibly floated away from its
+                // body.
+                //
+                // The abandoned gesture was not merely cosmetic. It is not
+                // committed by the next `disarm_gizmo` -- that pushes the
+                // pre-arm base against whatever the document already holds --
+                // but by the NEXT gizmo drag's release, because that press
+                // latches `pinned = placement` and adopts the stray placement
+                // as its starting point.
+                //
+                // Cancelled exactly as Escape cancels, rather than ignoring the
+                // press: ignoring it leaves the user in a modal drag with no
+                // exit that anything on screen tells them about.
+                if let Some(live) = &mut self.gizmo
+                    && live.grabbed.is_some()
+                    && self.drag.is_some_and(|drag| drag.button != button)
+                {
+                    live.placement = live.pinned;
+                    live.grabbed = None;
+                    self.drag = None;
+                    self.refresh_gizmo();
+                    self.status = "cancelled the drag".to_string();
+                    return;
+                }
 
                 // An open menu swallows the next press: closing it is what the
                 // click was for, and sculpting as well would be a surprise.
@@ -7475,6 +7680,17 @@ impl Brokkr {
             self.disarm_gizmo(true);
         }
         let task = self.dispatch(message);
+        // **Visibility is published BEFORE the re-arm, and the order is load
+        // bearing.** `arm_gizmo` refuses a body that is not drawn, and it asks
+        // `active_is_drawn`, which indexes `self.shown` by the node's position
+        // -- and `publish_visibility` is the only thing that writes it. Run the
+        // other way round, the message that ADDS a body arms against a `shown`
+        // that is one entry short, `get(index)` is `None`, `unwrap_or(false)`
+        // says hidden, and adding a cube with the Transform tool up refused
+        // with "that body is hidden -- turn its eye on to move it" and dropped
+        // the user back to Sculpt. The body was in the list, visible, eye on.
+        // Observed in the running application.
+        self.publish_visibility();
         // And the gizmo follows the active body. The guard above committed
         // whatever was in flight; this re-arms on whatever is active NOW, so
         // choosing a different row while the tool is up moves the gizmo there
@@ -7486,7 +7702,6 @@ impl Brokkr {
             self.status = why;
             self.tool = Tool::Sculpt;
         }
-        self.publish_visibility();
         task
     }
 
@@ -14150,6 +14365,158 @@ mod body_panel_tests {
         );
     }
 
+    /// **Toggling a mirror must rebuild the overlay, not just the flag.**
+    ///
+    /// `toggle_mirror` set `self.symmetry` and stopped. The planes are drawn by
+    /// `cursor::build` through `refresh_overlay`, which nothing called here, so
+    /// what stayed on screen was whatever the last refresh had produced --
+    /// turning X OFF left its plane drawn, and turning it back ON drew nothing
+    /// until some unrelated pointer motion rebuilt the batch. The planes were a
+    /// toggle behind.
+    ///
+    /// **`cursor.rs` already has `only_the_enabled_mirror_planes_are_drawn` and
+    /// it passed throughout**, because the geometry function was never wrong --
+    /// nothing checked that the hot path calls it. That is this project's
+    /// documented failure mode: a repair that is real, correct, unit-tested and
+    /// dead. So this asserts on what the RENDERER was handed, not on
+    /// `self.symmetry`, which was right the whole time.
+    #[test]
+    fn toggling_a_mirror_rebuilds_the_planes_the_renderer_holds() {
+        let mut app = app();
+        // A pointer event first, so there is a settled overlay to compare
+        // against rather than an empty one.
+        update(&mut app, Message::SymmetryAxisToggled(MirrorAxis::X));
+        let with_x = app.shared.overlay_snapshot();
+        assert!(app.symmetry.axis(MirrorAxis::X), "the fixture did not turn the mirror on");
+        assert!(
+            !with_x.is_empty(),
+            "the renderer holds no overlay at all after a mirror was turned on"
+        );
+
+        update(&mut app, Message::SymmetryAxisToggled(MirrorAxis::X));
+        let without_x = app.shared.overlay_snapshot();
+        assert!(!app.symmetry.axis(MirrorAxis::X), "the fixture did not turn the mirror off");
+        assert!(
+            without_x.surfaces.len() < with_x.surfaces.len(),
+            "the renderer still holds {} overlay surface vertices with the mirror off against {} with \
+             it on, so the plane is still being drawn for an axis that is now off",
+            without_x.surfaces.len(),
+            with_x.surfaces.len(),
+        );
+    }
+
+    /// **A body added with the Transform tool up must arm, not be called hidden.**
+    ///
+    /// `arm_gizmo` refuses a body that is not drawn, asking `active_is_drawn`,
+    /// which indexes `self.shown` by node position -- and `publish_visibility`
+    /// is the only thing that writes `self.shown`. It used to run AFTER the
+    /// re-arm, so the message that added a body armed against a `shown` one
+    /// entry short: `get(index)` was `None`, `unwrap_or(false)` said hidden,
+    /// and the add refused with "that body is hidden -- turn its eye on to move
+    /// it" and dropped the user back to Sculpt.
+    ///
+    /// Found by driving the running application: add a cube with the gizmo up
+    /// and the status says the body is hidden while the body is plainly in the
+    /// list, visible, with its eye on.
+    ///
+    /// The tool assertion is the one that matters. A wrong status line is
+    /// annoying; being silently thrown out of the mode you were working in is
+    /// the actual damage.
+    #[test]
+    fn adding_a_body_with_the_transform_tool_up_arms_on_it() {
+        let mut app = app();
+        update(&mut app, Message::ToolChanged(Tool::Transform));
+        assert!(app.gizmo.is_some(), "the fixture never armed on the first body");
+
+        update(&mut app, Message::PrimitiveAdded(PrimitiveKind::Cube));
+
+        assert_eq!(
+            app.tool,
+            Tool::Transform,
+            "adding a body threw the user out of the Transform tool: {}",
+            app.status
+        );
+        let armed = app.gizmo.expect("the gizmo should have re-armed on the new body");
+        assert_eq!(
+            armed.body,
+            app.doc.active(),
+            "the gizmo armed on something other than the body that was just added"
+        );
+        assert!(
+            !app.status.contains("hidden"),
+            "a visible body with its eye on was called hidden: {}",
+            app.status
+        );
+    }
+
+    /// **Undoing an added body must tell the renderer, or it is drawn for ever.**
+    ///
+    /// Reported from the running application: add a primitive, press ctrl+Z,
+    /// and the body leaves the BODIES list and stays on screen. Undo applies
+    /// `Change::NodeAdded`, which takes the node back out of the document; its
+    /// bricks are then in nobody's dirty set, so the remesh never touches them
+    /// and the pool goes on drawing a body nothing owns.
+    ///
+    /// `remove_body` had always forgotten a body it deleted. The history had no
+    /// equivalent, because `UndoOutcome::Applied` names only the FIRST node an
+    /// entry touched -- which is a different question from "what did this step
+    /// remove".
+    ///
+    /// **This is the mirror of the bug that shipped**, and it asserts the same
+    /// thing that one taught: what the RENDERER was told. A test that checked
+    /// only `doc.node(cube).is_none()` -- the DATA -- passes on the broken
+    /// build, because the data was never in doubt.
+    #[test]
+    fn undoing_an_added_body_tells_the_renderer_to_drop_it() {
+        let mut app = app();
+        update(&mut app, Message::PrimitiveAdded(PrimitiveKind::Cube));
+        let cube = app.doc.active();
+        let survivor = app.doc.nodes()[0].id;
+        // Whatever the add queued is not what is being measured.
+        let _ = app.shared.take_forgotten_for_tests();
+
+        update(&mut app, Message::Undo);
+
+        assert!(
+            app.doc.node(cube).is_none(),
+            "the fixture did not actually undo the add, so nothing below is exercised"
+        );
+        assert_eq!(
+            app.shared.take_forgotten_for_tests(),
+            vec![cube],
+            "undo removed the body from the document and left its slots in the pool, so it is \
+             still drawn with nothing in the BODIES list owning it"
+        );
+        assert!(
+            app.dirty.iter().any(|(body, _)| *body == survivor),
+            "the undo did not re-offer the surviving body, so a brick the pool refused while \
+             it was full stays missing with the banner gone"
+        );
+    }
+
+    /// And redo must put it back on screen, not merely back in the list.
+    #[test]
+    fn redoing_an_added_body_draws_it_again() {
+        let mut app = app();
+        update(&mut app, Message::PrimitiveAdded(PrimitiveKind::Cube));
+        let cube = app.doc.active();
+        update(&mut app, Message::Undo);
+        let _ = app.shared.take_forgotten_for_tests();
+
+        update(&mut app, Message::Redo);
+
+        assert!(app.doc.node(cube).is_some(), "redo did not put the body back in the document");
+        assert!(
+            app.shared.take_forgotten_for_tests().is_empty(),
+            "redo told the renderer to forget the body it had just restored"
+        );
+        assert!(
+            app.dirty.iter().any(|(body, _)| *body == cube),
+            "the restored body was never offered to the pool, so it is in the list and not on \
+             screen -- the same defect the other way round"
+        );
+    }
+
     /// **A delete owes the renderer two things, and neither is visible on
     /// screen if it is missing.**
     ///
@@ -19225,6 +19592,306 @@ mod gizmo_tests {
     }
 
     // ------------------------------------------------------- the whole point
+
+    /// **Coarsening the lattice must pull the camera up to the new floor.**
+    ///
+    /// `set_lattice` writes the voxel size and the content radius, from which
+    /// the distance floor and ceiling are derived, and never re-checked the
+    /// distance against them. One press of "coarser" from 0.25 mm takes the
+    /// floor from 0.500 to 2.000 with a floored camera still at 0.500, and the
+    /// next wheel notch INWARD then jumps it out to 2.000 and drags the target
+    /// four times away from its anchor -- a zoom in that flies backwards.
+    ///
+    /// The clamp also publishes, because neither `resample` nor `remove_body`
+    /// does and `Message::Frame` only publishes while a flight is running, so
+    /// the corrected distance would otherwise sit in `self.camera` while
+    /// `SharedFrame` held the old one. There is no camera getter on
+    /// `SharedFrame` to assert that through, so it is stated here rather than
+    /// claimed as a check.
+    #[test]
+    fn coarsening_the_lattice_pulls_the_camera_up_to_the_new_floor() {
+        let mut app = app();
+
+        // Put the camera on its floor at the current lattice.
+        app.camera.distance = app.camera.min_distance();
+        app.publish_camera();
+        let floor_before = app.camera.min_distance();
+        let sat_on_the_floor = app.camera.distance;
+
+        let coarse = app.doc.voxel_size() * 4.0;
+        app.doc.resample(coarse);
+        app.refresh_camera_lattice();
+
+        let floor_after = app.camera.min_distance();
+        assert!(
+            floor_after > floor_before * 2.0,
+            "the fixture did not actually raise the floor: {floor_before} then {floor_after}"
+        );
+        assert!(
+            sat_on_the_floor < floor_after,
+            "the camera was not under the new floor to begin with, so this tests nothing"
+        );
+        assert!(
+            app.camera.distance >= floor_after - 1.0e-6,
+            "the camera is at {} against a floor of {floor_after}, so the next notch inward \
+             will jump it outward",
+            app.camera.distance
+        );
+    }
+
+    /// **A squash after a turn must land on the axis the handle was drawn on.**
+    ///
+    /// `Similarity::then` composes `R2 R1 S2 S1`, so a scale composed onto a
+    /// rotation already in `pinned` squashes along the BODY's axes -- while the
+    /// gizmo drew its boxes, and took its drag direction, from the WORLD axes.
+    /// Measured on an ordinary quarter-turn-then-squash-to-0.6 with an
+    /// off-origin pivot: 8.49 mm between where the handle said the material
+    /// would go and where it went.
+    ///
+    /// **The default gesture reaches this.** `ROTATION_SNAP` is a quarter turn,
+    /// so an unshifted ring drag leaves a non-identity rotation in `placement`;
+    /// the next press latches it into `pinned` and any scale drag after that
+    /// composes onto it.
+    ///
+    /// Asserts the composed placement against the STEPWISE definition -- turn,
+    /// then squash along the body -- rather than against whatever the code
+    /// produces, because a test written the other way round canonises the bug.
+    #[test]
+    fn a_squash_after_a_quarter_turn_lands_on_the_axis_the_handle_was_drawn_on() {
+        let mut app = app();
+        arm(&mut app);
+
+        // A snapped quarter turn, which is the default unshifted ring drag.
+        turn_a_ring(&mut app, std::f32::consts::FRAC_PI_2);
+        let turned = app.gizmo.expect("armed").placement;
+        assert!(
+            turned.rotation.angle_between(glam::Quat::IDENTITY) > 0.1,
+            "the fixture did not actually turn the body: {:?}",
+            turned.rotation
+        );
+
+        let origin = app.gizmo.expect("armed").origin();
+        let scale = crate::gizmo::world_per_pixel(&app.camera, origin, SIZE.y);
+
+        // **The Y box, not the X one.** `turn_a_ring` grabs `Ring(0)` and so
+        // turns about X, which leaves X exactly where it was -- a fixture
+        // aimed at the X box passes on a broken build, which is what the first
+        // version of this test did.
+        let body_y = turned.rotation * Vec3::Y;
+        assert!(
+            body_y.distance(Vec3::Y) * (92.0 * scale) > 20.0 * scale,
+            "the turn moved the Y box by less than a grab radius, so the two placements are \
+             indistinguishable and this test cannot fail"
+        );
+
+        let at = project(&app, origin + body_y * (92.0 * scale));
+        assert_eq!(
+            crate::gizmo::pick(
+                &app.camera,
+                Vec2::new(SIZE.x, SIZE.y),
+                &app.gizmo.expect("armed"),
+                at
+            ),
+            Some(crate::gizmo::Handle::Scale(1)),
+            "after a turn the Y scale box is not where the body's own Y points, so the handle \
+             is drawn somewhere the squash will not go"
+        );
+    }
+
+    /// **A composed scale must not pass the floor on any axis.**
+    ///
+    /// The uniform handle bounded its floor against
+    /// `pinned.scale.max_element()`. After a per-axis squash to (1, 1, 0.05)
+    /// that reads 1.0 again, so the floor was computed as though nothing had
+    /// been squashed -- and `Similarity::then` multiplies scales component by
+    /// component, so the next uniform shrink composed to (0.05, 0.05, 0.0025):
+    /// twenty times under `MIN_SCALE`, which is precisely the state that
+    /// constant exists to prevent.
+    ///
+    /// The existing floor test drives `Handle::Uniform` only, so it cannot
+    /// reach this: the bug needs a per-axis squash FIRST to make the smallest
+    /// and largest axes disagree.
+    #[test]
+    fn a_squash_then_a_uniform_shrink_never_passes_the_floor_on_any_axis() {
+        let mut app = app();
+        arm(&mut app);
+        let origin = app.gizmo.expect("armed").origin();
+        let scale = crate::gizmo::world_per_pixel(&app.camera, origin, SIZE.y);
+
+        // Squash X as far inward as the handle allows.
+        let box_at = project(&app, origin + Vec3::X * (92.0 * scale));
+        let inward = project(&app, origin + Vec3::X * (0.5 * scale));
+        gesture(&mut app, box_at, &[inward]);
+        let squashed = app.gizmo.expect("armed").placement.scale;
+        assert!(
+            squashed.min_element() < 0.5,
+            "the fixture did not actually squash an axis: {squashed:?}"
+        );
+
+        // Then drag the centre handle inward, which composes onto it. The
+        // press has to land within `CENTRE_PX + GRAB_PX` of the middle to
+        // select `Uniform` at all, so the shrink is the RATIO of two short
+        // radii rather than a long sweep.
+        let centre = project(&app, origin);
+        gesture(&mut app, centre + Vec2::new(14.0, 0.0), &[centre + Vec2::new(1.0, 0.0)]);
+
+        let composed = app.gizmo.expect("armed").placement.scale;
+        assert!(
+            composed.min_element() >= crate::gizmo::MIN_SCALE - 1.0e-6,
+            "the composed scale {composed:?} fell to {} on its smallest axis, under the {} floor",
+            composed.min_element(),
+            crate::gizmo::MIN_SCALE,
+        );
+    }
+
+    /// **A second button down during a live transform abandons it.**
+    ///
+    /// There was no `self.drag.is_some()` guard on `Pressed`, so a right press
+    /// assigned an Orbit drag over a live `Transforming` one while
+    /// `gizmo.grabbed` and the partial `placement` survived. The right release
+    /// then took the Orbit arm, the Transforming arm never ran, and the left
+    /// release found no drag: the handle stayed lit and the gizmo floated away
+    /// from its body.
+    ///
+    /// The stray placement is not committed by the next `disarm_gizmo` -- that
+    /// pushes the pre-arm base -- but by the NEXT drag's release, because that
+    /// press latches `pinned = placement` and adopts it.
+    #[test]
+    fn a_second_button_during_a_transform_drag_abandons_it() {
+        let mut app = app();
+        arm(&mut app);
+        let pinned = app.gizmo.expect("armed").pinned;
+
+        let origin = app.gizmo.expect("armed").origin();
+        let scale = crate::gizmo::world_per_pixel(&app.camera, origin, SIZE.y);
+        let radius = crate::gizmo::RING_PX * scale;
+        let from = project(&app, origin + Vec3::Z * radius);
+        let to = project(&app, origin + (Vec3::Z * 0.9f32.cos() + Vec3::X * 0.9f32.sin()) * radius);
+
+        moved(&mut app, from);
+        app.on_pointer(PointerEvent::Pressed {
+            button: PointerButton::Left,
+            position: Vector::new(from.x, from.y),
+            size: SIZE,
+        });
+        moved(&mut app, to);
+        assert!(
+            app.gizmo.expect("armed").grabbed.is_some(),
+            "the fixture never grabbed a handle, so nothing below is exercised"
+        );
+
+        app.on_pointer(PointerEvent::Pressed {
+            button: PointerButton::Right,
+            position: Vector::new(to.x, to.y),
+            size: SIZE,
+        });
+
+        let live = app.gizmo.expect("still armed");
+        assert!(live.grabbed.is_none(), "the handle is still held after a second button went down");
+        assert_eq!(live.placement, pinned, "the abandoned gesture survived in the placement");
+        assert!(app.drag.is_none(), "a drag survived the cancel");
+    }
+
+    /// **Moving the camera under a held handle must not move the body.**
+    ///
+    /// `gizmo::drag` rebuilds both rays from the current camera, so a scroll, a
+    /// SpaceMouse nudge or a navigation-cube flight still in the air
+    /// re-interprets the pixel the button went down on. Measured before the
+    /// fix: the X-axis offset walked 5.4696 mm to 6.5737 mm for a 0.4 radian
+    /// yaw with the pointer stationary.
+    ///
+    /// **The axis arrow, not a ring, and shift is held.** `Ring(1)` under a
+    /// pure yaw orbit is exactly immune -- yaw is a rotation about that ring's
+    /// own axis -- so a ring fixture passes on a broken build, which is what
+    /// the first version of this test did. And with snapping on, a drift
+    /// smaller than half a snap step rounds away and hides the same bug.
+    #[test]
+    fn a_camera_nudge_during_a_transform_drag_does_not_move_the_body() {
+        let mut app = app();
+        arm(&mut app);
+
+        let (grip, along) = x_shaft_grip(&app);
+        let free = app.shift;
+        app.shift = true;
+        moved(&mut app, grip);
+        app.on_pointer(PointerEvent::Pressed {
+            button: PointerButton::Left,
+            position: Vector::new(grip.x, grip.y),
+            size: SIZE,
+        });
+        moved(&mut app, grip + along * 40.0);
+        assert!(
+            app.gizmo.expect("armed").grabbed.is_some(),
+            "the fixture never grabbed the axis arrow, so nothing below is exercised"
+        );
+        let before = app.gizmo.expect("armed").placement.translation;
+        assert!(
+            before.length() > 0.5,
+            "the drag moved the body by {} mm, too little to see a drift against",
+            before.length()
+        );
+
+        // The camera moves, and then the SAME pixel is reported again. The
+        // placement only changes on a `Moved` event, so the damage does not
+        // appear at the moment the camera turns -- it appears on the next
+        // pointer report, when `gizmo::drag` re-interprets the press pixel
+        // through the new camera. A test that only orbits and looks passes on
+        // a broken build, which is what the first version of this did.
+        app.camera.orbit_radians(Vec2::new(0.4, 0.0));
+        app.publish_camera();
+        moved(&mut app, grip + along * 40.0);
+        let after = app.gizmo.expect("armed").placement.translation;
+
+        assert!(
+            (after - before).length() <= 1.0e-3,
+            "the body moved {} mm because the camera did, with the pointer stationary \
+             ({before:?} then {after:?})",
+            (after - before).length()
+        );
+        app.shift = free;
+    }
+
+    /// **A press and release that moved nothing must not touch the field.**
+    ///
+    /// The Released arm calls `rebake_gizmo` for any `Transforming` drag with
+    /// no reference to whether anything moved, and the bake always restarts
+    /// from `gizmo_base` -- so an accidental click reproduced a bit-identical
+    /// field at full price: 159 ms of warp and 7.1 s of repair on the largest
+    /// arm-able body, plus a document-wide remesh and a stale thumbnail.
+    ///
+    /// `Bake::Identity` does not cover this. It fires only when the placement
+    /// is the identity outright; after any earlier transform in the session the
+    /// placement is a real one that simply has not changed since it was baked.
+    /// So this fixture turns a ring FIRST, and only then does the empty press.
+    #[test]
+    fn a_press_and_release_with_no_motion_does_not_re_bake_the_body() {
+        let mut app = app();
+        arm(&mut app);
+
+        // Put a real, non-identity placement in first, or the pre-existing
+        // identity short circuit would carry this test and it would pass on a
+        // build without the fix.
+        turn_a_ring(&mut app, 0.35);
+        let placement = app.gizmo.expect("armed").placement;
+        assert!(
+            placement.route(app.doc.voxel_size()).is_lossy(),
+            "the fixture snapped to the identity, so the cheap path would cover it anyway"
+        );
+
+        let before = warps_made_on_this_thread();
+        // A press and release on the same pixel, on a handle.
+        let gizmo = app.gizmo.expect("armed");
+        let origin = gizmo.origin();
+        let scale = crate::gizmo::world_per_pixel(&app.camera, origin, SIZE.y);
+        let at = project(&app, origin + Vec3::Z * (crate::gizmo::RING_PX * scale));
+        gesture(&mut app, at, &[at]);
+
+        assert_eq!(
+            warps_made_on_this_thread() - before,
+            0,
+            "a press and release that moved nothing still re-baked the body"
+        );
+    }
 
     /// **The test the entire anti-degradation design exists for.**
     ///

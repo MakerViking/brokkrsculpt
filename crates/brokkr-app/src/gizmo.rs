@@ -66,12 +66,20 @@ const HEAD_PX: f32 = 18.0;
 const HEAD_RADIUS_PX: f32 = 6.0;
 /// Half-width of the shaft ribbon.
 const SHAFT_HALF_PX: f32 = 1.6;
-/// Radius of the rotation rings. Clear of the arrowheads, which end at
 /// Where the per-axis scale box sits along its axis, in pixels.
 ///
-/// Between the move arrow's head and the rotation ring, so the three handles on
-/// one axis never compete for a pixel: the arrow ends at `SHAFT_PX + HEAD_PX`
-/// (80), this box is centred at 92, and the ring is at 104.
+/// Between the move arrow's head and the rotation ring: the arrow ends at
+/// `SHAFT_PX + HEAD_PX` (80), this box is centred at 92, and [`RING_PX`] is
+/// 128.
+///
+/// **Do not read that spacing as "these three never compete for a pixel",
+/// which is what this comment used to say.** They are clear in WORLD units
+/// along the axis and that is not the question -- a ring is a circle seen at
+/// an angle, so its projection sweeps every radius from 0 to `RING_PX` as the
+/// camera turns and crosses this box at a large fraction of camera angles.
+/// Moving the ring from 104 to 128 reduced that; it did not remove it. Any
+/// change to the spacing has to be judged by sweeping cameras and picking,
+/// never by comparing these constants.
 const SCALE_BOX_PX: f32 = 92.0;
 
 /// Half the scale box's side, in pixels. Its grab region is this plus GRAB_PX.
@@ -142,7 +150,7 @@ const SCALE_SNAP: f32 = 0.05;
 /// is the half that was missing and the half that mattered: `Similarity::then`
 /// multiplies scales, so two drags each saturating this ceiling compose to 400
 /// and ten drags at the floor compose to 1e-13. See the clamp in [`drag`].
-const MIN_SCALE: f32 = 0.05;
+pub(crate) const MIN_SCALE: f32 = 0.05;
 pub(crate) const MAX_SCALE: f32 = 20.0;
 
 /// One thing on the gizmo that can be grabbed.
@@ -275,6 +283,39 @@ fn to_pixels(camera: &OrbitCamera, viewport: Vec2, point: Vec3) -> Option<Vec2> 
 
 fn axis_of(index: u8) -> Vec3 {
     [Vec3::X, Vec3::Y, Vec3::Z][index as usize % 3]
+}
+
+/// The world direction a per-axis scale box sits on: the BODY's axis.
+///
+/// **The one place the gizmo is not square to the world, and it has to be.**
+/// The module header is right that a move and a quarter turn stay on world axes
+/// because that is where the exact route lives -- but a scale is never
+/// `Bake::Exact`, so nothing is given up here.
+///
+/// What forced it: `Similarity::then` stores `rotation = next.rotation *
+/// self.rotation` and `scale = next.scale * self.scale`, and `transform_point`
+/// applies `R * (S * p)`. Composed onto a rotation already in `pinned`, that is
+/// `R2 R1 S2 S1 p` where the stepwise truth is `R2 S2 R1 S1 p`. Those are not
+/// the same map -- but the composition is not broken, because
+/// `R1 S2 = (R1 S2 R1inv) R1`, so what it computes is a squash along the body's
+/// OWN axes. Perfectly representable, which is why the composed placement stays
+/// a valid `R S p + t` and why nothing in `similarity.rs` needs changing.
+///
+/// The lie was told here: the box was drawn and dragged on the world axis while
+/// the squash went along the body's. After an ordinary snapped quarter turn --
+/// `ROTATION_SNAP` is a quarter turn, so the DEFAULT unshifted ring drag leaves
+/// a rotation in `pinned` -- a squash to 0.6 landed 8.49 mm from where the
+/// handle said it would.
+///
+/// Taken from `placement` and NOT from `pinned`, which was the first version
+/// and did nothing at all: `pinned` is only latched when a button goes down, so
+/// after a completed turn it still holds the identity and the box stayed on the
+/// world axis exactly as before. The two agree during a scale drag anyway -- a
+/// scale gesture carries an identity rotation, so `pinned.then(gesture)` leaves
+/// the rotation untouched -- so there is nothing to be gained by the staler of
+/// the two and a whole fix to be lost.
+fn scale_axis_of(gizmo: &Gizmo, index: u8) -> Vec3 {
+    gizmo.placement.rotation * axis_of(index)
 }
 
 /// The two axes a plane handle spans, or a ring lies in.
@@ -421,7 +462,7 @@ pub fn pick(camera: &OrbitCamera, viewport: Vec2, gizmo: &Gizmo, at: Vec2) -> Op
     // Giving the ring first refusal costs the box nothing, because a press that
     // the ring wanted was never meant for the box.
     for index in 0..3u8 {
-        let box_centre = origin + axis_of(index) * (SCALE_BOX_PX * scale);
+        let box_centre = origin + scale_axis_of(gizmo, index) * (SCALE_BOX_PX * scale);
         if let Some(pixel) = to_pixels(camera, viewport, box_centre)
             && at.distance(pixel) <= SCALE_BOX_HALF_PX + GRAB_PX
         {
@@ -459,7 +500,23 @@ fn inside_polygon(corners: &[Vec2], at: Vec2) -> bool {
         positive |= cross > 0.0;
         negative |= cross < 0.0;
     }
-    !(positive && negative)
+    // **A polygon with no area contains nothing, and saying so takes the second
+    // clause.** Seen exactly edge-on, a plane handle's four corners project
+    // onto one line; every cross product is then exactly zero, neither flag is
+    // set, and `!(positive && negative)` alone answers TRUE for every point
+    // tested against it. Since `Plane` outranks `Axis` in the precedence, the
+    // handle swallowed the arrow drawn straight through it.
+    //
+    // Reachable in one click rather than by contrivance: at yaw 0 the corners
+    // of `plane_quad(0)` project to the same column to the last bit, and at
+    // pitch 0 plane 1 is collinear along the centre row at ANY yaw -- and the
+    // navigation cube's Front face flies the camera to exactly 0.0 on both.
+    //
+    // The damage is one pixel wide, not a dead handle: a point OFF the line
+    // still sees the doubled-back edges disagree and is correctly refused. But
+    // the pixel it takes is the arrow's own centreline, which is where a user
+    // aiming at an arrow puts the stylus.
+    !(positive && negative) && (positive || negative)
 }
 
 /// The gesture a drag from `from` to `to` describes, about the gizmo's pinned
@@ -568,9 +625,21 @@ pub fn drag(
             // drag that comes back to the pixel it started on must be exactly
             // the identity, and a clamp that could exclude it would make a
             // gesture uncancellable by hand.
-            let pinned = gizmo.pinned.scale.max_element().max(f32::MIN_POSITIVE);
-            let highest = (gizmo.max_scale / pinned).clamp(1.0, MAX_SCALE);
-            let lowest = MIN_SCALE.max(MIN_SCALE / pinned).min(1.0);
+            //
+            // **The floor comes off the SMALLEST axis and the ceiling off the
+            // largest**, because `Similarity::then` multiplies scales component
+            // by component, so it is the smallest axis that reaches `MIN_SCALE`
+            // first and the largest that reaches the ceiling first. Taking both
+            // from `max_element` -- which is what this did -- meant that after
+            // a per-axis squash to (1, 1, 0.05) the floor was computed from 1.0
+            // again, and the next uniform shrink composed to (0.05, 0.05,
+            // 0.0025): twenty times under `MIN_SCALE`, which is precisely the
+            // state that constant exists to prevent. `Handle::Scale` never had
+            // the bug because it bounds against its own axis.
+            let smallest = gizmo.pinned.scale.min_element().max(f32::MIN_POSITIVE);
+            let largest = gizmo.pinned.scale.max_element().max(f32::MIN_POSITIVE);
+            let highest = (gizmo.max_scale / largest).clamp(1.0, MAX_SCALE);
+            let lowest = MIN_SCALE.max(MIN_SCALE / smallest).min(1.0);
             let mut scale = (centre.distance(to) / started).clamp(lowest, highest);
             if snap.is_some() {
                 scale = ((scale / SCALE_SNAP).round() * SCALE_SNAP).clamp(lowest, highest);
@@ -585,7 +654,11 @@ pub fn drag(
             // to ONE component.** Measured along the projected axis rather than
             // radially, because a squash reads as "pull this end" and a radial
             // measure would grow it when the pointer moved sideways.
-            let axis = axis_of(index);
+            //
+            // The BODY's axis, matching where the box is drawn and picked. See
+            // [`scale_axis_of`] for why that is not the world axis and why this
+            // is the one part of the gizmo that turns with the body.
+            let axis = scale_axis_of(gizmo, index);
             let Some(centre) = to_pixels(camera, viewport, origin) else {
                 return Similarity::IDENTITY;
             };
@@ -718,22 +791,44 @@ pub fn build(batch: &mut OverlayBatch, camera: &OrbitCamera, viewport: Vec2, giz
         // another cone, because a second cone on the same axis reads as a
         // longer arrow and the two handles do different things -- this is the
         // one that squashes.
+        //
+        // **Drawn only if pressing its own centre would actually select it.**
+        // The box is 5 px square at 92 px and the ring's PROJECTION sweeps
+        // every radius out to `RING_PX` as the camera turns, so at a large
+        // fraction of angles the box's own centre pixel belongs to an arrow or
+        // a ring -- measured, before the boxes moved onto the body's axes, at
+        // roughly half of them, split across `Axis`, `Ring` and `Uniform`. A
+        // handle that is drawn where it cannot be pressed is worse than one
+        // that is absent: the user aims at it, gets a move or a turn, and sees
+        // the wrong thing light up.
+        //
+        // Asked of `pick` rather than re-derived from the constants, so the
+        // draw and the hit test cannot drift apart -- which is exactly the
+        // failure that put the ring at 104 through the box at 92, and which
+        // reasoning about world-space gaps got wrong. It is three extra `pick`
+        // calls a frame against a handful of handles, and it is the same
+        // honesty `MIN_SHAFT_PX` already gives the arrow.
         let box_colour = colour(Handle::Scale(index));
-        let box_centre = origin + axis * (SCALE_BOX_PX * scale);
+        let box_centre = origin + scale_axis_of(gizmo, index) * (SCALE_BOX_PX * scale);
+        let box_is_reachable = to_pixels(camera, viewport, box_centre).is_some_and(|pixel| {
+            pick(camera, viewport, gizmo, pixel) == Some(Handle::Scale(index))
+        });
         let half = SCALE_BOX_HALF_PX * scale;
         let (u, v) = other_axes(index);
-        for face in 0..3usize {
-            let normal = [axis, u, v][face];
-            let (a, b) = ([u, v, axis][face], [v, axis, u][face]);
-            for sign in [-1.0f32, 1.0] {
-                let middle = box_centre + normal * (half * sign);
-                batch.push_quad(
-                    middle - a * half - b * half,
-                    middle + a * half - b * half,
-                    middle + a * half + b * half,
-                    middle - a * half + b * half,
-                    box_colour,
-                );
+        if box_is_reachable {
+            for face in 0..3usize {
+                let normal = [axis, u, v][face];
+                let (a, b) = ([u, v, axis][face], [v, axis, u][face]);
+                for sign in [-1.0f32, 1.0] {
+                    let middle = box_centre + normal * (half * sign);
+                    batch.push_quad(
+                        middle - a * half - b * half,
+                        middle + a * half - b * half,
+                        middle + a * half + b * half,
+                        middle - a * half + b * half,
+                        box_colour,
+                    );
+                }
             }
         }
 
@@ -802,6 +897,115 @@ pub fn build(batch: &mut OverlayBatch, camera: &OrbitCamera, viewport: Vec2, giz
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **Every scale box that is drawn can be pressed.**
+    ///
+    /// A 5 px square at 92 px, with a ring whose PROJECTION sweeps every radius
+    /// out to `RING_PX` as the camera turns: at a large fraction of angles the
+    /// box's own centre pixel belongs to an arrow or a ring instead. Measured
+    /// before this gate, the box's centre was stolen at roughly half of camera
+    /// angles, split across `Axis`, `Ring` and `Uniform`. Aiming at a handle
+    /// and watching a different one light up is worse than the handle not
+    /// being there.
+    ///
+    /// Swept over cameras rather than argued from the constants, because
+    /// arguing from the constants is precisely what put a ring at 104 through a
+    /// box at 92 and called them twelve pixels clear.
+    #[test]
+    fn every_scale_box_that_is_drawn_can_be_pressed() {
+        let mut drawn = 0;
+        let mut checked = 0;
+        for yaw_step in 0..12 {
+            for pitch_step in 0..5 {
+                let mut camera = camera();
+                camera.yaw = yaw_step as f32 * std::f32::consts::TAU / 12.0;
+                camera.pitch = -0.8 + pitch_step as f32 * 0.4;
+                let gizmo = gizmo();
+                let origin = gizmo.origin();
+                let scale = world_per_pixel(&camera, origin, VIEWPORT.y);
+
+                for index in 0..3u8 {
+                    let centre = origin + scale_axis_of(&gizmo, index) * (SCALE_BOX_PX * scale);
+                    let Some(pixel) = to_pixels(&camera, VIEWPORT, centre) else {
+                        continue;
+                    };
+                    checked += 1;
+                    // `build` draws the box exactly when this holds, so the two
+                    // cannot disagree; what this asserts is that the rule is
+                    // the reachability one and not something weaker.
+                    if pick(&camera, VIEWPORT, &gizmo, pixel) == Some(Handle::Scale(index)) {
+                        drawn += 1;
+                    }
+                }
+            }
+        }
+        assert!(checked > 0, "the sweep projected no boxes at all");
+        assert!(
+            drawn > 0,
+            "not one scale box was reachable at any of {checked} camera-and-axis pairs, so the \
+             gate has switched the handle off entirely rather than hidden the unreachable ones"
+        );
+        assert!(
+            drawn < checked,
+            "every one of {checked} pairs was reachable, so this sweep never exercises the \
+             case the gate exists for and would pass with the gate removed"
+        );
+    }
+
+    /// **A polygon with no area contains nothing.**
+    ///
+    /// `inside_polygon` was `!(positive && negative)`. A plane handle seen
+    /// exactly edge-on projects its four corners onto one line, every cross
+    /// product is then exactly zero, neither flag is set, and the test answered
+    /// TRUE for every point put to it -- and `Plane` outranks `Axis`, so the
+    /// handle swallowed the arrow drawn straight through it.
+    ///
+    /// **Tested here rather than through a camera, and the reason is worth
+    /// recording.** The end-to-end path could not be made to reproduce it:
+    /// when a plane is close enough to edge-on for its corners to be collinear
+    /// to the last bit, some of them are also behind the near plane, so
+    /// `to_pixels` returns `None`, `all_on_screen` is false and `pick` skips
+    /// the handle before this function is ever called. That is a SECOND reason
+    /// the press is refused, not a reason the first one is sound -- it depends
+    /// on the near plane, which `apply_view` derives from the body and which
+    /// this branch has already had to fix once. The predicate is wrong on its
+    /// own terms and is fixed on its own terms.
+    #[test]
+    fn a_polygon_with_no_area_contains_nothing() {
+        // Four corners on one horizontal line, in the order `plane_quad`
+        // produces: near-near, far-near, far-far, near-far. Collapsed onto a
+        // line, that doubles back on itself exactly as an edge-on quad does.
+        let flat = [
+            Vec2::new(20.0, 50.0),
+            Vec2::new(40.0, 50.0),
+            Vec2::new(40.0, 50.0),
+            Vec2::new(20.0, 50.0),
+        ];
+
+        assert!(
+            !inside_polygon(&flat, Vec2::new(30.0, 50.0)),
+            "a zero-area quad claimed a point lying on its own line"
+        );
+        assert!(
+            !inside_polygon(&flat, Vec2::new(30.0, 51.0)),
+            "a zero-area quad claimed a point off its line"
+        );
+
+        // And a real quad still contains what it should, so the second clause
+        // has not simply switched the handle off.
+        let real = [
+            Vec2::new(20.0, 20.0),
+            Vec2::new(40.0, 20.0),
+            Vec2::new(40.0, 40.0),
+            Vec2::new(20.0, 40.0),
+        ];
+        assert!(inside_polygon(&real, Vec2::new(30.0, 30.0)), "a real quad lost its middle");
+        assert!(inside_polygon(&real, Vec2::new(20.0, 30.0)), "a real quad lost its own edge");
+        assert!(
+            !inside_polygon(&real, Vec2::new(10.0, 30.0)),
+            "a real quad claimed a point outside it"
+        );
+    }
 
     const VIEWPORT: Vec2 = Vec2::new(1280.0, 720.0);
     const VOXEL: f32 = 0.5;
