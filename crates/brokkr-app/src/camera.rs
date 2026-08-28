@@ -552,14 +552,54 @@ mod roll_tests {
     /// to about a part in a million, which is what a renderer and a picker
     /// need; they cannot agree to the last bit, because they are not the same
     /// arithmetic.
+    /// **Split into rotation and position, and run at the sizes the
+    /// application uses.**
+    ///
+    /// One absolute bound over all sixteen elements held only because the
+    /// fixture was 5 mm. The rotation columns are scale-free -- 4.2e-7 at every
+    /// radius tried -- while the whole of the growth is in the translation
+    /// column and is linear in the eye distance, so changing nothing but the
+    /// radius to `MODEL_RADIUS_MM` gives 1.144e-5 against the 1.0e-5 bound and
+    /// the test goes red with no defect behind it. A bound that fails on a
+    /// bigger model is not a bound, it is a fixture.
+    ///
+    /// So the rotation is compared element-wise and absolutely, and the
+    /// position is recovered from each matrix and compared RELATIVE to the
+    /// distance it was built from. Both carry about twenty times their margin
+    /// at every radius here.
     #[test]
     fn an_unrolled_camera_matches_the_matrix_look_at_would_have_built() {
-        let camera = OrbitCamera { yaw: 0.9, pitch: -0.4, ..OrbitCamera::framing(Vec3::ZERO, 5.0) };
-        assert_eq!(camera.roll, 0.0, "roll must default to zero");
+        for radius in [5.0_f32, crate::app::MODEL_RADIUS_MM, 230.0] {
+            let camera =
+                OrbitCamera { yaw: 0.9, pitch: -0.4, ..OrbitCamera::framing(Vec3::ZERO, radius) };
+            assert_eq!(camera.roll, 0.0, "roll must default to zero");
 
-        let expected = glam::camera::rh::view::look_at_mat4(camera.eye(), camera.target, Vec3::Y);
-        for (got, want) in camera.view().to_cols_array().iter().zip(expected.to_cols_array()) {
-            assert!((got - want).abs() < 1.0e-5, "{got} vs {want}");
+            let got = camera.view();
+            let want = glam::camera::rh::view::look_at_mat4(camera.eye(), camera.target, Vec3::Y);
+
+            // The rotation, which does not grow with the model.
+            for column in 0..3 {
+                for row in 0..3 {
+                    let (a, b) = (got.col(column)[row], want.col(column)[row]);
+                    assert!(
+                        (a - b).abs() < 1.0e-5,
+                        "at radius {radius}, rotation element ({column}, {row}) is {a} \
+                         against {b}"
+                    );
+                }
+            }
+
+            // The position, which does -- so it is bounded against the distance
+            // it was built from rather than against a constant.
+            let eye_of = |m: glam::Mat4| m.inverse().col(3).truncate();
+            let (got_eye, want_eye) = (eye_of(got), eye_of(want));
+            assert!(
+                got_eye.distance(want_eye) < camera.distance * 1.0e-5,
+                "at radius {radius}, the eye is {got_eye:?} against {want_eye:?}, \
+                 {} apart against a budget of {}",
+                got_eye.distance(want_eye),
+                camera.distance * 1.0e-5,
+            );
         }
     }
 
