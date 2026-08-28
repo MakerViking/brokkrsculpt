@@ -1380,7 +1380,13 @@ mod tests {
         let sample = puck.motion();
         assert!(!sample.live);
         assert_eq!(sample.axes, [0.0; 6]);
-        assert_eq!(puck.diagnosis(), Diagnosis::NoDevice);
+        // Off Linux there is no backend to find a device with, so the honest
+        // answer is `Unsupported` rather than "looked and found none" -- see
+        // `backend::SUPPORTED`. The centring above is what this test is for and
+        // holds everywhere; only the reason for the silence differs.
+        let expected =
+            if cfg!(target_os = "linux") { Diagnosis::NoDevice } else { Diagnosis::Unsupported };
+        assert_eq!(puck.diagnosis(), expected);
     }
 
     /// The kernel drops zero valued relative events, so a puck returning to

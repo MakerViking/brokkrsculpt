@@ -260,12 +260,22 @@ mod tests {
     fn only_a_model_file_is_handed_over() {
         // The guard that keeps this from becoming a way to open an arbitrary
         // file with an arbitrary program.
-        let slicer = PathBuf::from("/bin/true");
+        //
+        // `/bin/echo` rather than `/bin/true`: macOS ships no `/bin/true`, and
+        // that alone failed this test the first time the crate was built there
+        // -- the guard was fine, the fixture was not. Windows gets `cmd.exe`
+        // for the same reason. All three exist and all three spawn, which is
+        // the only property the passing cases need.
+        let slicer = if cfg!(target_os = "windows") {
+            PathBuf::from(r"C:\Windows\System32\cmd.exe")
+        } else {
+            PathBuf::from("/bin/echo")
+        };
         assert!(open(&slicer, Path::new("/tmp/x.brokkr")).is_err());
         assert!(open(&slicer, Path::new("/tmp/x")).is_err());
         assert!(open(&slicer, Path::new("/tmp/x.sh")).is_err());
-        // And the ones it will: `/bin/true` exists on this machine, so these
-        // exercise the spawn as well as the check.
+        // And the ones it will: the program above exists on this machine, so
+        // these exercise the spawn as well as the check.
         assert!(open(&slicer, Path::new("/tmp/x.stl")).is_ok());
         assert!(open(&slicer, Path::new("/tmp/x.3MF")).is_ok(), "the check is case insensitive");
     }
