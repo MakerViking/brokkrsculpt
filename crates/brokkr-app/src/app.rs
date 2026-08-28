@@ -590,6 +590,9 @@ pub struct Brokkr {
     gizmo_baked: Option<brokkr_core::Similarity>,
     /// Whether the welcome screen is up. See [`crate::welcome`].
     welcome: bool,
+    /// The TinkerAtlas articles that screen shows. See [`crate::articles`] for
+    /// why this is fetched only while the screen is actually up.
+    feed: crate::articles::Feed,
     /// The cube part under the pointer, lit so a click's effect is visible
     /// before the click.
     cube_hover: Option<navcube::Part>,
@@ -1674,6 +1677,7 @@ impl Brokkr {
             gizmo_base: None,
             gizmo_baked: None,
             welcome: false,
+            feed: crate::articles::Feed::default(),
             cube_hover: None,
             flight: None,
             menu: None,
@@ -7267,6 +7271,24 @@ impl Brokkr {
     /// The warning still stands for whatever modeless overlay does eventually
     /// take the pointer: **split this function in two at that point rather than
     /// widening it and quietly killing the drag.**
+    /// Ask TinkerAtlas for its articles, unless a request is already out.
+    ///
+    /// **Only ever called while the welcome screen is up**, which is what makes
+    /// the tick on that screen an honest control over it: turn the screen off
+    /// and this stops happening, with no second setting to find. See
+    /// [`crate::articles`].
+    ///
+    /// Re-fetched each time the screen opens rather than cached for the
+    /// session, because the whole point of the panel is that it is current, and
+    /// a user who opens it twice in a day has asked twice.
+    fn fetch_articles(&mut self) -> Task<Message> {
+        if matches!(self.feed, crate::articles::Feed::Loading) {
+            return Task::none();
+        }
+        self.feed = crate::articles::Feed::Loading;
+        Task::perform(async { crate::articles::fetch() }, Message::ArticlesLoaded)
+    }
+
     fn modal_open(&self) -> bool {
         self.welcome
             || self.confirm.is_some()
@@ -7765,6 +7787,20 @@ impl Brokkr {
         // same set, and that set is not a list anyone can keep correct.
         // Asking the question once, before the message is acted on, cannot go
         // out of date.
+        // **The startup fetch.** `Brokkr::new` returns a `Self` and not a
+        // `Task`, so there is nowhere in construction to start one from --
+        // and asking here rather than at each place that raises the screen
+        // means no path can forget. It runs once because the state moves off
+        // `Idle` immediately.
+        if self.welcome
+            && matches!(self.feed, crate::articles::Feed::Idle)
+            && !matches!(message, Message::ArticlesLoaded(_))
+        {
+            let fetch = self.fetch_articles();
+            let rest = self.update(message);
+            return Task::batch([fetch, rest]);
+        }
+
         // Before the gizmo guard and before dispatch, so that a card this
         // message goes on to raise is drawn over a screen that has already
         // gone rather than under one that has not.
@@ -7854,6 +7890,22 @@ impl Brokkr {
                 // the screen is dismissed.
                 self.top_menu = None;
                 self.welcome = true;
+                return self.fetch_articles();
+            }
+            Message::ArticlesRetried => return self.fetch_articles(),
+            Message::ArticlesLoaded(answer) => {
+                self.feed = match answer {
+                    Ok(articles) => crate::articles::Feed::Ready(articles),
+                    Err(why) => crate::articles::Feed::Failed(why),
+                };
+            }
+            Message::ArticleOpened(link) => {
+                // The screen stays up: reading an article is not choosing what
+                // to do with the application, and coming back to a dismissed
+                // welcome screen would be a surprise.
+                if let Err(why) = crate::articles::open_in_browser(&link) {
+                    self.status = why;
+                }
             }
             Message::WelcomeClosed => self.welcome = false,
             Message::WelcomeOnStartupSet(show) => crate::welcome::set_on_startup(show),
@@ -9709,21 +9761,34 @@ mod tests {
         );
     }
 
-    /// The tick must not dismiss the screen it is a setting for.
+    /// The tick must not dismiss the screen it is a setting for, and neither
+    /// must reading an article.
+    ///
+    /// **Asked of the rule and not by sending the message**, deliberately.
+    /// `WelcomeOnStartupSet` writes through to the real
+    /// `$XDG_CONFIG_HOME/brokkrsculpt/welcome.conf`, so driving it here would
+    /// reach into the config of whoever is running the suite -- and two such
+    /// tests in parallel would race on one file. `dismisses_the_welcome` is a
+    /// pure function of the message, so it can be asked directly; that the
+    /// preference round-trips is
+    /// `welcome::tests::the_preference_survives_being_written_and_read_back`,
+    /// which uses a path of its own for the same reason.
     #[test]
-    fn the_startup_tick_does_not_dismiss_the_welcome_screen() {
-        let mut app = app();
-        app.welcome = true;
+    fn the_screens_own_controls_do_not_dismiss_it() {
+        assert!(!dismisses_the_welcome(&Message::WelcomeOnStartupSet(false)));
+        assert!(!dismisses_the_welcome(&Message::WelcomeOnStartupSet(true)));
+        assert!(
+            !dismisses_the_welcome(&Message::ArticleOpened("https://tinkeratlas.com/x".into())),
+            "reading an article closed the screen it was read from"
+        );
+        assert!(!dismisses_the_welcome(&Message::ArticlesRetried));
+        assert!(!dismisses_the_welcome(&Message::ArticlesLoaded(Ok(Vec::new()))));
 
-        // Read the preference back rather than trusting the write: this is the
-        // one control whose whole job is to persist.
-        let was = crate::welcome::on_startup();
-        update(&mut app, Message::WelcomeOnStartupSet(!was));
-        assert!(app.welcome, "ticking the box closed the screen it belongs to");
-        assert_eq!(crate::welcome::on_startup(), !was, "the tick did not persist");
-
-        update(&mut app, Message::WelcomeOnStartupSet(was));
-        assert_eq!(crate::welcome::on_startup(), was, "the fixture did not put the setting back");
+        // And the ones that must: every button that starts real work.
+        assert!(dismisses_the_welcome(&Message::NewSculpt));
+        assert!(dismisses_the_welcome(&Message::OpenRequested));
+        assert!(dismisses_the_welcome(&Message::ImportRequested));
+        assert!(dismisses_the_welcome(&Message::WelcomeClosed));
     }
 
     /// No shortcut may reach the document through the welcome screen.

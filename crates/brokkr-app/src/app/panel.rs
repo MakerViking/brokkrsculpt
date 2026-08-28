@@ -568,39 +568,86 @@ impl Brokkr {
             }
         }
 
-        let key = |keys: &'static str, what: &'static str| {
-            row![
-                container(text(keys).size(theme::TEXT_SIZE_SMALL).color(theme::ACCENT))
-                    .width(Length::Fixed(96.0)),
-                text(what).size(theme::TEXT_SIZE_SMALL).color(theme::TEXT_DIM),
+        // **The articles, which is what SindriCAD's right column is.** It
+        // embeds the site in an iframe; there is no webview here, so the same
+        // articles arrive as data and are drawn with the same widgets as
+        // everything else. Three states, as that one has: asking, answered, and
+        // unreachable with a retry.
+        let right: Element<'_, Message> = match &self.feed {
+            crate::articles::Feed::Idle | crate::articles::Feed::Loading => column![
+                text("From TinkerAtlas").size(theme::TEXT_SIZE_SMALL).color(theme::TEXT_DIM),
+                text("Fetching the latest articles…")
+                    .size(theme::TEXT_SIZE_SMALL)
+                    .color(theme::TEXT_MUTE),
             ]
             .spacing(theme::S2)
+            .into(),
+            crate::articles::Feed::Failed(why) => column![
+                text("From TinkerAtlas").size(theme::TEXT_SIZE_SMALL).color(theme::TEXT_DIM),
+                // Says which way it failed rather than "offline": a 503 and no
+                // route are different problems and only one of them is yours.
+                text(why.clone()).size(theme::TEXT_SIZE_SMALL).color(theme::TEXT_MUTE),
+                button(text("Try again").size(theme::TEXT_SIZE_SMALL))
+                    .padding(Padding {
+                        top: theme::S1,
+                        bottom: theme::S1,
+                        left: theme::S3,
+                        right: theme::S3
+                    })
+                    .style(theme::tool_button)
+                    .on_press(Message::ArticlesRetried),
+            ]
+            .spacing(theme::S2)
+            .into(),
+            crate::articles::Feed::Ready(articles) if articles.is_empty() => column![
+                text("From TinkerAtlas").size(theme::TEXT_SIZE_SMALL).color(theme::TEXT_DIM),
+                text("Nothing published yet.").size(theme::TEXT_SIZE_SMALL).color(theme::TEXT_MUTE),
+            ]
+            .spacing(theme::S2)
+            .into(),
+            crate::articles::Feed::Ready(articles) => {
+                let mut list = column![
+                    text("From TinkerAtlas").size(theme::TEXT_SIZE_SMALL).color(theme::TEXT_DIM),
+                ]
+                .spacing(theme::S2);
+                for article in articles {
+                    list = list.push(
+                        button(
+                            column![
+                                text(article.title.clone())
+                                    .size(theme::TEXT_SIZE)
+                                    .color(theme::TEXT),
+                                text(article.summary.clone())
+                                    .size(theme::CAPTION_SIZE)
+                                    .color(theme::TEXT_DIM),
+                                text(article.date.clone())
+                                    .size(theme::CAPTION_SIZE)
+                                    .color(theme::TEXT_MUTE),
+                            ]
+                            .spacing(2),
+                        )
+                        .width(Length::Fill)
+                        .padding(Padding {
+                            top: theme::S2,
+                            bottom: theme::S2,
+                            left: theme::S3,
+                            right: theme::S3,
+                        })
+                        .style(theme::tool_button)
+                        .on_press(Message::ArticleOpened(article.link.clone())),
+                    );
+                }
+                list.into()
+            }
         };
-
         let right = column![
             text("A sculpting tool for people who print what they make.")
                 .size(theme::TEXT_SIZE)
                 .color(theme::TEXT),
-            space::vertical().height(theme::S2),
-            key("1 – 7", "pick a brush"),
-            key("shift", "smooth, while held"),
-            key("ctrl / alt", "carve instead of add"),
-            key("[ and ]", "brush size"),
-            key("s / u drag", "size and strength"),
-            key("x y z", "mirror across a plane"),
-            key("w", "move, turn and scale a body"),
-            key("m", "mask, to protect what you have"),
-            key("ctrl+Z", "undo, one whole stroke at a time"),
-            space::vertical().height(theme::S2),
-            text(
-                "Right-click the model for the current tool's settings, and the cube \
-                  top-right to look from a named direction."
-            )
-            .size(theme::TEXT_SIZE_SMALL)
-            .color(theme::TEXT_DIM),
+            right,
         ]
-        .spacing(theme::S1)
-        .width(Length::Fixed(320.0));
+        .spacing(theme::S3)
+        .width(Length::Fixed(340.0));
 
         let foot = row![
             checkbox(crate::welcome::on_startup())
@@ -621,8 +668,42 @@ impl Brokkr {
         .align_y(Alignment::Center)
         .spacing(theme::S3);
 
+        // **The keys stay.** They are the one thing a first-time user cannot get
+        // anywhere else -- there is no manual -- and they are cheap here: a
+        // strip under the two columns rather than a third column, so neither
+        // the actions nor the articles lose width to them.
+        let key = |keys: &'static str, what: &'static str| {
+            row![
+                container(text(keys).size(theme::CAPTION_SIZE).color(theme::ACCENT))
+                    .width(Length::Fixed(72.0)),
+                text(what).size(theme::CAPTION_SIZE).color(theme::TEXT_DIM),
+            ]
+            .spacing(theme::S2)
+        };
+        let keys = row![
+            column![
+                key("1 – 7", "pick a brush"),
+                key("shift", "smooth, while held"),
+                key("ctrl / alt", "carve instead of add"),
+                key("[ and ]", "brush size"),
+                key("s / u drag", "size and strength"),
+            ]
+            .spacing(2)
+            .width(Length::Fill),
+            column![
+                key("x y z", "mirror across a plane"),
+                key("w", "move, turn and scale a body"),
+                key("m", "mask, to protect what you have"),
+                key("ctrl+Z", "undo, a whole stroke at a time"),
+                key("right-click", "the current tool's settings"),
+            ]
+            .spacing(2)
+            .width(Length::Fill),
+        ]
+        .spacing(theme::S4);
+
         let card = container(
-            column![lockup, row![left, right].spacing(theme::S5), foot,].spacing(theme::S5),
+            column![lockup, row![left, right].spacing(theme::S5), keys, foot,].spacing(theme::S4),
         )
         .padding(theme::S5)
         .max_width(640.0)
