@@ -387,6 +387,12 @@ pub enum Message {
     WelcomeOpened,
     /// Dismiss it. Escape does this too.
     WelcomeClosed,
+    /// The TinkerAtlas feed came back, or did not.
+    ArticlesLoaded(Result<Vec<crate::articles::Article>, String>),
+    /// Ask again after a failure.
+    ArticlesRetried,
+    /// Read one in the browser.
+    ArticleOpened(String),
     /// The "show this on startup" tick, which is written through immediately:
     /// a preference that only lands when the dialog is dismissed the right way
     /// is one that silently forgets.

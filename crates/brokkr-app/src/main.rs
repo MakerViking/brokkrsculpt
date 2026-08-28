@@ -3,6 +3,7 @@
 //! BrokkrSculpt: a voxel and SDF based 3D sculpting application.
 
 mod app;
+mod articles;
 mod breadcrumbs;
 mod camera;
 mod crash;
