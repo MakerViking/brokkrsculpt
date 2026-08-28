@@ -56,6 +56,14 @@ const MAX_SHOWN: usize = 4;
 pub struct Article {
     pub title: String,
     pub link: String,
+    /// The opening of the article, cut to fit the card. See [`shorten`].
+    ///
+    /// **Shown again, and the card is a grid because of it.** An earlier pass
+    /// dropped this on the grounds that four summaries stacked in a 340-pixel
+    /// column read as a wall of text. That was true of the column; the answer
+    /// was the layout rather than the words, and the page this mirrors has
+    /// carried a summary on every card all along.
+    pub summary: String,
     /// As the feed wrote it, trimmed to the date. Not parsed into a calendar
     /// type: nothing here does arithmetic on it, and a date format that fails
     /// to parse should still be shown rather than swallowed.
@@ -180,7 +188,13 @@ fn parse_items(xml: &str) -> Result<Vec<(Article, Option<String>)>, String> {
             .and_then(|node| node.attribute("url"))
             .and_then(thumbnail_url);
         articles.push((
-            Article { title, link, date: date_only(&child("pubDate")), thumbnail: None },
+            Article {
+                title,
+                link,
+                summary: shorten(&child("description")),
+                date: date_only(&child("pubDate")),
+                thumbnail: None,
+            },
             picture,
         ));
         if articles.len() == MAX_SHOWN {
@@ -192,10 +206,14 @@ fn parse_items(xml: &str) -> Result<Vec<(Article, Option<String>)>, String> {
 
 /// How wide a thumbnail is asked for, in pixels.
 ///
-/// The panel draws them at half this, so the extra is for a HiDPI output. See
-/// [`thumbnail_url`] for why the size is asked of the server at all.
-const THUMB_WIDTH: u32 = 240;
-const THUMB_HEIGHT: u32 = 135;
+/// Sized for the grid card, which draws the picture at the card's full width
+/// rather than beside the text -- roughly 320 logical pixels on the 960-wide
+/// welcome card. The panel draws them at that width, so on a HiDPI output the
+/// renderer is upscaling slightly; asking for double would quadruple the bytes
+/// for a picture that sits behind a headline. See [`thumbnail_url`] for why the
+/// size is asked of the server at all.
+const THUMB_WIDTH: u32 = 320;
+const THUMB_HEIGHT: u32 = 180;
 
 /// Turn a stored-object URL into a resized one, or refuse it.
 ///
@@ -269,13 +287,54 @@ fn date_only(pub_date: &str) -> String {
     words[..4].join(" ")
 }
 
+/// Cut a summary to two lines on a card, without breaking a word.
+///
+/// A character count and not a pixel measurement: the text is laid out by the
+/// renderer at a size and font this module knows nothing about, and a count
+/// that is roughly right everywhere beats a measurement that is exactly right
+/// on one machine. `MAX_CHARS` is two lines of the grid card at
+/// `TEXT_SIZE_SMALL`, with the ellipsis counted.
+///
+/// See `panel.rs`'s own `shorten`, which does the same job for paths and
+/// records why a fixed-width column does not clip its own children.
+fn shorten(text: &str) -> String {
+    const MAX_CHARS: usize = 110;
+    let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if flat.chars().count() <= MAX_CHARS {
+        return flat;
+    }
+    let cut: String = flat.chars().take(MAX_CHARS - 1).collect();
+    // Back off to a word boundary so the ellipsis does not land mid-word.
+    let trimmed = cut.rsplit_once(' ').map(|(head, _)| head).unwrap_or(&cut);
+    format!("{trimmed}…")
+}
+
+/// Where the two buttons on the welcome screen lead.
+///
+/// Here rather than in `panel.rs` so they sit beside the rule that admits them:
+/// a URL and the policy deciding whether it may be opened are one thing, and
+/// splitting them is how one quietly stops satisfying the other.
+pub const JOIN_URL: &str = "https://tinkeratlas.com/signup";
+pub const VISIT_URL: &str = "https://tinkeratlas.com/";
+
+/// Whether a link may be handed to the user's browser.
+///
+/// **Split out of [`open_in_browser`] so acceptance can be tested.** That one
+/// spawns a process the moment it approves, so a test proving a URL is allowed
+/// would open a browser on whoever ran the suite -- which is why the existing
+/// test only ever checks refusals. This is the same question with no side
+/// effect.
+pub(crate) fn leads_to_tinkeratlas(link: &str) -> bool {
+    link.starts_with("https://tinkeratlas.com/")
+}
+
 /// Hand a link to whatever the desktop opens links with.
 ///
 /// `xdg-open` rather than a crate: this is Linux-first, `slicer.rs` already
 /// spawns a process the same way, and a browser-opening dependency would be a
 /// second one to audit for the sake of one command.
 pub fn open_in_browser(link: &str) -> Result<(), String> {
-    if !link.starts_with("https://tinkeratlas.com/") {
+    if !leads_to_tinkeratlas(link) {
         return Err("that link does not lead to TinkerAtlas".to_string());
     }
     std::process::Command::new("xdg-open")
@@ -338,6 +397,8 @@ mod tests {
         assert_eq!(articles[0].title, "Your Sketch Went Red");
         assert_eq!(articles[0].link, "https://tinkeratlas.com/site-posts/your-sketch-went-red");
         assert_eq!(articles[0].date, "Thu, 27 Aug 2026", "the time of day is not worth the width");
+        assert!(articles[0].summary.ends_with('…'), "a long summary was not cut");
+        assert_eq!(articles[1].summary, "Short one.", "a short summary was cut anyway");
     }
 
     /// **A link is handed to the browser, so it may only ever go one place.**
@@ -356,6 +417,19 @@ mod tests {
 
         assert!(open_in_browser("https://evil.example/phish").is_err());
         assert!(open_in_browser("http://tinkeratlas.com/site-posts/x").is_err(), "plain http");
+    }
+
+    /// **The welcome screen's two buttons must survive their own guard.**
+    ///
+    /// They are constants, so a typo in one is not a compile error and not a
+    /// panic -- the button simply reports "that link does not lead to
+    /// TinkerAtlas" when pressed, which nobody would find until a user did.
+    /// A wrong scheme is the likely slip, and it is exactly what the guard
+    /// rejects.
+    #[test]
+    fn the_welcome_buttons_lead_somewhere_the_guard_allows() {
+        assert!(leads_to_tinkeratlas(JOIN_URL), "the Join button would be refused: {JOIN_URL}");
+        assert!(leads_to_tinkeratlas(VISIT_URL), "the Visit button would be refused: {VISIT_URL}");
     }
 
     /// One bad entry must not blank the panel.
