@@ -383,6 +383,14 @@ pub enum Message {
     OpenRecent(std::path::PathBuf),
     /// Load the crash net left behind by a session that did not save.
     RecoverAutosave,
+    /// Show the welcome screen, from the Help menu.
+    WelcomeOpened,
+    /// Dismiss it. Escape does this too.
+    WelcomeClosed,
+    /// The "show this on startup" tick, which is written through immediately:
+    /// a preference that only lands when the dialog is dismissed the right way
+    /// is one that silently forgets.
+    WelcomeOnStartupSet(bool),
     /// Import a mesh: ask for a file, then read and voxelise whatever came back.
     ImportRequested,
     ImportChosen(Option<std::path::PathBuf>),

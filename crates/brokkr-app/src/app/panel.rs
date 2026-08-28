@@ -192,6 +192,15 @@ impl Brokkr {
         .spacing(theme::S3)
         .padding(theme::S3);
 
+        // **Above everything**, and it is the only card that can be. It is
+        // raised at startup before any other state can ask for a card, and
+        // reopened only from the Help menu, so nothing it could cover is
+        // waiting on an answer. Ranking it lower would let the unsaved-work
+        // prompt draw over a screen that has not been dismissed yet.
+        if self.welcome {
+            return stack![body, self.welcome_card(), self.resize_frame()].into();
+        }
+
         // The unsaved-work prompt outranks an open menu: it is modal, and a
         // menu drawn over it would be reachable while the prompt is not.
         if let Some(pending) = &self.confirm {
@@ -471,6 +480,157 @@ impl Brokkr {
         modal_layer(card)
     }
 
+    /// The welcome screen.
+    ///
+    /// Two columns, as SindriCAD's is: what to do down the left, something to
+    /// read down the right, "show this on startup" along the foot. See
+    /// [`crate::welcome`] for what did not come across from that one and why --
+    /// briefly, there is no webview to put its remote pane in and no sign-in to
+    /// put its account row in.
+    ///
+    /// The right column is the substitution that matters. SindriCAD's is a
+    /// news page fetched from TinkerAtlas; this is the keys, because there is
+    /// no manual yet and a beta is the moment people meet them for the first
+    /// time. It is deliberately short: a wall of text on a modal is read by
+    /// nobody, and everything here is also discoverable in the interface.
+    fn welcome_card(&self) -> Element<'_, Message> {
+        let lockup = row![
+            crate::logo::mark(32.0),
+            rich_text::<(), Message, _, _>([
+                span("Brokkr").color(theme::TEXT),
+                span("SCULPT").color(theme::ACCENT),
+            ])
+            .size(theme::TEXT_SIZE),
+        ]
+        .spacing(theme::S3)
+        .align_y(Alignment::Center);
+
+        type ButtonStyle = fn(&iced::Theme, button::Status) -> button::Style;
+        let action = |label: &'static str, message: Message, style: ButtonStyle| {
+            button(text(label).size(theme::TEXT_SIZE))
+                .width(Length::Fill)
+                .padding(Padding {
+                    top: theme::S2,
+                    bottom: theme::S2,
+                    left: theme::S4,
+                    right: theme::S4,
+                })
+                .style(style)
+                .on_press(message)
+        };
+
+        let mut left = column![
+            action("New sculpt", Message::NewSculpt, theme::tool_button_active),
+            action("Open…", Message::OpenRequested, theme::tool_button),
+            action("Import mesh…", Message::ImportRequested, theme::tool_button),
+        ]
+        .spacing(theme::S2)
+        .width(Length::Fixed(220.0));
+
+        // The recent list, exactly as SindriCAD presents it: the file name
+        // first and the directory under it, because the name is what anyone
+        // scans for and the directory is only ever the tiebreak.
+        let recent = self.recent.paths();
+        if !recent.is_empty() {
+            left = left.push(space::vertical().height(theme::S3));
+            left = left.push(text("Recent").size(theme::TEXT_SIZE_SMALL).color(theme::TEXT_DIM));
+            for path in recent.iter().take(6) {
+                let name = shorten(
+                    &path
+                        .file_name()
+                        .map(|name| name.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| path.to_string_lossy().into_owned()),
+                );
+                let folder = shorten(
+                    &path
+                        .parent()
+                        .map(|dir| dir.to_string_lossy().into_owned())
+                        .unwrap_or_default(),
+                );
+                left = left.push(
+                    button(
+                        column![
+                            text(name).size(theme::TEXT_SIZE).color(theme::TEXT),
+                            text(folder).size(theme::TEXT_SIZE_SMALL).color(theme::TEXT_DIM),
+                        ]
+                        .spacing(1),
+                    )
+                    .width(Length::Fill)
+                    .padding(Padding {
+                        top: theme::S2,
+                        bottom: theme::S2,
+                        left: theme::S3,
+                        right: theme::S3,
+                    })
+                    .style(theme::tool_button)
+                    .on_press(Message::OpenRecent(path.clone())),
+                );
+            }
+        }
+
+        let key = |keys: &'static str, what: &'static str| {
+            row![
+                container(text(keys).size(theme::TEXT_SIZE_SMALL).color(theme::ACCENT))
+                    .width(Length::Fixed(96.0)),
+                text(what).size(theme::TEXT_SIZE_SMALL).color(theme::TEXT_DIM),
+            ]
+            .spacing(theme::S2)
+        };
+
+        let right = column![
+            text("A sculpting tool for people who print what they make.")
+                .size(theme::TEXT_SIZE)
+                .color(theme::TEXT),
+            space::vertical().height(theme::S2),
+            key("1 – 7", "pick a brush"),
+            key("shift", "smooth, while held"),
+            key("ctrl / alt", "carve instead of add"),
+            key("[ and ]", "brush size"),
+            key("s / u drag", "size and strength"),
+            key("x y z", "mirror across a plane"),
+            key("w", "move, turn and scale a body"),
+            key("m", "mask, to protect what you have"),
+            key("ctrl+Z", "undo, one whole stroke at a time"),
+            space::vertical().height(theme::S2),
+            text(
+                "Right-click the model for the current tool's settings, and the cube \
+                  top-right to look from a named direction."
+            )
+            .size(theme::TEXT_SIZE_SMALL)
+            .color(theme::TEXT_DIM),
+        ]
+        .spacing(theme::S1)
+        .width(Length::Fixed(320.0));
+
+        let foot = row![
+            checkbox(crate::welcome::on_startup())
+                .label("Show this screen on startup")
+                .on_toggle(Message::WelcomeOnStartupSet)
+                .text_size(theme::TEXT_SIZE_SMALL),
+            space::horizontal(),
+            button(text("Close").size(theme::TEXT_SIZE))
+                .padding(Padding {
+                    top: theme::S2,
+                    bottom: theme::S2,
+                    left: theme::S5,
+                    right: theme::S5
+                })
+                .style(theme::tool_button)
+                .on_press(Message::WelcomeClosed),
+        ]
+        .align_y(Alignment::Center)
+        .spacing(theme::S3);
+
+        let card = container(
+            column![lockup, row![left, right].spacing(theme::S5), foot,].spacing(theme::S5),
+        )
+        .padding(theme::S5)
+        .max_width(640.0)
+        .style(theme::menu_card);
+
+        modal_layer(card)
+    }
+
     /// The bug report dialog.
     ///
     /// It shows the payload rather than describing it. `diagnostics` was
@@ -670,6 +830,7 @@ impl Brokkr {
                     .color(theme::TEXT_MUTE),
                 text("AGPL-3.0-only").size(theme::CAPTION_SIZE).color(theme::TEXT_MUTE),
                 separator(),
+                entry("Welcome screen", Message::WelcomeOpened),
                 entry("Copy diagnostics", Message::DiagnosticsCopied),
                 entry("Report a bug…", Message::BugReportOpened),
                 entry("Open the issue tracker", Message::IssueOpened),
@@ -2999,6 +3160,27 @@ impl Brokkr {
 ///
 /// The window's resize strips are stacked *above* the card in `view`, so they
 /// keep working: reverse traversal reaches them first.
+/// Cut a path down so it cannot push a column wider than it was given.
+///
+/// **iced has no ellipsis and a `Length::Fixed` column does not clip its
+/// children**, so a long path is not merely ugly -- it grows the row and shoves
+/// the column beside it off its own layout. Observed on the welcome screen with
+/// a recent file under `/mnt/.../Meshy_AI_Dragonstone_Carver_08232143232…`,
+/// which ran straight through the keys listed next to it.
+///
+/// The TAIL is kept, because that is the informative end of a path: the leaf
+/// directory says which project, and the root says only that it is on a disk.
+fn shorten(text: &str) -> String {
+    /// Roughly what fits in the recent column at `TEXT_SIZE_SMALL`.
+    const MAX_CHARS: usize = 34;
+    let count = text.chars().count();
+    if count <= MAX_CHARS {
+        return text.to_string();
+    }
+    let tail: String = text.chars().skip(count - (MAX_CHARS - 1)).collect();
+    format!("…{tail}")
+}
+
 fn modal_layer<'a>(card: impl Into<Element<'a, Message>>) -> Element<'a, Message> {
     opaque(
         container(card)
