@@ -7881,7 +7881,7 @@ impl Brokkr {
                     Err(why) => crate::articles::Feed::Failed(why),
                 };
             }
-            Message::ArticleOpened(link) => {
+            Message::LinkOpened(link) => {
                 // The screen stays up: reading an article is not choosing what
                 // to do with the application, and coming back to a dismissed
                 // welcome screen would be a surprise.
@@ -9769,7 +9769,7 @@ mod tests {
         assert!(!dismisses_the_welcome(&Message::WelcomeOnStartupSet(false)));
         assert!(!dismisses_the_welcome(&Message::WelcomeOnStartupSet(true)));
         assert!(
-            !dismisses_the_welcome(&Message::ArticleOpened("https://tinkeratlas.com/x".into())),
+            !dismisses_the_welcome(&Message::LinkOpened("https://tinkeratlas.com/x".into())),
             "reading an article closed the screen it was read from"
         );
         assert!(!dismisses_the_welcome(&Message::ArticlesRetried));

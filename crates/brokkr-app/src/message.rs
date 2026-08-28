@@ -391,8 +391,11 @@ pub enum Message {
     ArticlesLoaded(Result<Vec<crate::articles::Article>, String>),
     /// Ask again after a failure.
     ArticlesRetried,
-    /// Read one in the browser.
-    ArticleOpened(String),
+    /// Open a TinkerAtlas link in the browser: an article, or one of the two
+    /// buttons on the welcome screen. The link is checked against the one host
+    /// it may lead to before anything is spawned -- see
+    /// [`crate::articles::open_in_browser`].
+    LinkOpened(String),
     /// The "show this on startup" tick, which is written through immediately:
     /// a preference that only lands when the dialog is dismissed the right way
     /// is one that silently forgets.

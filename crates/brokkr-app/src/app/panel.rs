@@ -573,17 +573,14 @@ impl Brokkr {
         // articles arrive as data and are drawn with the same widgets as
         // everything else. Three states, as that one has: asking, answered, and
         // unreachable with a retry.
-        let right: Element<'_, Message> = match &self.feed {
-            crate::articles::Feed::Idle | crate::articles::Feed::Loading => column![
-                text("From TinkerAtlas").size(theme::TEXT_SIZE_SMALL).color(theme::TEXT_DIM),
+        let feed: Element<'_, Message> = match &self.feed {
+            crate::articles::Feed::Idle | crate::articles::Feed::Loading => {
                 text("Fetching the latest articles…")
                     .size(theme::TEXT_SIZE_SMALL)
-                    .color(theme::TEXT_MUTE),
-            ]
-            .spacing(theme::S2)
-            .into(),
+                    .color(theme::TEXT_MUTE)
+                    .into()
+            }
             crate::articles::Feed::Failed(why) => column![
-                text("From TinkerAtlas").size(theme::TEXT_SIZE_SMALL).color(theme::TEXT_DIM),
                 // Says which way it failed rather than "offline": a 503 and no
                 // route are different problems and only one of them is yours.
                 text(why.clone()).size(theme::TEXT_SIZE_SMALL).color(theme::TEXT_MUTE),
@@ -599,83 +596,113 @@ impl Brokkr {
             ]
             .spacing(theme::S2)
             .into(),
-            crate::articles::Feed::Ready(articles) if articles.is_empty() => column![
-                text("From TinkerAtlas").size(theme::TEXT_SIZE_SMALL).color(theme::TEXT_DIM),
-                text("Nothing published yet.").size(theme::TEXT_SIZE_SMALL).color(theme::TEXT_MUTE),
-            ]
-            .spacing(theme::S2)
-            .into(),
+            crate::articles::Feed::Ready(articles) if articles.is_empty() => {
+                text("Nothing published yet.")
+                    .size(theme::TEXT_SIZE_SMALL)
+                    .color(theme::TEXT_MUTE)
+                    .into()
+            }
             crate::articles::Feed::Ready(articles) => {
-                let mut list = column![
-                    text("From TinkerAtlas").size(theme::TEXT_SIZE_SMALL).color(theme::TEXT_DIM),
-                ]
-                .spacing(theme::S2);
-                for article in articles {
-                    // **The picture and the headline, and no summary.** The
-                    // summary is what made this a wall of text: four articles
-                    // of prose in a column beside three buttons reads as
-                    // something to get past rather than something to look at.
-                    // The page this mirrors shows a thumbnail, a title and a
-                    // date, and that is the whole row.
-                    let words = column![
-                        text(article.title.clone()).size(theme::TEXT_SIZE).color(theme::TEXT),
-                        text(article.date.clone())
-                            .size(theme::CAPTION_SIZE)
-                            .color(theme::TEXT_MUTE),
-                    ]
-                    .spacing(2)
-                    .width(Length::Fill);
-
-                    let inside: Element<'_, Message> = match &article.thumbnail {
+                // **Two to a row, picture on top.** The single narrow column
+                // this replaced could only carry a thumbnail beside the words,
+                // which left the picture too small to be worth its bytes and
+                // the text too narrow to carry a summary. Two wide cards give
+                // both, and match the page these articles come from.
+                let mut grid = column![].spacing(theme::S3);
+                for pair in articles.chunks(GRID_COLUMNS) {
+                    let mut line = row![].spacing(theme::S3);
+                    for article in pair {
+                        let mut card = column![].spacing(theme::S1).width(Length::Fill);
                         // Cloning the HANDLE and not the pixels: it is
                         // refcounted and keeps its id, so the renderer's atlas
                         // entry survives the frame. Building a handle here
                         // instead would mint a new id every frame and re-upload
                         // every thumbnail. See `articles::Article::thumbnail`.
-                        Some(handle) => row![
-                            container(
-                                iced::widget::image(handle.clone())
-                                    .width(Length::Fixed(THUMB_PX))
-                                    .content_fit(iced::ContentFit::Cover),
-                            )
-                            .clip(true)
-                            .width(Length::Fixed(THUMB_PX))
-                            .height(Length::Fixed(THUMB_PX * 9.0 / 16.0)),
-                            words,
-                        ]
-                        .spacing(theme::S3)
-                        .align_y(Alignment::Center)
-                        .into(),
-                        // No picture is an ordinary outcome, so the row simply
-                        // has none rather than a placeholder that would draw
-                        // the eye to what is missing.
-                        None => words.into(),
-                    };
-
-                    list = list.push(
-                        button(inside)
-                            .width(Length::Fill)
-                            .padding(Padding {
-                                top: theme::S2,
-                                bottom: theme::S2,
-                                left: theme::S2,
-                                right: theme::S3,
-                            })
-                            .style(theme::tool_button)
-                            .on_press(Message::ArticleOpened(article.link.clone())),
-                    );
+                        //
+                        // No picture is an ordinary outcome, so the card simply
+                        // has none rather than a placeholder that would draw the
+                        // eye to what is missing.
+                        if let Some(handle) = &article.thumbnail {
+                            card = card.push(
+                                container(
+                                    iced::widget::image(handle.clone())
+                                        .width(Length::Fill)
+                                        .content_fit(iced::ContentFit::Cover),
+                                )
+                                .clip(true)
+                                .width(Length::Fill)
+                                .height(Length::Fixed(CARD_THUMB_PX)),
+                            );
+                        }
+                        card = card.push(
+                            text(article.title.clone()).size(theme::TEXT_SIZE).color(theme::TEXT),
+                        );
+                        card = card.push(
+                            text(article.summary.clone())
+                                .size(theme::TEXT_SIZE_SMALL)
+                                .color(theme::TEXT_DIM),
+                        );
+                        card = card.push(
+                            text(article.date.clone())
+                                .size(theme::CAPTION_SIZE)
+                                .color(theme::TEXT_MUTE),
+                        );
+                        line = line.push(
+                            button(card)
+                                .width(Length::Fill)
+                                .padding(theme::S2)
+                                .style(theme::tool_button)
+                                .on_press(Message::LinkOpened(article.link.clone())),
+                        );
+                    }
+                    // A last row with one article in it must not stretch that
+                    // card across the width the pair would have had.
+                    for _ in pair.len()..GRID_COLUMNS {
+                        line = line.push(space::horizontal());
+                    }
+                    grid = grid.push(line);
                 }
-                list.into()
+                scrollable(grid).height(Length::Fixed(GRID_HEIGHT_PX)).into()
             }
         };
+
+        // **The two buttons, which are the point of the panel.** The articles
+        // say what the community is doing; these are how someone acts on it.
+        // Both go through the same one-host check every article link does, so
+        // neither can be turned into a way to open something else.
+        let atlas = |label: &'static str, link: &'static str, style: ButtonStyle| {
+            button(text(label).size(theme::TEXT_SIZE))
+                .padding(Padding {
+                    top: theme::S2,
+                    bottom: theme::S2,
+                    left: theme::S4,
+                    right: theme::S4,
+                })
+                .style(style)
+                .on_press(Message::LinkOpened(link.to_string()))
+        };
+        let heading = row![
+            column![
+                text("Welcome to BrokkrSculpt").size(theme::TITLE_SIZE).color(theme::TEXT),
+                text("A sculpting tool for people who print what they make.")
+                    .size(theme::TEXT_SIZE)
+                    .color(theme::TEXT_DIM),
+            ]
+            .spacing(theme::S1)
+            .width(Length::Fill),
+            atlas("Join TinkerAtlas", crate::articles::JOIN_URL, theme::tool_button_active),
+            atlas("Visit TinkerAtlas", crate::articles::VISIT_URL, theme::tool_button),
+        ]
+        .spacing(theme::S2)
+        .align_y(Alignment::Center);
+
         let right = column![
-            text("A sculpting tool for people who print what they make.")
-                .size(theme::TEXT_SIZE)
-                .color(theme::TEXT),
-            right,
+            heading,
+            text("Latest from TinkerAtlas").size(theme::TEXT_SIZE_SMALL).color(theme::TEXT_DIM),
+            feed,
         ]
         .spacing(theme::S3)
-        .width(Length::Fixed(340.0));
+        .width(Length::Fill);
 
         let foot = row![
             checkbox(self.welcome_on_startup)
@@ -734,7 +761,11 @@ impl Brokkr {
             column![lockup, row![left, right].spacing(theme::S5), keys, foot,].spacing(theme::S4),
         )
         .padding(theme::S5)
-        .max_width(640.0)
+        // **Wide enough for two article cards side by side**, which is what
+        // sets it: 220 for the actions, 16 of gap, two ~330 cards and the
+        // padding. The narrow card this replaced could only stack articles in
+        // one column, and that column could not carry a picture worth showing.
+        .max_width(960.0)
         .style(theme::menu_card);
 
         modal_layer(card)
@@ -3245,11 +3276,28 @@ impl Brokkr {
     }
 }
 
-/// How wide an article thumbnail is drawn, in logical pixels.
+/// How tall an article thumbnail is drawn on its card, in logical pixels.
 ///
-/// Half what the server is asked for, so the picture still has pixels to spare
-/// on a HiDPI output. See `articles::THUMB_WIDTH`.
-const THUMB_PX: f32 = 120.0;
+/// The picture spans the card's whole width, so only the height is fixed here;
+/// `ContentFit::Cover` crops to fill it whatever the source aspect is.
+///
+/// **Sized down from 16:9 so four cards and the key strip fit a 768-high
+/// window**, which is the size `tool_strip`'s header records as the one that
+/// must keep working. At 170 the card ran about eighty pixels past the bottom
+/// of the window and took the Close button with it -- seen on screen, not in a
+/// test, because nothing in the suite lays this out.
+const CARD_THUMB_PX: f32 = 120.0;
+
+/// How tall the article grid may be before it scrolls, in logical pixels.
+///
+/// Two rows of cards at [`CARD_THUMB_PX`] come to about this. It is a bound
+/// rather than a fit: a summary that wraps to a third line, or a fifth article
+/// if [`crate::articles::MAX_SHOWN`] ever grows, scrolls instead of pushing the
+/// footer off the screen. The page this mirrors scrolls its article column too.
+const GRID_HEIGHT_PX: f32 = 440.0;
+
+/// How many article cards sit side by side.
+const GRID_COLUMNS: usize = 2;
 
 /// Cut a path down so it cannot push a column wider than it was given.
 ///

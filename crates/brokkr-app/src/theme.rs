@@ -190,6 +190,10 @@ pub const FONT: Font = Font::with_name("Inter");
 pub const TEXT_SIZE: f32 = 13.0;
 pub const TEXT_SIZE_SMALL: f32 = 11.0;
 pub const CAPTION_SIZE: f32 = 10.0;
+/// The one heading big enough to be read as a title, on the welcome screen.
+/// Nothing inside the application proper uses it: panels are dense by design
+/// and a heading this size in one would cost a row of controls.
+pub const TITLE_SIZE: f32 = 20.0;
 /// Monospace for the debug overlay, where columns of numbers must not jitter.
 pub const MONO: Font = Font::MONOSPACE;
 
