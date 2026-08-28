@@ -75,3 +75,16 @@ evdev.workspace = true
 # workspace dependency and already compiled for `brokkr-gpu`'s own tests.
 [dev-dependencies]
 pollster.workspace = true
+
+# `poke` is nothing but evdev: it writes synthetic pointer and key events to
+# `/dev/uinput`. Opt-in rather than a `cfg` on each of its ten items, which
+# would be ten attributes saying the same thing, and rather than a bare
+# `cfg(target_os)` on the file, which cannot work because an example still
+# needs a `main` on the platforms it is switched off for. Build it with
+# `--features uinput`; `scripts/drive.py` is what drives the window day to day.
+[features]
+uinput = []
+
+[[example]]
+name = "poke"
+required-features = ["uinput"]
