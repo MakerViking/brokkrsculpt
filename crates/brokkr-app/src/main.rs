@@ -3,9 +3,12 @@
 //! BrokkrSculpt: a voxel and SDF based 3D sculpting application.
 
 mod app;
+mod articles;
 mod breadcrumbs;
 mod camera;
+mod crash;
 mod cursor;
+mod gizmo;
 #[cfg(target_os = "linux")]
 mod icon;
 mod input_watch;
@@ -23,6 +26,7 @@ mod theme;
 mod thumbnails;
 mod timeline;
 mod viewport;
+mod welcome;
 
 use app::Brokkr;
 
@@ -46,6 +50,11 @@ fn main() -> iced::Result {
         print!("{}", spacemouse::report());
         return Ok(());
     }
+
+    // Before anything can panic, and before the window opens. A panic used to
+    // take the window and leave nothing behind but a backtrace on a terminal
+    // the user had not launched from.
+    crash::install();
 
     // `brokkrsculpt`, not `brokkr_app`: env_logger filters on the MODULE PATH,
     // and the module path is the crate root name, which for a binary target is

@@ -135,6 +135,10 @@ pub struct SharedFrame {
     /// The navigation cube's geometry, in its own batch because it is drawn in
     /// its own pass with its own matrix.
     cube: Mutex<OverlayBatch>,
+    /// The transform gizmo's geometry. In its own batch because it is drawn in
+    /// its own pass -- the sculpt's matrix, but over the sculpt's depth so a
+    /// gizmo on a body's centroid is reachable rather than buried inside it.
+    gizmo: Mutex<OverlayBatch>,
     /// Which GPU and backend iced actually chose, recorded the first time the
     /// pipeline is built. The application cannot ask wgpu directly -- iced owns
     /// the adapter -- and it is the first thing a bug report needs.
@@ -149,6 +153,10 @@ pub struct SharedFrame {
     /// Bodies that have left the document and whose pool slots must go with
     /// them. See [`SharedFrame::forget_body`].
     forget: Mutex<Vec<NodeId>>,
+    /// Bodies whose slots must go but which are STILL IN THE DOCUMENT, because
+    /// their geometry has moved and is about to be uploaded again. See
+    /// [`SharedFrame::release_body`].
+    release: Mutex<Vec<NodeId>>,
     /// Bodies the renderer must not draw. See [`SharedFrame::set_hidden`].
     hidden: Mutex<Vec<NodeId>>,
     /// Bodies drawn with the opposite of [`MaskView::inverted`]. See
@@ -210,6 +218,11 @@ impl SharedFrame {
         std::mem::swap(&mut *self.cube.lock().expect("shared frame poisoned"), batch);
     }
 
+    /// The same hand off for the transform gizmo.
+    pub fn swap_gizmo(&self, batch: &mut OverlayBatch) {
+        std::mem::swap(&mut *self.gizmo.lock().expect("shared frame poisoned"), batch);
+    }
+
     /// The overlay geometry currently waiting for the renderer.
     ///
     /// The application swaps its buffer in here rather than keeping it, so this
@@ -217,6 +230,12 @@ impl SharedFrame {
     #[cfg(test)]
     pub fn overlay_snapshot(&self) -> OverlayBatch {
         self.overlay.lock().expect("shared frame poisoned").clone()
+    }
+
+    /// The same, for the transform gizmo.
+    #[cfg(test)]
+    pub fn gizmo_snapshot(&self) -> OverlayBatch {
+        self.gizmo.lock().expect("shared frame poisoned").clone()
     }
 
     /// The GPU iced chose, for diagnostics. "unknown" until the first frame.
@@ -304,6 +323,27 @@ impl SharedFrame {
     /// by a test before anything depended on it.
     pub fn forget_body(&self, body: NodeId) {
         self.forget.lock().expect("shared frame poisoned").push(body);
+    }
+
+    /// Drop a body's slots because its geometry MOVED, not because the body
+    /// went away.
+    ///
+    /// **Distinct from [`SharedFrame::forget_body`], and conflating the two
+    /// makes a body vanish permanently.** A forget means "this body has left
+    /// the document", so `apply` drops every queued upload and the pending
+    /// thumbnail that name it -- otherwise a delete leaves a ghost sliver drawn
+    /// for ever. A transform needs the first half and must not have the second:
+    /// the old slots are stale because the bricks are at new coordinates now,
+    /// but the new meshes are queued in the SAME frame and dropping them leaves
+    /// nothing to draw at all.
+    ///
+    /// That is exactly what shipped: a gizmo move called `forget_body`, the
+    /// re-mesh that followed was discarded by the forget filter, and the body
+    /// disappeared from the viewport with a black thumbnail while its field sat
+    /// intact in the document, the status line reporting an exact move. The
+    /// data was never in danger and that is what made it hard to see.
+    pub fn release_body(&self, body: NodeId) {
+        self.release.lock().expect("shared frame poisoned").push(body);
     }
 
     /// Replace the set of bodies the renderer must not draw.
@@ -398,6 +438,13 @@ impl SharedFrame {
         std::mem::take(&mut *self.forget.lock().expect("shared frame poisoned"))
     }
 
+    /// The released list, for the same reason and with the same swap semantics
+    /// as [`SharedFrame::take_forgotten_for_tests`].
+    #[cfg(test)]
+    pub fn take_released_for_tests(&self) -> Vec<NodeId> {
+        std::mem::take(&mut *self.release.lock().expect("shared frame poisoned"))
+    }
+
     /// Ask for one body's picture to be redrawn on the next frame the pool is
     /// quiet.
     ///
@@ -472,6 +519,19 @@ impl SharedFrame {
             std::mem::take(&mut *forget)
         };
         for body in &forgotten {
+            renderer.forget_body(*body);
+        }
+
+        // Released bodies free their slots in the same position as a forget --
+        // before the uploads, so a stale slot at an old brick coordinate cannot
+        // survive and draw the body twice -- but they are deliberately NOT
+        // added to `forgotten`, so the meshes queued behind them in this very
+        // frame still land. See `SharedFrame::release_body`.
+        let released: Vec<NodeId> = {
+            let mut release = self.release.lock().expect("shared frame poisoned");
+            std::mem::take(&mut *release)
+        };
+        for body in &released {
             renderer.forget_body(*body);
         }
 
@@ -654,6 +714,13 @@ pub(crate) fn shortcut(character: &str, command: bool, shift: bool, alt: bool) -
         // field. Pressed while masking it goes back to sculpting, which
         // `Message::ToolChanged` does for every tool.
         "m" => Some(Message::ToolChanged(Tool::Mask)),
+        // The transform gizmo. `w` is ZBrush's, Blender's and Maya's key for
+        // Move, taken rather than invented so muscle memory carries over --
+        // and one key rather than three, because this is one gizmo with move,
+        // turn and scale handles on it rather than three modes. Pressed while
+        // it is up it goes back to sculpting, which `Message::ToolChanged`
+        // does for every tool.
+        "w" => Some(Message::ToolChanged(Tool::Transform)),
         // Hold to see the mask, whatever the `show mask` toggle says. ZBrush's
         // own mask-visibility key is H, taken rather than invented so muscle
         // memory carries over, and held rather than latched because that is the
@@ -661,6 +728,10 @@ pub(crate) fn shortcut(character: &str, command: bool, shift: bool, alt: bool) -
         // without a second press. The release is decoded in `key_event`
         // alongside the sizing keys -- this function only ever sees presses.
         "h" => Some(Message::MaskPeekStarted),
+        // Blender's and Nomad's own key for this, taken rather than invented.
+        // It is the one keystroke that recovers ANY camera, however lost, and
+        // it is the other half of letting the camera move freely at all.
+        "f" => Some(Message::CameraFramedOnActive),
         "x" => Some(Message::SymmetryAxisToggled(MirrorAxis::X)),
         "y" => Some(Message::SymmetryAxisToggled(MirrorAxis::Y)),
         "z" => Some(Message::SymmetryAxisToggled(MirrorAxis::Z)),
@@ -728,12 +799,13 @@ fn route_pointer(
         }
         iced::Event::Mouse(mouse::Event::WheelScrolled { delta }) => {
             cursor.position_in(bounds)?;
+            let (position, size) = pointer_position(bounds, cursor)?;
             let amount = match delta {
                 mouse::ScrollDelta::Lines { y, .. } => *y,
                 // Pixel deltas are far larger per notch than line deltas.
                 mouse::ScrollDelta::Pixels { y, .. } => *y / 40.0,
             };
-            (PointerEvent::Scrolled { amount }, true)
+            (PointerEvent::Scrolled { amount, position, size }, true)
         }
         iced::Event::Keyboard(iced::keyboard::Event::ModifiersChanged(modifiers)) => (
             PointerEvent::Modifiers {
@@ -884,6 +956,13 @@ impl shader::Primitive for SculptPrimitive {
             let cube = shared.cube.lock().expect("shared frame poisoned");
             pipeline.renderer.write_cube(device, queue, &cube, navcube::view_projection(&camera));
         }
+        {
+            // The SCULPT's matrix, not one of the gizmo's own: it is world
+            // space geometry sitting on the body it moves, and only its size is
+            // held constant on screen.
+            let gizmo = shared.gizmo.lock().expect("shared frame poisoned");
+            pipeline.renderer.write_gizmo(device, queue, &gizmo, view_projection);
+        }
         // The cube's corner box is defined in logical pixels so it stays the
         // same physical size at any scale factor, but a render pass wants
         // physical ones. Worked out here because `render` sees neither the
@@ -964,6 +1043,23 @@ impl shader::Primitive for SculptPrimitive {
         let y = clip_bounds.y + cube.y;
         let width = cube.width.min(clip_bounds.width.saturating_sub(cube.x));
         let height = cube.height.min(clip_bounds.height.saturating_sub(cube.y));
+        // **The gizmo BEFORE the cube, and the order is decided by the press
+        // dispatch rather than by taste.** Both clear depth, so whichever draws
+        // last wins the pixels they share -- and `Brokkr::on_pointer` tests the
+        // navigation cube before it lets the gizmo claim anything. Drawing them
+        // the other way round would show a gizmo arrow over the cube that,
+        // clicked, flew the camera: the two would disagree about what is on top,
+        // and the one the user can see would be the one that is wrong.
+        pipeline.renderer.render_gizmo(
+            encoder,
+            target,
+            PixelRect {
+                x: clip_bounds.x,
+                y: clip_bounds.y,
+                width: clip_bounds.width,
+                height: clip_bounds.height,
+            },
+        );
         pipeline.renderer.render_cube(encoder, target, PixelRect { x, y, width, height });
     }
 }
@@ -1206,6 +1302,15 @@ mod apply_tests {
         }
     }
 
+    /// Publish over a chosen span of coordinates, so a body can be re-published
+    /// somewhere it was not before -- which is what a MOVE does and what
+    /// [`publish`] cannot express.
+    fn publish_over(shared: &SharedFrame, body: NodeId, span: std::ops::Range<i32>) {
+        for brick in span {
+            shared.publish(body, BrickCoord::new(brick, 0, 0), mesh());
+        }
+    }
+
     /// A mesh that actually covers pixels, for the one test whose claim is
     /// about what is in a cell rather than about which slots exist.
     ///
@@ -1338,6 +1443,78 @@ mod apply_tests {
             assert_eq!(after.bricks, before.bricks, "the pool grew for a body that was deleted");
             assert_eq!(after.triangles, before.triangles);
             assert_eq!(renderer.body_bricks(KEPT), 3, "the surviving body lost bricks");
+        }
+    }
+
+    /// **A RELEASED body's new meshes must reach the pool in the same frame.**
+    ///
+    /// This is the second meaning of "the body's old slots are finished with",
+    /// and the distinction between it and a forget is a bug that shipped: a
+    /// gizmo move called `forget_body`, `SharedFrame::apply` dropped every
+    /// queued upload naming it, and the cube vanished with a black thumbnail
+    /// while its field sat intact in the document and the status line said
+    /// "moved 50.63 mm -- exact".
+    ///
+    /// **The test that missed it asserted `world_bounds()` had changed** --
+    /// the DATA, which was never in danger -- and nothing asserted what the
+    /// RENDERER had been told. Nothing in the GPU module exercised
+    /// `release_body` at all: it had exactly two call sites and no test.
+    ///
+    /// The body is re-published at coordinates it did NOT occupy before,
+    /// because that is what a move produces and it is the case that does not
+    /// heal itself. `rebake_gizmo` marks the outgoing coordinates dirty in the
+    /// incoming field, so those slots are handed back by `upload`'s
+    /// empty-indices arm; what is not covered is the halo, since the outgoing
+    /// list is stored bricks only while the remesh covers stored bricks plus
+    /// their 26 neighbours. Those neighbour slots are in the pool, in nobody's
+    /// dirty set, and they are what draws at the old position.
+    #[test]
+    fn a_released_bodys_new_meshes_reach_the_pool_in_the_same_frame() {
+        let Some((device, queue)) = device_or_skip("shared frame release") else {
+            return;
+        };
+
+        const MOVED: NodeId = NodeId(1);
+        const STILL: NodeId = NodeId(2);
+
+        // Both orders, for the same reason the forget test takes both: `apply`
+        // does not record when anything was pushed and cannot tell them apart.
+        for release_first in [false, true] {
+            let mut renderer = renderer(&device, &queue);
+            let shared = SharedFrame::new();
+
+            publish_over(&shared, MOVED, 0..5);
+            publish_over(&shared, STILL, 100..103);
+            shared.apply(&mut renderer, &device, &queue);
+            assert_eq!(renderer.body_bricks(MOVED), 5, "the fixture published nothing");
+            assert_eq!(renderer.body_bricks(STILL), 3, "the fixture published no second body");
+
+            // The move: released and re-published somewhere else, one frame.
+            if release_first {
+                shared.release_body(MOVED);
+                publish_over(&shared, MOVED, 20..23);
+            } else {
+                publish_over(&shared, MOVED, 20..23);
+                shared.release_body(MOVED);
+            }
+            shared.apply(&mut renderer, &device, &queue);
+
+            // The assertion that pins a deleted release loop: a release must
+            // not swallow the uploads queued alongside it.
+            assert!(
+                renderer.body_bricks(MOVED) > 0,
+                "a released body has no slots at all, so the release ate the meshes queued \
+                 with it -- which is a forget wearing a release's name (released {})",
+                if release_first { "before publishing" } else { "after publishing" },
+            );
+            assert_eq!(
+                renderer.body_bricks(MOVED),
+                3,
+                "a released body holds {} slots against the 3 it was re-published with, so the \
+                 old position is still in the pool and still drawing",
+                renderer.body_bricks(MOVED),
+            );
+            assert_eq!(renderer.body_bricks(STILL), 3, "an untouched body lost slots");
         }
     }
 

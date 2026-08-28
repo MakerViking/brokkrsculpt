@@ -309,23 +309,6 @@ impl Default for Config {
     }
 }
 
-/// Bring an angle back into -pi..pi.
-///
-/// Roll accumulates for as long as the user holds the twist, and an angle in
-/// the thousands of radians both loses precision and reads as nonsense in the
-/// settings panel.
-fn wrap_angle(angle: f32) -> f32 {
-    use std::f32::consts::{PI, TAU};
-    let wrapped = angle % TAU;
-    if wrapped > PI {
-        wrapped - TAU
-    } else if wrapped < -PI {
-        wrapped + TAU
-    } else {
-        wrapped
-    }
-}
-
 impl Config {
     pub fn binding(&self, action: Action) -> AxisBinding {
         self.bind[action as usize]
@@ -408,7 +391,8 @@ impl Config {
 
         let roll = self.value(Action::Roll, motion);
         if roll != 0.0 {
-            camera.roll = wrap_angle(camera.roll + roll * self.orbit_sens * elapsed_ms * sign);
+            camera.roll =
+                crate::camera::wrap_angle(camera.roll + roll * self.orbit_sens * elapsed_ms * sign);
             moved = true;
         }
 
@@ -685,16 +669,7 @@ impl Config {
     }
 
     fn merge(&mut self, text: &str) {
-        for line in text.lines() {
-            let line = line.trim();
-            if line.is_empty() || line.starts_with('#') {
-                continue;
-            }
-            let Some((key, value)) = line.split_once('=') else {
-                continue;
-            };
-            let (key, value) = (key.trim(), value.trim());
-
+        for (key, value) in crate::paths::entries(text) {
             // An unknown key or an unparseable value leaves the default in
             // place rather than failing the whole file, so a config written by
             // a newer version still mostly works.

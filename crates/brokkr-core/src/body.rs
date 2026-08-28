@@ -588,6 +588,42 @@ impl Document {
         self.volume_mut(active).expect("the active node always holds a volume")
     }
 
+    /// Swap one NAMED body's field for another on the same lattice, handing
+    /// back the field that came out.
+    ///
+    /// **Returned rather than dropped, and that return is the whole point.**
+    /// The field that comes out is the only copy of itself -- [`Volume`] does
+    /// not implement `Clone` -- so a caller that wants to undo the swap has to
+    /// be given it, not asked to have kept one. That is what
+    /// [`crate::Change::WholeVolume`] is, and it is why this is not
+    /// `replace_active_volume` with an id bolted on: that one drops the old
+    /// field on the floor, which is fine for a caller that has already rebuilt
+    /// it from itself and fatal for one that has not.
+    ///
+    /// `None` when no such body exists, so a caller holding a stale id gets its
+    /// volume back rather than a panic.
+    ///
+    /// The lattice check is a `debug_assert` and not a refusal for the reason
+    /// [`Document::replace_active_volume`] gives: every caller derives the
+    /// replacement from the volume it is replacing, and
+    /// [`crate::Volume::warped`] keeps `voxel_size` untouched precisely so that
+    /// this stays true of the gizmo as well.
+    pub fn replace_volume(&mut self, id: NodeId, volume: Volume) -> Option<Volume> {
+        debug_assert_eq!(
+            volume.voxel_size(),
+            self.voxel_size,
+            "a body may not be swapped for one on a different lattice"
+        );
+        let data =
+            self.nodes.iter_mut().find(|node| node.id == id).and_then(|node| node.body.as_mut())?;
+        let previous = std::mem::replace(&mut data.volume, volume);
+        // In full rather than grown: the incoming field is a different one, and
+        // a box grown from the outgoing field's would be a box around geometry
+        // that is no longer there.
+        data.recompute_bounds();
+        Some(previous)
+    }
+
     /// Swap the active body's field for another one on the SAME lattice.
     ///
     /// For an operation that rewrites a whole field in place and keeps the row
@@ -1347,16 +1383,18 @@ impl Document {
     /// for a gesture that is mostly misses. A ray-slab test against a cached
     /// box is about 20 ns. That ratio is why [`BodyCache`] exists at all.
     ///
-    /// # The gate also buys a reach the march does not have
+    /// # The gate also spends no steps crossing the air in front of the model
     ///
-    /// [`crate::raycast`] advances by at most [`NARROW_BAND`] voxels a step,
-    /// because that is where the field saturates, so its total travel is
-    /// bounded by `MAX_STEPS * NARROW_BAND * voxel_size` -- 46 mm at a 0.03 mm
-    /// voxel, against a camera that frames a model from about three times its
-    /// radius. At the finest lattice the ray ran out of steps in the empty
-    /// space in front of the model and the cursor quietly stopped working.
-    /// Starting the march where the ray ENTERS the body's box spends none of
-    /// those steps crossing that emptiness.
+    /// [`crate::raycast`] is bounded at `MAX_STEPS`, and starting the march
+    /// where the ray ENTERS the body's box spends none of them on the empty
+    /// space before it. That used to be load bearing on its own -- a step was
+    /// at most [`NARROW_BAND`] voxels, which is 46 mm of total travel at a
+    /// 0.03 mm voxel, and the cursor quietly stopped working at the finest
+    /// lattice. The march now skips a whole brick at a time through empty
+    /// space and has the reach unaided, so this is headroom rather than the
+    /// only thing standing between the user and a dead cursor. Keep it: the
+    /// two together are what let the picker work inside a model's own hollow
+    /// interior, which is empty space the box does not exclude.
     pub fn pick(
         &self,
         origin: Vec3,
@@ -3790,36 +3828,37 @@ mod tests {
         );
     }
 
-    /// **The reach the march does not have on its own.**
+    /// The gate finds a model far out in front of the eye, and measures the
+    /// distance from the EYE rather than from the box it started the march at.
     ///
-    /// `raycast` advances by at most `NARROW_BAND` voxels a step, so its total
-    /// travel is `MAX_STEPS * NARROW_BAND * voxel_size`: 46 mm at a 0.03 mm
-    /// voxel. A camera framing the default model sits about 90 mm out, so at
-    /// the finest lattice the ray ran out of steps in the empty space in front
-    /// of the model and the cursor stopped working, with nothing anywhere
-    /// saying why.
+    /// # This test used to assert the opposite of what it asserts now
     ///
-    /// The fixture is a small ball at a far viewpoint rather than a large one,
-    /// because a 30 mm ball at 0.03 mm is some 12,000 dense bricks and over a
-    /// gigabyte. The distance is what the failure is about, and it is the same
-    /// distance either way.
+    /// It was written as "the reach the march does not have on its own", and
+    /// its first line asserted that a bare `raycast` from this eye returned
+    /// `None`: 512 steps of at most `NARROW_BAND` voxels is 46 mm at a 0.03 mm
+    /// voxel, against an eye 90 mm out. That assertion was deleted rather than
+    /// weakened, because it is no longer true and the reason is a fix:
+    /// [`crate::raycast`] now skips a whole brick at a time through empty
+    /// space, so the bare march covers this and about ten times more. Its own
+    /// reach is pinned by `a_ray_crossing_a_large_empty_region_still_finds_the_far_surface`,
+    /// where it belongs.
     ///
-    /// Both halves are asserted. Without the raycast line this would pass with
-    /// the gate deleted, on a march that simply had far enough to go.
+    /// **The gate is still wanted, and for the reason it was always wanted
+    /// most**: a ray-slab test against a cached box is about 20 ns where a
+    /// march that misses costs 0.025 ms, so 64 bodies of mostly-misses is the
+    /// difference between 1.3 microseconds and 1.6 ms of a 16 ms frame. What
+    /// this test pins is that the gate does not corrupt the answer -- the
+    /// advance it makes has to be added back, and forgetting that reports a
+    /// surface 87 mm nearer than it is.
     #[test]
-    fn the_box_gate_reaches_a_model_the_march_alone_runs_out_of_steps_before() {
+    fn the_box_gate_finds_a_far_model_and_still_measures_from_the_eye() {
         let voxel_size = 0.03;
         let mut volume = Volume::new(voxel_size);
         volume.seed_sphere(Vec3::ZERO, 3.0);
         let doc = Document::from_volume(volume);
         let body = doc.active();
 
-        // 512 steps of 3 voxels is 46.08 mm, and the eye is 90 mm out.
         let eye = Vec3::new(0.0, 0.0, 90.0);
-        assert!(
-            crate::raycast::raycast(doc.active_volume(), eye, Vec3::NEG_Z, 1000.0).is_none(),
-            "the march reached the model unaided, so this fixture no longer measures anything"
-        );
 
         let hit = doc
             .pick_body(body, eye, Vec3::NEG_Z, 1000.0)

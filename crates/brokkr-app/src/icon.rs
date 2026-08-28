@@ -564,6 +564,33 @@ const EYE_OFF: Glyph = Glyph {
 /// The pair is the one place in this set where orientation carries the entire
 /// meaning, which is why both are centred on the same axes and drawn at the same
 /// length.
+/// The four-way arrow every modelling tool uses for Move, plus a corner arc
+/// for the turn: one gizmo with move, turn and scale handles needs one glyph
+/// that says all three rather than three buttons.
+const GIZMO: Glyph = Glyph {
+    subs: &[
+        Sub { segs: &[Seg::Move(12.0, 4.5), Seg::Line(12.0, 19.5)], ink: Ink::Stroke },
+        Sub { segs: &[Seg::Move(4.5, 12.0), Seg::Line(19.5, 12.0)], ink: Ink::Stroke },
+        // Four arrowheads, one per arm.
+        Sub {
+            segs: &[Seg::Move(9.4, 7.1), Seg::Line(12.0, 4.5), Seg::Line(14.6, 7.1)],
+            ink: Ink::Stroke,
+        },
+        Sub {
+            segs: &[Seg::Move(9.4, 16.9), Seg::Line(12.0, 19.5), Seg::Line(14.6, 16.9)],
+            ink: Ink::Stroke,
+        },
+        Sub {
+            segs: &[Seg::Move(7.1, 9.4), Seg::Line(4.5, 12.0), Seg::Line(7.1, 14.6)],
+            ink: Ink::Stroke,
+        },
+        Sub {
+            segs: &[Seg::Move(16.9, 9.4), Seg::Line(19.5, 12.0), Seg::Line(16.9, 14.6)],
+            ink: Ink::Stroke,
+        },
+    ],
+};
+
 const PLUS: Glyph = Glyph {
     subs: &[
         Sub { segs: &[Seg::Move(12.0, 6.0), Seg::Line(12.0, 18.0)], ink: Ink::Stroke },
@@ -746,6 +773,7 @@ pub enum IconName {
     BrushMove,
     CutPlane,
     Mask,
+    Gizmo,
     Eye,
     EyeOff,
     Plus,
@@ -857,6 +885,7 @@ impl IconName {
             IconName::BrushMove => &BRUSH_MOVE,
             IconName::CutPlane => &CUT_PLANE,
             IconName::Mask => &MASK,
+            IconName::Gizmo => &GIZMO,
             IconName::Eye => &EYE,
             IconName::EyeOff => &EYE_OFF,
             IconName::Plus => &PLUS,

@@ -28,7 +28,14 @@ glam.workspace = true
 # fill_quad is axis-aligned rectangles only, which a 24px stroke icon with
 # circles and diagonals cannot be made of. A whole icon set is what earns the
 # six. See `icon.rs`.
-iced = { workspace = true, features = ["advanced", "wgpu", "debug", "canvas"] }
+iced = { workspace = true, features = ["advanced", "wgpu", "debug", "canvas", "image-without-codecs"] }
+# The welcome screen's article thumbnails. `default-features = false` is the
+# whole point: iced's own `image` feature is `image-without-codecs` PLUS
+# `image/default`, and it is the second half that brings AVIF, EXR, AV1 grain
+# synthesis and fax decoding -- measured against this lockfile, +72 crates.
+# The widget alone is +6 and these two decoders are +9. Both are needed: the
+# feed carries JPEG and PNG, and the render endpoint keeps a PNG a PNG.
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
 log.workspace = true
 rfd.workspace = true
 serde_json = "1.0.151"
@@ -46,6 +53,9 @@ serde_json = "1.0.151"
 # risk than a fortnight-old release of the code that terminates our TLS.
 # Lift the bound to "3" once 3.4.x has aged.
 ureq = { version = "~3.3", default-features = false, features = ["rustls"] }
+# +0 crates: already compiled for brokkr-core's 3MF importer. See articles.rs
+# for why the welcome screen reads RSS rather than the JSON API.
+roxmltree.workspace = true
 wgpu.workspace = true
 
 # Stylus pressure is read straight from the kernel's evdev interface. That sits

@@ -64,8 +64,16 @@ pub enum PointerEvent {
         button: PointerButton,
     },
     /// Positive is a scroll toward the model.
+    ///
+    /// Carries where the pointer was, because the zoom is anchored on what is
+    /// under it rather than on the camera's target. Legal to add without
+    /// weakening the capture rule: the scroll arm already gates on
+    /// `cursor.position_in(bounds)`, so there is no case where a scroll is
+    /// routed here without a position to go with it.
     Scrolled {
         amount: f32,
+        position: Vector,
+        size: Vector,
     },
     Modifiers {
         shift: bool,
@@ -375,6 +383,23 @@ pub enum Message {
     OpenRecent(std::path::PathBuf),
     /// Load the crash net left behind by a session that did not save.
     RecoverAutosave,
+    /// Show the welcome screen, from the Help menu.
+    WelcomeOpened,
+    /// Dismiss it. Escape does this too.
+    WelcomeClosed,
+    /// The TinkerAtlas feed came back, or did not.
+    ArticlesLoaded(Result<Vec<crate::articles::Article>, String>),
+    /// Ask again after a failure.
+    ArticlesRetried,
+    /// Open a TinkerAtlas link in the browser: an article, or one of the two
+    /// buttons on the welcome screen. The link is checked against the one host
+    /// it may lead to before anything is spawned -- see
+    /// [`crate::articles::open_in_browser`].
+    LinkOpened(String),
+    /// The "show this on startup" tick, which is written through immediately:
+    /// a preference that only lands when the dialog is dismissed the right way
+    /// is one that silently forgets.
+    WelcomeOnStartupSet(bool),
     /// Import a mesh: ask for a file, then read and voxelise whatever came back.
     ImportRequested,
     ImportChosen(Option<std::path::PathBuf>),
@@ -580,6 +605,12 @@ pub enum Message {
     /// key repeats while it is held, and a toggle would strobe.
     MaskPeekStarted,
     MaskPeekEnded,
+    /// Put the camera back on the active body, keeping the angles.
+    ///
+    /// The recovery half of a free camera. A camera that can go anywhere can
+    /// end up anywhere, and the answer is one keystroke back rather than a
+    /// fence around where it may go.
+    CameraFramedOnActive,
     /// Throw the active body's mask away. The map is MOVED into the history
     /// entry, so this allocates nothing however large the mask was.
     MaskCleared,
