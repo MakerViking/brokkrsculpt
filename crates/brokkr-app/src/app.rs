@@ -18932,44 +18932,6 @@ mod mask_generator_tests {
     }
 }
 
-#[cfg(test)]
-mod real_file_check {
-    use super::*;
-
-    #[test]
-    #[ignore]
-    fn the_dragonstone_project_opens_on_a_camera_that_can_move() {
-        let path = std::path::Path::new(
-            "/home/thomash/Downloads/Meshy_AI_Dragonstone_Carver_0823214323_generate_obj/Brokkr.brokkr",
-        );
-        if !path.exists() {
-            println!("absent, skipping");
-            return;
-        }
-        let mut app = Brokkr::with_tablet(crate::tablet::Tablet::inert());
-        app.open_project(path);
-        let c = app.camera;
-        println!("status: {}", app.status);
-        println!(
-            "target {:?}  distance {:.3}  floor {:.3}  far {:.1}",
-            c.target,
-            c.distance,
-            c.min_distance(),
-            c.far()
-        );
-        let before = app.camera.distance;
-        app.camera.zoom_by(OrbitCamera::zoom_factor(1.0));
-        println!(
-            "one scroll notch: {:.3} -> {:.3}  (moved {:.3} mm)",
-            before,
-            app.camera.distance,
-            (app.camera.distance - before).abs()
-        );
-        assert!((app.camera.distance - before).abs() > 1.0, "scroll still does nothing");
-        assert!(app.camera.target.distance(Vec3::ZERO) < 200.0, "still aimed at empty space");
-    }
-}
-
 /// The camera Thomas asked for: free to move, still focused on the sculpt.
 ///
 /// These are the tests that measure the OUTCOME rather than the mechanism.
