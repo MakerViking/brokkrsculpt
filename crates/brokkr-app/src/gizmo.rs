@@ -516,7 +516,9 @@ fn inside_polygon(corners: &[Vec2], at: Vec2) -> bool {
     // still sees the doubled-back edges disagree and is correctly refused. But
     // the pixel it takes is the arrow's own centreline, which is where a user
     // aiming at an arrow puts the stylus.
-    !(positive && negative) && (positive || negative)
+    // "the signs disagree, and at least one sign exists", which is exactly
+    // what a point inside a polygon of non-zero area looks like.
+    positive != negative
 }
 
 /// The gesture a drag from `from` to `to` describes, about the gizmo's pinned

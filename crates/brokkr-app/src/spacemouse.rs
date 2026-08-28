@@ -669,16 +669,7 @@ impl Config {
     }
 
     fn merge(&mut self, text: &str) {
-        for line in text.lines() {
-            let line = line.trim();
-            if line.is_empty() || line.starts_with('#') {
-                continue;
-            }
-            let Some((key, value)) = line.split_once('=') else {
-                continue;
-            };
-            let (key, value) = (key.trim(), value.trim());
-
+        for (key, value) in crate::paths::entries(text) {
             // An unknown key or an unparseable value leaves the default in
             // place rather than failing the whole file, so a config written by
             // a newer version still mostly works.

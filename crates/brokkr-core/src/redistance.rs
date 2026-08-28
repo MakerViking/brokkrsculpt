@@ -256,8 +256,7 @@ impl Volume {
         let mut by_colour: [Vec<BrickCoord>; 8] = Default::default();
         for coord in &coords {
             let v = coord.0;
-            let colour =
-                (v.x.rem_euclid(2) + v.y.rem_euclid(2) * 2 + v.z.rem_euclid(2) * 4) as usize;
+            let colour = ((v.x & 1) | ((v.y & 1) << 1) | ((v.z & 1) << 2)) as usize;
             by_colour[colour].push(*coord);
         }
 

@@ -590,6 +590,13 @@ pub struct Brokkr {
     gizmo_baked: Option<brokkr_core::Similarity>,
     /// Whether the welcome screen is up. See [`crate::welcome`].
     welcome: bool,
+    /// Whether it opens by itself next time.
+    ///
+    /// Held rather than read where it is drawn: the tick is inside `view()`,
+    /// which runs every frame, and `welcome::on_startup` opens and parses a
+    /// file. Every other setting in this application is loaded once into state
+    /// the same way -- see `recent` above and `spacemouse.config`.
+    welcome_on_startup: bool,
     /// The TinkerAtlas articles that screen shows. See [`crate::articles`] for
     /// why this is fetched only while the screen is actually up.
     feed: crate::articles::Feed,
@@ -1560,7 +1567,15 @@ fn keeps_the_rename_open(message: &Message) -> bool {
 }
 
 impl Brokkr {
-    pub fn new() -> Self {
+    /// The application, and whatever it must do before the first frame.
+    ///
+    /// **Returns a `Task` because iced takes one**: `IntoBoot` is implemented
+    /// for `(State, Task<Message>)`, so there is a place in construction to
+    /// start work from. The first version of this claimed otherwise and put a
+    /// guard in `update` instead, which meant re-entering the one function
+    /// every message passes through -- so every other guard in it had to be
+    /// safe against running twice, to serve one request at startup.
+    pub fn new() -> (Self, Task<Message>) {
         let mut app = Self::with_devices(Tablet::start(), SpaceMouse::start());
         // **Read here and not in `with_devices`, which is what the tests
         // build through.** The welcome screen is modal, so an application
@@ -1573,8 +1588,12 @@ impl Brokkr {
         // Set last, so it opens over a document that is already whole: it ranks
         // above every other card, and anything raised during construction would
         // be drawn underneath it and be unreachable.
-        app.welcome = crate::welcome::on_startup();
-        app
+        app.welcome_on_startup = crate::welcome::on_startup();
+        app.welcome = app.welcome_on_startup;
+        // The screen is up, so its articles are wanted. The only other place
+        // that raises it, `Message::WelcomeOpened`, asks for them too.
+        let boot = if app.welcome { app.fetch_articles() } else { Task::none() };
+        (app, boot)
     }
 
     /// Build with a given pressure source and an inert puck, which is what
@@ -1677,6 +1696,7 @@ impl Brokkr {
             gizmo_base: None,
             gizmo_baked: None,
             welcome: false,
+            welcome_on_startup: true,
             feed: crate::articles::Feed::default(),
             cube_hover: None,
             flight: None,
@@ -2358,29 +2378,6 @@ impl Brokkr {
     /// The base is taken out of the document on the FIRST bake rather than at
     /// arming, so that arming alone never touches the field -- pressing `w` and
     /// pressing it again has to be free.
-    /// Whether two placements would bake to the same field.
-    ///
-    /// **Not `==`, and that was tried first.** `transform_to` recomputes the
-    /// placement through `Similarity::then` on every `Moved` event, and that
-    /// arithmetic is not bit-reproducible: a press and release on a single
-    /// pixel produces a placement whose translation and scale deltas are
-    /// EXACTLY zero and whose quaternion differs in the last bits. An exact
-    /// comparison therefore never fired once, and the re-bake it was meant to
-    /// skip went on happening.
-    ///
-    /// The tolerances sit far below anything a real gesture can produce -- one
-    /// pixel of drag moves the translation by `world_per_pixel`, which is
-    /// millimetres on an ordinary camera, against a thousandth of a voxel here
-    /// -- so this cannot swallow a sub-slop drag the user meant. That matters:
-    /// `Drag::moved` is only set past `CLICK_SLOP_PX` while `transform_to` runs
-    /// on every event, so gating on `moved` instead would silently discard a
-    /// small deliberate nudge.
-    fn same_bake(a: brokkr_core::Similarity, b: brokkr_core::Similarity, voxel_size: f32) -> bool {
-        (a.translation - b.translation).length() <= voxel_size * 1.0e-3
-            && (a.scale - b.scale).abs().max_element() <= 1.0e-5
-            && a.rotation.dot(b.rotation).abs() >= 1.0 - 1.0e-6
-    }
-
     fn rebake_gizmo(&mut self) {
         let Some(gizmo) = self.gizmo else {
             return;
@@ -2420,8 +2417,7 @@ impl Brokkr {
         // Already baked, and nothing has moved since. Covers a press and
         // release on a handle with no motion, and a drag out and back across
         // two presses.
-        if self.gizmo_baked.is_some_and(|baked| Self::same_bake(baked, gizmo.placement, voxel_size))
-        {
+        if self.gizmo_baked.is_some_and(|baked| baked.same_bake(gizmo.placement, voxel_size)) {
             return;
         }
 
@@ -7245,6 +7241,24 @@ impl Brokkr {
         self.refresh_overlay();
     }
 
+    /// Ask TinkerAtlas for its articles, unless a request is already out.
+    ///
+    /// **Only ever called while the welcome screen is up**, which is what makes
+    /// the tick on that screen an honest control over it: turn the screen off
+    /// and this stops happening, with no second setting to find. See
+    /// [`crate::articles`].
+    ///
+    /// Re-fetched each time the screen opens rather than cached for the
+    /// session, because the whole point of the panel is that it is current, and
+    /// a user who opens it twice in a day has asked twice.
+    fn fetch_articles(&mut self) -> Task<Message> {
+        if matches!(self.feed, crate::articles::Feed::Loading) {
+            return Task::none();
+        }
+        self.feed = crate::articles::Feed::Loading;
+        Task::perform(async { crate::articles::fetch() }, Message::ArticlesLoaded)
+    }
+
     /// Whether a modal card is up, and therefore owns the input.
     ///
     /// One list, read by both halves of the guard: `on_key` for the keyboard
@@ -7271,24 +7285,6 @@ impl Brokkr {
     /// The warning still stands for whatever modeless overlay does eventually
     /// take the pointer: **split this function in two at that point rather than
     /// widening it and quietly killing the drag.**
-    /// Ask TinkerAtlas for its articles, unless a request is already out.
-    ///
-    /// **Only ever called while the welcome screen is up**, which is what makes
-    /// the tick on that screen an honest control over it: turn the screen off
-    /// and this stops happening, with no second setting to find. See
-    /// [`crate::articles`].
-    ///
-    /// Re-fetched each time the screen opens rather than cached for the
-    /// session, because the whole point of the panel is that it is current, and
-    /// a user who opens it twice in a day has asked twice.
-    fn fetch_articles(&mut self) -> Task<Message> {
-        if matches!(self.feed, crate::articles::Feed::Loading) {
-            return Task::none();
-        }
-        self.feed = crate::articles::Feed::Loading;
-        Task::perform(async { crate::articles::fetch() }, Message::ArticlesLoaded)
-    }
-
     fn modal_open(&self) -> bool {
         self.welcome
             || self.confirm.is_some()
@@ -7787,20 +7783,6 @@ impl Brokkr {
         // same set, and that set is not a list anyone can keep correct.
         // Asking the question once, before the message is acted on, cannot go
         // out of date.
-        // **The startup fetch.** `Brokkr::new` returns a `Self` and not a
-        // `Task`, so there is nowhere in construction to start one from --
-        // and asking here rather than at each place that raises the screen
-        // means no path can forget. It runs once because the state moves off
-        // `Idle` immediately.
-        if self.welcome
-            && matches!(self.feed, crate::articles::Feed::Idle)
-            && !matches!(message, Message::ArticlesLoaded(_))
-        {
-            let fetch = self.fetch_articles();
-            let rest = self.update(message);
-            return Task::batch([fetch, rest]);
-        }
-
         // Before the gizmo guard and before dispatch, so that a card this
         // message goes on to raise is drawn over a screen that has already
         // gone rather than under one that has not.
@@ -7907,8 +7889,14 @@ impl Brokkr {
                     self.status = why;
                 }
             }
-            Message::WelcomeClosed => self.welcome = false,
-            Message::WelcomeOnStartupSet(show) => crate::welcome::set_on_startup(show),
+            // Nothing to do: `dismisses_the_welcome` already cleared the flag
+            // before dispatch, which is what closes it for every other button
+            // on the card too.
+            Message::WelcomeClosed => {}
+            Message::WelcomeOnStartupSet(show) => {
+                self.welcome_on_startup = show;
+                crate::welcome::set_on_startup(show);
+            }
             Message::SymmetryAxisToggled(axis) => self.toggle_mirror(axis),
             Message::PatternChanged(kind) => self.brush.pattern.kind = kind,
             Message::PatternScaleChanged(scale) => self.brush.pattern.scale_mm = scale,
@@ -8611,8 +8599,11 @@ impl Brokkr {
 }
 
 impl Default for Brokkr {
+    /// The application without its boot task, which is what a `Default` can
+    /// promise. `Brokkr::new` is what `main` uses, and it returns the work to
+    /// be done before the first frame as well.
     fn default() -> Self {
-        Self::new()
+        Self::new().0
     }
 }
 

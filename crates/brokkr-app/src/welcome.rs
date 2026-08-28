@@ -16,12 +16,10 @@
 //! **The remote pane.** SindriCAD's right column is an `<iframe>` of
 //! `tinkeratlas.com/sindricad/welcome`, probed for reachability from Rust first
 //! because a cross-origin frame never reports its own load failures. There is
-//! no webview here to put a frame in, and the dependency policy would refuse
-//! one long before the design question came up -- `iced`'s `image` feature
-//! alone is seventy-one crates against this workspace's lockfile. So the second
-//! column carries what a first-time user actually needs and cannot get
-//! anywhere else yet: there is no manual, and a beta is the moment strangers
-//! meet the keys for the first time.
+//! no webview here to put a frame in, so the second column carries the same
+//! site's articles fetched as DATA instead -- see [`crate::articles`] -- with
+//! the keys beneath, which a first-time user cannot get anywhere else yet:
+//! there is no manual, and a beta is the moment strangers meet them.
 //!
 //! **The account row.** SindriCAD offers "Sign in with TinkerAtlas" and shows
 //! an avatar. This application has no sign-in at all, and that is a decision
@@ -65,18 +63,9 @@ fn read_from(path: Option<&std::path::Path>) -> bool {
     let Ok(text) = std::fs::read_to_string(path) else {
         return true;
     };
-    for line in text.lines() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        if let Some((name, value)) = line.split_once('=')
-            && name.trim() == KEY
-        {
-            return value.trim() != "false";
-        }
-    }
-    true
+    crate::paths::entries(&text)
+        .find(|(key, _)| *key == KEY)
+        .is_none_or(|(_, value)| value != "false")
 }
 
 /// Remember the answer. A write that fails is dropped: the preference is worth
