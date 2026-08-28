@@ -391,11 +391,24 @@ fn fetch_profile(token: String) -> Result<Account, String> {
         .body_mut()
         .read_to_string()
         .map_err(|why| format!("could not read the reply ({why})"))?;
+    profile_from_json(&text, token)
+}
+
+/// Pull the account out of what `/api/desktop/me` answered.
+///
+/// Split from the request so the wire shape can be pinned by a test. It is
+/// worth pinning: this cost a working sign-in once already.
+fn profile_from_json(text: &str, token: String) -> Result<Account, String> {
     let value: serde_json::Value =
-        serde_json::from_str(&text).map_err(|why| format!("the reply was not JSON ({why})"))?;
-    // The route answers `{ data: {...} }` or the profile itself, depending on
-    // the wrapper in front of it; accept either rather than couple to one.
-    let profile = value.get("data").unwrap_or(&value);
+        serde_json::from_str(text).map_err(|why| format!("the reply was not JSON ({why})"))?;
+    // **`{ "user": { … } }`, which is what the route actually returns.**
+    // Read off production rather than assumed: the first version of this
+    // looked for `data` and fell back to the whole object, and neither finds
+    // `username` in the real reply -- so every sign-in would have got as far
+    // as a valid token and then failed with "TinkerAtlas did not say who that
+    // is". `data` and the bare profile stay as fallbacks so a change of
+    // wrapper does not break sign-in a second time.
+    let profile = value.get("user").or_else(|| value.get("data")).unwrap_or(&value);
     let field = |name: &str| profile.get(name).and_then(|v| v.as_str()).unwrap_or_default();
 
     let username = field("username").to_string();
@@ -444,6 +457,43 @@ mod tests {
         // A stray or truncated escape is passed through rather than eaten.
         assert_eq!(percent_decode("100%"), "100%");
         assert_eq!(percent_decode("%zz"), "%zz");
+    }
+
+    /// **The exact shape `/api/desktop/me` returns**, copied from a live
+    /// response rather than from the route's source, because the source is
+    /// what I read the first time and still got this wrong.
+    ///
+    /// `NextResponse.json({ user })` wraps the profile in `user`. Looking for
+    /// `data` and falling back to the whole object finds neither, so a
+    /// perfectly good token produced "TinkerAtlas did not say who that is" at
+    /// the last step of every sign-in.
+    #[test]
+    fn the_profile_is_read_out_of_the_shape_production_actually_sends() {
+        let body = r#"{"user":{"id":"70aec187","username":"MakerViking",
+            "display_name":"MakerViking","avatar_url":"https://example.test/a.jpg"}}"#;
+        let account = profile_from_json(body, "ta_bskt_x".to_string()).expect("a profile");
+        assert_eq!(account.username, "MakerViking");
+        assert_eq!(account.display_name, "MakerViking");
+        assert_eq!(account.avatar_url, "https://example.test/a.jpg");
+    }
+
+    #[test]
+    fn a_bare_profile_or_a_data_wrapper_still_works() {
+        for body in [
+            r#"{"username":"m","display_name":"M"}"#,
+            r#"{"data":{"username":"m","display_name":"M"}}"#,
+        ] {
+            let account = profile_from_json(body, "t".to_string()).expect("a profile");
+            assert_eq!(account.username, "m", "failed on {body}");
+        }
+    }
+
+    /// A reply naming nobody is a failure, not an account with a blank name:
+    /// storing it would show an empty row and send reports under nothing.
+    #[test]
+    fn a_reply_that_names_nobody_is_refused() {
+        assert!(profile_from_json(r#"{"user":{"id":"x"}}"#, "t".to_string()).is_err());
+        assert!(profile_from_json("not json", "t".to_string()).is_err());
     }
 
     const STATE: &str = "0123456789abcdef0123456789abcdef";
