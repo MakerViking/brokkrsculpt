@@ -191,6 +191,13 @@ impl Volume {
     /// exact route must, and [`Similarity::route`] is what tells them whether
     /// they can.
     pub fn warped(&self, by: Similarity) -> Volume {
+        self.warped_inner(by, true)
+    }
+
+    /// The pass, with the source gather switchable so a test can prove that
+    /// reading through a gathered region and reading through the brick map
+    /// give the same field, rather than inferring it from a bench run.
+    fn warped_inner(&self, by: Similarity, gather: bool) -> Volume {
         WARPS_MADE.with(|made| made.set(made.get() + 1));
         let voxel_size = self.voxel_size();
         let mut warped = Volume::new(voxel_size);
@@ -228,7 +235,7 @@ impl Volume {
         let dim = BRICK_DIM as i32;
         let built: Vec<(BrickCoord, Brick)> = coords
             .par_iter()
-            .filter_map(|coord| {
+            .map_init(crate::region::FieldRegion::new, |region, coord| {
                 let origin = coord.origin();
                 let brick_min = origin.as_vec3() * voxel_size;
                 let brick_max = (origin + IVec3::splat(dim - 1)).as_vec3() * voxel_size;
@@ -242,6 +249,32 @@ impl Volume {
                         return Some((*coord, Brick::Uniform(INSIDE)));
                     }
                     crate::resample::Coverage::Surface => {}
+                }
+
+                // Gather the source over this brick's own inverse image once,
+                // then read it from a flat array. A trilinear sample is eight
+                // reads and `sample_world` does each as a hash lookup, so a
+                // dense brick was paying 262,144 of them -- measured at 68.7 ns
+                // a sample against 20.1 ns through a gathered region. This is
+                // the same treatment `Volume::resampled` has always had; the
+                // two loops are siblings and only this one was missing it.
+                //
+                // The `+1` padding `snapshot` applies is provably enough:
+                // `inverse_transform_point` is affine, so the image of the
+                // destination brick's box lies inside the box `inverse_bounds`
+                // returns, and only a trilinear sample's own neighbours can
+                // reach one voxel past it.
+                //
+                // Past `MAX_GATHERED_SAMPLES` fall back to reading through the
+                // volume, for the reason `resampled` gives: a large scale-up
+                // asks for a source box of billions of samples, and it has
+                // proportionally few bricks to fill.
+                let (source_lo, source_hi) = self.voxel_bounds(source_min, source_max);
+                let gathered_samples =
+                    (source_hi - source_lo + IVec3::splat(3)).as_i64vec3().element_product();
+                let gathered = gather && gathered_samples <= crate::resample::MAX_GATHERED_SAMPLES;
+                if gathered {
+                    self.snapshot(source_lo, source_hi, region);
                 }
 
                 let mut brick = Brick::dense_filled(OUTSIDE);
@@ -258,11 +291,43 @@ impl Volume {
                             // other distance is underestimated, which is the
                             // sound direction for a sphere trace: it steps
                             // short, never through. `Volume::redistance` is
-                            // what puts the magnitudes back afterwards, and
-                            // `Similarity::is_uniform_scale` is how the caller
-                            // knows whether it has to. See `crate::similarity`.
-                            let value = self.sample_world(by.inverse_transform_point(world))
-                                * by.min_scale();
+                            // what puts the magnitudes back afterwards.
+                            //
+                            // **The saturation plateau is NOT scaled with the
+                            // measured distances**, and this is a legality
+                            // repair rather than an accuracy one. A stored
+                            // `+/-NARROW_BAND` does not mean "three voxels
+                            // away", it means "further than the band reaches
+                            // and we stopped counting". Multiplying it by `s`
+                            // turns the whole far field into what reads as a
+                            // measured distance: at `s = 0.5` every value lands
+                            // inside `+/-1.5` and not one voxel is saturated
+                            // any more -- measured, 971,210 saturated voxels
+                            // became zero. `in_band` then accepts the plateau,
+                            // `measurable` stops skipping it, and a flat region
+                            // has no gradient, so `gradient_drift` reports 1.0
+                            // for a field whose real drift is 0.
+                            //
+                            // Writing the band edge back is a LIE about
+                            // distance -- the true clearance is only `3s` -- and
+                            // it is only sound because `redistance` runs
+                            // straight afterwards and re-solves the band
+                            // outward from the interface. It must NOT be
+                            // adopted as a policy in place of redistancing: at
+                            // `MIN_SCALE` it would claim three voxels of
+                            // clearance where 0.15 exists, and `raycast`
+                            // sphere-marches on exactly these values.
+                            let from = by.inverse_transform_point(world);
+                            let source = if gathered {
+                                region.sample(from / voxel_size)
+                            } else {
+                                self.sample_world(from)
+                            };
+                            let value = if source.abs() >= OUTSIDE {
+                                source
+                            } else {
+                                source * by.min_scale()
+                            };
                             data[brick_index(x, y, z)] = value.clamp(INSIDE, OUTSIDE);
                         }
                     }
@@ -274,6 +339,7 @@ impl Volume {
                     None => Some((*coord, brick)),
                 }
             })
+            .flatten()
             .collect();
 
         for (coord, brick) in built {
@@ -313,6 +379,7 @@ impl Volume {
 mod tests {
     use super::*;
     use crate::orientation::{AxisRotation, Facing};
+    use crate::redistance::GRADIENT_TOLERANCE;
     use crate::similarity::Bake;
     use glam::Quat;
 
@@ -564,6 +631,137 @@ mod tests {
             // scaled body sit beside its unscaled siblings.
             assert_eq!(scaled.voxel_size(), volume.voxel_size());
         }
+    }
+
+    /// **Reading through a gathered region must give the same field as reading
+    /// through the brick map.**
+    ///
+    /// `Volume::warped` used to call `sample_world` per destination voxel, and
+    /// a trilinear sample is eight reads, so a dense brick paid 262,144 hash
+    /// lookups. [`Volume::resampled`] has always gathered the source region
+    /// once and read a flat array instead; the two loops are siblings and only
+    /// this one was missing it.
+    ///
+    /// A speed change that quietly moved a voxel would be the worst kind, so
+    /// this drives both paths over a squash, a shrink and a grow and compares
+    /// the storage bit for bit -- including which bricks exist at all, since a
+    /// difference of one ULP either side of `is_collapsible`'s exact test would
+    /// change a brick's representation rather than its values.
+    #[test]
+    fn a_gathered_warp_is_bit_identical_to_a_sampled_one() {
+        let volume = sphere(0.5);
+        for scale in [Vec3::new(1.0, 0.6, 1.0), Vec3::splat(0.5), Vec3::splat(1.7)] {
+            let by = Similarity::about(Vec3::ZERO, Quat::IDENTITY, scale, Vec3::new(3.0, 0.0, 1.0));
+            let gathered = volume.warped_inner(by, true);
+            let sampled = volume.warped_inner(by, false);
+            assert!(
+                gathered.stats().dense_bricks > 0,
+                "no dense bricks at scale {scale:?}, so nothing was actually sampled"
+            );
+            crate::testing::assert_same_field(
+                &gathered,
+                &sampled,
+                &format!("gathering the source changed the field at scale {scale:?}"),
+            );
+        }
+    }
+
+    /// **A shrunk body must measure the size it was shrunk to.**
+    ///
+    /// `surface_bounds` rejects the far field with `value.abs() >= NARROW_BAND`,
+    /// which is only a valid test while the saturation constant IS
+    /// `NARROW_BAND`. A shrink used to scale the plateau along with the measured
+    /// distances, so nothing was saturated any more, the predicate stopped
+    /// rejecting anything, and the whole volume read as surface -- 47.75 mm
+    /// against an exact 36.000 on a 0.25 mm lattice, 32.6% out.
+    ///
+    /// That is not a cosmetic number. `set_working_size` divides by this span,
+    /// under a docstring calling the operation free and lossless, so a body
+    /// scaled down and then set to a size would have exported at the wrong
+    /// physical size -- a wrong part out of the slicer.
+    #[test]
+    fn the_measured_size_of_a_shrunk_body_is_the_size_it_was_shrunk_to() {
+        for voxel_size in [0.25_f32, 0.125] {
+            for scale in [0.6_f32, 0.3] {
+                let volume = sphere(voxel_size);
+                let shrunk = volume.warped(Similarity::about(
+                    Vec3::ZERO,
+                    Quat::IDENTITY,
+                    Vec3::splat(scale),
+                    Vec3::ZERO,
+                ));
+                let (lo, hi) = shrunk.surface_bounds().expect("the shrunk body has a surface");
+                let measured = (hi - lo).max_element();
+                let expected = RADIUS * 2.0 * scale;
+                assert!(
+                    (measured - expected).abs() <= voxel_size * 4.0,
+                    "a {RADIUS} mm-radius ball scaled by {scale} at a {voxel_size} mm voxel \
+                     measured {measured} mm across, expected {expected} mm"
+                );
+            }
+        }
+    }
+
+    /// **A shrink must leave a band that still reaches the band edge.**
+    ///
+    /// `d' = s * d(T_inv(p))` is exact for a similarity, so a uniformly scaled
+    /// body is a true distance field and its drift must measure as zero. It did
+    /// not, and the reason was the saturation plateau rather than the geometry:
+    /// the multiply scaled the clamp along with the measured distances, so at
+    /// `s = 0.5` the whole volume landed inside `+/-1.5` and **not one voxel was
+    /// saturated** -- measured, 971,210 became zero. `measurable` skips a voxel
+    /// only when its stencil touches saturation, so the flat far field was then
+    /// measured, and a flat region has no gradient, so `gradient_drift` came
+    /// back with 1.0.
+    ///
+    /// It was permanent, too. `rebake_gizmo` used to skip `redistance` when the
+    /// scale was uniform, on the correct-sounding reasoning that a similarity
+    /// leaves a true distance field, so nothing ever put the band back and the
+    /// body reported a drift of 1.0 for the rest of its life. Since the brush
+    /// residual is meant to be gated on measured drift, wiring it up would have
+    /// fired it on every body that had ever been scaled and never converged.
+    ///
+    /// Asserted on the pair, not on `warped` alone, because that is the pair
+    /// production runs: `warped` deliberately leaves a cliff at the band edge
+    /// and `redistance` is what resolves it. Testing `warped` by itself would
+    /// pin the intermediate state and forbid the fix.
+    #[test]
+    fn a_uniform_shrink_leaves_a_full_depth_band() {
+        let volume = sphere(0.5);
+        let before = volume.gradient_drift();
+        assert!(before <= GRADIENT_TOLERANCE, "the fixture already drifts by {before}");
+
+        let mut scaled = volume.warped(Similarity::about(
+            Vec3::ZERO,
+            Quat::IDENTITY,
+            Vec3::splat(0.5),
+            Vec3::ZERO,
+        ));
+        scaled.redistance();
+
+        let deepest = scaled
+            .brick_coords()
+            .collect::<Vec<_>>()
+            .into_iter()
+            .filter_map(|coord| match scaled.brick(coord) {
+                Some(Brick::Dense(data)) => data.iter().copied().fold(None::<f32>, |worst, v| {
+                    Some(worst.map_or(v.abs(), |w: f32| w.max(v.abs())))
+                }),
+                _ => None,
+            })
+            .fold(0.0f32, f32::max);
+        assert!(
+            deepest >= NARROW_BAND,
+            "the deepest value in the band is {deepest}, so the shrink carried the saturation \
+             plateau down with it and the band no longer reaches its own edge"
+        );
+
+        let drift = scaled.gradient_drift();
+        assert!(
+            drift <= GRADIENT_TOLERANCE,
+            "a uniform scale is an exact distance field, so the drift should be near zero \
+             and it measured {drift}"
+        );
     }
 
     /// A distance field that is not a distance field breaks the sphere trace,
