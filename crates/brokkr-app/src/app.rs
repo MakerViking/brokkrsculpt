@@ -588,6 +588,8 @@ pub struct Brokkr {
     /// sub-slop drag really does change the placement, and dropping it would be
     /// silently discarding something the user asked for.
     gizmo_baked: Option<brokkr_core::Similarity>,
+    /// Whether the welcome screen is up. See [`crate::welcome`].
+    welcome: bool,
     /// The cube part under the pointer, lit so a click's effect is visible
     /// before the click.
     cube_hover: Option<navcube::Part>,
@@ -1509,6 +1511,40 @@ fn keeps_the_gizmo_armed(message: &Message) -> bool {
     }
 }
 
+/// Whether a message is one of the welcome screen's own actions, and so
+/// dismisses it.
+///
+/// **It is a starting point, not a mode.** Pressing New sculpt has answered the
+/// question the screen was asking -- which is why SindriCAD's buttons call
+/// `close()` before their action rather than after. It is not only tidiness:
+/// the welcome card ranks above every other card, so leaving it up draws the
+/// unsaved-work prompt that `New sculpt` raises UNDERNEATH it, raised,
+/// unanswerable and invisible.
+///
+/// **Asked as "what closes it" and NOT as "what keeps it open", which is the
+/// opposite of the gizmo's guard beside it.** That one denies by default
+/// because an armed gizmo holds a gesture that must not survive an unrelated
+/// message. This holds nothing, so the two failure directions are not
+/// symmetric: a screen that lingers one message too long is a click, and a
+/// screen that never appears is invisible. Written the other way round it was
+/// dismissed before it could be seen -- by `TimelineResized`, a LAYOUT message
+/// the window emits as it lays itself out, which no allow-list would have
+/// thought to name.
+///
+/// The list is knowable and complete by construction: the card is `opaque`, so
+/// while it is up nothing else on screen can produce a message at all, and
+/// these are exactly the controls it offers.
+fn dismisses_the_welcome(message: &Message) -> bool {
+    matches!(
+        message,
+        Message::WelcomeClosed
+            | Message::NewSculpt
+            | Message::OpenRequested
+            | Message::ImportRequested
+            | Message::OpenRecent(_)
+    )
+}
+
 fn keeps_the_rename_open(message: &Message) -> bool {
     match message {
         Message::BodyRenameEdited(_) => true,
@@ -1522,7 +1558,20 @@ fn keeps_the_rename_open(message: &Message) -> bool {
 
 impl Brokkr {
     pub fn new() -> Self {
-        Self::with_devices(Tablet::start(), SpaceMouse::start())
+        let mut app = Self::with_devices(Tablet::start(), SpaceMouse::start());
+        // **Read here and not in `with_devices`, which is what the tests
+        // build through.** The welcome screen is modal, so an application
+        // constructed with it up has every keyboard and pointer path blocked by
+        // `modal_open` -- and a test that built one would silently stop
+        // sculpting. Worse, it would do so depending on whether the developer
+        // running the suite happens to have dismissed the screen, which is a
+        // test outcome that varies by machine.
+        //
+        // Set last, so it opens over a document that is already whole: it ranks
+        // above every other card, and anything raised during construction would
+        // be drawn underneath it and be unreachable.
+        app.welcome = crate::welcome::on_startup();
+        app
     }
 
     /// Build with a given pressure source and an inert puck, which is what
@@ -1624,6 +1673,7 @@ impl Brokkr {
             gizmo: None,
             gizmo_base: None,
             gizmo_baked: None,
+            welcome: false,
             cube_hover: None,
             flight: None,
             menu: None,
@@ -7218,7 +7268,8 @@ impl Brokkr {
     /// take the pointer: **split this function in two at that point rather than
     /// widening it and quietly killing the drag.**
     fn modal_open(&self) -> bool {
-        self.confirm.is_some()
+        self.welcome
+            || self.confirm.is_some()
             || self.orient_prompt.is_some()
             || self.bug_report.is_some()
             || self.pending_delete.is_some()
@@ -7245,6 +7296,14 @@ impl Brokkr {
             // the user typed, and throwing it away on a stray Escape is the
             // same class of loss the confirm prompt exists to prevent.
             iced::keyboard::Key::Named(iced::keyboard::key::Named::Escape) => {
+                // The welcome screen first, and unlike the bug report it DOES
+                // go on Escape: it holds nothing the user typed, so there is
+                // nothing to lose by dismissing it, and a modal with no
+                // keyboard exit is the one thing worse than no modal.
+                if self.welcome {
+                    self.welcome = false;
+                    return Task::none();
+                }
                 self.update(Message::MenuClosed)
             }
             iced::keyboard::Key::Character(character) => {
@@ -7706,6 +7765,12 @@ impl Brokkr {
         // same set, and that set is not a list anyone can keep correct.
         // Asking the question once, before the message is acted on, cannot go
         // out of date.
+        // Before the gizmo guard and before dispatch, so that a card this
+        // message goes on to raise is drawn over a screen that has already
+        // gone rather than under one that has not.
+        if self.welcome && dismisses_the_welcome(&message) {
+            self.welcome = false;
+        }
         if self.gizmo.is_some() && !keeps_the_gizmo_armed(&message) {
             self.disarm_gizmo(true);
         }
@@ -7783,6 +7848,15 @@ impl Brokkr {
                 let slot = self.live_strength_slot();
                 self.strengths[slot] = strength;
             }
+            Message::WelcomeOpened => {
+                // The menu it was chosen from has to go, or it is left drawn
+                // beneath the scrim: reachable to nothing, and still there when
+                // the screen is dismissed.
+                self.top_menu = None;
+                self.welcome = true;
+            }
+            Message::WelcomeClosed => self.welcome = false,
+            Message::WelcomeOnStartupSet(show) => crate::welcome::set_on_startup(show),
             Message::SymmetryAxisToggled(axis) => self.toggle_mirror(axis),
             Message::PatternChanged(kind) => self.brush.pattern.kind = kind,
             Message::PatternScaleChanged(scale) => self.brush.pattern.scale_mm = scale,
@@ -9612,6 +9686,78 @@ mod tests {
     /// reads or they prove nothing.
     fn ctrl() -> iced::keyboard::Modifiers {
         iced::keyboard::Modifiers::CTRL
+    }
+
+    /// **An action from the welcome screen dismisses it.**
+    ///
+    /// It is a starting point and not a mode: pressing New sculpt has answered
+    /// the question the screen was asking. And because the welcome card ranks
+    /// above every other card, leaving it up draws the unsaved-work prompt that
+    /// `New sculpt` raises UNDERNEATH it -- raised, unanswerable and invisible.
+    /// Seen exactly that way in the running application before this landed.
+    #[test]
+    fn an_action_from_the_welcome_screen_dismisses_it_so_its_prompt_is_reachable() {
+        let mut app = app_with_unsaved_work();
+        app.welcome = true;
+
+        update(&mut app, Message::NewSculpt);
+
+        assert!(!app.welcome, "the welcome screen survived an action taken from it");
+        assert!(
+            app.confirm.is_some(),
+            "the fixture raised no prompt, so this does not test what it names"
+        );
+    }
+
+    /// The tick must not dismiss the screen it is a setting for.
+    #[test]
+    fn the_startup_tick_does_not_dismiss_the_welcome_screen() {
+        let mut app = app();
+        app.welcome = true;
+
+        // Read the preference back rather than trusting the write: this is the
+        // one control whose whole job is to persist.
+        let was = crate::welcome::on_startup();
+        update(&mut app, Message::WelcomeOnStartupSet(!was));
+        assert!(app.welcome, "ticking the box closed the screen it belongs to");
+        assert_eq!(crate::welcome::on_startup(), !was, "the tick did not persist");
+
+        update(&mut app, Message::WelcomeOnStartupSet(was));
+        assert_eq!(crate::welcome::on_startup(), was, "the fixture did not put the setting back");
+    }
+
+    /// No shortcut may reach the document through the welcome screen.
+    ///
+    /// It is modal like every other card, and `modal_open` is the one place
+    /// that is decided -- a card missing from that list is a card the keyboard
+    /// reaches straight through.
+    #[test]
+    fn no_shortcut_fires_while_the_welcome_screen_is_up() {
+        let mut app = app();
+        app.welcome = true;
+        let before = app.brush.kind;
+
+        key(&mut app, "3", bare());
+        key(&mut app, "x", bare());
+
+        assert_eq!(app.brush.kind, before, "a brush number changed the tool behind the screen");
+        assert!(!app.symmetry.axis(MirrorAxis::X), "a mirror plane toggled behind the screen");
+        assert!(app.welcome, "a shortcut dismissed the screen instead of being swallowed");
+    }
+
+    /// Escape closes it, unlike the bug report, which holds typed text.
+    #[test]
+    fn escape_closes_the_welcome_screen() {
+        let mut app = app();
+        app.welcome = true;
+        update(
+            &mut app,
+            Message::KeyPressed {
+                key: iced::keyboard::Key::Named(iced::keyboard::key::Named::Escape),
+                modifiers: bare(),
+            },
+        );
+        assert!(!app.welcome, "Escape left the screen up, so it has no keyboard exit");
     }
 
     /// The undo that used to reach through the card.

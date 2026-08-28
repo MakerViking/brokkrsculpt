@@ -25,6 +25,7 @@ mod theme;
 mod thumbnails;
 mod timeline;
 mod viewport;
+mod welcome;
 
 use app::Brokkr;
 
