@@ -134,19 +134,20 @@ pub fn parse(xml: &str) -> Result<Vec<Article>, String> {
     Ok(parse_items(xml)?.into_iter().map(|(article, _)| article).collect())
 }
 
-/// The items, each with the URL of its picture if it has a usable one.
-///
-/// **Separate from [`parse`] so that parsing is pure.** Fetching thumbnails
-/// from inside the parser meant the unit tests only avoided the network by
-/// accident -- their fixtures happen to carry no `<enclosure>`, and the first
-/// one that did would have started making real requests from `cargo test`.
-/// Pull the items out of an RSS document.
+/// Pull the items out of an RSS document, each with the URL of its picture if
+/// it has a usable one.
 ///
 /// Deliberately tolerant: an item missing a title or a link is skipped rather
 /// than failing the whole feed, because one malformed entry on the site should
 /// not blank the panel. A document that is not XML at all IS an error -- that
 /// is a captive portal or an error page, and saying "no articles" for it would
 /// be a lie about what happened.
+///
+/// **It returns the picture URL rather than fetching it, so that parsing stays
+/// pure.** Fetching thumbnails from inside the parser meant the unit tests only
+/// avoided the network by accident -- their fixtures happen to carry no
+/// `<enclosure>`, and the first one that did would have started making real
+/// requests from `cargo test`.
 fn parse_items(xml: &str) -> Result<Vec<(Article, Option<String>)>, String> {
     let document =
         roxmltree::Document::parse(xml).map_err(|why| format!("the feed is not XML ({why})"))?;

@@ -66,6 +66,19 @@ const VOXEL_EPSILON: f32 = 1.0e-3;
 /// How near one a scale has to be to take the exact route.
 const SCALE_EPSILON: f32 = 1.0e-5;
 
+/// How near identical two rotations must be to count as the same bake.
+///
+/// **Deliberately NOT [`AXIS_EPSILON`], and they must not be merged.** That one
+/// classifies a rotation as near-enough-a-quarter-turn to take the exact route,
+/// and is loose on purpose. This one asks whether two quaternions are the same
+/// placement, which is a different question and needs the tighter answer:
+/// because a quaternion dot is `cos(θ/2)`, `1 - 1.0e-4` admits 1.62 degrees of
+/// real rotation while `1 - 1.0e-6` admits 0.16. At the looser figure
+/// [`Similarity::same_bake`] tells its caller nothing has moved after a
+/// deliberate degree-and-a-half turn, and the field silently keeps the old
+/// orientation. See `a_small_deliberate_rotation_is_not_the_same_bake`.
+const BAKE_ROTATION_EPSILON: f32 = 1.0e-6;
+
 /// A rotation, one uniform scale and a translation.
 ///
 /// Applied to a point as `rotation * (scale * point) + translation`. See the
@@ -204,18 +217,26 @@ impl Similarity {
     /// last bits. An exact comparison therefore never fires, and the caller
     /// that wanted to skip a re-bake pays for one anyway.
     ///
-    /// Expressed in the same epsilons [`Similarity::route`] uses, and that is
-    /// the point of it living here: the question is "would baking this again
-    /// produce the field we already have", which is the routing question, and
-    /// an app-side copy with its own tolerances can silently stop agreeing with
-    /// the router it exists to short-circuit. They are far below anything a
-    /// real gesture produces -- one pixel of drag moves the translation by a
-    /// whole `world_per_pixel` -- so this cannot swallow a deliberate nudge.
+    /// Translation and scale reuse [`Similarity::route`]'s own epsilons, which
+    /// is most of the point of it living here: the question is "would baking
+    /// this again produce the field we already have", and an app-side copy with
+    /// its own tolerances can silently stop agreeing with the router it exists
+    /// to short-circuit. They are far below anything a real gesture produces --
+    /// one pixel of drag moves the translation by a whole `world_per_pixel`.
+    ///
+    /// **Rotation is the exception** and takes [`BAKE_ROTATION_EPSILON`], not
+    /// `AXIS_EPSILON`: the routing constant answers a different question and is
+    /// two orders of magnitude looser, enough to swallow a real turn. The
+    /// argument above is a TRANSLATION argument and does not carry over.
     pub fn same_bake(self, other: Self, voxel_size: f32) -> bool {
+        // A voxel size of zero, negative or NaN is not a size a document can
+        // have; falling back to 1.0 keeps the translation term a plain distance
+        // rather than propagating a NaN into a comparison that would then be
+        // false and force a re-bake on every event.
         let voxel = if voxel_size.is_finite() && voxel_size > 0.0 { voxel_size } else { 1.0 };
         (self.translation - other.translation).length() <= voxel * VOXEL_EPSILON
             && (self.scale - other.scale).abs().max_element() <= SCALE_EPSILON
-            && self.rotation.dot(other.rotation).abs() >= 1.0 - AXIS_EPSILON
+            && self.rotation.dot(other.rotation).abs() >= 1.0 - BAKE_ROTATION_EPSILON
     }
 
     /// A conservative source box for a destination box: the eight corners
@@ -522,6 +543,53 @@ mod tests {
                 "a turn {offset} rad off square was called exact"
             );
         }
+    }
+
+    /// The rotation tolerance has to sit between two failures, and a single
+    /// constant shared with the router lands on the wrong side of one of them.
+    ///
+    /// Too tight and `same_bake` never fires, because `then` is not
+    /// bit-reproducible and a motionless press still perturbs the last bits --
+    /// the re-bake it exists to skip goes on happening. Too loose and it
+    /// reports "nothing moved" for a turn the user made on purpose, so the
+    /// field keeps the old orientation while the gizmo shows the new one.
+    ///
+    /// The upper end is what regressed when this moved into core: expressed in
+    /// `AXIS_EPSILON` it admitted 1.62 degrees, because a quaternion dot is
+    /// `cos(θ/2)` and the angle grows as the square root of the epsilon.
+    #[test]
+    fn a_small_deliberate_rotation_is_not_the_same_bake() {
+        let baked = Similarity::about(Vec3::ZERO, Quat::IDENTITY, Vec3::ONE, Vec3::ZERO);
+
+        // A turn a user can see, and well inside what AXIS_EPSILON would have
+        // swallowed. Half a degree is a fine nudge, not a slip.
+        for degrees in [0.5_f32, 1.0, 1.5, 5.0] {
+            let moved = Similarity::about(
+                Vec3::ZERO,
+                Quat::from_rotation_y(degrees.to_radians()),
+                Vec3::ONE,
+                Vec3::ZERO,
+            );
+            assert!(
+                !baked.same_bake(moved, VOXEL),
+                "a {degrees} degree turn was called the same bake, so it would not be baked"
+            );
+        }
+
+        // And the other end still holds: the last-bit difference a motionless
+        // press leaves behind must still count as unmoved, or the skip is dead
+        // code and every press re-bakes the whole field.
+        let jitter = Similarity {
+            rotation: Quat::from_xyzw(
+                baked.rotation.x,
+                baked.rotation.y,
+                baked.rotation.z + f32::EPSILON,
+                baked.rotation.w,
+            )
+            .normalize(),
+            ..baked
+        };
+        assert!(baked.same_bake(jitter, VOXEL), "float jitter was called a move");
     }
 
     /// Whatever the route says is exact really is a lattice map: every lattice
