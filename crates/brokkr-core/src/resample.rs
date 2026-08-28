@@ -32,7 +32,7 @@ use crate::volume::Volume;
 ///
 /// Four million is 16 MB of `f32` per worker, which is a sensible ceiling for
 /// something every core holds at once.
-const MAX_GATHERED_SAMPLES: i64 = 4 << 20;
+pub(crate) const MAX_GATHERED_SAMPLES: i64 = 4 << 20;
 
 /// What the old volume holds over some region.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
