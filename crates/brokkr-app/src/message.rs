@@ -400,6 +400,9 @@ pub enum Message {
     SignInRequested,
     /// The sign-in came back, with an account or with why not.
     SignInFinished(Result<crate::account::Account, String>),
+    /// The signed-in user's avatar arrived, or did not. `None` is ordinary:
+    /// no picture, an unreachable host, a format we do not decode.
+    AvatarLoaded(Option<iced::widget::image::Handle>),
     /// Forget the stored account. Local only: it does not revoke the token,
     /// which is done on the site under desktop connections.
     SignOutRequested,

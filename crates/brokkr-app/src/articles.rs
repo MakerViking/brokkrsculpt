@@ -226,17 +226,43 @@ const THUMB_HEIGHT: u32 = 180;
 ///
 /// Only ever the storage host, over TLS. These bytes are fed to a decoder, so
 /// where they come from is a security question and not a tidiness one.
-fn thumbnail_url(enclosure: &str) -> Option<String> {
+fn render_url(stored: &str, width: u32, height: u32) -> Option<String> {
     const PREFIX: &str = "https://api.tinkeratlas.com/storage/v1/object/public/";
     const RENDER: &str = "https://api.tinkeratlas.com/storage/v1/render/image/public/";
-    let rest = enclosure.strip_prefix(PREFIX)?;
+    let rest = stored.strip_prefix(PREFIX)?;
     // A query of its own would be appended to ours and could override the size.
     if rest.contains('?') {
         return None;
     }
-    Some(format!(
-        "{RENDER}{rest}?width={THUMB_WIDTH}&height={THUMB_HEIGHT}&resize=cover&quality=70"
-    ))
+    Some(format!("{RENDER}{rest}?width={width}&height={height}&resize=cover&quality=70"))
+}
+
+/// The 16:9 URL for an article thumbnail.
+fn thumbnail_url(enclosure: &str) -> Option<String> {
+    render_url(enclosure, THUMB_WIDTH, THUMB_HEIGHT)
+}
+
+/// How big an avatar is asked for. Square, because the row draws it in a
+/// square: the article size is 16:9 and an avatar through that comes back a
+/// letterbox with the top and bottom of someone's head cropped off.
+const AVATAR_PX: u32 = 64;
+
+/// Fetch the signed-in user's avatar, or nothing.
+///
+/// **The same allowlisted prefix and the same decoder path as an article
+/// picture**, deliberately: the profile URL Supabase stores is under exactly
+/// the storage prefix [`render_url`] already accepts, and it carries no query
+/// of its own, so nothing here widens what may be fed to a decoder. If a
+/// future avatar lives somewhere else, the answer is no picture, not a wider
+/// allowlist.
+///
+/// `None` for every failure. A missing avatar must never cost the row its
+/// name -- see the account row in `panel.rs`.
+pub fn fetch_avatar(stored_url: &str) -> Option<iced::widget::image::Handle> {
+    let url = render_url(stored_url, AVATAR_PX, AVATAR_PX)?;
+    let agent: ureq::Agent =
+        ureq::Agent::config_builder().timeout_global(Some(TIMEOUT)).build().into();
+    fetch_picture(&agent, &url, AVATAR_PX, AVATAR_PX)
 }
 
 /// Fetch and decode one thumbnail. `None` on any failure, which is ordinary.
@@ -246,17 +272,31 @@ fn thumbnail_url(enclosure: &str) -> Option<String> {
 /// propagates. The one thing it will not do is decode something enormous: the
 /// server was asked for 240 pixels, and anything far larger than that is not
 /// the picture that was requested.
-fn fetch_thumbnail(agent: &ureq::Agent, url: &str) -> Option<iced::widget::image::Handle> {
+fn fetch_picture(
+    agent: &ureq::Agent,
+    url: &str,
+    asked_width: u32,
+    asked_height: u32,
+) -> Option<iced::widget::image::Handle> {
     let mut response = agent.get(url).call().ok()?;
     let mut bytes = Vec::new();
     response.body_mut().as_reader().take(MAX_THUMB_BYTES).read_to_end(&mut bytes).ok()?;
 
     let decoded = image::load_from_memory(&bytes).ok()?;
     let (width, height) = (decoded.width(), decoded.height());
-    if width == 0 || height == 0 || width > THUMB_WIDTH * 4 || height > THUMB_HEIGHT * 4 {
+    // Four times what was ASKED FOR, not four times an article thumbnail: the
+    // check is "this is not remotely the picture we requested", so it has to
+    // scale with the request or it stops meaning that. A 64-pixel avatar
+    // measured against the article ceiling would wave through a 1280x720.
+    if width == 0 || height == 0 || width > asked_width * 4 || height > asked_height * 4 {
         return None;
     }
     Some(iced::widget::image::Handle::from_rgba(width, height, decoded.into_rgba8().into_raw()))
+}
+
+/// An article thumbnail at the article size.
+fn fetch_thumbnail(agent: &ureq::Agent, url: &str) -> Option<iced::widget::image::Handle> {
+    fetch_picture(agent, url, THUMB_WIDTH, THUMB_HEIGHT)
 }
 
 /// A ceiling on what will be read for one thumbnail.

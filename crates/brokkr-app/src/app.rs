@@ -608,6 +608,13 @@ pub struct Brokkr {
     /// Whether a sign-in is waiting on the browser, so the button can say so
     /// and cannot be pressed into starting a second listener.
     signing_in: bool,
+    /// The signed-in user's picture, once it has arrived.
+    ///
+    /// Held here and not on [`crate::account::Account`] so that module stays
+    /// free of the renderer: the account is an identity, this is a decoded
+    /// texture. It is also why it is not in the stored file -- a `Handle` is
+    /// not something to persist, and the URL it came from already is.
+    avatar: Option<iced::widget::image::Handle>,
     /// The cube part under the pointer, lit so a click's effect is visible
     /// before the click.
     cube_hover: Option<navcube::Part>,
@@ -1604,7 +1611,11 @@ impl Brokkr {
         app.account = crate::account::load();
         // The screen is up, so its articles are wanted. The only other place
         // that raises it, `Message::WelcomeOpened`, asks for them too.
-        let boot = if app.welcome { app.fetch_articles() } else { Task::none() };
+        let boot = if app.welcome {
+            Task::batch([app.fetch_articles(), app.fetch_avatar()])
+        } else {
+            Task::none()
+        };
         (app, boot)
     }
 
@@ -1712,6 +1723,7 @@ impl Brokkr {
             feed: crate::articles::Feed::default(),
             account: None,
             signing_in: false,
+            avatar: None,
             cube_hover: None,
             flight: None,
             menu: None,
@@ -7285,6 +7297,25 @@ impl Brokkr {
         Task::perform(async { crate::articles::fetch() }, Message::ArticlesLoaded)
     }
 
+    /// Ask for the signed-in user's picture, if there is one to ask for.
+    ///
+    /// Fetched when the welcome screen goes up rather than at startup, for the
+    /// same reason the articles are: the account row is the only place it is
+    /// drawn, so a session that never opens that screen never makes the
+    /// request. Once held it is kept -- it is the same picture.
+    fn fetch_avatar(&self) -> Task<Message> {
+        if self.avatar.is_some() {
+            return Task::none();
+        }
+        let Some(url) = self.account.as_ref().map(|a| a.avatar_url.clone()) else {
+            return Task::none();
+        };
+        if url.is_empty() {
+            return Task::none();
+        }
+        Task::perform(async move { crate::articles::fetch_avatar(&url) }, Message::AvatarLoaded)
+    }
+
     /// Whether a modal card is up, and therefore owns the input.
     ///
     /// One list, read by both halves of the guard: `on_key` for the keyboard
@@ -7898,7 +7929,7 @@ impl Brokkr {
                 // the screen is dismissed.
                 self.top_menu = None;
                 self.welcome = true;
-                return self.fetch_articles();
+                return Task::batch([self.fetch_articles(), self.fetch_avatar()]);
             }
             Message::ArticlesRetried => return self.fetch_articles(),
             Message::ArticlesLoaded(answer) => {
@@ -7940,15 +7971,20 @@ impl Brokkr {
                     Ok(account) => {
                         self.status = format!("signed in as {}", account.label());
                         self.account = Some(account);
+                        return self.fetch_avatar();
                     }
                     // "could not" is what colours the status line as an error;
                     // see `panel.rs`.
                     Err(why) => self.status = format!("could not sign in: {why}"),
                 }
             }
+            Message::AvatarLoaded(handle) => self.avatar = handle,
             Message::SignOutRequested => match crate::account::sign_out() {
                 Ok(()) => {
                     self.account = None;
+                    // Or the next person to sign in on this machine gets the
+                    // last one's face beside their name.
+                    self.avatar = None;
                     self.status = "signed out".to_string();
                 }
                 Err(why) => self.status = why,

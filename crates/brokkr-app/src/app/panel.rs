@@ -575,7 +575,29 @@ impl Brokkr {
         left = left.push(space::vertical().height(theme::S3));
         left = left.push(match &self.account {
             Some(account) => column![
-                text(account.label().to_string()).size(theme::TEXT_SIZE).color(theme::TEXT),
+                {
+                    // The picture is optional in the strongest sense: a
+                    // profile with none, a host that will not answer and a
+                    // format we do not decode all arrive here as `None`, and
+                    // in every one of them the row is the name alone. A
+                    // missing face must never cost the account row.
+                    let mut who = row![].spacing(theme::S2).align_y(Alignment::Center);
+                    if let Some(handle) = &self.avatar {
+                        who = who.push(
+                            container(
+                                iced::widget::image(handle.clone())
+                                    .width(Length::Fixed(AVATAR_ROW_PX))
+                                    .content_fit(iced::ContentFit::Cover),
+                            )
+                            .clip(true)
+                            .width(Length::Fixed(AVATAR_ROW_PX))
+                            .height(Length::Fixed(AVATAR_ROW_PX)),
+                        );
+                    }
+                    who.push(
+                        text(account.label().to_string()).size(theme::TEXT_SIZE).color(theme::TEXT),
+                    )
+                },
                 button(text("Sign out").size(theme::TEXT_SIZE_SMALL))
                     .padding(Padding {
                         top: theme::S1,
@@ -3359,6 +3381,13 @@ const GRID_HEIGHT_PX: f32 = 440.0;
 
 /// How many article cards sit side by side.
 const GRID_COLUMNS: usize = 2;
+
+/// How big the avatar is drawn in the account row, in logical pixels.
+///
+/// Smaller than the 64 asked of the server, which is deliberate: the row is
+/// one line of text tall, and a picture with pixels to spare stays sharp on a
+/// HiDPI output instead of being upscaled.
+const AVATAR_ROW_PX: f32 = 28.0;
 
 /// Cut a path down so it cannot push a column wider than it was given.
 ///
