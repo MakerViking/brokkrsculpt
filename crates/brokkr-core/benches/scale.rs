@@ -15,9 +15,10 @@
 use std::time::Instant;
 
 use brokkr_core::{
-    BrickCoord, BrickMesh, Brush, BrushDirection, BrushKind, BrushScratch, Stamp, Volume,
+    BrickCoord, BrickMesh, Brush, BrushDirection, BrushKind, BrushScratch, DEFAULT_RECLAIM_BUDGET,
+    Similarity, Stamp, Volume, redistance::GRADIENT_TOLERANCE,
 };
-use glam::Vec3;
+use glam::{Quat, Vec3};
 
 /// The model, in millimetres, matching what the application seeds.
 const MODEL_RADIUS: f32 = 30.0;
@@ -67,6 +68,137 @@ fn mesh_all(volume: &mut Volume) -> FullMesh {
         drawn_bricks: meshes.iter().filter(|mesh| !mesh.is_empty()).count(),
         milliseconds,
     }
+}
+
+/// What one release-time bake cost, for a body of a given size.
+struct BakePasses {
+    warp_ms: f64,
+    redistance_ms: f64,
+    /// The worst `||grad d| - 1|` before the warp, after it, and after the
+    /// repair. The middle number is the damage a per-axis scale does; the last
+    /// is whether `redistance` actually undid it.
+    drift_before: f32,
+    drift_warped: f32,
+    drift_repaired: f32,
+    dense_before: usize,
+    dense_after: usize,
+    resident_before: usize,
+    resident_after: usize,
+}
+
+/// A per-axis scale and the repair that follows it, which is what every gizmo
+/// release already pays for and what a deformer will pay again.
+///
+/// The scale is deliberately non-uniform: a uniform one leaves the field a true
+/// distance field, `Similarity::is_uniform_scale` says so, and `rebake_gizmo`
+/// skips the repair entirely. This measures the branch that does not skip.
+fn bake_passes(volume: &Volume) -> BakePasses {
+    let before = volume.stats();
+    let drift_before = volume.gradient_drift();
+
+    let squash =
+        Similarity::about(Vec3::ZERO, Quat::IDENTITY, Vec3::new(1.0, 0.6, 1.0), Vec3::ZERO);
+    let warp_start = Instant::now();
+    let mut warped = volume.warped(squash);
+    let warp_ms = millis(warp_start);
+    let drift_warped = warped.gradient_drift();
+
+    let redistance_start = Instant::now();
+    let report = warped.redistance();
+    let redistance_ms = millis(redistance_start);
+
+    let after = warped.stats();
+    BakePasses {
+        warp_ms,
+        redistance_ms,
+        drift_before,
+        drift_warped,
+        // `redistance` returns None when it declined, which means it judged the
+        // field already within tolerance -- so the drift it would have reported
+        // is the one measured going in.
+        drift_repaired: report.map_or(drift_warped, |report| report.worst_after),
+        dense_before: before.dense_bricks,
+        dense_after: after.dense_bricks,
+        resident_before: before.resident_bytes,
+        resident_after: after.resident_bytes,
+    }
+}
+
+/// The two passes that run on every gizmo release, neither of which had ever
+/// been timed.
+///
+/// Deliberately not in `budget.rs`: every constant there is derived from the
+/// 16 ms frame, and a release-time bake has no defensible frame budget. Putting
+/// these rows beside a budget would invite the next reader to invent one.
+///
+/// **The sweep stops at the size the gizmo can actually arm on.** `arm_gizmo`
+/// refuses outright when `size_of::<Volume>() + resident` exceeds
+/// [`DEFAULT_RECLAIM_BUDGET`], because a move it could not undo is worse than a
+/// move it will not make. Measuring past that measures a regime a deformer can
+/// never enter -- the reference dragon at 765 MB is one such body, and it is
+/// why the rows below print whether the gizmo would take them.
+fn report_release_passes() {
+    println!(
+        "The two passes every gizmo release pays for: one trilinear warp, then the repair.\n\
+         A {MODEL_RADIUS} mm sphere squashed to 0.6 along Y. The repair runs on EVERY resample\n\
+         now, uniform scales included -- a similarity leaves the measured distances exact but\n\
+         not the band, and this is the pass that puts the band back.\n"
+    );
+
+    for voxel_size in [0.25_f32, 0.18, 0.125, 0.09, 0.07] {
+        let mut volume = Volume::new(voxel_size);
+        volume.seed_sphere(Vec3::ZERO, MODEL_RADIUS);
+
+        let passes = bake_passes(&volume);
+        let entry_bytes = size_of::<Volume>() + passes.resident_before;
+        let armable = entry_bytes <= DEFAULT_RECLAIM_BUDGET;
+
+        println!(
+            "voxel {voxel_size:.4} mm   {:>7.1} MB in {} dense bricks   {}",
+            megabytes(passes.resident_before),
+            passes.dense_before,
+            if armable {
+                "the gizmo would arm on this"
+            } else {
+                "OVER the 512 MB arm limit, unreachable through the gizmo"
+            },
+        );
+        println!(
+            "  warp {:>9.1} ms   redistance {:>9.1} ms   together {:>9.1} ms",
+            passes.warp_ms,
+            passes.redistance_ms,
+            passes.warp_ms + passes.redistance_ms,
+        );
+        println!(
+            "  drift {:.3} before, {:.3} warped, {:.3} repaired   {}",
+            passes.drift_before,
+            passes.drift_warped,
+            passes.drift_repaired,
+            if passes.drift_repaired <= GRADIENT_TOLERANCE {
+                "within tolerance"
+            } else {
+                "STILL OUT OF TOLERANCE"
+            },
+        );
+        println!(
+            "  {} dense bricks after, {:>7.1} MB   {:+.1}% resident",
+            passes.dense_after,
+            megabytes(passes.resident_after),
+            (passes.resident_after as f64 / passes.resident_before.max(1) as f64 - 1.0) * 100.0,
+        );
+        println!();
+    }
+
+    println!(
+        "Read the redistance column first. It is serial where every other heavy pass in this\n\
+         crate is rayon-parallel, it runs NARROW_BAND + 1 outer iterations of eight Godunov\n\
+         sweeps over every dense brick, and it allocates a fresh 128 KB vector inside the outer\n\
+         loop. If it is seconds at the arm limit, then committing a deformation freezes the\n\
+         window and the repair has to be made parallel before anything is built on top of it.\n\n\
+         Read the resident column second. A warp that leaves more dense bricks than it found has\n\
+         not grown the model -- it has failed to collapse bricks back to tiles, which costs\n\
+         128 KB each and is invisible to any growth ceiling measured in stretch.\n"
+    );
 }
 
 fn main() {
@@ -156,4 +288,7 @@ fn main() {
          much per stamp while the remesh only grows with the number of bricks touched. Whichever\n\
          of those two crosses its budget first is what has to move to the GPU."
     );
+
+    println!();
+    report_release_passes();
 }
