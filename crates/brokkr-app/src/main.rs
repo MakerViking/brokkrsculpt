@@ -9,8 +9,12 @@ mod camera;
 mod crash;
 mod cursor;
 mod gizmo;
-#[cfg(target_os = "linux")]
 mod icon;
+// `/dev/input` and the evdev crate are Linux only, and so is everything that
+// reads them: the stylus in `tablet` and the puck in `spacemouse` both sit
+// behind the same gate. Windows and macOS need Pointer Input, Wintab or IOKit
+// instead, which is separate work rather than a port of this.
+#[cfg(target_os = "linux")]
 mod input_watch;
 mod logo;
 mod message;
