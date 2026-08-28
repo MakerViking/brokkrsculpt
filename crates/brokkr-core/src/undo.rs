@@ -76,6 +76,7 @@ use rustc_hash::FxHashMap;
 use crate::body::{Document, Node, NodeId, NodeMeta};
 use crate::brick::{Brick, BrickCoord};
 use crate::mask::{MaskBrick, MaskField};
+use crate::volume::Volume;
 
 /// Default ceiling on the brick snapshots undo history holds.
 ///
@@ -271,6 +272,29 @@ pub enum Change {
     /// Polarity rides inside the field rather than beside it, which is what
     /// makes Mask All one change and not two.
     WholeMask { body: NodeId, mask: Box<MaskField> },
+    /// A body's WHOLE field was replaced. Applying puts the previous one back.
+    ///
+    /// The transform gizmo's entry, and the shape follows [`Change::WholeMask`]
+    /// exactly rather than by analogy: the field that came off IS the only copy
+    /// of itself, [`crate::Volume`] does not implement `Clone` at all, so it is
+    /// MOVED in and a bake allocates nothing to record itself.
+    ///
+    /// **Its bytes are charged to the reclaim allowance and never to the stroke
+    /// budget.** A 765 MB field against the 256 MB stroke budget would evict
+    /// every stroke behind it -- and the operation would then have destroyed
+    /// the history it was trying to join. The reclaim allowance is the one that
+    /// exists for "the entry is the storage, and its size is known before the
+    /// operation runs", which is exactly this.
+    ///
+    /// **This is also what stops a transform clearing the history.**
+    /// [`Document::rotate`] and [`Document::resample`] both make every older
+    /// entry's brick coordinates meaningless, so their caller drops the whole
+    /// stack; with the original field on the stack instead, undoing the bake
+    /// makes those coordinates valid again and older strokes stay applicable.
+    /// The invariant in the module doc holds unchanged: eviction is still a
+    /// prefix or a suffix drop, and a body still only leaves through a
+    /// `NodeRemoved`.
+    WholeVolume { body: NodeId, volume: Box<Volume> },
     /// A row's name, eye, collapse or depth changed. Applying writes `before`.
     ///
     /// **The whole outline, both sides, over a FIXED id set.** That is what
@@ -322,6 +346,41 @@ impl Change {
                 let previous = volume.replace_mask(*mask);
                 Change::WholeMask { body, mask: Box::new(previous) }
             }
+            Change::WholeVolume { body, volume } => {
+                // Always applicable, by the same invariant `Change::Bricks`
+                // rests on: a removal sits above every edit to the body it
+                // removed, and eviction is a prefix or a suffix drop.
+                let previous = doc
+                    .replace_volume(body, *volume)
+                    .expect("a field change names a body that is still in the document");
+                // **Both sides marked dirty, and the outgoing side is the half
+                // that is easy to forget.** The same pairing
+                // [`crate::Volume::replace_mask`] makes, for a sharper reason:
+                // the field that arrives brings its own dirty set, and that set
+                // is EMPTY, because whatever remeshed it last drained it. So a
+                // swap that marks nothing tells the renderer nothing, and the
+                // screen goes on drawing the body where the change that is
+                // being undone put it -- geometry and interaction in different
+                // places, silently. The bricks the outgoing field occupied are
+                // marked in the INCOMING one so that each of them remeshes to
+                // an empty slice, which is also what hands its pool slot back.
+                //
+                // Not folded into [`Document::replace_volume`], which would be
+                // the tidier home for it: the gizmo takes a field OUT by
+                // swapping an empty placeholder in, and a blanket rule there
+                // would mark the real field's bricks in a placeholder that is
+                // about to be dropped, then mark nothing at all in the field
+                // that replaces it. The dirty pairing belongs to the callers
+                // that know which two fields are really being exchanged.
+                let landed = doc
+                    .volume_mut(body)
+                    .expect("the field just swapped in is still in the document");
+                landed.mark_everything_dirty();
+                for coord in previous.brick_coords() {
+                    landed.mark_dirty(coord);
+                }
+                Change::WholeVolume { body, volume: Box::new(previous) }
+            }
             Change::Outline { before, after } => {
                 debug_assert!(
                     same_ids(&before, &after),
@@ -346,6 +405,7 @@ impl Change {
             Change::NodeAdded { id, .. } => *id,
             Change::NodeRemoved { node, .. } => node.id,
             Change::WholeMask { body, .. } => *body,
+            Change::WholeVolume { body, .. } => *body,
             Change::Outline { before, after } => {
                 before.iter().zip(after).find(|(was, now)| was != now).map_or_else(
                     || before.first().map_or(NodeId(0), |meta| meta.id),
@@ -361,7 +421,7 @@ impl Change {
             Change::Bricks { edit, .. } => edit.bytes(),
             // Both hold a whole thing that was moved out of the document
             // rather than copied out of it. See `reclaim_bytes`.
-            Change::NodeRemoved { .. } | Change::WholeMask { .. } => 0,
+            Change::NodeRemoved { .. } | Change::WholeMask { .. } | Change::WholeVolume { .. } => 0,
             Change::NodeAdded { .. } => size_of::<Self>(),
             Change::Outline { before, after } => {
                 before.iter().chain(after).map(NodeMeta::bytes).sum()
@@ -377,6 +437,12 @@ impl Change {
         match self {
             Change::NodeRemoved { node, .. } => removed_node_bytes(node),
             Change::WholeMask { mask, .. } => size_of::<MaskField>() + mask.bytes(),
+            // `resident_bytes`, the same measure `removed_node_bytes` takes of
+            // a deleted body's field, so a bake and a delete are charged in one
+            // currency against one allowance.
+            Change::WholeVolume { volume, .. } => {
+                size_of::<Volume>() + volume.stats().resident_bytes
+            }
             _ => 0,
         }
     }
@@ -485,6 +551,7 @@ impl Entry {
             let id = match change {
                 Change::Bricks { body, .. } => *body,
                 Change::WholeMask { body, .. } => *body,
+                Change::WholeVolume { body, .. } => *body,
                 Change::NodeAdded { id, .. } => *id,
                 Change::NodeRemoved { .. } | Change::Outline { .. } => return None,
             };
@@ -802,6 +869,7 @@ mod tests {
     use crate::volume::Volume;
     use crate::{Brush, BrushDirection, BrushKind, BrushScratch, Stamp};
     use glam::Vec3;
+    use std::collections::HashSet;
 
     fn sculpted() -> (Document, Brush, BrushScratch) {
         let mut doc = Document::new(1.0);
@@ -1845,5 +1913,219 @@ mod tests {
             doc.volume(body).expect("a body").mask().is_free(),
             "the refused undo put the mask back anyway"
         );
+    }
+
+    // ------------------------------------------------- a whole field replaced
+
+    /// The gizmo's entry follows [`Change::WholeMask`]'s byte policy exactly,
+    /// and the reason is the same one written larger: a 765 MB field against
+    /// the 256 MB stroke budget would evict every stroke behind it, so the bake
+    /// would destroy the history it was trying to join.
+    #[test]
+    fn a_whole_volume_change_is_charged_to_reclaim_and_not_the_stroke_budget() {
+        let (mut doc, _, _) = sculpted();
+        let body = doc.active();
+        let resident = doc.volume(body).expect("a body").stats().resident_bytes;
+        assert!(resident > 0, "the fixture holds no field");
+
+        let moved = doc.volume(body).expect("a body").shifted(glam::IVec3::new(3, 0, 0));
+        let previous = doc.replace_volume(body, moved).expect("the body is in the document");
+
+        let entry = Entry::new(vec![Change::WholeVolume { body, volume: Box::new(previous) }]);
+        assert_eq!(entry.stroke_bytes(), 0, "a moved field was charged to the stroke budget");
+        assert!(
+            entry.reclaim_bytes() >= resident,
+            "the reclaim allowance is not counting the {resident} bytes it is holding"
+        );
+    }
+
+    /// Undoing a bake has to give the field back bit for bit, because a bake is
+    /// the one operation whose forward direction is lossy: "turn it back" is
+    /// not a recovery path for a free-angle transform the way it is for a
+    /// quarter turn.
+    #[test]
+    fn undoing_a_bake_puts_the_field_back_bit_for_bit() {
+        let (mut doc, _, _) = sculpted();
+        let body = doc.active();
+
+        let sampled: Vec<f32> = (0..64)
+            .map(|step| {
+                let at = Vec3::new(20.0 - step as f32 * 0.5, step as f32 * 0.25 - 8.0, 0.0);
+                doc.volume(body).expect("a body").sample_world(at)
+            })
+            .collect();
+
+        // A free-angle turn, so the forward direction really is destructive.
+        let placement = crate::Similarity::about(
+            Vec3::ZERO,
+            glam::Quat::from_rotation_y(0.4),
+            Vec3::ONE,
+            Vec3::ZERO,
+        );
+        let baked = doc.volume(body).expect("a body").warped(placement);
+        let previous = doc.replace_volume(body, baked).expect("the body is in the document");
+
+        let after: Vec<f32> = (0..64)
+            .map(|step| {
+                let at = Vec3::new(20.0 - step as f32 * 0.5, step as f32 * 0.25 - 8.0, 0.0);
+                doc.volume(body).expect("a body").sample_world(at)
+            })
+            .collect();
+        assert_ne!(after, sampled, "the fixture's transform changed nothing");
+
+        let mut history = History::new(DEFAULT_HISTORY_BUDGET);
+        history.push(Entry::new(vec![Change::WholeVolume { body, volume: Box::new(previous) }]));
+        undo(&mut history, &mut doc);
+
+        let restored: Vec<f32> = (0..64)
+            .map(|step| {
+                let at = Vec3::new(20.0 - step as f32 * 0.5, step as f32 * 0.25 - 8.0, 0.0);
+                doc.volume(body).expect("a body").sample_world(at)
+            })
+            .collect();
+        assert_eq!(restored, sampled, "undoing a bake did not put the field back");
+
+        redo(&mut history, &mut doc);
+        let again: Vec<f32> = (0..64)
+            .map(|step| {
+                let at = Vec3::new(20.0 - step as f32 * 0.5, step as f32 * 0.25 - 8.0, 0.0);
+                doc.volume(body).expect("a body").sample_world(at)
+            })
+            .collect();
+        assert_eq!(again, after, "redo did not put the transform back");
+    }
+
+    /// **Putting the field back is only half of undoing a bake; saying so is
+    /// the other half, and it is the half that was missing.**
+    ///
+    /// A field arrives on the stack with an EMPTY dirty set, because whatever
+    /// remeshed it last drained it. So a swap that marks nothing leaves the
+    /// document holding the original body and the screen holding the moved one
+    /// -- and every subsequent stroke, pick and brush ring then acts on a
+    /// position the user cannot see. Asserting on the field alone is exactly
+    /// what let that through, so this asserts on the dirty set instead, and on
+    /// BOTH sides of the swap: the bricks the field arriving occupies, and the
+    /// bricks the field leaving vacates, which have to remesh to nothing.
+    #[test]
+    fn undoing_a_bake_marks_the_bricks_both_fields_touched() {
+        let (mut doc, _, _) = sculpted();
+        let body = doc.active();
+
+        let before: HashSet<BrickCoord> =
+            doc.volume(body).expect("a body").brick_coords().collect();
+        // Far enough to clear the original footprint entirely, so "the vacated
+        // bricks" is a set the assertion below can actually be about.
+        let moved = doc.volume(body).expect("a body").shifted(glam::IVec3::splat(96));
+        let after: HashSet<BrickCoord> = moved.brick_coords().collect();
+        assert!(
+            before.is_disjoint(&after),
+            "the fixture did not move the body clear of where it was"
+        );
+        let previous = doc.replace_volume(body, moved).expect("the body is in the document");
+
+        let mut history = History::new(DEFAULT_HISTORY_BUDGET);
+        history.push(Entry::new(vec![Change::WholeVolume { body, volume: Box::new(previous) }]));
+
+        // Drained first, so what the assertion sees is what the undo marked.
+        let mut dirty = Vec::new();
+        doc.take_dirty(&mut dirty);
+        undo(&mut history, &mut doc);
+        doc.take_dirty(&mut dirty);
+        let marked: HashSet<BrickCoord> =
+            dirty.iter().filter(|(id, _)| *id == body).map(|(_, coord)| *coord).collect();
+
+        assert!(
+            before.is_subset(&marked),
+            "the field going back in was not scheduled for a remesh, so it stays invisible"
+        );
+        assert!(
+            after.is_subset(&marked),
+            "the bricks the moved field vacated were not scheduled, so its triangles stay on \
+             screen and its pool slices are never handed back"
+        );
+    }
+
+    /// The same for redo, which walks the identical code with the two fields
+    /// the other way round -- and would fail the identical way.
+    #[test]
+    fn redoing_a_bake_marks_the_bricks_both_fields_touched() {
+        let (mut doc, _, _) = sculpted();
+        let body = doc.active();
+
+        let before: HashSet<BrickCoord> =
+            doc.volume(body).expect("a body").brick_coords().collect();
+        let moved = doc.volume(body).expect("a body").shifted(glam::IVec3::splat(96));
+        let after: HashSet<BrickCoord> = moved.brick_coords().collect();
+        let previous = doc.replace_volume(body, moved).expect("the body is in the document");
+
+        let mut history = History::new(DEFAULT_HISTORY_BUDGET);
+        history.push(Entry::new(vec![Change::WholeVolume { body, volume: Box::new(previous) }]));
+        undo(&mut history, &mut doc);
+
+        let mut dirty = Vec::new();
+        doc.take_dirty(&mut dirty);
+        redo(&mut history, &mut doc);
+        doc.take_dirty(&mut dirty);
+        let marked: HashSet<BrickCoord> =
+            dirty.iter().filter(|(id, _)| *id == body).map(|(_, coord)| *coord).collect();
+
+        assert!(before.is_subset(&marked), "redo left the vacated bricks on screen");
+        assert!(after.is_subset(&marked), "redo did not schedule the field it put back");
+    }
+
+    /// **A bake does not clear the undo history.** `Document::rotate` and
+    /// `Document::resample` both leave every older entry naming bricks of a
+    /// volume that no longer exists, so their caller drops the whole stack; the
+    /// gizmo puts the original field ON the stack instead, so undoing the bake
+    /// makes those older coordinates valid again and the stroke behind it still
+    /// applies.
+    #[test]
+    fn a_stroke_behind_a_bake_is_still_undoable_afterwards() {
+        let (mut doc, brush, mut scratch) = sculpted();
+        let body = doc.active();
+
+        let at = Vec3::new(0.0, 25.0, 0.0);
+        let volume = doc.volume_mut(body).expect("a body");
+        volume.begin_stroke();
+        let normal = volume.gradient_world(at);
+        for _ in 0..4 {
+            brush.apply(volume, &Stamp::new(at, normal, BrushDirection::Add), &mut scratch);
+        }
+        let edit = volume.end_stroke().expect("the stroke changed something");
+        let after_stroke = doc.volume(body).expect("a body").sample_world(at);
+
+        let mut history = History::new(DEFAULT_HISTORY_BUDGET);
+        history.push(Entry::stroke(body, edit));
+
+        let moved = doc.volume(body).expect("a body").shifted(glam::IVec3::new(4, 0, 0));
+        let previous = doc.replace_volume(body, moved).expect("the body is in the document");
+        history.push(Entry::new(vec![Change::WholeVolume { body, volume: Box::new(previous) }]));
+
+        // Undo the bake, then the stroke behind it. The second one is the
+        // claim: it names bricks of the field the bake replaced.
+        assert!(matches!(undo(&mut history, &mut doc), UndoOutcome::Applied(_)));
+        assert!(
+            (doc.volume(body).expect("a body").sample_world(at) - after_stroke).abs() < 1.0e-6,
+            "undoing the bake did not restore the sculpted field"
+        );
+        assert!(matches!(undo(&mut history, &mut doc), UndoOutcome::Applied(_)));
+        assert!(
+            doc.volume(body).expect("a body").sample_world(at) > after_stroke,
+            "the stroke behind the bake did not come off"
+        );
+    }
+
+    /// A bake on a hidden body is refused for the same reason a stroke on one
+    /// is: the field would change with nothing on screen saying so.
+    #[test]
+    fn undoing_a_bake_on_a_hidden_body_is_refused() {
+        let (mut doc, _, _) = sculpted();
+        let body = doc.active();
+        let moved = doc.volume(body).expect("a body").shifted(glam::IVec3::new(2, 0, 0));
+        let previous = doc.replace_volume(body, moved).expect("the body is in the document");
+
+        let mut history = History::new(DEFAULT_HISTORY_BUDGET);
+        history.push(Entry::new(vec![Change::WholeVolume { body, volume: Box::new(previous) }]));
+        assert_eq!(history.undo(&mut doc, &[false]), UndoOutcome::Refused(body));
     }
 }

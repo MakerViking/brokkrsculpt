@@ -192,6 +192,15 @@ impl Brokkr {
         .spacing(theme::S3)
         .padding(theme::S3);
 
+        // **Above everything**, and it is the only card that can be. It is
+        // raised at startup before any other state can ask for a card, and
+        // reopened only from the Help menu, so nothing it could cover is
+        // waiting on an answer. Ranking it lower would let the unsaved-work
+        // prompt draw over a screen that has not been dismissed yet.
+        if self.welcome {
+            return stack![body, self.welcome_card(), self.resize_frame()].into();
+        }
+
         // The unsaved-work prompt outranks an open menu: it is modal, and a
         // menu drawn over it would be reachable while the prompt is not.
         if let Some(pending) = &self.confirm {
@@ -471,6 +480,297 @@ impl Brokkr {
         modal_layer(card)
     }
 
+    /// The welcome screen.
+    ///
+    /// Two columns, as SindriCAD's is: what to do down the left, something to
+    /// read down the right, "show this on startup" along the foot. See
+    /// [`crate::welcome`] for what did not come across from that one and why --
+    /// briefly, there is no webview to put its remote pane in and no sign-in to
+    /// put its account row in.
+    ///
+    /// The right column is the substitution that matters. SindriCAD's is a
+    /// news page fetched from TinkerAtlas; this is the keys, because there is
+    /// no manual yet and a beta is the moment people meet them for the first
+    /// time. It is deliberately short: a wall of text on a modal is read by
+    /// nobody, and everything here is also discoverable in the interface.
+    fn welcome_card(&self) -> Element<'_, Message> {
+        let lockup = row![
+            crate::logo::mark(32.0),
+            rich_text::<(), Message, _, _>([
+                span("Brokkr").color(theme::TEXT),
+                span("SCULPT").color(theme::ACCENT),
+            ])
+            .size(theme::TEXT_SIZE),
+        ]
+        .spacing(theme::S3)
+        .align_y(Alignment::Center);
+
+        type ButtonStyle = fn(&iced::Theme, button::Status) -> button::Style;
+        let action = |label: &'static str, message: Message, style: ButtonStyle| {
+            button(text(label).size(theme::TEXT_SIZE))
+                .width(Length::Fill)
+                .padding(Padding {
+                    top: theme::S2,
+                    bottom: theme::S2,
+                    left: theme::S4,
+                    right: theme::S4,
+                })
+                .style(style)
+                .on_press(message)
+        };
+
+        let mut left = column![
+            action("New sculpt", Message::NewSculpt, theme::tool_button_active),
+            action("Open…", Message::OpenRequested, theme::tool_button),
+            action("Import mesh…", Message::ImportRequested, theme::tool_button),
+        ]
+        .spacing(theme::S2)
+        .width(Length::Fixed(220.0));
+
+        // The recent list, exactly as SindriCAD presents it: the file name
+        // first and the directory under it, because the name is what anyone
+        // scans for and the directory is only ever the tiebreak.
+        let recent = self.recent.paths();
+        if !recent.is_empty() {
+            left = left.push(space::vertical().height(theme::S3));
+            left = left.push(text("Recent").size(theme::TEXT_SIZE_SMALL).color(theme::TEXT_DIM));
+            for path in recent.iter().take(6) {
+                let name = shorten(
+                    &path
+                        .file_name()
+                        .map(|name| name.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| path.to_string_lossy().into_owned()),
+                );
+                let folder = shorten(
+                    &path
+                        .parent()
+                        .map(|dir| dir.to_string_lossy().into_owned())
+                        .unwrap_or_default(),
+                );
+                left = left.push(
+                    button(
+                        column![
+                            text(name).size(theme::TEXT_SIZE).color(theme::TEXT),
+                            text(folder).size(theme::TEXT_SIZE_SMALL).color(theme::TEXT_DIM),
+                        ]
+                        .spacing(1),
+                    )
+                    .width(Length::Fill)
+                    .padding(Padding {
+                        top: theme::S2,
+                        bottom: theme::S2,
+                        left: theme::S3,
+                        right: theme::S3,
+                    })
+                    .style(theme::tool_button)
+                    .on_press(Message::OpenRecent(path.clone())),
+                );
+            }
+        }
+
+        // **The articles, which is what SindriCAD's right column is.** It
+        // embeds the site in an iframe; there is no webview here, so the same
+        // articles arrive as data and are drawn with the same widgets as
+        // everything else. Three states, as that one has: asking, answered, and
+        // unreachable with a retry.
+        let feed: Element<'_, Message> = match &self.feed {
+            crate::articles::Feed::Idle | crate::articles::Feed::Loading => {
+                text("Fetching the latest articles…")
+                    .size(theme::TEXT_SIZE_SMALL)
+                    .color(theme::TEXT_MUTE)
+                    .into()
+            }
+            crate::articles::Feed::Failed(why) => column![
+                // Says which way it failed rather than "offline": a 503 and no
+                // route are different problems and only one of them is yours.
+                text(why.clone()).size(theme::TEXT_SIZE_SMALL).color(theme::TEXT_MUTE),
+                button(text("Try again").size(theme::TEXT_SIZE_SMALL))
+                    .padding(Padding {
+                        top: theme::S1,
+                        bottom: theme::S1,
+                        left: theme::S3,
+                        right: theme::S3
+                    })
+                    .style(theme::tool_button)
+                    .on_press(Message::ArticlesRetried),
+            ]
+            .spacing(theme::S2)
+            .into(),
+            crate::articles::Feed::Ready(articles) if articles.is_empty() => {
+                text("Nothing published yet.")
+                    .size(theme::TEXT_SIZE_SMALL)
+                    .color(theme::TEXT_MUTE)
+                    .into()
+            }
+            crate::articles::Feed::Ready(articles) => {
+                // **Two to a row, picture on top.** The single narrow column
+                // this replaced could only carry a thumbnail beside the words,
+                // which left the picture too small to be worth its bytes and
+                // the text too narrow to carry a summary. Two wide cards give
+                // both, and match the page these articles come from.
+                let mut grid = column![].spacing(theme::S3);
+                for pair in articles.chunks(GRID_COLUMNS) {
+                    let mut line = row![].spacing(theme::S3);
+                    for article in pair {
+                        let mut card = column![].spacing(theme::S1).width(Length::Fill);
+                        // Cloning the HANDLE and not the pixels: it is
+                        // refcounted and keeps its id, so the renderer's atlas
+                        // entry survives the frame. Building a handle here
+                        // instead would mint a new id every frame and re-upload
+                        // every thumbnail. See `articles::Article::thumbnail`.
+                        //
+                        // No picture is an ordinary outcome, so the card simply
+                        // has none rather than a placeholder that would draw the
+                        // eye to what is missing.
+                        if let Some(handle) = &article.thumbnail {
+                            card = card.push(
+                                container(
+                                    iced::widget::image(handle.clone())
+                                        .width(Length::Fill)
+                                        .content_fit(iced::ContentFit::Cover),
+                                )
+                                .clip(true)
+                                .width(Length::Fill)
+                                .height(Length::Fixed(CARD_THUMB_PX)),
+                            );
+                        }
+                        card = card.push(
+                            text(article.title.clone()).size(theme::TEXT_SIZE).color(theme::TEXT),
+                        );
+                        card = card.push(
+                            text(article.summary.clone())
+                                .size(theme::TEXT_SIZE_SMALL)
+                                .color(theme::TEXT_DIM),
+                        );
+                        card = card.push(
+                            text(article.date.clone())
+                                .size(theme::CAPTION_SIZE)
+                                .color(theme::TEXT_MUTE),
+                        );
+                        line = line.push(
+                            button(card)
+                                .width(Length::Fill)
+                                .padding(theme::S2)
+                                .style(theme::tool_button)
+                                .on_press(Message::LinkOpened(article.link.clone())),
+                        );
+                    }
+                    // A last row with one article in it must not stretch that
+                    // card across the width the pair would have had.
+                    for _ in pair.len()..GRID_COLUMNS {
+                        line = line.push(space::horizontal());
+                    }
+                    grid = grid.push(line);
+                }
+                scrollable(grid).height(Length::Fixed(GRID_HEIGHT_PX)).into()
+            }
+        };
+
+        // **The two buttons, which are the point of the panel.** The articles
+        // say what the community is doing; these are how someone acts on it.
+        // Both go through the same one-host check every article link does, so
+        // neither can be turned into a way to open something else.
+        let atlas = |label: &'static str, link: &'static str, style: ButtonStyle| {
+            button(text(label).size(theme::TEXT_SIZE))
+                .padding(Padding {
+                    top: theme::S2,
+                    bottom: theme::S2,
+                    left: theme::S4,
+                    right: theme::S4,
+                })
+                .style(style)
+                .on_press(Message::LinkOpened(link.to_string()))
+        };
+        let heading = row![
+            column![
+                text("Welcome to BrokkrSculpt").size(theme::TITLE_SIZE).color(theme::TEXT),
+                text("A sculpting tool for people who print what they make.")
+                    .size(theme::TEXT_SIZE)
+                    .color(theme::TEXT_DIM),
+            ]
+            .spacing(theme::S1)
+            .width(Length::Fill),
+            atlas("Join TinkerAtlas", crate::articles::JOIN_URL, theme::tool_button_active),
+            atlas("Visit TinkerAtlas", crate::articles::VISIT_URL, theme::tool_button),
+        ]
+        .spacing(theme::S2)
+        .align_y(Alignment::Center);
+
+        let right = column![
+            heading,
+            text("Latest from TinkerAtlas").size(theme::TEXT_SIZE_SMALL).color(theme::TEXT_DIM),
+            feed,
+        ]
+        .spacing(theme::S3)
+        .width(Length::Fill);
+
+        let foot = row![
+            checkbox(self.welcome_on_startup)
+                .label("Show this screen on startup")
+                .on_toggle(Message::WelcomeOnStartupSet)
+                .text_size(theme::TEXT_SIZE_SMALL),
+            space::horizontal(),
+            button(text("Close").size(theme::TEXT_SIZE))
+                .padding(Padding {
+                    top: theme::S2,
+                    bottom: theme::S2,
+                    left: theme::S5,
+                    right: theme::S5
+                })
+                .style(theme::tool_button)
+                .on_press(Message::WelcomeClosed),
+        ]
+        .align_y(Alignment::Center)
+        .spacing(theme::S3);
+
+        // **The keys stay.** They are the one thing a first-time user cannot get
+        // anywhere else -- there is no manual -- and they are cheap here: a
+        // strip under the two columns rather than a third column, so neither
+        // the actions nor the articles lose width to them.
+        let key = |keys: &'static str, what: &'static str| {
+            row![
+                container(text(keys).size(theme::CAPTION_SIZE).color(theme::ACCENT))
+                    .width(Length::Fixed(72.0)),
+                text(what).size(theme::CAPTION_SIZE).color(theme::TEXT_DIM),
+            ]
+            .spacing(theme::S2)
+        };
+        let keys = row![
+            column![
+                key("1 – 7", "pick a brush"),
+                key("shift", "smooth, while held"),
+                key("ctrl / alt", "carve instead of add"),
+                key("[ and ]", "brush size"),
+                key("s / u drag", "size and strength"),
+            ]
+            .spacing(2)
+            .width(Length::Fill),
+            column![
+                key("x y z", "mirror across a plane"),
+                key("w", "move, turn and scale a body"),
+                key("m", "mask, to protect what you have"),
+                key("ctrl+Z", "undo, a whole stroke at a time"),
+                key("right-click", "the current tool's settings"),
+            ]
+            .spacing(2)
+            .width(Length::Fill),
+        ]
+        .spacing(theme::S4);
+
+        let card = container(
+            column![lockup, row![left, right].spacing(theme::S5), keys, foot,].spacing(theme::S4),
+        )
+        .padding(theme::S5)
+        // **Wide enough for two article cards side by side**, which is what
+        // sets it: 220 for the actions, 16 of gap, two ~330 cards and the
+        // padding. The narrow card this replaced could only stack articles in
+        // one column, and that column could not carry a picture worth showing.
+        .max_width(960.0)
+        .style(theme::menu_card);
+
+        modal_layer(card)
+    }
+
     /// The bug report dialog.
     ///
     /// It shows the payload rather than describing it. `diagnostics` was
@@ -670,6 +970,7 @@ impl Brokkr {
                     .color(theme::TEXT_MUTE),
                 text("AGPL-3.0-only").size(theme::CAPTION_SIZE).color(theme::TEXT_MUTE),
                 separator(),
+                entry("Welcome screen", Message::WelcomeOpened),
                 entry("Copy diagnostics", Message::DiagnosticsCopied),
                 entry("Report a bug…", Message::BugReportOpened),
                 entry("Open the issue tracker", Message::IssueOpened),
@@ -1389,62 +1690,98 @@ impl Brokkr {
 
         let (cut_style, cut_ink) = theme::tool_toggle(self.tool == Tool::Cut);
         let (mask_style, mask_ink) = theme::tool_toggle(self.tool == Tool::Mask);
+        let (move_style, move_ink) = theme::tool_toggle(self.tool == Tool::Transform);
 
         container(
-            column![
-                text("TOOL").size(theme::CAPTION_SIZE).color(theme::TEXT_MUTE),
-                brushes,
-                text("MIRROR").size(theme::CAPTION_SIZE).color(theme::TEXT_MUTE),
-                mirrors,
-                text("MODE").size(theme::CAPTION_SIZE).color(theme::TEXT_MUTE),
-                // The live state is shown in the strip, not just in the status
-                // line, because **these are the two modes that change what a
-                // left drag does, and only one of the two is destructive.**
-                // (That sentence used to read "this is the one mode", here and
-                // in `handoff.md`; masking made both halves false.) That
-                // asymmetry is also why Escape clears the cut and not the mask:
-                // a cut is a pending destructive thing, a mask is expensive
-                // work with no undo entry until the stroke lands.
-                //
-                // The words stay for exactly that reason: "armed" versus
-                // "plane" is a state, and an icon says which tool this is, not
-                // whether it is about to go off.
-                button(
-                    column![
-                        icon::icon(icon::IconName::CutPlane, theme::ICON_TOOL, cut_ink),
-                        text(if self.tool == Tool::Cut { "armed" } else { "plane" })
+            scrollable(
+                column![
+                    text("TOOL").size(theme::CAPTION_SIZE).color(theme::TEXT_MUTE),
+                    brushes,
+                    text("MIRROR").size(theme::CAPTION_SIZE).color(theme::TEXT_MUTE),
+                    mirrors,
+                    text("MODE").size(theme::CAPTION_SIZE).color(theme::TEXT_MUTE),
+                    // The live state is shown in the strip, not just in the status
+                    // line, because **these are the two modes that change what a
+                    // left drag does, and only one of the two is destructive.**
+                    // (That sentence used to read "this is the one mode", here and
+                    // in `handoff.md`; masking made both halves false.) That
+                    // asymmetry is also why Escape clears the cut and not the mask:
+                    // a cut is a pending destructive thing, a mask is expensive
+                    // work with no undo entry until the stroke lands.
+                    //
+                    // The words stay for exactly that reason: "armed" versus
+                    // "plane" is a state, and an icon says which tool this is, not
+                    // whether it is about to go off.
+                    button(
+                        column![
+                            icon::icon(icon::IconName::CutPlane, theme::ICON_TOOL, cut_ink),
+                            text(if self.tool == Tool::Cut { "armed" } else { "plane" })
+                                .size(theme::TEXT_SIZE_SMALL),
+                        ]
+                        .width(Length::Fill)
+                        .spacing(0)
+                        .align_x(Alignment::Center)
+                    )
+                    .width(Length::Fill)
+                    .style(cut_style)
+                    .on_press(Message::ToolChanged(Tool::Cut)),
+                    button(
+                        column![
+                            icon::icon(icon::IconName::Mask, theme::ICON_TOOL, mask_ink),
+                            // The same live substitution the brush buttons make for
+                            // Smooth: while shift is held a mask drag blurs, so the
+                            // button says what the next drag will actually do.
+                            text(match (self.tool == Tool::Mask, smoothing) {
+                                (true, true) => "blur",
+                                (true, false) => "on",
+                                (false, _) => "mask",
+                            })
                             .size(theme::TEXT_SIZE_SMALL),
-                    ]
+                        ]
+                        .width(Length::Fill)
+                        .spacing(0)
+                        .align_x(Alignment::Center)
+                    )
                     .width(Length::Fill)
-                    .spacing(0)
-                    .align_x(Alignment::Center)
-                )
-                .width(Length::Fill)
-                .style(cut_style)
-                .on_press(Message::ToolChanged(Tool::Cut)),
-                button(
-                    column![
-                        icon::icon(icon::IconName::Mask, theme::ICON_TOOL, mask_ink),
-                        // The same live substitution the brush buttons make for
-                        // Smooth: while shift is held a mask drag blurs, so the
-                        // button says what the next drag will actually do.
-                        text(match (self.tool == Tool::Mask, smoothing) {
-                            (true, true) => "blur",
-                            (true, false) => "on",
-                            (false, _) => "mask",
-                        })
-                        .size(theme::TEXT_SIZE_SMALL),
-                    ]
+                    .style(mask_style)
+                    .on_press(Message::ToolChanged(Tool::Mask)),
+                    // The third mode that changes what a left drag does. The word
+                    // under it says whether the next release will cost the surface
+                    // anything, which is the one thing about this tool a user
+                    // cannot see by looking at the model.
+                    button(
+                        column![
+                            icon::icon(icon::IconName::Gizmo, theme::ICON_TOOL, move_ink),
+                            text(match self.tool == Tool::Transform {
+                                true if smoothing => "free",
+                                true => "snap",
+                                false => "move",
+                            })
+                            .size(theme::TEXT_SIZE_SMALL),
+                        ]
+                        .width(Length::Fill)
+                        .spacing(0)
+                        .align_x(Alignment::Center)
+                    )
                     .width(Length::Fill)
-                    .spacing(0)
-                    .align_x(Alignment::Center)
-                )
-                .width(Length::Fill)
-                .style(mask_style)
-                .on_press(Message::ToolChanged(Tool::Mask)),
-            ]
-            .spacing(theme::S3)
-            .align_x(Alignment::Center),
+                    .style(move_style)
+                    .on_press(Message::ToolChanged(Tool::Transform)),
+                ]
+                .spacing(theme::S3)
+                .align_x(Alignment::Center),
+            )
+            // **The strip outgrew the window and the last button was clipped to
+            // a sliver.** Its own doc comment above predicted this -- "one
+            // screenshot at 768 settles it properly and none has been taken" --
+            // and then the gizmo added a fourth mode button and the prediction
+            // came true: Thomas found the tool only by noticing the sliver.
+            //
+            // Scrollable rather than smaller, for the same reason the
+            // properties panel is: shrinking type or dropping the words under
+            // the icons would bet the tool picker on telling clay from draw at
+            // eighteen pixels, which the brush buttons above explicitly refuse
+            // to do. The scrollbar is only reachable when it is needed.
+            .height(Length::Fill),
         )
         .padding(theme::S3)
         .width(Length::Fixed(76.0))
@@ -2937,6 +3274,50 @@ impl Brokkr {
         .spacing(theme::S2)
         .into()
     }
+}
+
+/// How tall an article thumbnail is drawn on its card, in logical pixels.
+///
+/// The picture spans the card's whole width, so only the height is fixed here;
+/// `ContentFit::Cover` crops to fill it whatever the source aspect is.
+///
+/// **Sized down from 16:9 so four cards and the key strip fit a 768-high
+/// window**, which is the size `tool_strip`'s header records as the one that
+/// must keep working. At 170 the card ran about eighty pixels past the bottom
+/// of the window and took the Close button with it -- seen on screen, not in a
+/// test, because nothing in the suite lays this out.
+const CARD_THUMB_PX: f32 = 120.0;
+
+/// How tall the article grid may be before it scrolls, in logical pixels.
+///
+/// Two rows of cards at [`CARD_THUMB_PX`] come to about this. It is a bound
+/// rather than a fit: a summary that wraps to a third line, or a fifth article
+/// if [`crate::articles::MAX_SHOWN`] ever grows, scrolls instead of pushing the
+/// footer off the screen. The page this mirrors scrolls its article column too.
+const GRID_HEIGHT_PX: f32 = 440.0;
+
+/// How many article cards sit side by side.
+const GRID_COLUMNS: usize = 2;
+
+/// Cut a path down so it cannot push a column wider than it was given.
+///
+/// **iced has no ellipsis and a `Length::Fixed` column does not clip its
+/// children**, so a long path is not merely ugly -- it grows the row and shoves
+/// the column beside it off its own layout. Observed on the welcome screen with
+/// a recent file under `/mnt/.../Meshy_AI_Dragonstone_Carver_08232143232…`,
+/// which ran straight through the keys listed next to it.
+///
+/// The TAIL is kept, because that is the informative end of a path: the leaf
+/// directory says which project, and the root says only that it is on a disk.
+fn shorten(text: &str) -> String {
+    /// Roughly what fits in the recent column at `TEXT_SIZE_SMALL`.
+    const MAX_CHARS: usize = 34;
+    let count = text.chars().count();
+    if count <= MAX_CHARS {
+        return text.to_string();
+    }
+    let tail: String = text.chars().skip(count - (MAX_CHARS - 1)).collect();
+    format!("…{tail}")
 }
 
 /// Centre a modal card on a layer that dims the application and swallows the

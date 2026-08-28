@@ -5,3 +5,7 @@
 
 # Internal session-handoff doc — kept locally, never shipped
 handoff.md
+
+# Working plan — kept locally, never shipped. It names an unprotected public
+# write endpoint, which a public repository is the wrong place for.
+plan.md

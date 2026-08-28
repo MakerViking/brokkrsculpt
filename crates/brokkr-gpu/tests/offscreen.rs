@@ -116,6 +116,19 @@ impl Harness {
     /// application does too. A frustum that disagreed with the projection would
     /// show up here as missing geometry.
     fn frame(&self, renderer: &SculptRenderer) -> Vec<u8> {
+        self.frame_inner(renderer, false)
+    }
+
+    /// The same, plus the gizmo's own always-on-top pass.
+    ///
+    /// A second entry point rather than a flag on every call site, because the
+    /// gizmo pass is the only thing in the renderer that CLEARS depth and so
+    /// the only thing whose presence changes what a frame means.
+    fn frame_with_gizmo(&self, renderer: &SculptRenderer) -> Vec<u8> {
+        self.frame_inner(renderer, true)
+    }
+
+    fn frame_inner(&self, renderer: &SculptRenderer, gizmo: bool) -> Vec<u8> {
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("offscreen") });
@@ -146,6 +159,14 @@ impl Harness {
             PixelRect { x: 0, y: 0, width: WIDTH, height: HEIGHT },
             &Frustum::from_view_projection(self.view_projection),
         );
+
+        if gizmo {
+            renderer.render_gizmo(
+                &mut encoder,
+                &self.view,
+                PixelRect { x: 0, y: 0, width: WIDTH, height: HEIGHT },
+            );
+        }
 
         encoder.copy_texture_to_buffer(
             wgpu::TexelCopyTextureInfo {
@@ -1992,4 +2013,146 @@ fn read_back(harness: &Harness, texture: &wgpu::Texture) -> Vec<u8> {
     drop(mapped);
     buffer.unmap();
     pixels
+}
+
+/// **The property the transform gizmo exists on, on a real device.**
+///
+/// A gizmo sits on the body it moves, which means its origin is INSIDE the
+/// mesh. Every one of `overlay.rs`'s three pipelines compares `Less` against
+/// the sculpt's depth, so geometry there is buried and unreachable -- correct
+/// for a brush ring lying on a surface, useless for a control the user has to
+/// grab. `SculptRenderer::overlay_pass` clears depth and keeps `Less`, which is
+/// what makes the gizmo visible while still occluding itself.
+///
+/// Both halves are asserted, and the first is what gives the second meaning:
+/// the same geometry through the ordinary overlay has to be hidden, or the test
+/// would pass just as well if the depth clear did nothing.
+#[test]
+fn a_gizmo_inside_the_model_is_drawn_over_it_where_an_overlay_would_be_buried() {
+    let Some(harness) = Harness::new() else {
+        eprintln!("no usable wgpu adapter, skipping the gizmo render test");
+        return;
+    };
+
+    let distance = MODEL_RADIUS * 3.0;
+    let mut renderer = SculptRenderer::new(&harness.device, &harness.queue, TARGET_FORMAT);
+    renderer.resize(&harness.device, WIDTH, HEIGHT);
+    renderer.write_uniforms(&harness.queue, &uniforms(distance));
+
+    let mut volume = Volume::new(VOXEL_SIZE);
+    volume.seed_sphere(Vec3::ZERO, MODEL_RADIUS);
+    upload_all(&mut renderer, &harness.device, &harness.queue, &mut volume);
+
+    let bare = harness.frame(&renderer);
+    let differing = |a: &[u8], b: &[u8]| {
+        a.as_chunks::<4>()
+            .0
+            .iter()
+            .zip(b.as_chunks::<4>().0.iter())
+            .filter(|(x, y)| x[..3] != y[..3])
+            .count()
+    };
+
+    // A quad at the model's CENTRE, buried under 30 mm of sphere.
+    let toward_eye = Vec3::new(0.45, 0.35, 1.0).normalize();
+    let right = toward_eye.cross(Vec3::Y).normalize();
+    let up = right.cross(toward_eye).normalize();
+    let half = 10.0;
+    let mut batch = OverlayBatch::default();
+    batch.push_quad(
+        -right * half - up * half,
+        right * half - up * half,
+        right * half + up * half,
+        -right * half + up * half,
+        [0.94, 0.35, 0.46, 1.0],
+    );
+
+    // Through the ordinary overlay: buried, which is the behaviour the gizmo
+    // could not live with.
+    renderer.write_overlay(&harness.device, &harness.queue, &batch, view_projection(distance));
+    let buried = harness.frame(&renderer);
+    dump("gizmo-through-the-overlay", &buried);
+    let leaked = differing(&bare, &buried);
+
+    // Through the gizmo's own pass: drawn.
+    renderer.write_overlay(
+        &harness.device,
+        &harness.queue,
+        &OverlayBatch::default(),
+        view_projection(distance),
+    );
+    renderer.write_gizmo(&harness.device, &harness.queue, &batch, view_projection(distance));
+    let shown = harness.frame_with_gizmo(&renderer);
+    dump("gizmo-through-its-own-pass", &shown);
+    let drawn = differing(&bare, &shown);
+
+    assert!(drawn > 2_000, "the gizmo pass drew almost nothing over the model: {drawn} pixels");
+    assert!(
+        leaked < drawn / 10,
+        "the ordinary overlay was not buried after all, so this test proves nothing: \
+         {leaked} pixels against the gizmo pass's {drawn}"
+    );
+}
+
+/// The cleared-depth pass still depth-tests WITHIN itself, which is what gives
+/// an arrowhead over its own shaft and three crossing rings for free.
+///
+/// Without it the answer would be draw order, and the alternative -- a
+/// `depth_compare: Always` pipeline -- would need the geometry sorted back to
+/// front on the CPU every time the camera moved.
+#[test]
+fn the_gizmo_pass_occludes_its_own_far_side() {
+    let Some(harness) = Harness::new() else {
+        eprintln!("no usable wgpu adapter, skipping the gizmo occlusion test");
+        return;
+    };
+
+    let distance = MODEL_RADIUS * 3.0;
+    let mut renderer = SculptRenderer::new(&harness.device, &harness.queue, TARGET_FORMAT);
+    renderer.resize(&harness.device, WIDTH, HEIGHT);
+    renderer.write_uniforms(&harness.queue, &uniforms(distance));
+
+    let toward_eye = Vec3::new(0.45, 0.35, 1.0).normalize();
+    let right = toward_eye.cross(Vec3::Y).normalize();
+    let up = right.cross(toward_eye).normalize();
+    let quad = |batch: &mut OverlayBatch, centre: Vec3, half: f32, colour: [f32; 4]| {
+        batch.push_quad(
+            centre - right * half - up * half,
+            centre + right * half - up * half,
+            centre + right * half + up * half,
+            centre - right * half + up * half,
+            colour,
+        );
+    };
+
+    // A big near quad and a small far one directly behind it, submitted FAR
+    // FIRST so that draw order alone would leave the near one on top anyway...
+    let mut near_first = OverlayBatch::default();
+    quad(&mut near_first, toward_eye * 20.0, 14.0, [0.1, 0.9, 0.3, 1.0]);
+    quad(&mut near_first, toward_eye * -20.0, 6.0, [0.9, 0.1, 0.1, 1.0]);
+    renderer.write_gizmo(&harness.device, &harness.queue, &near_first, view_projection(distance));
+    let near_first_frame = harness.frame_with_gizmo(&renderer);
+
+    // ...and the same pair submitted the other way round. If depth is working,
+    // the two frames are identical; if it is draw order, the small red quad
+    // paints over the green one in exactly one of them.
+    let mut far_first = OverlayBatch::default();
+    quad(&mut far_first, toward_eye * -20.0, 6.0, [0.9, 0.1, 0.1, 1.0]);
+    quad(&mut far_first, toward_eye * 20.0, 14.0, [0.1, 0.9, 0.3, 1.0]);
+    renderer.write_gizmo(&harness.device, &harness.queue, &far_first, view_projection(distance));
+    let far_first_frame = harness.frame_with_gizmo(&renderer);
+    dump("gizmo-self-occlusion", &far_first_frame);
+
+    let differing = near_first_frame
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .zip(far_first_frame.as_chunks::<4>().0.iter())
+        .filter(|(a, b)| a[..3] != b[..3])
+        .count();
+    assert_eq!(
+        differing, 0,
+        "the gizmo pass is resolving overlap by draw order rather than by depth: \
+         {differing} pixels changed when the two quads were submitted the other way round"
+    );
 }

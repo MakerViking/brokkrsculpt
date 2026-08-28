@@ -76,6 +76,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use crate::brick::{BRICK_DIM, BRICK_VOXELS, BrickCoord, brick_index};
 use crate::orientation::AxisRotation;
 use crate::project::MAX_VOLUME_BYTES;
+use crate::similarity::Similarity;
 use crate::volume::VolumeStats;
 
 /// A voxel a brush may change freely.
@@ -1131,6 +1132,158 @@ impl MaskField {
                                 local.y as usize,
                                 local.z as usize,
                             ));
+                        }
+                    }
+                }
+                match brick.is_collapsible() {
+                    Some(UNMASKED) => None,
+                    Some(byte) => Some((*coord, MaskBrick::Uniform(byte))),
+                    None => Some((*coord, brick)),
+                }
+            })
+            .collect();
+
+        out.bricks.reserve(built.len());
+        for (coord, brick) in built {
+            out.bricks.insert(coord, brick);
+        }
+        out
+    }
+
+    /// This mask moved by whole VOXELS, sub-brick offsets included.
+    ///
+    /// The mask half of [`crate::Volume::shifted`], and value-exact for the
+    /// same reason: every destination cell takes exactly one source cell's
+    /// byte. [`MaskField::translated`] moves whole bricks and cannot express a
+    /// sub-brick offset at all; this one gathers, and delegates to it when the
+    /// offset happens to be brick aligned so that the common case still moves
+    /// `Box` pointers rather than bytes.
+    ///
+    /// Nearest neighbour is not a choice here, it is the absence of one: at
+    /// whole-voxel granularity there is nothing between two cells to
+    /// interpolate.
+    pub(crate) fn shifted(&self, offset_voxels: IVec3) -> MaskField {
+        let dim = BRICK_DIM as i32;
+        if offset_voxels.rem_euclid(IVec3::splat(dim)) == IVec3::ZERO {
+            return self.translated(offset_voxels / dim);
+        }
+
+        let mut out = MaskField {
+            bricks: FxHashMap::default(),
+            inverted: self.inverted,
+            // Carried forward rather than reset, for the reason
+            // [`MaskField::translated`] gives.
+            revision: self.revision + 1,
+        };
+        if self.bricks.is_empty() {
+            return out;
+        }
+
+        // Every destination brick any source brick reaches. A source brick
+        // shifted by a sub-brick offset straddles up to eight of them.
+        let mut wanted: FxHashSet<BrickCoord> = FxHashSet::default();
+        for coord in self.bricks.keys() {
+            let low = BrickCoord::containing(coord.origin() + offset_voxels).0;
+            let high = BrickCoord::containing(coord.max_voxel() + offset_voxels).0;
+            for bz in low.z..=high.z {
+                for by in low.y..=high.y {
+                    for bx in low.x..=high.x {
+                        wanted.insert(BrickCoord::new(bx, by, bz));
+                    }
+                }
+            }
+        }
+
+        let coords: Vec<BrickCoord> = wanted.into_iter().collect();
+        let built: Vec<(BrickCoord, MaskBrick)> = coords
+            .par_iter()
+            .filter_map(|coord| {
+                let source_low = coord.origin() - offset_voxels;
+                let source_high = coord.max_voxel() - offset_voxels;
+                if let Some(byte) = self.uniform_over(source_low, source_high) {
+                    return (byte != UNMASKED).then_some((*coord, MaskBrick::Uniform(byte)));
+                }
+
+                let mut brick = MaskBrick::dense_filled(UNMASKED);
+                let data = brick.make_dense();
+                for z in 0..BRICK_DIM {
+                    for y in 0..BRICK_DIM {
+                        for x in 0..BRICK_DIM {
+                            let cell = source_low + IVec3::new(x as i32, y as i32, z as i32);
+                            data[brick_index(x, y, z)] = self.byte_at(cell);
+                        }
+                    }
+                }
+                match brick.is_collapsible() {
+                    Some(UNMASKED) => None,
+                    Some(byte) => Some((*coord, MaskBrick::Uniform(byte))),
+                    None => Some((*coord, brick)),
+                }
+            })
+            .collect();
+
+        out.bricks.reserve(built.len());
+        for (coord, brick) in built {
+            out.bricks.insert(coord, brick);
+        }
+        out
+    }
+
+    /// This mask rebuilt through a similarity, onto the SAME lattice.
+    ///
+    /// Nearest neighbour, for the reason [`MaskField::resampled`] gives:
+    /// protection is an authored intent rather than a measurement, and
+    /// interpolating it would soften a painted edge on every pass.
+    ///
+    /// The destination footprint is found by pushing each source brick's own
+    /// box FORWARD through the map, rather than by walking the field's bounds.
+    /// Protection over empty space is real -- it is what stops Draw growing
+    /// material there -- so a mask brick with no field brick under it has to be
+    /// carried, and it would be invisible to a walk of the field.
+    pub(crate) fn warped(&self, by: Similarity, voxel_size: f32) -> MaskField {
+        let mut out = MaskField {
+            bricks: FxHashMap::default(),
+            inverted: self.inverted,
+            revision: self.revision + 1,
+        };
+        if self.bricks.is_empty() {
+            return out;
+        }
+
+        let mut wanted: FxHashSet<BrickCoord> = FxHashSet::default();
+        for coord in self.bricks.keys() {
+            let source_low = coord.origin().as_vec3() * voxel_size;
+            let source_high = coord.max_voxel().as_vec3() * voxel_size;
+            // The forward image of a box, by the same eight-corner argument
+            // [`Similarity::inverse_bounds`] makes for the backward one --
+            // which is what `inverse().inverse_bounds(..)` says.
+            let (low, high) = crate::transform::forward_bounds(by, source_low, source_high);
+            let low = BrickCoord::containing((low / voxel_size).floor().as_ivec3() - IVec3::ONE).0;
+            let high = BrickCoord::containing((high / voxel_size).ceil().as_ivec3() + IVec3::ONE).0;
+            for bz in low.z..=high.z {
+                for byy in low.y..=high.y {
+                    for bx in low.x..=high.x {
+                        wanted.insert(BrickCoord::new(bx, byy, bz));
+                    }
+                }
+            }
+        }
+
+        let coords: Vec<BrickCoord> = wanted.into_iter().collect();
+        let built: Vec<(BrickCoord, MaskBrick)> = coords
+            .par_iter()
+            .filter_map(|coord| {
+                let origin = coord.origin();
+                let mut brick = MaskBrick::dense_filled(UNMASKED);
+                let data = brick.make_dense();
+                for z in 0..BRICK_DIM {
+                    for y in 0..BRICK_DIM {
+                        for x in 0..BRICK_DIM {
+                            let world = (origin + IVec3::new(x as i32, y as i32, z as i32))
+                                .as_vec3()
+                                * voxel_size;
+                            let source = by.inverse_transform_point(world) / voxel_size;
+                            data[brick_index(x, y, z)] = self.byte_at(source.round().as_ivec3());
                         }
                     }
                 }

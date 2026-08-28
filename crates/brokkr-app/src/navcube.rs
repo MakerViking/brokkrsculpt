@@ -22,7 +22,7 @@ use brokkr_gpu::OverlayBatch;
 use glam::{Mat4, Vec2, Vec3};
 
 use crate::camera::OrbitCamera;
-use crate::theme;
+use crate::theme::{self, linear};
 
 /// Edge length of the corner box, in logical pixels.
 pub const SIZE_PX: f32 = 92.0;
@@ -98,11 +98,6 @@ pub fn view_projection(camera: &OrbitCamera) -> Mat4 {
     let projection =
         glam::camera::rh::proj::directx::orthographic(-reach, reach, -reach, reach, 0.1, 10.0);
     projection * view
-}
-
-fn linear(colour: iced::Color, alpha: f32) -> [f32; 4] {
-    let to_linear = |c: f32| c.powf(2.2);
-    [to_linear(colour.r), to_linear(colour.g), to_linear(colour.b), alpha]
 }
 
 /// Line segments making up a letter, in a unit square with y up.

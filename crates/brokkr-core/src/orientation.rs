@@ -147,6 +147,27 @@ impl AxisRotation {
         AxisRotation::quarter_turn(from.normal().cross(to.normal()))
     }
 
+    /// The rotation whose basis images are `columns`, when they name one.
+    ///
+    /// **The validation is why this exists rather than a public field.** The
+    /// type's whole value is that it cannot hold anything but a signed
+    /// permutation of determinant +1 -- a reflection would export every
+    /// triangle inside out, and a column with two nonzero entries would not map
+    /// the lattice onto itself at all -- and a `pub` field would put that
+    /// invariant in the hands of every future caller. `None` for anything else.
+    ///
+    /// Its one caller is [`crate::similarity::Similarity::route`], which reads
+    /// a quarter turn off a quaternion by asking where the three basis vectors
+    /// land. That is a construction from outside this module, and it has to be
+    /// checked rather than trusted.
+    pub fn from_columns(columns: [IVec3; 3]) -> Option<AxisRotation> {
+        if columns.iter().any(|column| column.abs().element_sum() != 1) {
+            return None;
+        }
+        let rotation = AxisRotation { columns };
+        (rotation.determinant() == 1).then_some(rotation)
+    }
+
     /// A quarter turn about a unit basis vector, positive by the right hand
     /// rule.
     ///
