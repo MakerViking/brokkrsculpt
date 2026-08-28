@@ -568,6 +568,42 @@ impl Brokkr {
             }
         }
 
+        // **The account row, and signing in is optional.** It buys one thing
+        // and the copy says which: a bug report that can be answered. Nothing
+        // else in the application changes when it is empty -- see
+        // [`crate::account`] and `report::send`.
+        left = left.push(space::vertical().height(theme::S3));
+        left = left.push(match &self.account {
+            Some(account) => column![
+                text(account.label().to_string()).size(theme::TEXT_SIZE).color(theme::TEXT),
+                button(text("Sign out").size(theme::TEXT_SIZE_SMALL))
+                    .padding(Padding {
+                        top: theme::S1,
+                        bottom: theme::S1,
+                        left: theme::S3,
+                        right: theme::S3
+                    })
+                    .style(theme::tool_button)
+                    .on_press(Message::SignOutRequested),
+            ]
+            .spacing(theme::S1),
+            None => column![
+                action(
+                    if self.signing_in {
+                        "Waiting for the browser…"
+                    } else {
+                        "Sign in with TinkerAtlas"
+                    },
+                    Message::SignInRequested,
+                    theme::tool_button,
+                ),
+                text("Optional. Lets us reply to your bug reports.")
+                    .size(theme::CAPTION_SIZE)
+                    .color(theme::TEXT_MUTE),
+            ]
+            .spacing(theme::S1),
+        });
+
         // **The articles, which is what SindriCAD's right column is.** It
         // embeds the site in an iframe; there is no webview here, so the same
         // articles arrive as data and are drawn with the same widgets as
@@ -824,9 +860,24 @@ impl Brokkr {
                     .label("attach the diagnostics and what this session did")
                     .on_toggle(Message::BugReportDetailToggled)
                     .text_size(theme::CAPTION_SIZE),
-                text("Sent anonymously to tinkeratlas.com. Home directories are removed.")
-                    .size(theme::CAPTION_SIZE)
-                    .color(theme::TEXT_MUTE),
+                // **Says which of the two it is, before the Send button.**
+                // Signing in changes what leaves the machine -- the report
+                // stops being anonymous and is filed under a name -- and a
+                // user who signed in on a different screen should not have to
+                // infer that here. Signed out, the old sentence stands
+                // unchanged because the old behaviour is unchanged.
+                text(match &self.account {
+                    Some(account) => format!(
+                        "Sent to tinkeratlas.com as {}, so we can reply. \
+                         Home directories are removed.",
+                        account.label()
+                    ),
+                    None => "Sent anonymously to tinkeratlas.com. \
+                             Home directories are removed."
+                        .to_string(),
+                })
+                .size(theme::CAPTION_SIZE)
+                .color(theme::TEXT_MUTE),
                 preview,
                 row![
                     action(

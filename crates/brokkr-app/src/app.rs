@@ -600,6 +600,14 @@ pub struct Brokkr {
     /// The TinkerAtlas articles that screen shows. See [`crate::articles`] for
     /// why this is fetched only while the screen is actually up.
     feed: crate::articles::Feed,
+    /// The signed-in TinkerAtlas account, if there is one. See
+    /// [`crate::account`]: optional throughout, and its only effect on
+    /// behaviour is that a bug report goes out under this name instead of
+    /// anonymously.
+    account: Option<crate::account::Account>,
+    /// Whether a sign-in is waiting on the browser, so the button can say so
+    /// and cannot be pressed into starting a second listener.
+    signing_in: bool,
     /// The cube part under the pointer, lit so a click's effect is visible
     /// before the click.
     cube_hover: Option<navcube::Part>,
@@ -1590,6 +1598,10 @@ impl Brokkr {
         // be drawn underneath it and be unreachable.
         app.welcome_on_startup = crate::welcome::on_startup();
         app.welcome = app.welcome_on_startup;
+        // Read here for the same reason the welcome flag is: `with_devices` is
+        // what the tests build through, and a test that picked up whoever is
+        // signed in on the machine running it would pass or fail on that.
+        app.account = crate::account::load();
         // The screen is up, so its articles are wanted. The only other place
         // that raises it, `Message::WelcomeOpened`, asks for them too.
         let boot = if app.welcome { app.fetch_articles() } else { Task::none() };
@@ -1698,6 +1710,8 @@ impl Brokkr {
             welcome: false,
             welcome_on_startup: true,
             feed: crate::articles::Feed::default(),
+            account: None,
+            signing_in: false,
             cube_hover: None,
             flight: None,
             menu: None,
@@ -7909,6 +7923,36 @@ impl Brokkr {
                 self.welcome_on_startup = show;
                 crate::welcome::set_on_startup(show);
             }
+            Message::SignInRequested => {
+                // Guarded rather than merely disabled in the view: a second
+                // press would bind a second listener and open a second tab,
+                // and only one of them could ever be answered.
+                if self.signing_in {
+                    return Task::none();
+                }
+                self.signing_in = true;
+                self.status = "waiting for the browser…".to_string();
+                return Task::perform(async { crate::account::sign_in() }, Message::SignInFinished);
+            }
+            Message::SignInFinished(outcome) => {
+                self.signing_in = false;
+                match outcome {
+                    Ok(account) => {
+                        self.status = format!("signed in as {}", account.label());
+                        self.account = Some(account);
+                    }
+                    // "could not" is what colours the status line as an error;
+                    // see `panel.rs`.
+                    Err(why) => self.status = format!("could not sign in: {why}"),
+                }
+            }
+            Message::SignOutRequested => match crate::account::sign_out() {
+                Ok(()) => {
+                    self.account = None;
+                    self.status = "signed out".to_string();
+                }
+                Err(why) => self.status = why,
+            },
             Message::SymmetryAxisToggled(axis) => self.toggle_mirror(axis),
             Message::PatternChanged(kind) => self.brush.pattern.kind = kind,
             Message::PatternScaleChanged(scale) => self.brush.pattern.scale_mm = scale,
@@ -8016,8 +8060,17 @@ impl Brokkr {
                     draft.sending = true;
                 }
                 self.status = "sending the report…".to_string();
+                // Built here and not inside the task: the account lives on
+                // `self`, and the task has to own everything it touches.
+                let authorization = self.account.as_ref().map(|a| a.authorization());
                 return Task::perform(
-                    async move { crate::report::send(report, crate::report::TINKERATLAS) },
+                    async move {
+                        crate::report::send(
+                            report,
+                            crate::report::TINKERATLAS,
+                            authorization.as_deref(),
+                        )
+                    },
                     Message::BugReportFinished,
                 );
             }

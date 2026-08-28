@@ -396,6 +396,13 @@ pub enum Message {
     /// it may lead to before anything is spawned -- see
     /// [`crate::articles::open_in_browser`].
     LinkOpened(String),
+    /// Start the browser half of signing in to TinkerAtlas.
+    SignInRequested,
+    /// The sign-in came back, with an account or with why not.
+    SignInFinished(Result<crate::account::Account, String>),
+    /// Forget the stored account. Local only: it does not revoke the token,
+    /// which is done on the site under desktop connections.
+    SignOutRequested,
     /// The "show this on startup" tick, which is written through immediately:
     /// a preference that only lands when the dialog is dismissed the right way
     /// is one that silently forgets.
