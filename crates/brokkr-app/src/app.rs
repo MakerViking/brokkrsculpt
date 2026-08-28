@@ -1698,6 +1698,36 @@ impl Brokkr {
         if app.has_autosave() {
             app.status = "an autosave from a previous session is in File > Recover".to_string();
         }
+        // **And a crash outranks it**, because it is the rarer message and the
+        // one with something to do about it. Taken rather than read, so it is
+        // said once; see `crash::take_pending`.
+        if let Some(report) = crate::crash::take_pending() {
+            app.status =
+                "the last session crashed — Help > Report a bug will send the report".to_string();
+            // The path goes to the log rather than the status line: it is long
+            // enough to wrap the title bar onto two lines, and it is the one
+            // part of the message a user does not need in order to act.
+            //
+            // The summary is found by looking for the `message:` heading and
+            // not by counting lines. Counting picked line five, which is
+            // `os: linux` -- a summary that is the same on every crash, which
+            // is worse than none.
+            let summary = report
+                .lines()
+                .skip_while(|line| !line.starts_with("message:"))
+                .nth(1)
+                .unwrap_or("(no message)")
+                .trim();
+            match crate::crash::report_path() {
+                Some(path) => {
+                    log::warn!(
+                        "the previous session crashed: {summary} (report in {})",
+                        path.display()
+                    )
+                }
+                None => log::warn!("the previous session crashed: {summary}"),
+            }
+        }
         app
     }
 

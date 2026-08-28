@@ -5,6 +5,7 @@
 mod app;
 mod breadcrumbs;
 mod camera;
+mod crash;
 mod cursor;
 mod gizmo;
 #[cfg(target_os = "linux")]
@@ -55,6 +56,11 @@ fn main() -> iced::Result {
     // crate had been invisible since the day it was written -- which is why an
     // import or a resample left no trace in a log people were being told to
     // read. `brokkr_gpu` IS correct: that one is a library.
+    // Before anything can panic, and before the window opens. A panic used to
+    // take the window and leave nothing behind but a backtrace on a terminal
+    // the user had not launched from.
+    crash::install();
+
     env_logger::Builder::from_env(
         env_logger::Env::default().default_filter_or("warn,brokkrsculpt=info,brokkr_gpu=info"),
     )
