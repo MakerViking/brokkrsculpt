@@ -86,6 +86,43 @@ jobs:
           fi
           echo "brokkr-core is clean"
 
+  # **A survey, not a gate.** The open beta ships on three platforms and this
+  # workspace has only ever been compiled on one, so the `cfg(not(linux))`
+  # fallbacks in `tablet.rs` and `spacemouse.rs` have never been built by
+  # anything. This job exists to find out what breaks; a red row here is the
+  # information, not a regression. Nothing depends on it and it must not be
+  # made a required check until it is actually green.
+  #
+  # `RUSTFLAGS` is deliberately cleared. The workflow-level `-D warnings` turns
+  # the first unused import in the first crate into a hard error, which stops
+  # the compile before the interesting platform errors further up the tree are
+  # ever reached -- the opposite of what a survey wants. Warnings come back
+  # when these platforms are being fixed rather than measured.
+  cross:
+    name: Build and test (${{ matrix.os }})
+    strategy:
+      # Both platforms every run: one failing must not cancel the other, or
+      # half the answer is missing.
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    env:
+      RUSTFLAGS: ""
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: Swatinem/rust-cache@v2
+
+      # Separate from the test step so the report can say which of the two
+      # failed. A workspace that does not build and one that builds but fails
+      # its tests are different amounts of work.
+      - name: Build
+        run: cargo build --workspace --all-targets
+
+      - name: Test
+        run: cargo test --workspace
+
   budget:
     name: Performance budget
     runs-on: ubuntu-latest
