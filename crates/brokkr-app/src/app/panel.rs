@@ -1784,7 +1784,17 @@ impl Brokkr {
             .height(Length::Fill),
         )
         .padding(theme::S3)
-        .width(Length::Fixed(76.0))
+        // **Wide enough for the labels AND the scrollbar.** 76 was measured
+        // against a strip that did not have one. Making it scrollable took a
+        // scrollbar's width out of the content -- iced spends it from the
+        // inside rather than overlaying -- and the labels under the icons lost
+        // exactly that much: "Flatten" and "Smooth" came back clipped, which
+        // reads as a rendering fault rather than as a strip that is too narrow.
+        //
+        // The words are the reason this column is not eighteen pixels of icon
+        // in the first place, per the note above, so they set the width and the
+        // scrollbar is added to it rather than taken out of it.
+        .width(Length::Fixed(92.0))
         .height(Length::Fill)
         .style(theme::tool_strip)
         .into()
