@@ -1500,6 +1500,24 @@ impl LockedFills {
 struct Locked {
     field: FieldRegion,
     fills: LockedFills,
+    /// The mask over the same box, snapshotted with the field.
+    ///
+    /// **Both warps read from the lock, which is what makes the gesture a pure
+    /// function of the drag.** `free` used to be read LIVE at the destination
+    /// voxel; once the warp writes the mask, a live read would feed the next
+    /// event a mask this event moved, and the displacement would drift while
+    /// the pointer stood still. That is the accumulation this file's own
+    /// warning is about. Locked, both fields resample from the same frozen
+    /// pair by the same displacement, so dragging out and back returns the
+    /// mask exactly as it returns the form.
+    ///
+    /// A `FieldRegion` and not a `u8` twin, for the reason
+    /// `Volume::snapshot_mask` already gives: it exists, it is tested, and it
+    /// samples.
+    mask: FieldRegion,
+    /// False when the body carries no mask at all, so the second pass and the
+    /// per voxel multiply are both skipped entirely.
+    masked: bool,
 }
 
 /// A Move gesture, holding the field as it stood when the button went down.
@@ -1683,6 +1701,12 @@ impl MoveStroke {
             volume.snapshot(read_lo, read_hi, &mut locked.field);
             let (stored_lo, stored_hi) = locked.field.bounds();
             locked.fills.build(volume, stored_lo, stored_hi);
+            // Only when there is one. An unmasked body pays nothing for any of
+            // this: no snapshot, no second pass, no multiply.
+            locked.masked = !volume.mask().is_free();
+            if locked.masked {
+                volume.snapshot_mask(read_lo, read_hi, &mut locked.mask);
+            }
         }
     }
 
@@ -1804,13 +1828,27 @@ impl MoveStroke {
             // Zero reach: this never answers `OnlyNearDifferentNeighbours`,
             // because what it has to prove is about the locked copy and not
             // about the brick's neighbours in the volume.
+            let masked = locked.masked;
+            let locked_mask = &locked.mask;
+            // `use_mask` stays ON -- it is what gives `decide` a resolved
+            // `preview.mask`, and a fully protected brick has to keep being
+            // skipped whole. Only the per voxel multiply is taken from the
+            // LOCKED mask instead of the live one: the second pass below moves
+            // the mask, and a live read would feed the next event a mask this
+            // event had just moved, so the drag would creep while the pointer
+            // stood still. That is the accumulation this file warns about.
             volume.edit_voxels_where(
                 anchor.lo,
                 anchor.hi,
                 0,
                 true,
                 decide,
-                |_, position, value, free| {
+                |voxel, position, value, _| {
+                    let free = if masked {
+                        1.0 - (locked_mask.get(voxel) / PROTECTED as f32).clamp(0.0, 1.0)
+                    } else {
+                        1.0
+                    };
                     // Explicitly, and not by way of a zero displacement. A zero
                     // displacement makes the warp resample the LOCKED COPY at
                     // the voxel, which is the value at lock time rather than the
@@ -1850,6 +1888,53 @@ impl MoveStroke {
                     field.sample((position - displacement * free) / voxel_size)
                 },
             );
+
+            // **The mask travels with the material.** Reported as a mask that
+            // hangs in the air: drag an unmasked finger towards a masked ring
+            // and the finger arrives masked, because the warp moved the field
+            // and left protection nailed to the lattice. Every other warp in
+            // the workspace carries the mask -- `shifted`, `rotated`,
+            // `resampled` and `warped` all do, each with a test -- and this was
+            // the one that did not.
+            //
+            // The same displacement and the same `free`, resampled from the
+            // same lock, so the two fields cannot come apart. Second pass
+            // rather than folded into the first because `edit_voxels_where`
+            // hands back one `f32` per voxel and that one is the field's.
+            if masked {
+                let (lo, hi) = (anchor.lo, anchor.hi);
+                for z in lo.z..=hi.z {
+                    for y in lo.y..=hi.y {
+                        for x in lo.x..=hi.x {
+                            let voxel = IVec3::new(x, y, z);
+                            let free =
+                                1.0 - (locked_mask.get(voxel) / PROTECTED as f32).clamp(0.0, 1.0);
+                            if free <= 0.0 {
+                                // Protected voxels do not move, so their
+                                // protection does not either. Skipping is not
+                                // an optimisation: writing them would resample
+                                // at zero displacement and could round a
+                                // saturated byte down off PROTECTED.
+                                continue;
+                            }
+                            let position = voxel.as_vec3() * voxel_size;
+                            let Some(displacement) = move_displacement(
+                                anchors,
+                                drag,
+                                position,
+                                inverse_radius,
+                                falloff,
+                                cap,
+                            ) else {
+                                continue;
+                            };
+                            let from = (position - displacement * free) / voxel_size;
+                            let carried = locked_mask.sample(from).clamp(0.0, PROTECTED as f32);
+                            volume.mask_mut().write(voxel, carried.round() as u8);
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -4017,6 +4102,68 @@ mod move_tests {
         assert!(
             (masked - unmasked * 0.5).abs() < 1.0e-4,
             "a masked body did not halve the drag cap: {masked} against {unmasked} unmasked"
+        );
+    }
+
+    /// **A mask must travel with the material, not sit in the air waiting.**
+    ///
+    /// Reported from the running app: with the rest of a hand masked, dragging
+    /// a finger towards the ring made the finger "inherit mask while moving --
+    /// like there is a sticky mask in the air there". It is exactly that. The
+    /// warp resamples the FIELD from `position - displacement * free` and never
+    /// touches the mask, so a voxel's protection is whatever happened to be at
+    /// the place the material arrived at. Drag unmasked material into masked
+    /// space and it comes out masked, and no further stroke will touch it.
+    ///
+    /// `Volume::warped` -- the whole-body version of this same domain warp --
+    /// carries the mask through it, and so do `shifted`, `rotated` and
+    /// `resampled`, each with a test saying so. The brush was the one warp that
+    /// did not.
+    ///
+    /// A PARTIAL mask ahead of the drag rather than a full one, because `free`
+    /// scales the displacement: fully protected space admits no material at
+    /// all, so the bug cannot be shown there. Half protected is where material
+    /// arrives AND protection is waiting for it.
+    ///
+    /// **The LEADING EDGE is the only place this can be seen**, and that is the
+    /// test rather than an accident of it. A voxel deep inside the masked slab
+    /// is fed by material that was itself masked, so 127 there is the right
+    /// answer; only where unmasked material crosses in does the mask have to
+    /// give way. Measured on this fixture: the edge voxel goes 127 -> 43 with
+    /// the fix and stays at 127 without it, because without it nothing writes
+    /// the mask at all.
+    #[test]
+    fn material_dragged_into_masked_space_does_not_pick_up_its_mask() {
+        let brush = Brush { kind: BrushKind::Move, radius: 9.0, strength: 0.8, ..Brush::default() };
+        let at = Vec3::new(24.0, 0.0, 0.0);
+        let mut volume = sphere_with_a_bump();
+
+        // The near edge of the masked slab: inside the brush box, which at
+        // radius 9 about x=24 is x in 15..=33, and the first voxel unmasked
+        // material reaches. A voxel past the box is never visited by the warp
+        // at all and one deeper in is fed by masked material, so neither would
+        // prove anything.
+        let ahead = IVec3::new(28, 0, 0);
+        assert_eq!(volume.mask().at(ahead), UNMASKED, "the fixture starts unmasked");
+        for x in 28..40 {
+            for y in -6..6 {
+                for z in -6..6 {
+                    volume.mask_mut().write(IVec3::new(x, y, z), PROTECTED / 2);
+                }
+            }
+        }
+
+        let mut stroke = MoveStroke::new();
+        stroke.begin(&volume, &brush, at, Symmetry::OFF, Vec3::ZERO);
+        stroke.drag_to(&mut volume, at + Vec3::X * 8.0, 1.0);
+        stroke.end();
+
+        // The material that arrived brought its own protection with it, which
+        // was none. Not the half-mask that was hanging in the air.
+        assert!(
+            volume.mask().at(ahead) < PROTECTED / 4,
+            "unmasked material dragged into masked space came out masked: {} at {ahead:?}",
+            volume.mask().at(ahead)
         );
     }
 

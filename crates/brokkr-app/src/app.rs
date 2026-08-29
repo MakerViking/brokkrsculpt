@@ -3733,8 +3733,9 @@ impl Brokkr {
     /// One row and its whole subtree, prompted on the SUM of what it takes.
     ///
     /// **The prompt is on the SIZE and nothing else**, and the threshold is the
-    /// same 512 MB as the reclaim allowance because a delete that would be
-    /// evicted before it could be undone is exactly the one that has to warn.
+    /// reclaim allowance itself -- named, not copied, so raising one raises the
+    /// other -- because a delete that would be evicted before it could be
+    /// undone is exactly the one that has to warn.
     /// It is measured over the whole subtree, so a folder delete asks about
     /// what it is really taking -- and folders make the prompt the common case
     /// rather than the exception.
@@ -5635,6 +5636,17 @@ impl Brokkr {
         // `framing` leaves the default lattice behind, and the floor is a
         // number of voxels, so it has to be told the real one.
         self.refresh_camera_lattice();
+        // **The brush is in millimetres and the model just changed size.** The
+        // 3 mm default is a twentieth of the 60 mm starting ball, which is a
+        // brush; against a 200 mm import it is a pin, and against a model that
+        // arrived small it covered the whole thing. Neither is a radius anyone
+        // chose, and both read as the controls being broken rather than as a
+        // slider needing a drag. Held at the same twentieth so the brush means
+        // the same thing whatever was opened.
+        let longest = imported.report.longest_mm;
+        if longest.is_finite() && longest > 0.0 {
+            self.brush.radius = (longest / 20.0).clamp(MIN_RADIUS_MM, self.max_radius());
+        }
         self.history.clear();
         self.history_stats = self.history.stats();
         self.project_path = None;
@@ -8534,6 +8546,16 @@ impl Brokkr {
                             // here instead, or the two will overflow it
                             // between them with nothing reporting it.
                             let options = brokkr_core::voxelise::VoxeliseOptions::at(voxel_size);
+                            // Asked of the MESH, not of the document. The
+                            // document's size is whatever the last thing on
+                            // screen was built at -- 0.25 mm for the starting
+                            // ball -- and inheriting it meant a three million
+                            // triangle model was voxelised at the resolution
+                            // chosen for a sphere, and that the same file
+                            // imported twice gave two different results.
+                            let options = brokkr_core::voxelise::VoxeliseOptions::at(
+                                brokkr_core::voxelise::voxel_for_mesh(&mesh, &options),
+                            );
                             brokkr_core::voxelise::voxelise(&mesh, &options).map(
                                 |(volume, report)| crate::message::Imported {
                                     volume,

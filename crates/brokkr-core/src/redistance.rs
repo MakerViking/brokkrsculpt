@@ -251,7 +251,8 @@ impl Volume {
         // `Vec<(BrickCoord, Brick)>` over every dense brick duplicates the
         // field at 128 KB a brick, which would take `rebake_gizmo`'s deliberate
         // two live copies to three -- about 1.4 GB on the bench's 470 MB row,
-        // on a path whose arm limit is 512 MB. At most an eighth is staged
+        // on a path whose arm limit is the reclaim allowance, now 1 GB. At most
+        // an eighth is staged
         // here.
         let mut by_colour: [Vec<BrickCoord>; 8] = Default::default();
         for coord in &coords {

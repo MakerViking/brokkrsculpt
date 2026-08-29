@@ -8,8 +8,8 @@ use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::apron::ApronBuffer;
 use crate::brick::{
-    BRICK_DIM, BRICK_VOXELS, Brick, BrickCoord, INSIDE, NARROW_BAND, OUTSIDE, apron_index,
-    brick_index,
+    BRICK_DIM, BRICK_VOXELS, Brick, BrickCoord, INSIDE, NARROW_BAND, OUTSIDE, StoredBrick,
+    apron_index, brick_index,
 };
 use crate::mask::{MaskBrick, MaskEdit, MaskField, MaskSlab, PROTECTED, UNMASKED};
 use crate::mesh::{BrickMesh, MeshScratch, mesh_apron};
@@ -1524,11 +1524,15 @@ impl Volume {
         let (bricks, masks, polarity) = edit.into_parts();
         let mut inverse = Vec::with_capacity(bricks.len());
         for (coord, brick) in bricks {
+            // Decoded on the way in and re-encoded on the way out. The live
+            // map only ever holds a real `Brick`; history only ever holds a
+            // `StoredBrick`. One pass over a brick each way, against a memcpy
+            // of the same brick before -- and a quarter of the bytes kept.
             let previous = match brick {
-                Some(brick) => self.bricks.insert(coord, brick),
+                Some(brick) => self.bricks.insert(coord, brick.decode()),
                 None => self.bricks.remove(&coord),
             };
-            inverse.push((coord, previous));
+            inverse.push((coord, previous.as_ref().map(StoredBrick::encode)));
             self.mark_brick_and_neighbours_dirty(coord);
         }
 
