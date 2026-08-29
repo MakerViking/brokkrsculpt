@@ -273,8 +273,8 @@ should have to discover for themselves.
 |---|---|---|---|
 | Sculpting, import, export, printing | yes | yes | yes |
 | Masking **display** | yes | yes | **wrong — see below** |
-| Stylus pressure and tilt | yes | untested | no |
-| SpaceMouse | yes | no | no |
+| Stylus pressure and tilt | yes | untested | untested |
+| SpaceMouse | yes | untested | untested |
 | Installer the OS trusts | n/a | no | no |
 
 - **macOS masking renders wrong.** The tint spreads past the mask and a seam
@@ -282,20 +282,42 @@ should have to discover for themselves.
   unaffected, and so is anything you export — but you cannot trust the blue to
   tell you where it is. A difference in how the Metal backend reads a vertex
   attribute; it is being chased, and Linux and Windows are unaffected.
-- **Stylus on Windows is written but has never met a tablet.** The PEN panel
-  says which state it is in: *"Listening for a pen through Raw Input; none has
-  reported yet"* against *"Reading the pen through Raw Input."* If it never
-  leaves the first, strokes run at full pressure exactly as a mouse does — so
-  it degrades rather than breaks. A screenshot of that panel is the single most
-  useful bug report a Windows user with a tablet can send.
-- **No stylus or SpaceMouse on macOS.** Both are read straight from the Linux
-  kernel today and the macOS equivalents are not written yet.
+- **Stylus and SpaceMouse on Windows and macOS are written but have never met
+  the hardware.** Windows reads them through Raw Input, macOS through IOKit,
+  and both compile on their own platform — but nobody involved owns a tablet or
+  a puck on either, so "it works" is not a claim being made. Both panels say
+  which state they are in rather than leaving you guessing:
+
+  > *"Listening for a pen through Raw Input; none has reported yet"* — against —
+  > *"Reading the pen through Raw Input."*
+
+  If it never leaves the first, strokes run at full pressure exactly as a mouse
+  does, so it degrades rather than breaks. **A screenshot of that panel is the
+  single most useful bug report a Windows or macOS user with a tablet can
+  send.** On macOS, silence most often means Input Monitoring has not been
+  granted in System Settings → Privacy & Security.
 - **Neither installer is signed**, because the certificates cost money this
-  project does not have yet. macOS will tell you the app *"is damaged and can't
-  be opened"* — it is not; that is what Gatekeeper says about any unsigned
-  download, and `xattr -dr com.apple.quarantine` on the app clears it. Windows
-  shows SmartScreen's *"Windows protected your PC"*, which needs **More info**
-  then **Run anyway**.
+  project does not have yet.
+
+  **macOS** will say the app *"is damaged and can't be opened."* It is not
+  damaged — that is what Gatekeeper says about any unsigned download. Move it
+  to Applications, then in Terminal:
+
+  ```
+  xattr -dr com.apple.quarantine /Applications/BrokkrSculpt.app
+  ```
+
+  The Terminal command rather than the usual advice, deliberately. Control+click
+  → Open **no longer works**: Sequoia removed it. The supported route is now
+  System Settings → Privacy & Security → **Open Anyway** after a failed launch,
+  which needs an admin password and only offers the button for about an hour
+  afterwards — and an app with no signature at all may not appear there to be
+  excused. Removing the quarantine flag is the one path that does not depend on
+  any of that. It turns off nothing system-wide; it marks this one download as
+  one you chose.
+
+  **Windows** shows SmartScreen's *"Windows protected your PC"*, which needs
+  **More info** then **Run anyway**.
 
 **The honest limits**, both of which you will meet in ordinary use rather than
 in exotic corner cases:
