@@ -74,7 +74,7 @@ use std::collections::VecDeque;
 use rustc_hash::FxHashMap;
 
 use crate::body::{Document, Node, NodeId, NodeMeta};
-use crate::brick::{Brick, BrickCoord};
+use crate::brick::{Brick, BrickCoord, StoredBrick};
 use crate::mask::{MaskBrick, MaskField};
 use crate::volume::Volume;
 
@@ -88,13 +88,27 @@ pub const DEFAULT_HISTORY_BUDGET: usize = 256 * 1024 * 1024;
 /// Default ceiling on the volumes undo history is holding on BEHALF of deleted
 /// bodies, separate from [`DEFAULT_HISTORY_BUDGET`].
 ///
-/// **512 MB is also the threshold at which deleting a body prompts with its
-/// size, and that is one number rather than two that happen to coincide**: a
-/// delete which would be evicted before it could be undone is exactly the
-/// delete that has to warn first. Forty modest 20 MB bodies is 800 MB against
-/// this allowance with no single body anywhere near it, which is why the
-/// eviction itself also has to say something -- see [`HistoryStats::dropped_bodies`].
-pub const DEFAULT_RECLAIM_BUDGET: usize = 512 * 1024 * 1024;
+/// **Also the threshold at which deleting a body prompts with its size, and
+/// that is one number rather than two that happen to coincide**: a delete which
+/// would be evicted before it could be undone is exactly the delete that has to
+/// warn first. Forty modest 20 MB bodies is 800 MB against this allowance with
+/// no single body anywhere near it, which is why the eviction itself also has
+/// to say something -- see [`HistoryStats::dropped_bodies`].
+///
+/// **A gigabyte, raised from half of one.** The number was set when an import
+/// took the document's own voxel size; once an import chose its own, a
+/// 3,100,109 triangle model came in at 0.168 mm and 537 MB -- five percent over
+/// the old allowance, so the gizmo refused to arm and the model could not be
+/// moved at all. Half a gigabyte stopped being "larger than any body a session
+/// will hold" the moment imports started resolving what the file contains.
+///
+/// This raises the combined history ceiling to 1.25 GB, which the module doc
+/// above discusses and which the volume guard still cannot see. It buys room
+/// rather than fixing the cost: a move's entry is a copy of the WHOLE field
+/// because a transform rewrites every voxel, and the entry that would not be a
+/// copy -- an exactly invertible move recorded as its inverse -- is the real
+/// answer and is tracked separately.
+pub const DEFAULT_RECLAIM_BUDGET: usize = 1024 * 1024 * 1024;
 
 /// The prior contents of every brick one stroke changed.
 ///
@@ -125,9 +139,13 @@ pub struct StrokeEdit {
     bytes: usize,
 }
 
-/// The prior contents of a set of field bricks. `None` is a brick that did not
-/// exist, which undo puts back by removing it again.
-type PriorBricks = Vec<(BrickCoord, Option<Brick>)>;
+/// The prior contents of a set of field bricks, run length encoded. `None` is
+/// a brick that did not exist, which undo puts back by removing it again.
+///
+/// [`StoredBrick`] rather than [`Brick`] because a narrow band field is 86.8%
+/// saturated and encodes 4.39x smaller -- see that type for the measurement.
+/// The budget below is unchanged and now holds four times as many strokes.
+type PriorBricks = Vec<(BrickCoord, Option<StoredBrick>)>;
 
 /// The same for mask bricks. Named alongside [`PriorBricks`] rather than
 /// written out: the two differ by one word deep inside a nested generic, and
@@ -144,7 +162,13 @@ impl StrokeEdit {
         if bricks.is_empty() && masks.is_empty() && polarity.is_none() {
             return None;
         }
-        Some(Self::from_parts(bricks.into_iter().collect(), masks.into_iter().collect(), polarity))
+        // Encoded here, at the one place a stroke's priors enter history, so
+        // no caller has to remember to and no path can store a raw brick.
+        let encoded: PriorBricks = bricks
+            .into_iter()
+            .map(|(coord, brick)| (coord, brick.as_ref().map(StoredBrick::encode)))
+            .collect();
+        Some(Self::from_parts(encoded, masks.into_iter().collect(), polarity))
     }
 
     /// An entry that puts back field bricks and nothing else.
@@ -207,8 +231,12 @@ impl StrokeEdit {
 /// has not recorded yet and the prediction is only worth having while it is
 /// exact. Two copies of this formula would drift and nothing would say so.
 #[inline]
-pub(crate) fn prior_bytes(prior: Option<&Brick>) -> usize {
-    size_of::<(BrickCoord, Option<Brick>)>() + prior.map_or(0, Brick::heap_bytes)
+pub(crate) fn predicted_prior_bytes(prior: Option<&Brick>) -> usize {
+    size_of::<(BrickCoord, Option<StoredBrick>)>() + prior.map_or(0, Brick::encoded_bytes)
+}
+
+pub(crate) fn prior_bytes(prior: Option<&StoredBrick>) -> usize {
+    size_of::<(BrickCoord, Option<StoredBrick>)>() + prior.map_or(0, StoredBrick::heap_bytes)
 }
 
 /// What one mask brick's prior contents cost the stroke budget.
@@ -871,6 +899,22 @@ mod tests {
     use glam::Vec3;
     use std::collections::HashSet;
 
+    /// A brick no encoder can shrink, for the budget and eviction fixtures.
+    ///
+    /// **Not `dense_filled`.** A brick of one repeated value is one run and six
+    /// bytes now, so a fixture built from those puts nothing against the budget
+    /// and the eviction it is checking never happens -- the test passes by
+    /// proving history is empty. Every voxel different is the worst case the
+    /// `Dense` fallback exists for, which is also the weight these budgets were
+    /// written against: 131,104 bytes an entry.
+    fn incompressible_brick() -> Brick {
+        let mut values = Box::new([0.0f32; crate::BRICK_VOXELS]);
+        for (index, slot) in values.iter_mut().enumerate() {
+            *slot = f32::from_bits(0x3f00_0000 | (index as u32 & 0xffff));
+        }
+        Brick::Dense(values)
+    }
+
     fn sculpted() -> (Document, Brush, BrushScratch) {
         let mut doc = Document::new(1.0);
         doc.active_volume_mut().seed_sphere(Vec3::ZERO, 24.0);
@@ -1162,7 +1206,7 @@ mod tests {
         for index in 0..STROKES {
             let coord = BrickCoord::new(index as i32, 0, 0);
             let volume = doc.volume_mut(body).expect("the starting body");
-            volume.insert_brick(coord, Brick::dense_filled(0.5));
+            volume.insert_brick(coord, incompressible_brick());
             history.push(Entry::stroke(body, StrokeEdit::from_bricks(vec![(coord, None)])));
         }
         assert_eq!(history.stats().undo_entries, STROKES, "a push evicted something");
@@ -1205,7 +1249,7 @@ mod tests {
         let mut history = History::new(BUDGET);
         for coord in coords {
             let volume = doc.volume_mut(body).expect("the starting body");
-            volume.insert_brick(coord, Brick::dense_filled(0.5));
+            volume.insert_brick(coord, incompressible_brick());
             history.push(Entry::stroke(body, StrokeEdit::from_bricks(vec![(coord, None)])));
         }
         assert_eq!(history.stats().undo_entries, 3, "a push evicted something");
@@ -1258,7 +1302,7 @@ mod tests {
         let mut history = History::new(BUDGET);
         for coord in [older, newest] {
             let volume = doc.volume_mut(body).expect("the starting body");
-            volume.insert_brick(coord, Brick::dense_filled(0.5));
+            volume.insert_brick(coord, incompressible_brick());
             history.push(Entry::stroke(body, StrokeEdit::from_bricks(vec![(coord, None)])));
         }
         assert_eq!(history.stats().undo_entries, 2, "a push evicted something");
@@ -1619,23 +1663,95 @@ mod tests {
 
     // --- the mask half of an entry -------------------------------------------
 
-    /// A mask entry weighs a quarter of a sculpt entry, **to the byte**.
+    /// A mask entry weighs a quarter of an UNCOMPRESSED sculpt entry, **to the
+    /// byte**, and a sculpt entry no longer weighs that.
     ///
     /// Both numbers rather than the ratio between them, and that is not
     /// pedantry: a ratio passes on a mask brick that collapsed to a tile, which
     /// costs no heap at all, and it passes on an entry that recorded no mask
-    /// bricks. 32 + 32,768 against 32 + 131,072 is the arithmetic the whole
-    /// "+25% storage" argument for eight bits rests on, and it is checked here
-    /// because this is where the undo budget reads it.
+    /// bricks. 32 + 32,768 is the arithmetic the whole "+25% storage" argument
+    /// for eight bits rests on, and it is checked here because this is where
+    /// the undo budget reads it.
+    ///
+    /// The field half is now the ENCODED size. A brick of one repeated value
+    /// is one run -- six bytes -- which is the best case and shows the encoder
+    /// is actually running; the average on real geometry is 4.39x, not 21,845x.
+    /// `an_encoded_brick_restores_bit_for_bit` is what pins correctness; this
+    /// pins that the budget is charged the encoded figure and not the raw one.
     #[test]
-    fn a_mask_entry_is_a_quarter_the_weight_of_a_sculpt_entry() {
+    fn a_mask_entry_is_a_quarter_the_weight_of_an_unencoded_sculpt_entry() {
         let dense = MaskBrick::dense_filled(200);
         assert_eq!(mask_prior_bytes(Some(&dense)), 32_800);
         assert_eq!(mask_prior_bytes(Some(&MaskBrick::Uniform(200))), 32);
         assert_eq!(mask_prior_bytes(None), 32);
 
         let field = Brick::Dense(Box::new([0.0; crate::BRICK_VOXELS]));
-        assert_eq!(prior_bytes(Some(&field)), 131_104);
+        // What it used to cost, and what the predictor must no longer quote.
+        assert_eq!(size_of::<(BrickCoord, Option<Brick>)>() + field.heap_bytes(), 131_104);
+        // One value throughout is one run.
+        assert_eq!(field.encoded_bytes(), 6);
+        // 40 and not 32: a `StoredBrick` carries a boxed slice, which is a fat
+        // pointer, so the tuple that holds one is a word wider than the tuple
+        // that held a `Brick`. Eight bytes an entry against 131,072 saved.
+        assert_eq!(size_of::<(BrickCoord, Option<StoredBrick>)>(), 40);
+        assert_eq!(prior_bytes(Some(&StoredBrick::encode(&field))), 40 + 6);
+        assert_eq!(predicted_prior_bytes(Some(&field)), 40 + 6);
+    }
+
+    /// **The encoding is lossless, bit for bit, or undo silently corrupts.**
+    ///
+    /// Bits and not values: `-0.0 == 0.0` compares equal and reads back
+    /// differently, and two NaNs with different payloads are different voxels
+    /// to anything that stores them. A run table that merged either would give
+    /// back a brick that looks right in a debugger and is not what was there.
+    #[test]
+    fn an_encoded_brick_restores_bit_for_bit() {
+        let mut values = [crate::OUTSIDE; crate::BRICK_VOXELS];
+        // A shell of varying distance in a saturated field, which is the shape
+        // every real brick has.
+        for (index, slot) in values.iter_mut().enumerate().take(4096).skip(1000) {
+            *slot = (index as f32 * 0.001).sin() * crate::NARROW_BAND;
+        }
+        values[9000] = -0.0;
+        values[9001] = 0.0;
+        values[9002] = f32::NAN;
+        for slot in values.iter_mut().take(30_000).skip(20_000) {
+            *slot = crate::INSIDE;
+        }
+        let original = Brick::Dense(Box::new(values));
+
+        let encoded = StoredBrick::encode(&original);
+        assert_eq!(encoded.heap_bytes(), original.encoded_bytes(), "predictor disagrees");
+        assert!(
+            encoded.heap_bytes() < original.heap_bytes(),
+            "a shell in a saturated field did not shrink: {} against {}",
+            encoded.heap_bytes(),
+            original.heap_bytes()
+        );
+
+        let Brick::Dense(restored) = encoded.decode() else {
+            panic!("a dense brick decoded to a tile");
+        };
+        for index in 0..crate::BRICK_VOXELS {
+            assert_eq!(
+                restored[index].to_bits(),
+                values[index].to_bits(),
+                "voxel {index} came back different"
+            );
+        }
+    }
+
+    /// A tile costs nothing encoded, exactly as it costs nothing live.
+    #[test]
+    fn a_uniform_brick_encodes_to_no_heap_at_all() {
+        let tile = Brick::Uniform(crate::INSIDE);
+        let encoded = StoredBrick::encode(&tile);
+        assert_eq!(encoded.heap_bytes(), 0);
+        assert_eq!(tile.encoded_bytes(), 0);
+        match encoded.decode() {
+            Brick::Uniform(value) => assert_eq!(value, crate::INSIDE),
+            Brick::Dense(_) => panic!("a tile decoded to a dense brick"),
+        }
     }
 
     /// **A sculpt stroke records ZERO mask bytes**, and that is what the whole
