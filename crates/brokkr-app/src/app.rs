@@ -12841,9 +12841,21 @@ mod export_tests {
     fn the_diagnostics_carry_what_a_bug_report_needs() {
         let app = app();
         let report = app.diagnostics();
-        for expected in ["BrokkrSculpt", "session:", "model:", "view:", "tablet:", "spacemouse:"] {
+        for expected in ["BrokkrSculpt", "model:", "view:", "tablet:", "spacemouse:"] {
             assert!(report.contains(expected), "diagnostics are missing {expected}:\n{report}");
         }
+        // The platform line is one or the other, never neither. `session:`
+        // answers "Wayland or X11, and which compositor", which only Linux can
+        // be asked; everywhere else the OS version is the useful fact and
+        // `os:` carries it. Asserting the pair rather than one name is what
+        // stops a future platform silently reporting no platform at all --
+        // this test demanded `session:` on every OS and passed for a year
+        // because only one OS was built.
+        let platform = if cfg!(target_os = "linux") { "session:" } else { "os:" };
+        assert!(
+            report.contains(platform),
+            "diagnostics name no platform; expected {platform}:\n{report}"
+        );
         // The commit is what ties a binary to its source, which is an AGPL
         // obligation rather than a nicety.
         assert!(report.contains(build_commit()));
