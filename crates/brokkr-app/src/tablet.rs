@@ -125,6 +125,12 @@ struct Shared {
     in_proximity: AtomicBool,
     /// The two pen ends, tracked separately because proximity is either of
     /// them and the kernel reports them as different tools.
+    ///
+    /// Only the evdev reader sets it and only Linux has one, so off Linux it is
+    /// written by nobody and read by nobody. Kept rather than `cfg`'d out: the
+    /// struct is shared and a second shape for two platforms costs more than
+    /// the allow.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     tool_tip: AtomicBool,
     tool_eraser: AtomicBool,
     tilt_x: AtomicU32,
@@ -168,12 +174,16 @@ impl Shared {
         self.last_event_ms.store(self.now_ms(), Ordering::Relaxed);
     }
 
+    // Same as the rest of these: written by the evdev reader alone.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     fn set_pressure(&self, value: f32) {
         self.pressure.store(value.to_bits(), Ordering::Relaxed);
         self.peak.fetch_max(value.to_bits(), Ordering::Relaxed);
         self.touch();
     }
 
+    // Written by the evdev reader alone; see `tool_tip`.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     fn set_tilt(&self, tilt: Vec2) {
         self.tilt_x.store(tilt.x.to_bits(), Ordering::Relaxed);
         self.tilt_y.store(tilt.y.to_bits(), Ordering::Relaxed);
@@ -184,6 +194,8 @@ impl Shared {
     ///
     /// Proximity is either end. Pressure and tilt are cleared when both are
     /// gone, so a lifted pen cannot leave a stale value scaling later strokes.
+    // Written by the evdev reader alone; see `tool_tip`.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     fn set_tool(&self, tip: Option<bool>, eraser: Option<bool>) {
         if let Some(down) = tip {
             self.tool_tip.store(down, Ordering::Relaxed);
@@ -203,6 +215,8 @@ impl Shared {
     }
 
     /// Convenience for tests and for dropping every tool at once.
+    // Written by the evdev reader alone; see `tool_tip`.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     fn set_proximity(&self, present: bool) {
         self.set_tool(Some(present), Some(false));
     }
