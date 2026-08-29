@@ -157,6 +157,13 @@ impl Shared {
         self.started.elapsed().as_millis() as u64
     }
 
+    // Written only by the evdev backend, which is Linux only. The fields and
+    // the readers are shared, so these stay compiled everywhere rather than
+    // being cfg'd into two shapes -- but with no producer on Windows or macOS
+    // they are dead there, and `-D warnings` is right to say so. Allowed with
+    // a reason rather than silenced: when those platforms grow a Pointer
+    // Input, Wintab or IOKit backend, it calls exactly these.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     fn touch(&self) {
         self.last_event_ms.store(self.now_ms(), Ordering::Relaxed);
     }
@@ -327,6 +334,13 @@ pub fn shape(raw: f32, curve: f32) -> f32 {
 /// Devices differ by more than an order of magnitude here, so nothing may
 /// assume a fixed maximum. A device reporting a degenerate range is treated as
 /// full pressure rather than dividing by zero.
+// Written only by the evdev backend, which is Linux only. The fields and
+// the readers are shared, so these stay compiled everywhere rather than
+// being cfg'd into two shapes -- but with no producer on Windows or macOS
+// they are dead there, and `-D warnings` is right to say so. Allowed with
+// a reason rather than silenced: when those platforms grow a Pointer
+// Input, Wintab or IOKit backend, it calls exactly these.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn normalise(value: i32, minimum: i32, maximum: i32) -> f32 {
     if maximum <= minimum {
         return 1.0;
@@ -339,6 +353,13 @@ fn normalise(value: i32, minimum: i32, maximum: i32) -> f32 {
 /// Scaled against the larger half of the range rather than mapped across the
 /// whole of it, so that an upright pen reading zero comes out as exactly zero
 /// even on a device whose range is slightly lopsided, like -64 to 63.
+// Written only by the evdev backend, which is Linux only. The fields and
+// the readers are shared, so these stay compiled everywhere rather than
+// being cfg'd into two shapes -- but with no producer on Windows or macOS
+// they are dead there, and `-D warnings` is right to say so. Allowed with
+// a reason rather than silenced: when those platforms grow a Pointer
+// Input, Wintab or IOKit backend, it calls exactly these.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn normalise_signed(value: i32, minimum: i32, maximum: i32) -> f32 {
     let extent = minimum.abs().max(maximum.abs());
     if extent == 0 {
