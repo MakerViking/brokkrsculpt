@@ -1,0 +1,211 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+#
+# Rolling `beta` prerelease, unsigned, on all three platforms.
+#
+# **Unsigned is a decision, not an omission.** Apple enrolment is $99/yr and
+# Microsoft's is its own process, and neither is affordable yet; SindriCAD ships
+# the same way and has since its own beta. What that costs the user is one
+# scary dialog per platform, so the release notes below tell them exactly what
+# it says and exactly what to do about it. Signing goes in here later and
+# nothing else about this file changes.
+#
+# Everything is built from source on the platform it targets. There is no cross
+# compilation: `ring` will not build its C for darwin from a Linux host and the
+# Windows target wants `lib.exe`, so the matrix IS the toolchain.
+name: Release
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Package (${{ matrix.os }})
+    strategy:
+      # One platform failing must not cancel the others: a two-platform release
+      # is worth publishing while the third is fixed.
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            asset: brokkrsculpt-linux-x86_64.tar.gz
+          - os: windows-latest
+            asset: brokkrsculpt-windows-x86_64.zip
+          - os: macos-latest
+            asset: brokkrsculpt-macos-arm64.zip
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: Swatinem/rust-cache@v2
+
+      # The same set the CI job installs. Without them winit and iced fail to
+      # link rather than failing to run, so this is a build dependency and not a
+      # runtime one.
+      - name: Install Linux system libraries
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libx11-dev libxkbcommon-dev libwayland-dev libxcursor-dev \
+            libxrandr-dev libxi-dev libgl1-mesa-dev
+
+      - name: Build
+        run: cargo build --release -p brokkr-app
+
+      # A plain tarball rather than an AppImage or a .deb. Both are worth having
+      # and neither is worth blocking a beta on: a tarball runs on every distro,
+      # needs no packaging toolchain in CI, and the `.desktop` file beside it is
+      # what a user copies into ~/.local/share/applications if they want a menu
+      # entry.
+      - name: Package (Linux)
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          set -euo pipefail
+          mkdir -p stage/brokkrsculpt
+          cp target/release/brokkrsculpt stage/brokkrsculpt/
+          cp packaging/brokkrsculpt.desktop stage/brokkrsculpt/
+          cp README.md LICENSE stage/brokkrsculpt/
+          tar -C stage -czf "${{ matrix.asset }}" brokkrsculpt
+
+      - name: Package (Windows)
+        if: matrix.os == 'windows-latest'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path stage/brokkrsculpt | Out-Null
+          Copy-Item target/release/brokkrsculpt.exe stage/brokkrsculpt/
+          Copy-Item README.md, LICENSE stage/brokkrsculpt/
+          Compress-Archive -Path stage/brokkrsculpt -DestinationPath "${{ matrix.asset }}"
+
+      # A real `.app`, because a bare Mach-O binary is not something a Mac user
+      # can double click. Hand-built rather than bundled by a tool: the whole
+      # bundle is a directory, an `Info.plist` and the executable, and adding a
+      # packaging dependency to write nine lines of XML is the wrong trade.
+      #
+      # `ditto` and not `zip`, because zip flattens the bundle's structure and
+      # the result does not open.
+      - name: Package (macOS)
+        if: matrix.os == 'macos-latest'
+        run: |
+          set -euo pipefail
+          APP="stage/BrokkrSculpt.app"
+          mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
+          cp target/release/brokkrsculpt "$APP/Contents/MacOS/BrokkrSculpt"
+          chmod +x "$APP/Contents/MacOS/BrokkrSculpt"
+          cat > "$APP/Contents/Info.plist" <<'PLIST'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>CFBundleName</key><string>BrokkrSculpt</string>
+            <key>CFBundleDisplayName</key><string>BrokkrSculpt</string>
+            <key>CFBundleIdentifier</key><string>com.tinkeratlas.brokkrsculpt</string>
+            <key>CFBundleExecutable</key><string>BrokkrSculpt</string>
+            <key>CFBundlePackageType</key><string>APPL</string>
+            <key>CFBundleShortVersionString</key><string>0.1.0</string>
+            <key>CFBundleVersion</key><string>0.1.0</string>
+            <key>LSMinimumSystemVersion</key><string>11.0</string>
+            <key>NSHighResolutionCapable</key><true/>
+          </dict>
+          </plist>
+          PLIST
+          cp README.md LICENSE stage/
+          ditto -c -k --keepParent "$APP" "${{ matrix.asset }}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: ${{ matrix.asset }}
+          if-no-files-found: error
+
+  publish:
+    name: Publish the rolling beta
+    needs: build
+    # `always()` so two good platforms still publish when the third fails to
+    # build. `needs.build.result` is checked in the step instead, which is what
+    # lets the notes say which ones are actually attached.
+    if: always() && github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          R: ${{ github.repository }}
+          SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          files=$(find dist -type f \( -name '*.tar.gz' -o -name '*.zip' \))
+          if [ -z "$files" ]; then
+            echo "no artifacts were built, so there is nothing to publish"
+            exit 1
+          fi
+          echo "attaching:"; echo "$files"
+
+          cat > notes.md <<'NOTES'
+          **An open beta, and unsigned.** Both matter to what you are about to see.
+
+          ## The dialog your OS will show you
+
+          Nothing here is signed by Apple or Microsoft, because those cost money
+          this project does not have yet. Neither warning is about anything being
+          wrong with the download.
+
+          - **macOS** will say *"BrokkrSculpt.app is damaged and can't be opened."*
+            It is not damaged; that is what Gatekeeper says about any unsigned app
+            from the internet. Run `xattr -dr com.apple.quarantine /Applications/BrokkrSculpt.app`
+            after moving it to Applications, then open it normally.
+          - **Windows** will show *"Windows protected your PC"* from SmartScreen.
+            Click **More info**, then **Run anyway**.
+          - **Linux** has nothing to say about it. Untar and run `./brokkrsculpt`.
+
+          ## Known, and worth knowing before you file it
+
+          - **macOS masking renders wrong.** A masked body's tint spreads past the
+            mask and shows a seam between bricks. The geometry is correct and
+            everything else works; this is a difference in how the Metal backend
+            reads a vertex attribute and it is being chased. Linux and Windows are
+            unaffected.
+          - Windows and macOS have **no stylus pressure and no SpaceMouse**. Both
+            are read straight from the Linux kernel today; the other two platforms
+            fall back to full pressure and no puck.
+
+          ## Reporting
+
+          Help > Report a bug sends straight from the app, anonymously unless you
+          have signed in.
+          NOTES
+          printf '\n---\nBuilt from `%s`.\n' "$SHA" >> notes.md
+
+          # **Updated in place, never deleted first.** Deleting the release and
+          # recreating it leaves a window with no release at all, and since the
+          # delete would come before the upload that window is however long the
+          # assets take to push -- during which every download link 404s, and if
+          # the create then fails the release is simply gone. That happened for
+          # real on SindriCAD on 2026-08-05. A retry here repairs rather than
+          # destroys.
+          if gh release view beta --repo "$R" >/dev/null 2>&1; then
+            gh release edit beta --repo "$R" --prerelease \
+              --title "BrokkrSculpt open beta" --notes-file notes.md --target "$SHA"
+          else
+            gh release create beta --repo "$R" --prerelease \
+              --title "BrokkrSculpt open beta" --notes-file notes.md --target "$SHA"
+          fi
+
+          # `--clobber` resets each asset's download count, which is the cost of a
+          # rolling tag and is accepted: GitHub keeps no record of a replaced
+          # asset, so lifetime totals are not recoverable either way.
+          # shellcheck disable=SC2086
+          gh release upload beta $files --repo "$R" --clobber
