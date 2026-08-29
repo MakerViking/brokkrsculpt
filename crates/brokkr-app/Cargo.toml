@@ -63,6 +63,9 @@ wgpu.workspace = true
 # and it works with any tablet the kernel has a driver for rather than a list of
 # vendors. Nothing else in the stack can supply it: iced 0.14 drops winit's
 # force field, and winit 0.30 only ever had it for touch.
+[target.'cfg(target_os = "windows")'.dependencies]
+windows-sys.workspace = true
+
 [target.'cfg(target_os = "linux")'.dependencies]
 evdev.workspace = true
 

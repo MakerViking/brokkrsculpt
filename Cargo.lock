@@ -425,6 +425,7 @@ dependencies = [
  "serde_json",
  "ureq",
  "wgpu",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
