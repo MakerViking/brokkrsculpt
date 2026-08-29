@@ -580,6 +580,71 @@ fn bounds(corners: &Corners) -> (Vec3, Vec3) {
     (minimum, maximum)
 }
 
+/// How much a model has to be scaled by to be a plausible size, or 1.
+///
+/// One rule, used by [`place`] to do it and by [`voxel_for_mesh`] to predict
+/// it. Two copies would let the suggested voxel be computed for a size the
+/// import does not actually build at.
+fn refit_scale(longest: f32, refit_if_implausible: bool) -> f32 {
+    if refit_if_implausible && !(IMPLAUSIBLY_SMALL_MM..=IMPLAUSIBLY_LARGE_MM).contains(&longest) {
+        REFIT_LONGEST_MM / longest
+    } else {
+        1.0
+    }
+}
+
+/// The voxel size that resolves what this mesh actually contains.
+///
+/// **The document's voxel size is the wrong answer, and was the one being
+/// used.** An import inherited whatever the last thing on screen happened to
+/// be built at -- 0.25 mm for the starting ball -- so the same file imported
+/// into a fresh document and into a resampled one came out at different
+/// resolutions, and a 3,100,109 triangle model was voxelised at the resolution
+/// chosen for a sphere.
+///
+/// Refinement does not catch it. That loop reacts to surface *lost* for being
+/// thinner than a voxel, and a chunky model loses nothing at any size -- so a
+/// model with no thin features is never asked whether it is being resolved,
+/// only whether it is being perforated.
+///
+/// `sqrt(area / triangles)` is the typical triangle's own scale, and for an
+/// equilateral triangle it comes to about two thirds of an edge -- so a voxel
+/// this size puts rather more than one across every triangle in the file. That
+/// is the honest target: finer resolves nothing the source does not contain,
+/// and costs the square of it in both time and memory.
+///
+/// Clamped to what the pool can hold, because a dense enough mesh will ask for
+/// a size that does not fit and [`preflight`] would then refuse the import
+/// outright rather than coarsening it.
+pub fn voxel_for_mesh(mesh: &ExportMesh, options: &VoxeliseOptions) -> f32 {
+    let corners: Corners = mesh
+        .triangles
+        .iter()
+        .map(|[a, b, c]| {
+            [mesh.positions[*a as usize], mesh.positions[*b as usize], mesh.positions[*c as usize]]
+        })
+        .collect();
+    if corners.is_empty() {
+        return options.voxel_size;
+    }
+    let (minimum, maximum) = bounds(&corners);
+    let longest = (maximum - minimum).max_element();
+    if !longest.is_finite() || longest <= 0.0 {
+        return options.voxel_size;
+    }
+
+    let scale = refit_scale(longest, options.refit_if_implausible) as f64;
+    // Area scales with the square of the size, so the refit is applied here
+    // rather than to every corner: this only needs the number.
+    let area = surface_area(&corners) * scale * scale;
+    let wanted = (area / corners.len() as f64).sqrt() as f32;
+
+    match workable_voxel_for(area, wanted, 0.0) {
+        Some(coarser) => coarser,
+        None => wanted,
+    }
+}
+
 fn place(
     mesh: &ExportMesh,
     options: &VoxeliseOptions,
@@ -600,13 +665,7 @@ fn place(
         return Err(ImportError::Malformed("the mesh has no size in any direction".into()));
     }
 
-    let scale = if options.refit_if_implausible
-        && !(IMPLAUSIBLY_SMALL_MM..=IMPLAUSIBLY_LARGE_MM).contains(&longest)
-    {
-        REFIT_LONGEST_MM / longest
-    } else {
-        1.0
-    };
+    let scale = refit_scale(longest, options.refit_if_implausible);
     let centre = if options.centre { (minimum + maximum) * 0.5 } else { Vec3::ZERO };
 
     if scale != 1.0 || centre != Vec3::ZERO {
@@ -2417,6 +2476,22 @@ mod tests {
              cannot be sculpted at it"
         );
         assert!((report.longest_mm - REFIT_LONGEST_MM).abs() < 0.01);
+    }
+
+    /// The bug this exists to stop: an import inheriting whatever the document
+    /// happened to be built at, so the same file gave two different results
+    /// depending on what was open before it.
+    #[test]
+    fn the_import_voxel_comes_from_the_mesh_not_from_the_seed() {
+        let mesh = cube(Vec3::splat(-15.0), Vec3::splat(15.0));
+        let after_a_coarse_document = voxel_for_mesh(&mesh, &VoxeliseOptions::at(1.0));
+        let after_a_fine_one = voxel_for_mesh(&mesh, &VoxeliseOptions::at(0.05));
+        assert_eq!(
+            after_a_coarse_document, after_a_fine_one,
+            "the seed leaked into the choice, so this file imports differently \
+             depending on what was on screen first"
+        );
+        assert!(after_a_coarse_document > 0.0, "a 30 mm cube got no usable voxel size");
     }
 
     /// The only backstop otherwise is an assert deep in `FieldRegion::resize`,
