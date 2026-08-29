@@ -1151,7 +1151,15 @@ impl Brokkr {
         .align_y(Alignment::End)
         .padding(theme::S4);
 
-        stack![container(stacked).padding(theme::S4), bug].into()
+        // **The FILL layer goes first, and that is not cosmetic.** `Stack`
+        // takes its size from its base layer and lays the rest out inside it
+        // (`iced_widget-0.14.2` `Stack::layout`). With the top-left column
+        // first the stack was shrink-sized to that column, so this layer's
+        // "bottom right" was the bottom right of a box about one button
+        // across -- and the bug drew directly on top of the info toggle. One
+        // button visible, wrong glyph, and nothing at all in the corner it was
+        // written for.
+        stack![bug, container(stacked).padding(theme::S4)].into()
     }
 
     /// The standing mask card, over the viewport, whenever anything is masked.
