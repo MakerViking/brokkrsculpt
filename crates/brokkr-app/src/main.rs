@@ -21,6 +21,12 @@ mod message;
 mod navcube;
 mod paths;
 mod printer;
+// Reading HID devices on macOS and on Windows, the way `input_watch` reads
+// them on Linux. Both the pen and the puck come through whichever applies.
+#[cfg(target_os = "macos")]
+mod raw_hid;
+#[cfg(target_os = "windows")]
+mod raw_input;
 mod recent;
 mod report;
 mod slicer;

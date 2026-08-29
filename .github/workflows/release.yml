@@ -165,8 +165,17 @@ jobs:
 
           - **macOS** will say *"BrokkrSculpt.app is damaged and can't be opened."*
             It is not damaged; that is what Gatekeeper says about any unsigned app
-            from the internet. Run `xattr -dr com.apple.quarantine /Applications/BrokkrSculpt.app`
-            after moving it to Applications, then open it normally.
+            from the internet. Move it to Applications, then in Terminal run
+            `xattr -dr com.apple.quarantine /Applications/BrokkrSculpt.app` and
+            open it normally.
+
+            Not Control+click then Open -- Sequoia removed that. The supported
+            route is System Settings > Privacy & Security > **Open Anyway** after
+            a failed launch, but it wants an admin password, only offers the
+            button for about an hour afterwards, and an app with no signature at
+            all may not appear there to be excused at all. The quarantine flag is
+            the one path that does not depend on any of that, and it turns off
+            nothing system wide.
           - **Windows** will show *"Windows protected your PC"* from SmartScreen.
             Click **More info**, then **Run anyway**.
           - **Linux** has nothing to say about it. Untar and run `./brokkrsculpt`.

@@ -26,7 +26,9 @@ Note that the Microsoft Store MSIX path does not care about repo visibility, so 
 
 A native desktop 3D sculpting application in the spirit of ZBrush and Nomad Sculpt. Voxel/SDF based, GPU accelerated, Linux first, built to stay interactive at high detail. Output is print ready geometry, so watertight and manifold meshes are a hard requirement, not a nice to have.
 
-**Primary target platform: Linux.** Nomad Sculpt ships desktop builds for Windows and macOS but not Linux. That gap is the reason this project exists. Windows and macOS come later and must not compromise the Linux build.
+**Primary target platform: Linux.** Nomad Sculpt ships desktop builds for Windows and macOS but not Linux. That gap is the reason this project exists, and it does not stop being the reason now that all three ship.
+
+**Status, 2026-08-29: all three build and are published.** Linux is still where the work happens and still sets the bar; Windows and macOS compile from the same commit, run the same suite, and are held to "must not compromise the Linux build" exactly as written. What they do NOT yet have is time on real hardware -- see the platform table in the README, which says specifically what is unproven on each.
 
 ## What we are explicitly NOT building
 
@@ -151,7 +153,7 @@ Done when: a sphere at a 256-cubed effective volume can be sculpted continuously
 ### M1: A real brush system
 
 - Brushes: draw, clay, smooth, inflate, pinch, flatten
-- Radius and strength, with pressure support if a stylus is present
+- Radius and strength, with pressure support if a stylus is present. Read below the toolkit on every platform -- evdev on Linux, Raw Input on Windows, IOKit on macOS -- because iced drops winit's `force` field and winit has no desktop pen pressure to drop.
 - Falloff curve control
 - X axis symmetry
 - Stroke interpolation
@@ -190,13 +192,16 @@ Treat these as tests, not aspirations. Add a benchmark harness at M0 and keep it
 - Never allocate in the per frame path
 - Never remesh a brick that was not marked dirty
 
-## Distribution (context only, do not build yet)
+## Distribution
 
-Recorded so packaging decisions are not made blindly later:
+**No longer context only: an unsigned rolling `beta` prerelease ships all three
+platforms from `.github/workflows/release.yml`, rebuilt on every push to
+`main`.** Signing is the part still waiting on funding, and the notes below are
+what it will cost when it happens.
 
-- **Linux:** first and primary. AppImage plus tarball, matching SindriCAD's approach.
+- **Linux:** first and primary. A tarball ships today; AppImage is still wanted, matching SindriCAD's approach.
 - **Windows:** package as **MSIX for the Microsoft Store**. Store registration is now free for both individual and company accounts, and Microsoft re-signs MSIX packages server side, so Store users never see a SmartScreen warning and no certificate purchase is needed. Note that a plain EXE or MSI submitted to the Store is NOT re-signed. Direct downloads from tinkeratlas.com still need separate signing, free via SignPath Foundation if the project is open source.
-- **macOS:** last. Requires the 99 USD per year Apple Developer Program for notarization. The old right-click-to-open Gatekeeper bypass was removed in macOS Sequoia, so unsigned builds now force users through System Settings, Privacy and Security, "Open Anyway", and an admin password. This is the only platform with an unavoidable recurring cost.
+- **macOS:** ships unsigned as a `.app` in a zip, built with `ditto` to keep the bundle structure. Requires the 99 USD per year Apple Developer Program for notarization, and is the only platform with an unavoidable recurring cost. The old right-click-to-open Gatekeeper bypass was removed in macOS Sequoia, so unsigned builds force users through System Settings, Privacy and Security, "Open Anyway", and an admin password -- **and an app with no signature at all may not appear in that list to be excused**, which is why the release notes give `xattr -dr com.apple.quarantine` as the primary instruction rather than the Apple-supported route.
 
 ## Working conventions
 
