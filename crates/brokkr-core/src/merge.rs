@@ -60,7 +60,7 @@
 
 use crate::body::{Document, NodeId};
 use crate::brick::{BRICK_VOXELS, Brick, INSIDE, OUTSIDE};
-use crate::undo::{Change, Entry, prior_bytes, removed_node_bytes};
+use crate::undo::{Change, Entry, predicted_prior_bytes, removed_node_bytes};
 use crate::volume::Volume;
 
 /// What the union does to one brick of the shared lattice.
@@ -405,7 +405,7 @@ impl Document {
                 continue;
             }
             bricks += 1;
-            stroke_bytes += prior_bytes(prior);
+            stroke_bytes += predicted_prior_bytes(prior);
         }
 
         let reclaim_bytes = self.node(source).map_or(0, removed_node_bytes);
@@ -473,6 +473,7 @@ mod tests {
     use super::*;
     use crate::brick::{BRICK_DIM, BrickCoord};
     use crate::undo::History;
+    use crate::undo::prior_bytes;
 
     const VOXEL: f32 = 0.5;
 
