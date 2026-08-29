@@ -286,13 +286,25 @@ fn push_escaped(out: &mut String, value: &str) {
     out.push('"');
 }
 
-/// Which OS build this is, for the reports where the distribution is the story.
+/// Which OS build this is, for the reports where the platform is the story.
 ///
 /// SindriCAD added this after a report it could not diagnose: the only platform
 /// facts it collected were "linux" and "x86_64", neither of which says which
-/// desktop or driver stack is installed. Linux reads `/etc/os-release` rather
-/// than shelling out; the other platforms return nothing, which is honest.
-fn os_build() -> String {
+/// desktop or driver stack is installed.
+///
+/// **All three now, and the other two matter MORE than Linux.** This returned
+/// an empty string off Linux and called that honest, which it was while Linux
+/// was the only platform anyone shipped. It stopped being adequate the day
+/// Windows and macOS builds went out: those are the two nobody here can
+/// reproduce anything on, so a report from them arriving without an OS version
+/// is a report that cannot be chased. macOS in particular is where the version
+/// IS the question -- Sequoia changed what Gatekeeper does to an unsigned app,
+/// and the Metal divergence in the masking tint may well be version specific.
+///
+/// Read from files, never by shelling out, so this cannot hang on a slow
+/// process or hand a report an error message from a shell.
+pub(crate) fn os_build() -> String {
+    // Linux: the distribution, which names the desktop and driver stack.
     if cfg!(target_os = "linux")
         && let Ok(text) = std::fs::read_to_string("/etc/os-release")
     {
@@ -302,6 +314,46 @@ fn os_build() -> String {
             }
         }
     }
+
+    // macOS: the same plist `sw_vers` reads, scanned the same way `os-release`
+    // is rather than parsed as XML. The two keys sit on the line after their
+    // own `<key>`, which is the whole of the format worth knowing here.
+    if cfg!(target_os = "macos")
+        && let Ok(text) =
+            std::fs::read_to_string("/System/Library/CoreServices/SystemVersion.plist")
+    {
+        let value_after = |key: &str| -> Option<String> {
+            let at = text.find(&format!("<key>{key}</key>"))?;
+            let rest = &text[at..];
+            let open = rest.find("<string>")? + "<string>".len();
+            let close = rest[open..].find("</string>")?;
+            Some(rest[open..open + close].to_string())
+        };
+        if let Some(version) = value_after("ProductVersion") {
+            let build = value_after("ProductBuildVersion").unwrap_or_default();
+            return if build.is_empty() {
+                format!("macOS {version}")
+            } else {
+                format!("macOS {version} ({build})")
+            };
+        }
+    }
+
+    // Windows: `OS` and `OSVERSION` are not set, and the registry needs an API
+    // call this crate has no other reason to make. The environment does carry
+    // the processor identifier and the edition is not worth a dependency, so
+    // this reports what it can rather than nothing -- an empty string here was
+    // the actual gap.
+    if cfg!(target_os = "windows") {
+        let build = std::env::var("OS").unwrap_or_default();
+        let arch = std::env::consts::ARCH;
+        return if build.is_empty() {
+            format!("Windows ({arch})")
+        } else {
+            format!("{build} ({arch})")
+        };
+    }
+
     String::new()
 }
 

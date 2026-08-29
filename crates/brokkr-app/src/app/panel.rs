@@ -1126,7 +1126,32 @@ impl Brokkr {
             stacked = stacked.push(self.mask_card(card));
         }
 
-        container(stacked).padding(theme::S4).into()
+        // **Bottom right, and a `stack!` rather than a corner of the column
+        // above.** The column grows downward from the top left -- stats,
+        // overflow warning, mask card -- so anything appended to it lands
+        // under whatever happens to be showing, which is a different place
+        // every session. A second layer pinned to the opposite corner is
+        // somewhere a user can learn.
+        //
+        // The `Fill` container does NOT capture: it is a `container`, whose
+        // `mouse_interaction` is `None`, so `Stack` lets presses through to the
+        // shader behind it and a drag started over empty viewport still
+        // sculpts. The `Button` inside captures, and only inside its own
+        // bounds. That is the rule this file records for `mask_card`, applied
+        // the other way round -- see [`Self::mask_card`] and [`modal_layer`].
+        let bug = container(
+            button(icon::icon(icon::IconName::Bug, theme::ICON_CHROME, theme::TEXT_DIM))
+                .padding(theme::S2)
+                .style(theme::tool_button)
+                .on_press(Message::BugReportOpened),
+        )
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .align_x(Alignment::End)
+        .align_y(Alignment::End)
+        .padding(theme::S4);
+
+        stack![container(stacked).padding(theme::S4), bug].into()
     }
 
     /// The standing mask card, over the viewport, whenever anything is masked.

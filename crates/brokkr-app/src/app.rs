@@ -5186,12 +5186,24 @@ impl Brokkr {
         use std::fmt::Write;
         let mut out = String::new();
         let _ = writeln!(out, "BrokkrSculpt {} ({})", env!("CARGO_PKG_VERSION"), build_commit());
-        let _ = writeln!(
-            out,
-            "session: {} on {}",
-            std::env::var("XDG_SESSION_TYPE").unwrap_or_else(|_| "unknown".into()),
-            std::env::var("XDG_CURRENT_DESKTOP").unwrap_or_else(|_| "unknown".into()),
-        );
+        // **The OS line, and it is not the same question on each platform.**
+        // `XDG_SESSION_TYPE` and `XDG_CURRENT_DESKTOP` answer "Wayland or X11,
+        // and which compositor", which is the first thing to know about a
+        // Linux graphics report. They are unset everywhere else, so this used
+        // to print "unknown on unknown" on Windows and macOS -- noise shaped
+        // like data, in the one place a reader is scanning for facts. Off
+        // Linux the version is the useful thing instead, and `report`'s
+        // `os_build` already knows it.
+        if cfg!(target_os = "linux") {
+            let _ = writeln!(
+                out,
+                "session: {} on {}",
+                std::env::var("XDG_SESSION_TYPE").unwrap_or_else(|_| "unknown".into()),
+                std::env::var("XDG_CURRENT_DESKTOP").unwrap_or_else(|_| "unknown".into()),
+            );
+        } else {
+            let _ = writeln!(out, "os: {}", crate::report::os_build());
+        }
         let _ = writeln!(out, "wgpu: {}", self.shared.adapter_summary());
         let _ = writeln!(
             out,
