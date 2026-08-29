@@ -86,6 +86,60 @@ jobs:
           fi
           echo "brokkr-core is clean"
 
+  # **A survey, not a gate.** The open beta ships on three platforms and this
+  # workspace has only ever been compiled on one, so the `cfg(not(linux))`
+  # fallbacks in `tablet.rs` and `spacemouse.rs` have never been built by
+  # anything. This job exists to find out what breaks; a red row here is the
+  # information, not a regression. Nothing depends on it and it must not be
+  # made a required check until it is actually green.
+  #
+  # Windows GATES and macOS does not, and that asymmetry is the current state
+  # of the port rather than a preference.
+  #
+  # Windows builds and passes the whole suite, so it is held to the same bar as
+  # Linux: warnings are errors there again, because this platform is now being
+  # kept rather than measured.
+  #
+  # macOS builds and passes 16 of 20 offscreen render tests. The four that fail
+  # are a Metal/Vulkan divergence in what reaches the screen -- a uniformly
+  # masked body showing a 58 level tint jump at a brick seam, which the seam
+  # test itself predicts is "a vertex that fell back to the unmasked byte".
+  # Nobody has yet run this on a Mac to see it, and a pixel divergence cannot be
+  # diagnosed through a CI log. Informational until someone can watch it, which
+  # is honest about the state; deleting the job or leaving main red are the two
+  # worse options. **macOS must gate before it ships to anyone.**
+  cross:
+    name: Build and test (${{ matrix.os }})
+    strategy:
+      # Both platforms every run: one failing must not cancel the other, or
+      # half the answer is missing.
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            informational: false
+          - os: macos-latest
+            informational: true
+    runs-on: ${{ matrix.os }}
+    continue-on-error: ${{ matrix.informational }}
+    env:
+      # Cleared only where the platform is still a survey. On Windows the
+      # workflow-level `-D warnings` applies again.
+      RUSTFLAGS: ${{ matrix.informational && '' || '-D warnings' }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: Swatinem/rust-cache@v2
+
+      # Separate from the test step so the report can say which of the two
+      # failed. A workspace that does not build and one that builds but fails
+      # its tests are different amounts of work.
+      - name: Build
+        run: cargo build --workspace --all-targets
+
+      - name: Test
+        run: cargo test --workspace
+
   budget:
     name: Performance budget
     runs-on: ubuntu-latest

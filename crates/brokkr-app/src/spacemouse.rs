@@ -466,6 +466,13 @@ impl Shared {
         self.started.elapsed().as_millis() as u64
     }
 
+    // Written only by the evdev backend, which is Linux only. The fields and
+    // the readers are shared, so these stay compiled everywhere rather than
+    // being cfg'd into two shapes -- but with no producer on Windows or macOS
+    // they are dead there, and `-D warnings` is right to say so. Allowed with
+    // a reason rather than silenced: when those platforms grow a Pointer
+    // Input, Wintab or IOKit backend, it calls exactly these.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     fn set_axis(&self, index: usize, value: i32) {
         self.axes[index].store(value, Ordering::Relaxed);
         self.full_scale.fetch_max(value.saturating_abs(), Ordering::Relaxed);
@@ -473,10 +480,19 @@ impl Shared {
         self.seen.store(true, Ordering::Relaxed);
     }
 
+    // Same as `set_axis` above: written only by the evdev backend.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     fn press(&self, index: usize) {
         self.presses[index].fetch_add(1, Ordering::Relaxed);
     }
 
+    // Written only by the evdev backend, which is Linux only. The fields and
+    // the readers are shared, so these stay compiled everywhere rather than
+    // being cfg'd into two shapes -- but with no producer on Windows or macOS
+    // they are dead there, and `-D warnings` is right to say so. Allowed with
+    // a reason rather than silenced: when those platforms grow a Pointer
+    // Input, Wintab or IOKit backend, it calls exactly these.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     fn clear_axes(&self) {
         for axis in &self.axes {
             axis.store(0, Ordering::Relaxed);
@@ -1380,7 +1396,13 @@ mod tests {
         let sample = puck.motion();
         assert!(!sample.live);
         assert_eq!(sample.axes, [0.0; 6]);
-        assert_eq!(puck.diagnosis(), Diagnosis::NoDevice);
+        // Off Linux there is no backend to find a device with, so the honest
+        // answer is `Unsupported` rather than "looked and found none" -- see
+        // `backend::SUPPORTED`. The centring above is what this test is for and
+        // holds everywhere; only the reason for the silence differs.
+        let expected =
+            if cfg!(target_os = "linux") { Diagnosis::NoDevice } else { Diagnosis::Unsupported };
+        assert_eq!(puck.diagnosis(), expected);
     }
 
     /// The kernel drops zero valued relative events, so a puck returning to

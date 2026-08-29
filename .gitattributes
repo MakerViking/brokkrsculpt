@@ -1,0 +1,14 @@
+# The export goldens are compared BYTE FOR BYTE, so git must hand every
+# platform the bytes that were committed and not a translation of them.
+#
+# GitHub's Windows runners check out with `core.autocrlf=true`. Without this
+# line git rewrites LF to CRLF in anything it decides is text, and
+# `a_known_mesh_writes_the_bytes_committed_in_the_golden` is then handed a file
+# that differs from the one in the commit -- which is exactly how it failed on
+# windows-latest alone while passing on Linux and macOS. The `.stl` and `.3mf`
+# goldens escaped only because git already saw them as binary; the `.obj` is
+# ASCII text and did not.
+#
+# The whole directory rather than `*.obj`, so a golden added later is covered
+# by default instead of by remembering.
+crates/brokkr-core/tests/fixtures/** -text
