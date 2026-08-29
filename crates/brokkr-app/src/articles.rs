@@ -365,19 +365,38 @@ pub const VISIT_URL: &str = "https://tinkeratlas.com/";
 /// test only ever checks refusals. This is the same question with no side
 /// effect.
 pub(crate) fn leads_to_tinkeratlas(link: &str) -> bool {
-    link.starts_with("https://tinkeratlas.com/")
+    link.starts_with("https://tinkeratlas.com/") || link == crate::update_check::RELEASE_PAGE
 }
 
 /// Hand a link to whatever the desktop opens links with.
 ///
-/// `xdg-open` rather than a crate: this is Linux-first, `slicer.rs` already
+/// The platform's own opener rather than a crate: `slicer.rs` already
 /// spawns a process the same way, and a browser-opening dependency would be a
 /// second one to audit for the sake of one command.
 pub fn open_in_browser(link: &str) -> Result<(), String> {
     if !leads_to_tinkeratlas(link) {
         return Err("that link does not lead to TinkerAtlas".to_string());
     }
-    std::process::Command::new("xdg-open")
+    // **One of these three, and no shell.** `xdg-open` exists only on Linux,
+    // so every link in the application -- Join, Visit, each article, and the
+    // release page -- was dead on the other two platforms the day they
+    // shipped. macOS has `open`; Windows has no single-word equivalent, and
+    // the usual `cmd /C start` puts a SHELL between us and a URL that came out
+    // of an RSS feed. `rundll32 url.dll,FileProtocolHandler` is what the
+    // shell's `start` ends up calling anyway, and it takes the argument
+    // directly.
+    let (program, leading) = if cfg!(target_os = "macos") {
+        ("open", None)
+    } else if cfg!(target_os = "windows") {
+        ("rundll32.exe", Some("url.dll,FileProtocolHandler"))
+    } else {
+        ("xdg-open", None)
+    };
+    let mut command = std::process::Command::new(program);
+    if let Some(first) = leading {
+        command.arg(first);
+    }
+    command
         .arg(link)
         .spawn()
         .map(|_| ())
@@ -468,6 +487,19 @@ mod tests {
     /// rejects.
     #[test]
     fn the_welcome_buttons_lead_somewhere_the_guard_allows() {
+        // **Every button that opens a link, not just the two added together.**
+        // The release page was added to the welcome card and to the status
+        // line without being added here, so "get it" refused itself on every
+        // press and said the release page does not lead to TinkerAtlas --
+        // which is true, and is why the allowlist has to name it.
+        assert!(
+            leads_to_tinkeratlas(crate::update_check::RELEASE_PAGE),
+            "the update button would be refused: {}",
+            crate::update_check::RELEASE_PAGE
+        );
+        // Still refused: the exception is that ONE page, not GitHub.
+        assert!(!leads_to_tinkeratlas("https://github.com/MakerViking/brokkrsculpt"));
+        assert!(!leads_to_tinkeratlas("https://github.com/someone/else/releases/tag/beta"));
         assert!(leads_to_tinkeratlas(JOIN_URL), "the Join button would be refused: {JOIN_URL}");
         assert!(leads_to_tinkeratlas(VISIT_URL), "the Visit button would be refused: {VISIT_URL}");
     }
