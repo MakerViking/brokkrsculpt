@@ -1593,12 +1593,15 @@ mod tests {
         let sample = puck.motion();
         assert!(!sample.live);
         assert_eq!(sample.axes, [0.0; 6]);
-        // Off Linux there is no backend to find a device with, so the honest
-        // answer is `Unsupported` rather than "looked and found none" -- see
-        // `backend::SUPPORTED`. The centring above is what this test is for and
-        // holds everywhere; only the reason for the silence differs.
+        // Keyed on `backend::SUPPORTED` and NOT on a list of platforms. Where
+        // there is a backend the honest answer is "looked and found none";
+        // where there is not it is "unsupported", and `diagnosis` decides that
+        // on exactly this flag. A platform list was right when Linux was the
+        // only backend and went stale the moment Windows grew one -- this
+        // cannot. The centring above is what the test is for and holds
+        // everywhere; only the reason for the silence differs.
         let expected =
-            if cfg!(target_os = "linux") { Diagnosis::NoDevice } else { Diagnosis::Unsupported };
+            if backend::SUPPORTED { Diagnosis::NoDevice } else { Diagnosis::Unsupported };
         assert_eq!(puck.diagnosis(), expected);
     }
 
