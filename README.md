@@ -521,7 +521,7 @@ canvas paths costs 6.
 ## Checking it
 
 ```fish
-cargo test --workspace     # 610 tests
+cargo test --workspace     # 1316 tests
 cargo bench -p brokkr-core # budget gate; exits non-zero when one is blown
 ```
 
