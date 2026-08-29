@@ -15,12 +15,12 @@
 <p align="center">
   <a href="https://github.com/MakerViking/brokkrsculpt/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/MakerViking/brokkrsculpt/actions/workflows/ci.yml/badge.svg"></a>
   <img alt="Licence: AGPL-3.0-only" src="https://img.shields.io/badge/licence-AGPL--3.0--only-blue">
-  <img alt="Platform: Linux" src="https://img.shields.io/badge/platform-Linux-informational">
+  <img alt="Platforms: Linux, Windows, macOS" src="https://img.shields.io/badge/platform-Linux%20%7C%20Windows%20%7C%20macOS-informational">
   <img alt="Built with Rust" src="https://img.shields.io/badge/built%20with-Rust-orange">
 </p>
 
 <p align="center">
-  <img alt="The BrokkrSculpt interface: brush strip, viewport and properties panel" src="docs/images/ui-full-0819.jpg" width="900">
+  <img alt="BrokkrSculpt: a dwarven smith carved in the viewport, brush strip on the left, properties on the right" src="docs/images/ui-dwarf-0827.jpg" width="900">
 </p>
 
 Start from a ball, a scan, or something you downloaded. Push it around until it
@@ -128,12 +128,17 @@ without a menu of every combination.
 
 ## Get it
 
-**There is no release build yet.** No installer, no AppImage, no package. A
-signed, packaged build is the specific thing waiting on funding; until then,
-running BrokkrSculpt means building it.
+**[Download the open beta](https://github.com/MakerViking/brokkrsculpt/releases/tag/beta)**
+— Linux, Windows and macOS, rebuilt from `main` on every change.
 
-You need **Linux**, a **Vulkan-capable GPU**, and a Rust toolchain at least as
-new as the `rust-version` in the workspace manifest.
+Nothing is signed, so both Windows and macOS will warn you about it. Read
+[What works on which platform](#what-works-on-which-platform) before you start:
+the three builds are not equally finished, and it says so specifically. Signing
+is the thing waiting on funding.
+
+Or build it, which is what Linux development does anyway. You need a
+**Vulkan-capable GPU** and a Rust toolchain at least as new as the
+`rust-version` in the workspace manifest.
 
 ```fish
 git clone https://github.com/MakerViking/brokkrsculpt
@@ -177,12 +182,17 @@ sudo usermod -aG input $USER
 
 ### Which platforms
 
-Linux is where this is built and tested every day, so it is what works today and
-what the code is honest about. It is not where this stops. **Windows and macOS
-builds are wanted**, the way SindriCAD already ships them, and **tablets** —
-Android and iPad — after that, because sculpting with a pen on glass is the
-right way to do this and there is no good reason a voxel engine cannot go there.
-None of it is done. Saying so is not the same as not caring about it.
+**All three, as of the open beta** — with the honest caveat that they are not
+equally finished. Linux is where this is built and used every day. Windows and
+macOS compile, pass the same suite and are published from the same commit, but
+have had far less time in front of real hardware; [What works on which
+platform](#what-works-on-which-platform) says exactly where each one stands
+rather than leaving you to find out.
+
+**Tablets** — Android and iPad — come after that, because sculpting with a pen
+on glass is the right way to do this and there is no good reason a voxel engine
+cannot go there. That part is not done. Saying so is not the same as not caring
+about it.
 
 ## Printing
 
@@ -229,15 +239,63 @@ source:
   SindriCAD attaches a token when it has one cached; this deliberately has no
   sign-in at all, which leaves nothing on disk to leak.
 
+## Masking
+
+Paint over what you want left alone, and every brush stops at it. The tint is
+a view, not a material: it says where protection is, and turning it off changes
+nothing about what a stroke does.
+
+<p align="center">
+  <img alt="A masked head and beard shown in blue while the rest of the model stays unprotected" src="docs/images/mask-0827.jpg" width="820">
+</p>
+
+Masking scales the brush's effect rather than switching it, so a softly painted
+edge gives a soft boundary rather than a cut line, and Move carries a mask along
+with the material it displaces instead of leaving it behind in the air.
+
 ## Status
 
 Milestones M0 through M3 of [docs/BUILD-SPEC.md](docs/BUILD-SPEC.md) are
-complete, and a good deal beyond them. **610 tests pass**, clippy is at zero
+complete, and a good deal beyond them. **1316 tests pass**, clippy is at zero
 warnings, and three performance gates fail the build if a budget is blown.
 
-**Not there yet:** masking, procedural primitives, painting filament slots by
-hand, a packaged build, and builds for Windows, macOS and tablets. All on the
-list rather than ruled out.
+**Not there yet:** procedural primitives, painting filament slots by hand, and
+signed installers. All on the list rather than ruled out.
+
+### What works on which platform
+
+**This is an open beta and it is not the same beta everywhere.** Linux is where
+it is built and used every day; Windows and macOS compile, pass the suite, and
+have had far less time on real hardware. Nothing below is a surprise anyone
+should have to discover for themselves.
+
+| | Linux | Windows | macOS |
+|---|---|---|---|
+| Sculpting, import, export, printing | yes | yes | yes |
+| Masking **display** | yes | yes | **wrong — see below** |
+| Stylus pressure and tilt | yes | untested | no |
+| SpaceMouse | yes | no | no |
+| Installer the OS trusts | n/a | no | no |
+
+- **macOS masking renders wrong.** The tint spreads past the mask and a seam
+  shows between bricks. The mask itself is correct — what a brush does is
+  unaffected, and so is anything you export — but you cannot trust the blue to
+  tell you where it is. A difference in how the Metal backend reads a vertex
+  attribute; it is being chased, and Linux and Windows are unaffected.
+- **Stylus on Windows is written but has never met a tablet.** The PEN panel
+  says which state it is in: *"Listening for a pen through Raw Input; none has
+  reported yet"* against *"Reading the pen through Raw Input."* If it never
+  leaves the first, strokes run at full pressure exactly as a mouse does — so
+  it degrades rather than breaks. A screenshot of that panel is the single most
+  useful bug report a Windows user with a tablet can send.
+- **No stylus or SpaceMouse on macOS.** Both are read straight from the Linux
+  kernel today and the macOS equivalents are not written yet.
+- **Neither installer is signed**, because the certificates cost money this
+  project does not have yet. macOS will tell you the app *"is damaged and can't
+  be opened"* — it is not; that is what Gatekeeper says about any unsigned
+  download, and `xattr -dr com.apple.quarantine` on the app clears it. Windows
+  shows SmartScreen's *"Windows protected your PC"*, which needs **More info**
+  then **Run anyway**.
 
 **The honest limits**, both of which you will meet in ordinary use rather than
 in exotic corner cases:
