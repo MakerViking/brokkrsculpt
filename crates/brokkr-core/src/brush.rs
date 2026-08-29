@@ -3986,6 +3986,39 @@ mod move_tests {
     /// The mask here is fully protected and nowhere near the brush, so the
     /// per voxel multiply is 1.0 everywhere the gesture writes: what is being
     /// measured is the cap and nothing else.
+    #[test]
+    fn a_masked_body_gives_a_move_gesture_half_the_drag_cap() {
+        let brush = Brush { kind: BrushKind::Move, radius: 9.0, strength: 0.8, ..Brush::default() };
+        let at = Vec3::new(24.0, 0.0, 0.0);
+        // Far past the cap, so both gestures clamp and it is the clamp being
+        // compared rather than the pointer.
+        let far = at + Vec3::Y * 200.0;
+
+        let reach = |mask: bool| {
+            let mut volume = sphere_with_a_bump();
+            if mask {
+                volume.mask_mut().write(IVec3::new(400, 400, 400), PROTECTED);
+            }
+            let mut stroke = MoveStroke::new();
+            stroke.begin(&volume, &brush, at, Symmetry::OFF, Vec3::ZERO);
+            stroke.drag_to(&mut volume, far, 1.0);
+            let applied = stroke.applied().length();
+            stroke.end();
+            applied
+        };
+
+        let unmasked = reach(false);
+        let masked = reach(true);
+        assert!(
+            (unmasked - brush.max_drag()).abs() < 1.0e-4,
+            "the unmasked gesture did not reach its own cap: {unmasked} against {}",
+            brush.max_drag()
+        );
+        assert!(
+            (masked - unmasked * 0.5).abs() < 1.0e-4,
+            "a masked body did not halve the drag cap: {masked} against {unmasked} unmasked"
+        );
+    }
 
     /// **A mask must travel with the material, not sit in the air waiting.**
     ///
@@ -4048,40 +4081,6 @@ mod move_tests {
             volume.mask().at(ahead) < PROTECTED / 4,
             "unmasked material dragged into masked space came out masked: {} at {ahead:?}",
             volume.mask().at(ahead)
-        );
-    }
-
-    #[test]
-    fn a_masked_body_gives_a_move_gesture_half_the_drag_cap() {
-        let brush = Brush { kind: BrushKind::Move, radius: 9.0, strength: 0.8, ..Brush::default() };
-        let at = Vec3::new(24.0, 0.0, 0.0);
-        // Far past the cap, so both gestures clamp and it is the clamp being
-        // compared rather than the pointer.
-        let far = at + Vec3::Y * 200.0;
-
-        let reach = |mask: bool| {
-            let mut volume = sphere_with_a_bump();
-            if mask {
-                volume.mask_mut().write(IVec3::new(400, 400, 400), PROTECTED);
-            }
-            let mut stroke = MoveStroke::new();
-            stroke.begin(&volume, &brush, at, Symmetry::OFF, Vec3::ZERO);
-            stroke.drag_to(&mut volume, far, 1.0);
-            let applied = stroke.applied().length();
-            stroke.end();
-            applied
-        };
-
-        let unmasked = reach(false);
-        let masked = reach(true);
-        assert!(
-            (unmasked - brush.max_drag()).abs() < 1.0e-4,
-            "the unmasked gesture did not reach its own cap: {unmasked} against {}",
-            brush.max_drag()
-        );
-        assert!(
-            (masked - unmasked * 0.5).abs() < 1.0e-4,
-            "a masked body did not halve the drag cap: {masked} against {unmasked} unmasked"
         );
     }
 
