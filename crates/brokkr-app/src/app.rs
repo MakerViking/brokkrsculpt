@@ -3733,8 +3733,9 @@ impl Brokkr {
     /// One row and its whole subtree, prompted on the SUM of what it takes.
     ///
     /// **The prompt is on the SIZE and nothing else**, and the threshold is the
-    /// same 512 MB as the reclaim allowance because a delete that would be
-    /// evicted before it could be undone is exactly the one that has to warn.
+    /// reclaim allowance itself -- named, not copied, so raising one raises the
+    /// other -- because a delete that would be evicted before it could be
+    /// undone is exactly the one that has to warn.
     /// It is measured over the whole subtree, so a folder delete asks about
     /// what it is really taking -- and folders make the prompt the common case
     /// rather than the exception.

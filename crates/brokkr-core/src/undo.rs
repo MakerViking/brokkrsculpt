@@ -88,13 +88,27 @@ pub const DEFAULT_HISTORY_BUDGET: usize = 256 * 1024 * 1024;
 /// Default ceiling on the volumes undo history is holding on BEHALF of deleted
 /// bodies, separate from [`DEFAULT_HISTORY_BUDGET`].
 ///
-/// **512 MB is also the threshold at which deleting a body prompts with its
-/// size, and that is one number rather than two that happen to coincide**: a
-/// delete which would be evicted before it could be undone is exactly the
-/// delete that has to warn first. Forty modest 20 MB bodies is 800 MB against
-/// this allowance with no single body anywhere near it, which is why the
-/// eviction itself also has to say something -- see [`HistoryStats::dropped_bodies`].
-pub const DEFAULT_RECLAIM_BUDGET: usize = 512 * 1024 * 1024;
+/// **Also the threshold at which deleting a body prompts with its size, and
+/// that is one number rather than two that happen to coincide**: a delete which
+/// would be evicted before it could be undone is exactly the delete that has to
+/// warn first. Forty modest 20 MB bodies is 800 MB against this allowance with
+/// no single body anywhere near it, which is why the eviction itself also has
+/// to say something -- see [`HistoryStats::dropped_bodies`].
+///
+/// **A gigabyte, raised from half of one.** The number was set when an import
+/// took the document's own voxel size; once an import chose its own, a
+/// 3,100,109 triangle model came in at 0.168 mm and 537 MB -- five percent over
+/// the old allowance, so the gizmo refused to arm and the model could not be
+/// moved at all. Half a gigabyte stopped being "larger than any body a session
+/// will hold" the moment imports started resolving what the file contains.
+///
+/// This raises the combined history ceiling to 1.25 GB, which the module doc
+/// above discusses and which the volume guard still cannot see. It buys room
+/// rather than fixing the cost: a move's entry is a copy of the WHOLE field
+/// because a transform rewrites every voxel, and the entry that would not be a
+/// copy -- an exactly invertible move recorded as its inverse -- is the real
+/// answer and is tracked separately.
+pub const DEFAULT_RECLAIM_BUDGET: usize = 1024 * 1024 * 1024;
 
 /// The prior contents of every brick one stroke changed.
 ///
