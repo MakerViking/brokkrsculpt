@@ -1163,7 +1163,83 @@ mod backend {
     }
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "windows")))]
+/// macOS: the puck comes from IOKit, matched on the multi axis controller.
+///
+/// Same capability rule as the other two, in the same HID numbers: usage 0x08
+/// on the generic desktop page, axes 0x30 through 0x35.
+///
+/// **No sign extension here, unlike Windows.** `IOHIDValueGetIntegerValue`
+/// returns a `CFIndex`, which is signed, and IOKit has already applied the
+/// element's own sign -- so a value that Raw Input would have handed over as
+/// 0xFFFF arrives as -1. Doing the Windows correction here would turn every
+/// negative axis back into a large positive one.
+#[cfg(target_os = "macos")]
+mod backend {
+    use super::{Axis, Shared};
+    use crate::raw_hid::{self, PAGE_BUTTON, PAGE_GENERIC, Sample};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    pub const SUPPORTED: bool = true;
+
+    const USAGE_MULTI_AXIS: u32 = 0x08;
+    /// Paired with the axis rather than lined up by index, for the reason the
+    /// Windows backend gives: reordering either must not silently swap two.
+    const USAGE_AXES: [(Axis, u32); 6] = [
+        (Axis::Tx, 0x30),
+        (Axis::Ty, 0x31),
+        (Axis::Tz, 0x32),
+        (Axis::Rx, 0x33),
+        (Axis::Ry, 0x34),
+        (Axis::Rz, 0x35),
+    ];
+
+    static SAW_A_REPORT: AtomicBool = AtomicBool::new(false);
+
+    pub fn report() -> String {
+        if SAW_A_REPORT.load(Ordering::Relaxed) {
+            "Reading the puck through IOKit.".to_string()
+        } else {
+            "Listening for a six axis device through IOKit; none has reported yet. macOS may \
+             need Input Monitoring for BrokkrSculpt in Privacy & Security."
+                .to_string()
+        }
+    }
+
+    pub fn spawn(shared: Arc<Shared>) {
+        std::thread::Builder::new()
+            .name("brokkr-puck".to_string())
+            .spawn(move || {
+                raw_hid::pump(PAGE_GENERIC, USAGE_MULTI_AXIS, move |sample| {
+                    decode(&shared, sample);
+                });
+            })
+            .ok();
+    }
+
+    fn decode(shared: &Arc<Shared>, sample: Sample) {
+        if sample.page == PAGE_BUTTON {
+            // Buttons are numbered from one on their own page; `press` counts
+            // from zero, and a release is a zero value rather than a message.
+            if sample.value != 0 && sample.usage >= 1 {
+                shared.press(sample.usage as usize - 1);
+            }
+            return;
+        }
+        if sample.page != PAGE_GENERIC {
+            return;
+        }
+        for (axis, usage) in USAGE_AXES {
+            if sample.usage == usage {
+                shared.set_axis(axis as usize, sample.value as i32);
+                SAW_A_REPORT.store(true, Ordering::Relaxed);
+                return;
+            }
+        }
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
 mod backend {
     use super::Shared;
     use std::sync::Arc;
@@ -1176,7 +1252,7 @@ mod backend {
     pub fn spawn(_shared: Arc<Shared>) {}
 
     pub fn report() -> String {
-        "The SpaceMouse is implemented for Linux and Windows so far.".to_string()
+        "The SpaceMouse is not implemented for this platform.".to_string()
     }
 }
 

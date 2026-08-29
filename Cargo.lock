@@ -413,6 +413,7 @@ dependencies = [
  "brokkr-core",
  "brokkr-gpu",
  "bytemuck",
+ "core-foundation 0.10.1",
  "env_logger",
  "evdev",
  "glam 0.33.3",

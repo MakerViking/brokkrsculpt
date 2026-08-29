@@ -27,6 +27,12 @@ windows-sys = { version = "0.61", features = [
   "Win32_UI_WindowsAndMessaging",
   "Win32_Devices_HumanInterfaceDevice",
 ] }
+# Core Foundation, for the macOS HID reader. **Already in the graph on that
+# target** via winit, so this pins what is compiled rather than adding to it.
+# IOKit itself is ten `extern` declarations in `raw_hid` and no crate: the
+# same trade the nonce made, where a dependency has to be doing something hard
+# to be worth it, and retain/release is hard while ten signatures are not.
+core-foundation = "0.10"
 glam = { version = "0.33", features = ["bytemuck"] }
 iced = "0.14"
 iced_wgpu = "0.14"

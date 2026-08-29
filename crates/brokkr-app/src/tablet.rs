@@ -767,7 +767,104 @@ mod backend {
     }
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "windows")))]
+/// macOS: the pen comes from IOKit, matched on the digitizer page.
+///
+/// The scaffolding -- the manager, the run loop and the per element callback --
+/// is [`crate::raw_hid`], shared with the puck. What is here is only which
+/// usages a pen has and what they mean, and they are the same usages Windows
+/// reads because they are the HID specification's rather than either
+/// platform's.
+///
+/// **IOKit hands over elements, not reports**, so unlike Windows there is no
+/// report to pull apart: each callback already says which usage changed and
+/// what range it declares. The cost is that tip, eraser and proximity arrive
+/// as separate callbacks rather than together, so the tool state is assembled
+/// from whichever arrives.
+#[cfg(target_os = "macos")]
+mod backend {
+    use super::Shared;
+    use crate::raw_hid::{self, PAGE_DIGITIZER, Sample};
+    use glam::Vec2;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+
+    pub const SUPPORTED: bool = true;
+
+    const USAGE_PEN: u32 = 0x02;
+    const USAGE_TIP_PRESSURE: u32 = 0x30;
+    const USAGE_IN_RANGE: u32 = 0x32;
+    const USAGE_X_TILT: u32 = 0x3D;
+    const USAGE_Y_TILT: u32 = 0x3E;
+    const USAGE_TIP_SWITCH: u32 = 0x42;
+    const USAGE_ERASER: u32 = 0x45;
+
+    static SAW_A_REPORT: AtomicBool = AtomicBool::new(false);
+    /// Tilt arrives one axis at a time, so the other axis has to be remembered
+    /// or every X callback would zero the Y the user is still holding.
+    static TILT_X: AtomicU32 = AtomicU32::new(0);
+    static TILT_Y: AtomicU32 = AtomicU32::new(0);
+
+    pub fn report() -> String {
+        if SAW_A_REPORT.load(Ordering::Relaxed) {
+            "Reading the pen through IOKit.".to_string()
+        } else {
+            "Listening for a pen through IOKit; none has reported yet. macOS may need \
+             Input Monitoring for BrokkrSculpt in Privacy & Security."
+                .to_string()
+        }
+    }
+
+    pub fn spawn(shared: Arc<Shared>) {
+        std::thread::Builder::new()
+            .name("brokkr-pen".to_string())
+            .spawn(move || {
+                raw_hid::pump(PAGE_DIGITIZER, USAGE_PEN, move |sample| {
+                    decode(&shared, sample);
+                });
+            })
+            .ok();
+    }
+
+    fn decode(shared: &Arc<Shared>, sample: Sample) {
+        if sample.page != PAGE_DIGITIZER {
+            return;
+        }
+        let down = sample.value != 0;
+        match sample.usage {
+            USAGE_TIP_SWITCH => shared.set_tool(Some(down), None),
+            USAGE_ERASER => shared.set_tool(None, Some(down)),
+            // Out of range clears both ends, which is what drops pressure and
+            // tilt; in range on its own says nothing about which end it is.
+            USAGE_IN_RANGE if !down => shared.set_tool(Some(false), Some(false)),
+            USAGE_IN_RANGE => {}
+            USAGE_TIP_PRESSURE => {
+                shared.set_pressure(scaled(&sample));
+                SAW_A_REPORT.store(true, Ordering::Relaxed);
+            }
+            USAGE_X_TILT | USAGE_Y_TILT => {
+                let value = signed(&sample);
+                let slot = if sample.usage == USAGE_X_TILT { &TILT_X } else { &TILT_Y };
+                slot.store(value.to_bits(), Ordering::Relaxed);
+                shared.set_tilt(Vec2::new(
+                    f32::from_bits(TILT_X.load(Ordering::Relaxed)),
+                    f32::from_bits(TILT_Y.load(Ordering::Relaxed)),
+                ));
+                SAW_A_REPORT.store(true, Ordering::Relaxed);
+            }
+            _ => {}
+        }
+    }
+
+    fn scaled(sample: &Sample) -> f32 {
+        super::normalise(sample.value as i32, sample.minimum as i32, sample.maximum as i32)
+    }
+
+    fn signed(sample: &Sample) -> f32 {
+        super::normalise_signed(sample.value as i32, sample.minimum as i32, sample.maximum as i32)
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
 mod backend {
     use super::Shared;
     use std::sync::Arc;
@@ -780,7 +877,7 @@ mod backend {
     pub fn spawn(_shared: Arc<Shared>) {}
 
     pub fn report() -> String {
-        "Pen pressure is implemented for Linux and Windows so far.".to_string()
+        "Pen pressure is not implemented for this platform.".to_string()
     }
 }
 
