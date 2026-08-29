@@ -130,6 +130,9 @@ without a menu of every combination.
 
 **[Download the open beta](https://github.com/MakerViking/brokkrsculpt/releases/tag/beta)**
 — Linux, Windows and macOS, rebuilt from `main` on every change.
+[`CHANGELOG.md`](CHANGELOG.md) says what moved since you last looked, which
+matters here: the download link never changes, so two people running "the beta"
+may not be running the same thing.
 
 Nothing is signed, so both Windows and macOS will warn you about it. Read
 [What works on which platform](#what-works-on-which-platform) before you start:

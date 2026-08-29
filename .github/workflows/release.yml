@@ -196,6 +196,27 @@ jobs:
           Help > Report a bug sends straight from the app, anonymously unless you
           have signed in.
           NOTES
+          # The changelog's own Unreleased section, so a user who downloads
+          # twice can tell what changed. Section 1 is Unreleased; when it is
+          # EMPTY -- which happens on the build carrying a release cut, since
+          # the cut is its own commit -- fall back to section 2, the newest
+          # named version. Without that fallback the cut would replace real
+          # notes with none, on a tag that is rewritten every build.
+          if [ -f CHANGELOG.md ]; then
+            section() { awk -v want="$1" '/^## /{n++} n==want && !/^## /' CHANGELOG.md | sed -e '/./,$!d'; }
+            section 1 > changes.md
+            if [ ! -s changes.md ]; then
+              echo "Unreleased is empty (a release was just cut) -- using the newest named section"
+              section 2 > changes.md
+            fi
+            if [ -s changes.md ]; then
+              printf '\n## What changed\n\n' >> notes.md
+              cat changes.md >> notes.md
+            fi
+          else
+            echo "WARNING: no CHANGELOG.md, publishing boilerplate notes only"
+          fi
+
           printf '\n---\nBuilt from `%s`.\n' "$SHA" >> notes.md
 
           # **Updated in place, never deleted first.** Deleting the release and
