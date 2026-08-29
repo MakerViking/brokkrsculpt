@@ -93,11 +93,21 @@ jobs:
   # information, not a regression. Nothing depends on it and it must not be
   # made a required check until it is actually green.
   #
-  # `RUSTFLAGS` is deliberately cleared. The workflow-level `-D warnings` turns
-  # the first unused import in the first crate into a hard error, which stops
-  # the compile before the interesting platform errors further up the tree are
-  # ever reached -- the opposite of what a survey wants. Warnings come back
-  # when these platforms are being fixed rather than measured.
+  # Windows GATES and macOS does not, and that asymmetry is the current state
+  # of the port rather than a preference.
+  #
+  # Windows builds and passes the whole suite, so it is held to the same bar as
+  # Linux: warnings are errors there again, because this platform is now being
+  # kept rather than measured.
+  #
+  # macOS builds and passes 16 of 20 offscreen render tests. The four that fail
+  # are a Metal/Vulkan divergence in what reaches the screen -- a uniformly
+  # masked body showing a 58 level tint jump at a brick seam, which the seam
+  # test itself predicts is "a vertex that fell back to the unmasked byte".
+  # Nobody has yet run this on a Mac to see it, and a pixel divergence cannot be
+  # diagnosed through a CI log. Informational until someone can watch it, which
+  # is honest about the state; deleting the job or leaving main red are the two
+  # worse options. **macOS must gate before it ships to anyone.**
   cross:
     name: Build and test (${{ matrix.os }})
     strategy:
@@ -105,10 +115,17 @@ jobs:
       # half the answer is missing.
       fail-fast: false
       matrix:
-        os: [windows-latest, macos-latest]
+        include:
+          - os: windows-latest
+            informational: false
+          - os: macos-latest
+            informational: true
     runs-on: ${{ matrix.os }}
+    continue-on-error: ${{ matrix.informational }}
     env:
-      RUSTFLAGS: ""
+      # Cleared only where the platform is still a survey. On Windows the
+      # workflow-level `-D warnings` applies again.
+      RUSTFLAGS: ${{ matrix.informational && '' || '-D warnings' }}
     steps:
       - uses: actions/checkout@v5
 

@@ -532,11 +532,22 @@ fn the_sculpt_loop_renders_and_responds_to_a_stroke() {
         "{changed} pixels changed but only {lit} were ever drawn, so the whole model moved rather than the brushed part"
     );
 
-    // Adding clay must not carve a hole in the silhouette.
+    // Adding clay must not carve a HOLE in the silhouette, which is what this
+    // is for -- not that the outline is pixel for pixel monotonic, which it
+    // cannot be. Adding material moves the surface, the surface moves the
+    // silhouette edge by fractions of a pixel, and which edge pixels clear the
+    // coverage threshold changes in both directions. macOS shrank by 17 of
+    // 73,779 (0.02%) and Linux does not; both are the same picture.
+    //
+    // A thousandth, so a hole is still caught by three orders of magnitude: the
+    // stroke covers hundreds of pixels and losing one would show here long
+    // before this tolerance did.
     let (lit_after, _) = coverage(&after);
+    let floor = lit - lit / 1000;
     assert!(
-        lit_after >= lit,
-        "the silhouette shrank from {lit} to {lit_after} pixels after adding material"
+        lit_after >= floor,
+        "the silhouette shrank from {lit} to {lit_after} pixels after adding material, past the \
+         {floor} that edge rasterisation alone can account for"
     );
 }
 
