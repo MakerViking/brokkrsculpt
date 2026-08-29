@@ -3986,6 +3986,71 @@ mod move_tests {
     /// The mask here is fully protected and nowhere near the brush, so the
     /// per voxel multiply is 1.0 everywhere the gesture writes: what is being
     /// measured is the cap and nothing else.
+
+    /// **A mask must travel with the material, not sit in the air waiting.**
+    ///
+    /// Reported from the running app: with the rest of a hand masked, dragging
+    /// a finger towards the ring made the finger "inherit mask while moving --
+    /// like there is a sticky mask in the air there". It is exactly that. The
+    /// warp resamples the FIELD from `position - displacement * free` and never
+    /// touches the mask, so a voxel's protection is whatever happened to be at
+    /// the place the material arrived at. Drag unmasked material into masked
+    /// space and it comes out masked, and no further stroke will touch it.
+    ///
+    /// `Volume::warped` -- the whole-body version of this same domain warp --
+    /// carries the mask through it, and so do `shifted`, `rotated` and
+    /// `resampled`, each with a test saying so. The brush was the one warp that
+    /// did not.
+    ///
+    /// A PARTIAL mask ahead of the drag rather than a full one, because `free`
+    /// scales the displacement: fully protected space admits no material at
+    /// all, so the bug cannot be shown there. Half protected is where material
+    /// arrives AND protection is waiting for it.
+    ///
+    /// **Reproduction, not yet a fix.** Ignored so the suite stays green while
+    /// it stands as the executable description of the bug. Making it pass means
+    /// locking a snapshot of the MASK beside the field and warping both by the
+    /// one displacement -- `edit_voxels_where` hands the warp
+    /// `(position, value, free)` and takes back a single `f32`, so there is no
+    /// seam to write a mask through today. It also has to settle which mask
+    /// scales the displacement: `free` is read live at the DESTINATION, which
+    /// is why half-masked air brakes part of a finger and tears it, and the
+    /// source's own protection is the defensible answer. The file's own warning
+    /// -- the mask is read fresh per event while the copy is locked once -- is
+    /// exactly the trap that change has to avoid.
+    #[test]
+    #[ignore = "reproduces the sticky-mask-in-the-air bug; the warp does not carry the mask yet"]
+    fn material_dragged_into_masked_space_does_not_pick_up_its_mask() {
+        let brush = Brush { kind: BrushKind::Move, radius: 9.0, strength: 0.8, ..Brush::default() };
+        let at = Vec3::new(24.0, 0.0, 0.0);
+        let mut volume = sphere_with_a_bump();
+
+        // Empty space just off the bump, half protected, in the direction the
+        // drag will carry the material.
+        let ahead = IVec3::new(34, 0, 0);
+        assert_eq!(volume.mask().at(ahead), UNMASKED, "the fixture starts unmasked");
+        for x in 30..40 {
+            for y in -6..6 {
+                for z in -6..6 {
+                    volume.mask_mut().write(IVec3::new(x, y, z), PROTECTED / 2);
+                }
+            }
+        }
+
+        let mut stroke = MoveStroke::new();
+        stroke.begin(&volume, &brush, at, Symmetry::OFF, Vec3::ZERO);
+        stroke.drag_to(&mut volume, at + Vec3::X * 8.0, 1.0);
+        stroke.end();
+
+        // The material that arrived brought its own protection with it, which
+        // was none. Not the half-mask that was hanging in the air.
+        assert!(
+            volume.mask().at(ahead) < PROTECTED / 4,
+            "unmasked material dragged into masked space came out masked: {} at {ahead:?}",
+            volume.mask().at(ahead)
+        );
+    }
+
     #[test]
     fn a_masked_body_gives_a_move_gesture_half_the_drag_cap() {
         let brush = Brush { kind: BrushKind::Move, radius: 9.0, strength: 0.8, ..Brush::default() };
