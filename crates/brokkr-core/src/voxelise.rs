@@ -60,7 +60,20 @@ use crate::volume::Volume;
 
 /// Longest dimension, in millimetres, below which a model is assumed to be in
 /// the wrong units rather than genuinely tiny.
-const IMPLAUSIBLY_SMALL_MM: f32 = 0.5;
+///
+/// **Ten, not the half-millimetre this started at.** Half a millimetre catches
+/// a model written in metres, which is what it was for, and lets a normalised
+/// one straight through: a generative exporter emits a unit or two across, and
+/// `Meshy_AI_Ringforger_of_the_Emb_...obj` arrived 1.905 mm wide -- far too
+/// small to sculpt, comfortably above 0.5, so it was taken at its word. At
+/// 3,100,109 triangles inside 1.9 mm it plainly states no real size; nothing is
+/// modelled to three million triangles at the size of a grain of rice.
+///
+/// The cost of being wrong here is visible and one gesture to undo -- a
+/// genuinely tiny part arrives at [`REFIT_LONGEST_MM`] and the report says so,
+/// and `w` scales it back. The cost of the old value was an import that could
+/// not be sculpted and gave no clue why.
+const IMPLAUSIBLY_SMALL_MM: f32 = 10.0;
 /// ...and above which the same is assumed at the other end.
 const IMPLAUSIBLY_LARGE_MM: f32 = 500.0;
 /// What an implausible model is rescaled to, longest dimension.
@@ -2379,6 +2392,30 @@ mod tests {
         let mesh = cube(Vec3::splat(-0.01), Vec3::splat(0.01));
         let (_, report) = build(&mesh);
         assert!(report.rescaled_by > 1.0, "a 0.02 mm model was left unusably small");
+        assert!((report.longest_mm - REFIT_LONGEST_MM).abs() < 0.01);
+    }
+
+    /// The gap the old half-millimetre threshold left open, and the one a
+    /// generative exporter lands in every time.
+    ///
+    /// `Meshy_AI_Ringforger_of_the_Emb_...obj` came in 1.905 mm across --
+    /// nowhere near 0.5, so it was taken at its word and voxelised at a size
+    /// nothing could be sculpted at: 33 dense bricks for 3,100,109 triangles,
+    /// 0.6% of the surface lost, and a default 3 mm brush larger than the whole
+    /// model. Refitted it is 200 mm, 47,990 bricks and **nothing lost at all**.
+    ///
+    /// Between the two existing cases on purpose: 0.02 mm is a metres error and
+    /// 30 mm is a real size, and neither says what happens to the normalised
+    /// unit-or-two a generator emits.
+    #[test]
+    fn a_model_a_couple_of_millimetres_across_is_refitted_not_believed() {
+        let mesh = cube(Vec3::splat(-0.95), Vec3::splat(0.95));
+        let (_, report) = build(&mesh);
+        assert!(
+            report.rescaled_by > 1.0,
+            "a 1.9 mm model was believed; a generative export arrives this size and \
+             cannot be sculpted at it"
+        );
         assert!((report.longest_mm - REFIT_LONGEST_MM).abs() < 0.01);
     }
 
