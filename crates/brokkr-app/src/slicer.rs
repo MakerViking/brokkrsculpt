@@ -174,6 +174,15 @@ mod tests {
     }
 
     #[test]
+    // `candidates_for` takes the platform as an argument, but the `PathBuf` it
+    // builds them with does not: `join` uses the HOST separator and
+    // `is_absolute` the host rule, so on Windows this table comes back
+    // `\`-joined and `/usr/bin/orca-slicer` is not absolute. Asserting the
+    // Linux table there would be asserting Windows `PathBuf` semantics. It is
+    // also dead code there -- a Windows build only ever asks for the Windows
+    // table, which `windows_and_macos_look_where_those_platforms_install`
+    // covers from any host because it only checks prefixes.
+    #[cfg(unix)]
     fn the_linux_table_looks_in_every_place_orca_is_actually_installed() {
         let found = candidates_for("linux", Some(&home()), &no_env);
         let shown: Vec<String> = found.iter().map(|path| path.display().to_string()).collect();
@@ -209,6 +218,8 @@ mod tests {
     }
 
     #[test]
+    // Linux table, host `PathBuf` semantics -- see the note above.
+    #[cfg(unix)]
     fn a_relative_xdg_data_home_is_refused_rather_than_joined_onto() {
         // Joining a relative value onto the home directory produces a path
         // that is not where anything is, and then reports "not installed".
@@ -248,6 +259,8 @@ mod tests {
     }
 
     #[test]
+    // Linux table, host `PathBuf` semantics -- see the note above.
+    #[cfg(unix)]
     fn nothing_is_looked_for_under_a_home_that_is_not_known() {
         // Every entry has to be absolute and real; a `None` home must drop the
         // entries that needed it rather than producing relative paths.
