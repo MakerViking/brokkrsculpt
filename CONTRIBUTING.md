@@ -83,7 +83,13 @@ documented where it lives:
 
 ## Reporting bugs
 
-Use the in-app reporter (**Help > Report a bug**) — it shows you the exact
-payload before it sends, and there is no account and no stored credential — or
-open a GitHub issue. For anything security-sensitive, see
+Use the in-app reporter — the bug button in the corner of the viewport, or
+**Help > Report a bug**. It shows you the exact payload before it sends, and it
+is anonymous unless you have signed in to TinkerAtlas, which the dialog says
+either way. Or open a GitHub issue. For anything security-sensitive, see
 [`SECURITY.md`](SECURITY.md) instead.
+
+**On Windows or macOS, include the PEN and PUCK lines from the diagnostics.**
+Those backends are written and compiled but have never met hardware, so a
+report saying which of "listening" or "reading" they show is the most useful
+thing anyone with a tablet or a SpaceMouse can send.

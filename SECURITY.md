@@ -34,17 +34,28 @@ In scope:
   XML, and a project file is raw binary that describes its own allocations.
   The readers are mutation-fuzzed and the growth paths are bounded, but a file
   that panics, hangs, exhausts memory or reads out of bounds is a valid report.
-- the outbound bug report to `tinkeratlas.com` over HTTPS (anonymous; no
-  account, no stored credential; the payload is shown before it is sent and
-  passes through path redaction first)
+- the outbound bug report to `tinkeratlas.com` over HTTPS. Anonymous unless
+  you have signed in, and the dialog names which before you send. The payload
+  is shown in full first and passes through path redaction.
+- **the TinkerAtlas sign-in token, when you have one.** Optional, and it exists
+  so a bug report can be replied to. Obtained through the system browser and a
+  loopback callback guarded by a nonce, never by the application handling your
+  password; stored in the per-user application data directory, mode `0600` on
+  Linux and macOS. Windows has no mode: there the profile's own ACLs are what
+  exclude other users, which is the same set `0600` excludes and admits an
+  administrator exactly as `0600` admits root. Sign out deletes the file.
 - the read-only Moonraker query to a printer you configure on your own LAN.
   This leg is plain HTTP by necessity and is deliberately kept separate from
   the HTTPS one; the host in `printer.conf` is validated when it is read, not
   only when it is written.
-- reading input devices through `evdev` (`/dev/input`), which requires
-  membership of the `input` group
+- reading input devices directly, below the window system, on all three
+  platforms: `evdev` (`/dev/input`) on Linux, which requires membership of the
+  `input` group; Raw Input on Windows; IOKit on macOS, which requires Input
+  Monitoring. A pen and a six-axis puck are the only devices matched, and only
+  their own usages are read
 - files the application writes without being asked: the autosave and recent
-  list under `$XDG_STATE_HOME` / `$XDG_CONFIG_HOME`
+  list, under `$XDG_STATE_HOME` / `$XDG_CONFIG_HOME` on Linux,
+  `%LOCALAPPDATA%` / `%APPDATA%` on Windows, and Application Support on macOS
 
 Out of scope:
 
