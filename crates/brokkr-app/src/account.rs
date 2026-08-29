@@ -172,14 +172,33 @@ fn store(account: &Account) -> Result<(), String> {
 /// `OpenOptions::mode` applies the bits at creation, which is the point: a
 /// `write` followed by `set_permissions` leaves a window in which the token is
 /// on disk with the default mask.
+///
+/// # Windows has no mode, and that is not an oversight
+///
+/// `std::os::unix` does not exist there, so the bits are `cfg`'d off -- and a
+/// bare `cfg` is exactly what a later reader would take for a forgotten
+/// platform, so: **the token is protected by the per-user app data directory
+/// instead.** `%LOCALAPPDATA%` sits under a profile whose ACLs already exclude
+/// other standard users, which is the same set `0o600` excludes. What both let
+/// through is an administrator, precisely as `0o600` lets through root, so the
+/// threat models line up rather than one being a downgrade of the other.
+///
+/// SindriCAD reached the same answer for the same file -- see
+/// `src-tauri/src/tinkeratlas.rs`, which wraps its own `set_permissions` in
+/// `cfg(unix)` -- and one behaviour across the two apps is worth more here than
+/// a Windows-only ACL call that would need a Windows machine to test.
+///
+/// macOS is unix and keeps the mode. Gating on `unix` and not on
+/// `target_os = "linux"` is what makes that true.
 fn write_private(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
-    use std::os::unix::fs::OpenOptionsExt;
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(path)?;
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(path)?;
     file.write_all(bytes)?;
     file.sync_all()
 }
