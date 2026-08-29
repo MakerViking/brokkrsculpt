@@ -36,6 +36,7 @@ mod tablet;
 mod theme;
 mod thumbnails;
 mod timeline;
+mod update_check;
 mod viewport;
 mod welcome;
 

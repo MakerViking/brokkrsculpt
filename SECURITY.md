@@ -44,6 +44,14 @@ In scope:
   Linux and macOS. Windows has no mode: there the profile's own ACLs are what
   exclude other users, which is the same set `0600` excludes and admits an
   administrator exactly as `0600` admits root. Sign out deletes the file.
+- **the update check to `api.github.com` on startup.** One unauthenticated
+  GET asking which commit the published beta was built from, so the
+  application can say whether yours differs. It downloads nothing and executes
+  nothing. It is skipped entirely for a build made from a dirty tree or
+  outside a checkout, so a development machine never makes the call. Worth
+  stating plainly because it is a new third party: GitHub learns that an
+  address is running BrokkrSculpt, and the request names the application in
+  its user agent rather than disguising itself.
 - the read-only Moonraker query to a printer you configure on your own LAN.
   This leg is plain HTTP by necessity and is deliberately kept separate from
   the HTTPS one; the host in `printer.conf` is validated when it is read, not

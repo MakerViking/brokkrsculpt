@@ -375,6 +375,9 @@ pub struct Brokkr {
     /// which is what makes "the volume" stop being a thing a call site can mean
     /// by accident.
     doc: Document,
+    /// A newer beta, once the check has answered. `None` until then and
+    /// `None` forever if there is nothing to say.
+    newer_build: Option<crate::update_check::Newer>,
     camera: OrbitCamera,
     brush: Brush,
     symmetry: Symmetry,
@@ -1611,12 +1614,23 @@ impl Brokkr {
         app.account = crate::account::load();
         // The screen is up, so its articles are wanted. The only other place
         // that raises it, `Message::WelcomeOpened`, asks for them too.
-        let boot = if app.welcome {
-            Task::batch([app.fetch_articles(), app.fetch_avatar()])
-        } else {
-            Task::none()
-        };
-        (app, boot)
+        let mut boot =
+            if app.welcome { vec![app.fetch_articles(), app.fetch_avatar()] } else { Vec::new() };
+        // **Asked whether the welcome screen is up or not**, unlike the
+        // articles. The user who most needs to hear that their build is stale
+        // is the one who turned the welcome screen off, and the answer goes to
+        // the status line as well as the card.
+        //
+        // In `new` and not in `with_devices`, for the same reason as the two
+        // above: `with_devices` is what the tests build through, and a suite
+        // that reached out to GitHub on every construction would be slow,
+        // rate limited, and would fail on a machine with no network.
+        let running = build_commit().to_string();
+        boot.push(Task::perform(
+            async move { crate::update_check::check(&running) },
+            Message::UpdateChecked,
+        ));
+        (app, Task::batch(boot))
     }
 
     /// Build with a given pressure source and an inert puck, which is what
@@ -1659,6 +1673,7 @@ impl Brokkr {
         let doc = Document::from_volume(volume);
         let mut app = Self {
             model_radius_body: doc.active(),
+            newer_build: None,
             doc,
             camera: OrbitCamera::framing(Vec3::ZERO, MODEL_RADIUS_MM),
             brush: Brush::default(),
@@ -7949,6 +7964,23 @@ impl Brokkr {
                     Ok(articles) => crate::articles::Feed::Ready(articles),
                     Err(why) => crate::articles::Feed::Failed(why),
                 };
+            }
+            Message::UpdateChecked(answer) => {
+                // Also to the status line, and ONLY when the card is not up.
+                // The card carries the same notice with a button on it, so
+                // saying it twice would be noise -- and the person who needs
+                // the status line is exactly the one who turned the card off.
+                if let Some(newer) = &answer
+                    && !self.welcome
+                    && self.status.is_empty()
+                {
+                    self.status = format!(
+                        "a different beta is published ({}) -- {}",
+                        newer.commit,
+                        crate::update_check::RELEASE_PAGE
+                    );
+                }
+                self.newer_build = answer;
             }
             Message::LinkOpened(link) => {
                 // The screen stays up: reading an article is not choosing what

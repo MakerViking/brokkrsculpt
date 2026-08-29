@@ -391,6 +391,10 @@ pub enum Message {
     ArticlesLoaded(Result<Vec<crate::articles::Article>, String>),
     /// Ask again after a failure.
     ArticlesRetried,
+    /// The answer from the update check: `Some` when the published beta was
+    /// built from a different commit than this binary. Never an error --
+    /// see `update_check::check` for why a failure is silence.
+    UpdateChecked(Option<crate::update_check::Newer>),
     /// Open a TinkerAtlas link in the browser: an article, or one of the two
     /// buttons on the welcome screen. The link is checked against the one host
     /// it may lead to before anything is spawned -- see

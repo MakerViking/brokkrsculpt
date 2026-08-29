@@ -762,11 +762,31 @@ impl Brokkr {
         .spacing(theme::S3)
         .width(Length::Fill);
 
+        // **"Different", not "newer", and that is the whole wording.** The
+        // rolling tag means the check compares commits, and two commits do not
+        // say which came first -- see `update_check`. Claiming a newer version
+        // exists when all that is known is that the published one differs
+        // would be a small lie told on every launch.
+        let update: Element<'_, Message> = match &self.newer_build {
+            Some(newer) => button(
+                text(format!("A different beta is published ({}) — get it", newer.commit))
+                    .size(theme::TEXT_SIZE_SMALL)
+                    .color(theme::ACCENT),
+            )
+            .padding(0)
+            .style(theme::tool_button)
+            .on_press(Message::LinkOpened(crate::update_check::RELEASE_PAGE.to_string()))
+            .into(),
+            None => space::horizontal().into(),
+        };
+
         let foot = row![
             checkbox(self.welcome_on_startup)
                 .label("Show this screen on startup")
                 .on_toggle(Message::WelcomeOnStartupSet)
                 .text_size(theme::TEXT_SIZE_SMALL),
+            space::horizontal(),
+            update,
             space::horizontal(),
             button(text("Close").size(theme::TEXT_SIZE))
                 .padding(Padding {
