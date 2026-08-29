@@ -218,16 +218,20 @@ pub fn sign_out() -> Result<(), String> {
 
 /// Sixteen random bytes as hex, from the kernel.
 ///
-/// `/dev/urandom` rather than a crate: this application is Linux-first
-/// throughout -- it opens links with `xdg-open` and reads the puck from
-/// `/dev/input` -- and a dependency for thirty-two characters would be a
-/// second supply chain to audit for something the kernel already does. The
-/// server requires `[a-f0-9]{16,64}`, which this satisfies at 32.
+/// `getrandom` rather than `/dev/urandom`, which is where this started and
+/// which does not exist on Windows -- the nonce test was the single thing that
+/// failed there once the token file compiled.
+///
+/// **Not a new dependency.** iced pulls winit pulls ahash pulls exactly this
+/// crate at exactly this version, so naming it directly adds no code to the
+/// build and no second supply chain to audit. The original note here argued
+/// that a dependency for thirty-two characters was not worth a supply chain;
+/// that was right, and it is why this is the one crate that costs nothing.
+///
+/// The server requires `[a-f0-9]{16,64}`, which this satisfies at 32.
 fn nonce() -> Result<String, String> {
     let mut bytes = [0u8; 16];
-    std::fs::File::open("/dev/urandom")
-        .and_then(|mut file| file.read_exact(&mut bytes))
-        .map_err(|why| format!("no randomness available ({why})"))?;
+    getrandom::fill(&mut bytes).map_err(|why| format!("no randomness available ({why})"))?;
     Ok(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
 }
 
