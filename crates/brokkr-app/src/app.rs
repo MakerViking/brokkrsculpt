@@ -9603,7 +9603,7 @@ mod tests {
     /// shortcut fired anyway.
     #[test]
     fn a_key_a_widget_already_consumed_never_reaches_the_application() {
-        let typed = key_window_event("z", ctrl());
+        let typed = key_window_event("z", command());
 
         let message = key_event(typed, iced::event::Status::Captured, iced::window::Id::unique());
 
@@ -9619,7 +9619,7 @@ mod tests {
     /// -- dropping the modifiers would turn every `ctrl+z` into a bare `z`.
     #[test]
     fn an_ignored_key_press_is_forwarded_with_its_key_and_modifiers_intact() {
-        let mut modifiers = ctrl();
+        let mut modifiers = command();
         modifiers.insert(iced::keyboard::Modifiers::SHIFT);
         let pressed = key_window_event("z", modifiers);
 
@@ -9746,11 +9746,20 @@ mod tests {
         iced::keyboard::Modifiers::empty()
     }
 
-    /// `command()` is control on this platform, and the shortcut table reads
-    /// `command()` rather than the raw bit, so the tests must set what it
-    /// reads or they prove nothing.
-    fn ctrl() -> iced::keyboard::Modifiers {
-        iced::keyboard::Modifiers::CTRL
+    /// The modifier that `command()` reads, for whichever platform is running.
+    ///
+    /// **Not a bare `CTRL`.** The shortcut table is fed `modifiers.command()`,
+    /// which iced maps to Cmd on macOS and Control everywhere else, so a test
+    /// that sets the raw control bit proves nothing on a Mac -- it asserts that
+    /// Control+Z undoes, which on that platform it correctly does not. Four
+    /// tests failed exactly that way the first time this crate was built for
+    /// macOS. The behaviour was right and the fixture was wrong.
+    fn command() -> iced::keyboard::Modifiers {
+        if cfg!(target_os = "macos") {
+            iced::keyboard::Modifiers::LOGO
+        } else {
+            iced::keyboard::Modifiers::CTRL
+        }
     }
 
     /// **An action from the welcome screen dismisses it.**
@@ -9852,7 +9861,7 @@ mod tests {
         assert!(app.confirm.is_some(), "the fixture never raised a prompt");
 
         let before = app.doc.active_volume().sample_world(front);
-        key(&mut app, "z", ctrl());
+        key(&mut app, "z", command());
 
         assert_eq!(
             app.doc.active_volume().sample_world(front),
@@ -9904,7 +9913,7 @@ mod tests {
         key(&mut app, "2", bare());
         assert_eq!(app.brush.kind, BrushKind::ALL[1], "the digit did not reach the brush");
 
-        key(&mut app, "z", ctrl());
+        key(&mut app, "z", command());
         assert_ne!(
             app.doc.active_volume().sample_world(front),
             sculpted,
@@ -10264,6 +10273,12 @@ mod tests {
     /// and verifies against the same `self.doc` within one call, so the two can
     /// never disagree without an injection point that does not exist.
     #[test]
+    // The trick IS the symlink: a link to `/dev/null` is what makes the write
+    // succeed and the read-back come up empty. Windows has neither piece, and
+    // the behaviour under test -- keep the previous file when a save cannot be
+    // read back -- is platform-independent, so it is covered here and taken on
+    // trust there rather than faked with a second, weaker fixture.
+    #[cfg(unix)]
     fn a_save_that_cannot_read_its_own_output_back_keeps_the_previous_file() {
         let directory = scratch("save-unreadable");
         let path = directory.join("sculpt.brokkr");

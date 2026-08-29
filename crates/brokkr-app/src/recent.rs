@@ -3,10 +3,10 @@
 //! The list of recently opened sculpts.
 //!
 //! Deliberately the same shape as [`crate::spacemouse::Config`]: a flat text
-//! file under `$XDG_CONFIG_HOME/brokkrsculpt`, hand parsed, where anything
-//! missing or unreadable falls back to a working default rather than being an
-//! error. A recent files list is a convenience, and no convenience may stop the
-//! application starting or interrupt what the user was doing.
+//! file in [`crate::paths::config_file`]'s directory, hand parsed, where
+//! anything missing or unreadable falls back to a working default rather than
+//! being an error. A recent files list is a convenience, and no convenience may
+//! stop the application starting or interrupt what the user was doing.
 
 use std::path::{Path, PathBuf};
 
@@ -127,17 +127,20 @@ impl Recent {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // A recorded path must be absolute or the list drops it, and what counts as
+    // absolute differs per platform -- see `paths::absolute`.
+    use crate::paths::absolute;
 
     #[test]
     fn recording_puts_the_newest_first_and_removes_the_duplicate() {
         let mut recent = Recent::load_from(None);
-        recent.record(Path::new("/a.brokkr"));
-        recent.record(Path::new("/b.brokkr"));
-        recent.record(Path::new("/a.brokkr"));
+        recent.record(&absolute("a.brokkr"));
+        recent.record(&absolute("b.brokkr"));
+        recent.record(&absolute("a.brokkr"));
 
         assert_eq!(
             recent.paths(),
-            [PathBuf::from("/a.brokkr"), PathBuf::from("/b.brokkr")],
+            [absolute("a.brokkr"), absolute("b.brokkr")],
             "reopening a file should move it to the top rather than list it twice"
         );
     }
@@ -145,25 +148,29 @@ mod tests {
     #[test]
     fn a_recorded_file_can_be_forgotten_when_it_goes_away() {
         let mut recent = Recent::load_from(None);
-        recent.record(Path::new("/gone.brokkr"));
-        recent.forget(Path::new("/gone.brokkr"));
+        recent.record(&absolute("gone.brokkr"));
+        recent.forget(&absolute("gone.brokkr"));
         assert!(recent.is_empty());
     }
 
     #[test]
     fn the_list_is_capped() {
-        let text: String = (0..40).map(|index| format!("/sculpt{index}.brokkr\n")).collect();
+        let text: String = (0..40)
+            .map(|index| format!("{}\n", absolute(&format!("sculpt{index}.brokkr")).display()))
+            .collect();
         let recent = Recent::parse(&text);
         assert_eq!(recent.paths().len(), CAPACITY);
-        assert_eq!(recent.paths()[0], PathBuf::from("/sculpt0.brokkr"));
+        assert_eq!(recent.paths()[0], absolute("sculpt0.brokkr"));
     }
 
     #[test]
     fn garbage_parses_to_whatever_of_it_was_good() {
-        let recent = Recent::parse("\n\nnot/absolute\n/good.brokkr\n   \n/good.brokkr\n");
+        let good = absolute("good.brokkr");
+        let text = format!("\n\nnot/absolute\n{0}\n   \n{0}\n", good.display());
+        let recent = Recent::parse(&text);
         assert_eq!(
             recent.paths(),
-            [PathBuf::from("/good.brokkr")],
+            [good],
             "a relative path, a blank line and a duplicate should all be dropped"
         );
     }
@@ -181,22 +188,22 @@ mod tests {
 
         let mut written = Recent::load_from(Some(file.clone()));
         assert!(written.is_empty(), "a file that does not exist yet is an empty list");
-        written.record(Path::new("/one.brokkr"));
-        written.record(Path::new("/two.brokkr"));
+        written.record(&absolute("one.brokkr"));
+        written.record(&absolute("two.brokkr"));
 
         let read = Recent::load_from(Some(file.clone()));
         assert_eq!(
             read.paths(),
-            [PathBuf::from("/two.brokkr"), PathBuf::from("/one.brokkr")],
+            [absolute("two.brokkr"), absolute("one.brokkr")],
             "the most recently recorded should come back first"
         );
 
         // And recording one it already has moves it up rather than repeating it.
         let mut again = read;
-        again.record(Path::new("/one.brokkr"));
+        again.record(&absolute("one.brokkr"));
         assert_eq!(
             Recent::load_from(Some(file)).paths(),
-            [PathBuf::from("/one.brokkr"), PathBuf::from("/two.brokkr")]
+            [absolute("one.brokkr"), absolute("two.brokkr")]
         );
 
         std::fs::remove_dir_all(&directory).ok();
@@ -207,12 +214,8 @@ mod tests {
     #[test]
     fn a_list_with_no_file_silently_does_not_persist() {
         let mut orphan = Recent::load_from(None);
-        orphan.record(Path::new("/somewhere.brokkr"));
-        assert_eq!(
-            orphan.paths(),
-            [PathBuf::from("/somewhere.brokkr")],
-            "it still tracks in memory"
-        );
+        orphan.record(&absolute("somewhere.brokkr"));
+        assert_eq!(orphan.paths(), [absolute("somewhere.brokkr")], "it still tracks in memory");
         orphan.save();
     }
 }

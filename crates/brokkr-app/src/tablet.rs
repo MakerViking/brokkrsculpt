@@ -125,6 +125,12 @@ struct Shared {
     in_proximity: AtomicBool,
     /// The two pen ends, tracked separately because proximity is either of
     /// them and the kernel reports them as different tools.
+    ///
+    /// Only the evdev reader sets it and only Linux has one, so off Linux it is
+    /// written by nobody and read by nobody. Kept rather than `cfg`'d out: the
+    /// struct is shared and a second shape for two platforms costs more than
+    /// the allow.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     tool_tip: AtomicBool,
     tool_eraser: AtomicBool,
     tilt_x: AtomicU32,
@@ -157,16 +163,27 @@ impl Shared {
         self.started.elapsed().as_millis() as u64
     }
 
+    // Written only by the evdev backend, which is Linux only. The fields and
+    // the readers are shared, so these stay compiled everywhere rather than
+    // being cfg'd into two shapes -- but with no producer on Windows or macOS
+    // they are dead there, and `-D warnings` is right to say so. Allowed with
+    // a reason rather than silenced: when those platforms grow a Pointer
+    // Input, Wintab or IOKit backend, it calls exactly these.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     fn touch(&self) {
         self.last_event_ms.store(self.now_ms(), Ordering::Relaxed);
     }
 
+    // Same as the rest of these: written by the evdev reader alone.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     fn set_pressure(&self, value: f32) {
         self.pressure.store(value.to_bits(), Ordering::Relaxed);
         self.peak.fetch_max(value.to_bits(), Ordering::Relaxed);
         self.touch();
     }
 
+    // Written by the evdev reader alone; see `tool_tip`.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     fn set_tilt(&self, tilt: Vec2) {
         self.tilt_x.store(tilt.x.to_bits(), Ordering::Relaxed);
         self.tilt_y.store(tilt.y.to_bits(), Ordering::Relaxed);
@@ -177,6 +194,8 @@ impl Shared {
     ///
     /// Proximity is either end. Pressure and tilt are cleared when both are
     /// gone, so a lifted pen cannot leave a stale value scaling later strokes.
+    // Written by the evdev reader alone; see `tool_tip`.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     fn set_tool(&self, tip: Option<bool>, eraser: Option<bool>) {
         if let Some(down) = tip {
             self.tool_tip.store(down, Ordering::Relaxed);
@@ -196,6 +215,8 @@ impl Shared {
     }
 
     /// Convenience for tests and for dropping every tool at once.
+    // Written by the evdev reader alone; see `tool_tip`.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     fn set_proximity(&self, present: bool) {
         self.set_tool(Some(present), Some(false));
     }
@@ -327,6 +348,13 @@ pub fn shape(raw: f32, curve: f32) -> f32 {
 /// Devices differ by more than an order of magnitude here, so nothing may
 /// assume a fixed maximum. A device reporting a degenerate range is treated as
 /// full pressure rather than dividing by zero.
+// Written only by the evdev backend, which is Linux only. The fields and
+// the readers are shared, so these stay compiled everywhere rather than
+// being cfg'd into two shapes -- but with no producer on Windows or macOS
+// they are dead there, and `-D warnings` is right to say so. Allowed with
+// a reason rather than silenced: when those platforms grow a Pointer
+// Input, Wintab or IOKit backend, it calls exactly these.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn normalise(value: i32, minimum: i32, maximum: i32) -> f32 {
     if maximum <= minimum {
         return 1.0;
@@ -339,6 +367,13 @@ fn normalise(value: i32, minimum: i32, maximum: i32) -> f32 {
 /// Scaled against the larger half of the range rather than mapped across the
 /// whole of it, so that an upright pen reading zero comes out as exactly zero
 /// even on a device whose range is slightly lopsided, like -64 to 63.
+// Written only by the evdev backend, which is Linux only. The fields and
+// the readers are shared, so these stay compiled everywhere rather than
+// being cfg'd into two shapes -- but with no producer on Windows or macOS
+// they are dead there, and `-D warnings` is right to say so. Allowed with
+// a reason rather than silenced: when those platforms grow a Pointer
+// Input, Wintab or IOKit backend, it calls exactly these.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn normalise_signed(value: i32, minimum: i32, maximum: i32) -> f32 {
     let extent = minimum.abs().max(maximum.abs());
     if extent == 0 {
