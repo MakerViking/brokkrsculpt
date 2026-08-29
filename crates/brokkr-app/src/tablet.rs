@@ -678,65 +678,34 @@ mod backend {
     }
 }
 
-/// Windows: the pen comes from Raw Input, and the HID report is parsed by
-/// Windows rather than by hand.
+/// Windows: the pen comes from Raw Input, on the digitizer page.
 ///
-/// **Why Raw Input and not Windows Ink or Wintab.** Ink means `WM_POINTER` on
-/// the application's own window, which would put pen handling inside iced's
-/// event loop -- and iced 0.14 drops winit's `force` field, which is the whole
-/// reason this module exists. Wintab means loading a vendor DLL that only some
-/// tablets ship. Raw Input is in the OS, needs no vendor anything, and is read
-/// on a thread of our own exactly as evdev is on Linux, so the two backends
-/// have the same shape and the same seam.
-///
-/// **`HidP_GetUsageValue` and not a report descriptor parser.** The reports are
-/// vendor-specific and the descriptor that explains them is a small language;
-/// Windows has already parsed it, and asks only for the usage. Pressure is
-/// usage 0x30 on the Digitizer page, tilt is 0x3D and 0x3E, and the logical
-/// range comes from `HidP_GetValueCaps` so a tablet reporting 0..8191 and one
-/// reporting 0..1023 both normalise correctly.
-///
-/// **A message-only window.** `RegisterRawInputDevices` needs an `HWND` to
-/// deliver to, and `RIDEV_INPUTSINK` is what makes the reports arrive even
-/// when the window is not focused -- which matters because this window is
-/// never shown and never focused. It is created on this thread, which is also
-/// the thread that pumps it: a message loop only ever receives on the thread
-/// that created the window.
+/// The scaffolding -- the sink window, the pump, and asking Windows what a
+/// report says -- is [`crate::raw_input`], shared with the puck. What is here
+/// is only which usages a pen has and what they mean.
 #[cfg(target_os = "windows")]
 mod backend {
     use super::Shared;
+    use crate::raw_input::{self, PAGE_DIGITIZER};
     use glam::Vec2;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
-
-    use windows_sys::Win32::Devices::HumanInterfaceDevice::{
-        HIDP_STATUS_SUCCESS, HIDP_VALUE_CAPS, HidP_GetUsageValue, HidP_GetUsages,
-        HidP_GetValueCaps, HidP_Input, PHIDP_PREPARSED_DATA,
-    };
-    use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
-    use windows_sys::Win32::UI::Input::{
-        GetRawInputData, GetRawInputDeviceInfoW, HRAWINPUT, RAWINPUT, RAWINPUTDEVICE,
-        RAWINPUTHEADER, RID_INPUT, RIDEV_INPUTSINK, RIDI_PREPARSEDDATA, RegisterRawInputDevices,
-    };
-    use windows_sys::Win32::UI::WindowsAndMessaging::{
-        CreateWindowExW, DefWindowProcW, DispatchMessageW, GetMessageW, HWND_MESSAGE, MSG,
-        RegisterClassW, WM_INPUT, WNDCLASSW,
-    };
+    use windows_sys::Win32::Devices::HumanInterfaceDevice::PHIDP_PREPARSED_DATA;
 
     pub const SUPPORTED: bool = true;
 
-    /// HID usage page for digitizers, and the usages this reads from it.
-    const PAGE_DIGITIZER: u16 = 0x0D;
+    /// Usage 0x02 on the digitizer page is a pen; the rest are what it reports.
     const USAGE_PEN: u16 = 0x02;
-    const USAGE_IN_RANGE: u16 = 0x32;
     const USAGE_TIP_PRESSURE: u16 = 0x30;
-    const USAGE_TIP_SWITCH: u16 = 0x42;
-    const USAGE_ERASER: u16 = 0x45;
+    const USAGE_IN_RANGE: u16 = 0x32;
     const USAGE_X_TILT: u16 = 0x3D;
     const USAGE_Y_TILT: u16 = 0x3E;
+    const USAGE_TIP_SWITCH: u16 = 0x42;
+    const USAGE_ERASER: u16 = 0x45;
 
-    /// Set once a report has been decoded, so `report` can say whether the
-    /// pipe is live rather than only whether it was set up.
+    /// Set once a report has been decoded, so the panel can say whether the
+    /// pipe is LIVE rather than only whether it was set up. On a platform
+    /// nobody here can test, that difference is the whole value of the panel.
     static SAW_A_REPORT: AtomicBool = AtomicBool::new(false);
 
     pub fn report() -> String {
@@ -750,254 +719,51 @@ mod backend {
     pub fn spawn(shared: Arc<Shared>) {
         std::thread::Builder::new()
             .name("brokkr-pen".to_string())
-            .spawn(move || unsafe { pump(&shared) })
+            .spawn(move || {
+                raw_input::pump("BrokkrPenSink", PAGE_DIGITIZER, USAGE_PEN, |data, report| {
+                    decode(&shared, data, report);
+                });
+            })
             .ok();
     }
 
-    /// Create the sink window, register for pen reports, and pump until the
-    /// process ends.
-    ///
-    /// Failures are silent by design and leave `SUPPORTED` true with no reports
-    /// arriving, which `report` then says out loud. A pen that cannot be read
-    /// must not stop the application starting -- the same rule the evdev
-    /// backend follows.
-    unsafe fn pump(shared: &Arc<Shared>) {
-        let class_name: Vec<u16> = "BrokkrPenSink\0".encode_utf16().collect();
-        let mut class: WNDCLASSW = unsafe { std::mem::zeroed() };
-        class.lpfnWndProc = Some(wndproc);
-        class.lpszClassName = class_name.as_ptr();
-        unsafe { RegisterClassW(&class) };
+    fn decode(shared: &Arc<Shared>, data: PHIDP_PREPARSED_DATA, report: &[u8]) {
+        let at = |usage| raw_input::button(data, report, PAGE_DIGITIZER, usage);
+        let (tip, eraser, in_range) = (at(USAGE_TIP_SWITCH), at(USAGE_ERASER), at(USAGE_IN_RANGE));
 
-        let window = unsafe {
-            CreateWindowExW(
-                0,
-                class_name.as_ptr(),
-                class_name.as_ptr(),
-                0,
-                0,
-                0,
-                0,
-                0,
-                HWND_MESSAGE,
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-                std::ptr::null(),
-            )
-        };
-        if window.is_null() {
-            return;
-        }
-
-        let device = RAWINPUTDEVICE {
-            usUsagePage: PAGE_DIGITIZER,
-            usUsage: USAGE_PEN,
-            // Delivered even unfocused, which this window always is.
-            dwFlags: RIDEV_INPUTSINK,
-            hwndTarget: window,
-        };
-        if unsafe { RegisterRawInputDevices(&device, 1, size_of::<RAWINPUTDEVICE>() as u32) == 0 } {
-            return;
-        }
-
-        let mut message: MSG = unsafe { std::mem::zeroed() };
-        // `GetMessageW` returns -1 on error, 0 on WM_QUIT, positive otherwise.
-        while unsafe { GetMessageW(&mut message, std::ptr::null_mut(), 0, 0) } > 0 {
-            if message.message == WM_INPUT {
-                unsafe { handle(shared, message.lParam as isize as HRAWINPUT) };
-            }
-            unsafe { DispatchMessageW(&message) };
-        }
-    }
-
-    /// Nothing to do here: `WM_INPUT` is read from the message loop rather than
-    /// from the procedure, so the report is handled on the same thread either
-    /// way and there is no state to keep between them.
-    unsafe extern "system" fn wndproc(window: HWND, message: u32, w: WPARAM, l: LPARAM) -> LRESULT {
-        unsafe { DefWindowProcW(window, message, w, l) }
-    }
-
-    /// Decode one report and push it at `Shared`.
-    unsafe fn handle(shared: &Arc<Shared>, handle: HRAWINPUT) {
-        let header = size_of::<RAWINPUTHEADER>() as u32;
-        let mut size = 0u32;
-        if unsafe { GetRawInputData(handle, RID_INPUT, std::ptr::null_mut(), &mut size, header) }
-            != 0
-            || size == 0
-        {
-            return;
-        }
-        let mut buffer = vec![0u8; size as usize];
-        let read = unsafe {
-            GetRawInputData(handle, RID_INPUT, buffer.as_mut_ptr().cast(), &mut size, header)
-        };
-        if read != size {
-            return;
-        }
-
-        let raw = buffer.as_ptr() as *const RAWINPUT;
-        let hid = unsafe { &(*raw).data.hid };
-        let count = hid.dwCount as usize;
-        let stride = hid.dwSizeHid as usize;
-        if count == 0 || stride == 0 {
-            return;
-        }
-
-        let Some(preparsed) = (unsafe { preparsed_data((*raw).header.hDevice) }) else {
-            return;
-        };
-        let data = preparsed.as_ptr() as PHIDP_PREPARSED_DATA;
-        let reports = hid.bRawData.as_ptr();
-
-        for index in 0..count {
-            let report = unsafe { std::slice::from_raw_parts(reports.add(index * stride), stride) };
-            unsafe { decode(shared, data, report) };
-        }
-    }
-
-    /// The device's parsed report descriptor, which Windows keeps for us.
-    unsafe fn preparsed_data(device: *mut core::ffi::c_void) -> Option<Vec<u8>> {
-        let mut size = 0u32;
-        unsafe {
-            GetRawInputDeviceInfoW(device, RIDI_PREPARSEDDATA, std::ptr::null_mut(), &mut size)
-        };
-        if size == 0 {
-            return None;
-        }
-        let mut buffer = vec![0u8; size as usize];
-        let read = unsafe {
-            GetRawInputDeviceInfoW(
-                device,
-                RIDI_PREPARSEDDATA,
-                buffer.as_mut_ptr().cast(),
-                &mut size,
-            )
-        };
-        // Returns the bytes written, or -1 (as u32) when the buffer was short.
-        if read == u32::MAX || read == 0 { None } else { Some(buffer) }
-    }
-
-    /// Pull the usages this application cares about out of one report.
-    unsafe fn decode(shared: &Arc<Shared>, data: PHIDP_PREPARSED_DATA, report: &[u8]) {
-        let mut tip = None;
-        let mut eraser = None;
-        let mut in_range = None;
-        for (usage, slot) in [
-            (USAGE_TIP_SWITCH, &mut tip),
-            (USAGE_ERASER, &mut eraser),
-            (USAGE_IN_RANGE, &mut in_range),
-        ] {
-            *slot = unsafe { button(data, report, usage) };
-        }
-
-        // Proximity first: `set_tool` clears pressure and tilt when the pen
-        // leaves, and doing it after would clear the values just written.
+        // Proximity FIRST: `set_tool` clears pressure and tilt when the pen
+        // leaves, so doing it afterwards would wipe the values just written.
         match (in_range, tip, eraser) {
             (Some(false), _, _) => shared.set_tool(Some(false), Some(false)),
-            (_, tip, eraser) if tip.is_some() || eraser.is_some() => {
-                shared.set_tool(tip, eraser);
-            }
+            (_, tip, eraser) if tip.is_some() || eraser.is_some() => shared.set_tool(tip, eraser),
             _ => {}
         }
 
-        if let Some(pressure) = unsafe { scaled(data, report, USAGE_TIP_PRESSURE) } {
+        if let Some(pressure) = scaled(data, report, USAGE_TIP_PRESSURE) {
             shared.set_pressure(pressure);
             SAW_A_REPORT.store(true, Ordering::Relaxed);
         }
 
-        let x = unsafe { signed(data, report, USAGE_X_TILT) };
-        let y = unsafe { signed(data, report, USAGE_Y_TILT) };
+        let x = signed(data, report, USAGE_X_TILT);
+        let y = signed(data, report, USAGE_Y_TILT);
         if x.is_some() || y.is_some() {
             shared.set_tilt(Vec2::new(x.unwrap_or(0.0), y.unwrap_or(0.0)));
             SAW_A_REPORT.store(true, Ordering::Relaxed);
         }
     }
 
-    /// Whether a digitizer button usage is set in this report.
-    ///
-    /// `HidP_GetUsages` fills the usages that are ON, so a usage the device has
-    /// but is not asserting comes back absent -- which is the difference
-    /// between "up" and "this device has no such button" and is why the
-    /// capability is checked separately by the caller through `None`.
-    unsafe fn button(data: PHIDP_PREPARSED_DATA, report: &[u8], usage: u16) -> Option<bool> {
-        let mut list = [0u16; 16];
-        let mut length = list.len() as u32;
-        let status = unsafe {
-            HidP_GetUsages(
-                HidP_Input,
-                PAGE_DIGITIZER,
-                0,
-                list.as_mut_ptr(),
-                &mut length,
-                data,
-                report.as_ptr() as *mut u8,
-                report.len() as u32,
-            )
-        };
-        if status != HIDP_STATUS_SUCCESS {
-            return None;
-        }
-        Some(list[..length as usize].contains(&usage))
-    }
-
-    /// A value usage normalised to 0..1 against the range the device declares.
-    unsafe fn scaled(data: PHIDP_PREPARSED_DATA, report: &[u8], usage: u16) -> Option<f32> {
-        let raw = unsafe { value(data, report, usage)? };
-        let (minimum, maximum) = unsafe { range(data, usage)? };
+    /// A usage normalised to 0..1 against the range the device declares.
+    fn scaled(data: PHIDP_PREPARSED_DATA, report: &[u8], usage: u16) -> Option<f32> {
+        let raw = raw_input::value(data, report, PAGE_DIGITIZER, usage)?;
+        let (minimum, maximum) = raw_input::range(data, PAGE_DIGITIZER, usage)?;
         Some(super::normalise(raw, minimum, maximum))
     }
 
     /// The same, for a usage that swings both ways, like tilt.
-    unsafe fn signed(data: PHIDP_PREPARSED_DATA, report: &[u8], usage: u16) -> Option<f32> {
-        let raw = unsafe { value(data, report, usage)? };
-        let (minimum, maximum) = unsafe { range(data, usage)? };
+    fn signed(data: PHIDP_PREPARSED_DATA, report: &[u8], usage: u16) -> Option<f32> {
+        let raw = raw_input::value(data, report, PAGE_DIGITIZER, usage)?;
+        let (minimum, maximum) = raw_input::range(data, PAGE_DIGITIZER, usage)?;
         Some(super::normalise_signed(raw, minimum, maximum))
-    }
-
-    unsafe fn value(data: PHIDP_PREPARSED_DATA, report: &[u8], usage: u16) -> Option<i32> {
-        let mut out = 0u32;
-        let status = unsafe {
-            HidP_GetUsageValue(
-                HidP_Input,
-                PAGE_DIGITIZER,
-                0,
-                usage,
-                &mut out,
-                data,
-                report.as_ptr() as *mut u8,
-                report.len() as u32,
-            )
-        };
-        (status == HIDP_STATUS_SUCCESS).then_some(out as i32)
-    }
-
-    /// The logical range the device declares for a usage.
-    ///
-    /// Read from the caps rather than assumed: a tablet reporting 0..8191 and
-    /// one reporting 0..1023 are both ordinary, and assuming either would give
-    /// the other eight times the pressure or an eighth of it.
-    unsafe fn range(data: PHIDP_PREPARSED_DATA, usage: u16) -> Option<(i32, i32)> {
-        let mut count = 0u16;
-        // Asked for the count first: the caps array is per device and a fixed
-        // guess would either truncate a rich tablet or waste a page on a plain
-        // one.
-        let status =
-            unsafe { HidP_GetValueCaps(HidP_Input, std::ptr::null_mut(), &mut count, data) };
-        // A short buffer is the expected answer to a null one, and carries the
-        // count we asked for.
-        if count == 0 && status == HIDP_STATUS_SUCCESS {
-            return None;
-        }
-        let mut caps: Vec<HIDP_VALUE_CAPS> = vec![unsafe { std::mem::zeroed() }; count as usize];
-        let status = unsafe { HidP_GetValueCaps(HidP_Input, caps.as_mut_ptr(), &mut count, data) };
-        if status != HIDP_STATUS_SUCCESS {
-            return None;
-        }
-        caps[..count as usize].iter().find_map(|cap| {
-            let matches = cap.UsagePage == PAGE_DIGITIZER
-                && !cap.IsRange
-                && unsafe { cap.Anonymous.NotRange.Usage } == usage;
-            matches.then_some((cap.LogicalMin, cap.LogicalMax))
-        })
     }
 }
 

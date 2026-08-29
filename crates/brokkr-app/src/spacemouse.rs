@@ -1042,7 +1042,128 @@ mod backend {
     }
 }
 
-#[cfg(not(target_os = "linux"))]
+/// Windows: the puck comes from Raw Input, on the generic desktop page.
+///
+/// **The same capability rule as Linux, expressed in HID.** A puck is usage
+/// 0x08, Multi-axis Controller, and the six axes are usages 0x30 through 0x35
+/// in exactly the order [`Axis::ALL`] wants them. Matching on that rather than
+/// on a vendor id is the same argument the module header makes: a mouse has X
+/// and Y and a wheel, and only a six axis device has six axes.
+///
+/// **One thing is simpler here than on Linux.** The kernel drops zero valued
+/// relative events, so evdev has to read silence as "the cap came back to
+/// centre" -- see [`Shared::clear_axes`] and the timeout around it. A HID
+/// report carries all six axes every time, zeros included, so the centre
+/// arrives as data and there is nothing to infer.
+#[cfg(target_os = "windows")]
+mod backend {
+    use super::{Axis, Shared};
+    use crate::raw_input::{self, PAGE_GENERIC};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use windows_sys::Win32::Devices::HumanInterfaceDevice::PHIDP_PREPARSED_DATA;
+
+    pub const SUPPORTED: bool = true;
+
+    /// Usage 0x08 on the generic desktop page is a multi-axis controller.
+    const USAGE_MULTI_AXIS: u16 = 0x08;
+    /// The usage each axis is reported under, paired with the axis itself
+    /// rather than left to line up by index. `Axis::ALL` and this list are
+    /// already in the same order; zipping them says so to the compiler instead
+    /// of to a reader, so reordering either one cannot silently swap two axes.
+    const USAGE_AXES: [(Axis, u16); 6] = [
+        (Axis::Tx, 0x30),
+        (Axis::Ty, 0x31),
+        (Axis::Tz, 0x32),
+        (Axis::Rx, 0x33),
+        (Axis::Ry, 0x34),
+        (Axis::Rz, 0x35),
+    ];
+    /// The button page, which is its own page rather than a usage on this one.
+    const PAGE_BUTTON: u16 = 0x09;
+
+    static SAW_A_REPORT: AtomicBool = AtomicBool::new(false);
+
+    pub fn report() -> String {
+        if SAW_A_REPORT.load(Ordering::Relaxed) {
+            "Reading the puck through Raw Input.".to_string()
+        } else {
+            "Listening for a six axis device through Raw Input; none has reported yet.".to_string()
+        }
+    }
+
+    pub fn spawn(shared: Arc<Shared>) {
+        std::thread::Builder::new()
+            .name("brokkr-puck".to_string())
+            .spawn(move || {
+                raw_input::pump(
+                    "BrokkrPuckSink",
+                    PAGE_GENERIC,
+                    USAGE_MULTI_AXIS,
+                    |data, report| {
+                        decode(&shared, data, report);
+                    },
+                );
+            })
+            .ok();
+    }
+
+    fn decode(shared: &Arc<Shared>, data: PHIDP_PREPARSED_DATA, report: &[u8]) {
+        // A puck usually splits translation and rotation across two report
+        // ids, so a report carrying only three of the six is normal and the
+        // other three must be left alone rather than zeroed -- zeroing them
+        // would make every translation cancel the rotation before it.
+        let mut saw_an_axis = false;
+        for (axis, usage) in USAGE_AXES {
+            if let Some(raw) = raw_input::value(data, report, PAGE_GENERIC, usage) {
+                shared.set_axis(axis as usize, sign_extend(data, raw, usage));
+                saw_an_axis = true;
+            }
+        }
+
+        // Buttons live on their own page and are numbered from one, while
+        // `press` counts from zero.
+        if let Some(down) = raw_input::pressed(data, report, PAGE_BUTTON) {
+            for usage in down {
+                if usage >= 1 {
+                    shared.press(usage as usize - 1);
+                }
+            }
+        }
+
+        if saw_an_axis {
+            SAW_A_REPORT.store(true, Ordering::Relaxed);
+        }
+    }
+
+    /// Put the sign back on an axis Windows handed over as unsigned.
+    ///
+    /// **`HidP_GetUsageValue` does not sign extend.** A puck's axes are
+    /// centred on zero and swing both ways, so a device declaring -350..350
+    /// reports -1 as 0xFFFF and reading it raw gives 65535 -- the cap pushed
+    /// gently one way would come back as a violent shove the other. The
+    /// declared range is what says how wide the field is and whether it is
+    /// signed at all; `HidP_GetUsageValueArray` and friends have the same
+    /// property, so this is the correction and not a workaround.
+    fn sign_extend(data: PHIDP_PREPARSED_DATA, raw: i32, usage: u16) -> i32 {
+        let Some((minimum, maximum)) = raw_input::range(data, PAGE_GENERIC, usage) else {
+            return raw;
+        };
+        if minimum >= 0 {
+            return raw;
+        }
+        // The smallest power of two that holds the declared span, which is the
+        // field width the device actually reports in.
+        let span = (maximum - minimum) as u32;
+        let bits = u32::BITS - span.leading_zeros();
+        let half = 1i64 << (bits - 1);
+        let wrap = 1i64 << bits;
+        let value = raw as i64;
+        (if value >= half { value - wrap } else { value }) as i32
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "windows")))]
 mod backend {
     use super::Shared;
     use std::sync::Arc;
@@ -1055,7 +1176,7 @@ mod backend {
     pub fn spawn(_shared: Arc<Shared>) {}
 
     pub fn report() -> String {
-        "The SpaceMouse is implemented for Linux only so far.".to_string()
+        "The SpaceMouse is implemented for Linux and Windows so far.".to_string()
     }
 }
 
