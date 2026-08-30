@@ -132,8 +132,11 @@ pub fn gates(target: &Target, build: Option<u64>, commit: &str) -> Result<(), Re
         return Err(Refusal::NotAReleaseBuild);
     }
     // Then the platform, so a download is routed to the state directory for
-    // hand-over rather than staged inside a bundle it must never edit.
+    // hand-over rather than staged where it must not be written.
     if is_in_app_bundle(&target.path) || cfg!(target_os = "macos") {
+        return Err(Refusal::HandOverOnly);
+    }
+    if cfg!(windows) && !windows_hop_opted_in() {
         return Err(Refusal::HandOverOnly);
     }
     directory_is_safe(&target.directory)
@@ -152,6 +155,42 @@ pub fn target_is_the_installed_build(target: &Target) -> bool {
         (Some(running), Some(installed)) => running == installed,
         _ => false,
     }
+}
+
+/// The environment variable that opts a Windows install into self-replacement.
+const WINDOWS_OPT_IN: &str = "BROKKR_WINDOWS_SELF_UPDATE";
+
+/// Whether this Windows install may replace itself.
+///
+/// **Off by default, and that is a decision rather than an omission.** The
+/// Windows sequence in this file is written, compile-checked on the target and
+/// exercised end to end through its probe seam -- but `docs/AUTOUPDATE-PLAN.md`
+/// gates it on something no amount of code satisfies:
+///
+/// > This phase does not ship until a person with a Windows desktop has taken
+/// > the hop once.
+///
+/// That has not happened, and as of 2026-08-30 nobody on this project has a
+/// Windows machine to do it on. A green `windows-latest` runner does not
+/// substitute: it is a different security context, it writes no
+/// Mark-of-the-Web, and it says nothing about SmartScreen or Smart App Control
+/// on a real desktop. The failure being avoided is not "the update does not
+/// apply" -- it is "the application no longer starts and none of our recovery
+/// code runs, because nothing of ours is allowed to execute".
+///
+/// So Windows does what macOS does: download, verify, and hand the file over.
+/// That is Phase 2, it is already the shipped behaviour everywhere the swap is
+/// refused, and it costs a Windows user one manual step rather than their
+/// install.
+///
+/// Setting `BROKKR_WINDOWS_SELF_UPDATE=1` opts in. It is deliberately awkward
+/// -- an environment variable, for an application people double-click -- because
+/// the person setting it is volunteering to be the first human through a path
+/// that can break their install, and that should be a decision rather than a
+/// default. When someone has taken the hop and reported it, this function
+/// becomes `true` and this comment becomes history.
+pub fn windows_hop_opted_in() -> bool {
+    std::env::var_os(WINDOWS_OPT_IN).is_some_and(|value| value == "1")
 }
 
 /// Whether this executable lives inside a macOS `.app` bundle.
@@ -338,6 +377,9 @@ pub fn install(target: &Target, staged: &Path, previous_sha256: &str) -> Result<
     }
     #[cfg(windows)]
     {
+        if !windows_hop_opted_in() {
+            return Err(Refusal::HandOverOnly);
+        }
         swap_windows(target, staged, previous_sha256, &exclusive_probe)
     }
     #[cfg(all(not(windows), not(target_os = "macos")))]
@@ -1343,6 +1385,23 @@ mod tests {
     /// there rather than being cfg'd away.
     fn gates_pass() -> Result<(), Refusal> {
         if cfg!(target_os = "macos") { Err(Refusal::HandOverOnly) } else { Ok(()) }
+    }
+
+    /// **The Windows hop is off unless somebody opts in**, and the default is
+    /// what this pins. The sequence is written and tested; what is missing is a
+    /// human on a real Windows desktop, which the plan requires and which no
+    /// runner provides. Shipping it on by default would make the first tester
+    /// whoever updated first.
+    ///
+    /// Asserted without touching the environment: `set_var` is unsafe on the
+    /// 2024 edition and process-wide, and this suite runs in parallel.
+    #[test]
+    fn windows_self_replacement_is_off_until_a_human_has_taken_the_hop() {
+        assert!(
+            !windows_hop_opted_in(),
+            "self-replacement on Windows must be opt-in while the plan's human gate is unmet"
+        );
+        assert_eq!(WINDOWS_OPT_IN, "BROKKR_WINDOWS_SELF_UPDATE");
     }
 
     /// The bundle test runs on every platform, which is the point of making it
