@@ -394,7 +394,36 @@ pub enum Message {
     /// The answer from the update check: `Some` when the published beta was
     /// built from a different commit than this binary. Never an error --
     /// see `update_check::check` for why a failure is silence.
-    UpdateChecked(Option<crate::update_check::Newer>),
+    UpdateChecked(Option<crate::update::Offer>),
+    /// Accept a verified offer: download the payload and stop there.
+    ///
+    /// **Downloads, and does not install.** Phase 2 verifies the bytes and
+    /// tells the user where they are; nothing is made executable and nothing
+    /// restarts. That is the permanent macOS answer and the interim one
+    /// everywhere else.
+    UpdateDownloadRequested,
+    /// Install the downloaded build and restart into it.
+    ///
+    /// Its own always-shown modal rather than `guard`'s, because `guard` only
+    /// prompts when there is work to lose -- routing the update question
+    /// through it would restart the app under anyone whose document happened to
+    /// be saved. The work question is asked afterwards, by `guard`, which is
+    /// what that gate is actually for.
+    /// The Install button. Resolves the window the way `WindowClose` does --
+    /// the view has no window id to hand, and `iced::window::latest()` is how
+    /// this application gets one.
+    /// Take the offer to go back to the build that was replaced.
+    UpdateRevertRequested,
+    UpdateInstallPressed,
+    UpdateInstallRequested(iced::window::Id),
+    /// Where the verified payload landed, or why it did not.
+    UpdateDownloaded(Result<std::path::PathBuf, String>),
+    /// The update-check tick, from either surface that carries it.
+    ///
+    /// Two surfaces on purpose: the welcome screen, beside the articles tick it
+    /// sits next to, and Help, because the default is `always` and a switch
+    /// reachable only from a screen the user turned off is not a switch.
+    UpdateCheckSet(bool),
     /// Open a TinkerAtlas link in the browser: an article, or one of the two
     /// buttons on the welcome screen. The link is checked against the one host
     /// it may lead to before anything is spawned -- see

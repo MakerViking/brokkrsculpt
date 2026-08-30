@@ -26,12 +26,22 @@
 //! **Only while the welcome screen is actually on screen.** Everything else
 //! this application does is local: the bug reporter talks to the network when a
 //! user asks it to, and `printer.rs` talks to a machine on the LAN. A fetch on
-//! every launch would be a new outbound connection nobody asked for, and this
-//! application has deliberately no account and no stored credential.
+//! every launch would be a new outbound connection nobody asked for.
 //!
 //! Tying it to the screen makes the control honest: **turning the welcome
 //! screen off also turns this off**, with no second setting to find, and the
 //! tick that does it is on the screen itself.
+//!
+//! That is the rule for *this* module and not for the application. It used to
+//! say the application "has deliberately no account and no stored credential",
+//! which stopped being true when sign-in landed: `account::load` reads a stored
+//! credential at startup and `fetch_avatar` fetches the avatar it names, which
+//! is a second connection this tick governs. The updater is a third, and it has
+//! its own switch rather than this one, because the person who most needs to
+//! hear their build is stale is the one who turned this screen off. The
+//! property that actually holds, and the one worth defending, is **every
+//! outbound connection has exactly one visible switch** -- not "the network is
+//! only touched while the welcome screen is up".
 
 use std::io::Read;
 use std::time::Duration;
@@ -357,6 +367,16 @@ fn shorten(text: &str) -> String {
 pub const JOIN_URL: &str = "https://tinkeratlas.com/signup";
 pub const VISIT_URL: &str = "https://tinkeratlas.com/";
 
+/// Where a user is sent to get a build.
+///
+/// Here rather than in the updater for the reason above: this is one of the
+/// prefixes [`may_be_opened`] admits, and a URL that lives apart from the rule
+/// admitting it is a URL that will one day stop being admitted. It was in
+/// `update_check.rs` until the updater replaced that module, and moving it was
+/// not optional -- the allowlist and its test both read it, so deleting the old
+/// module without moving this first does not compile.
+pub const RELEASE_PAGE: &str = "https://github.com/MakerViking/brokkrsculpt/releases/tag/beta";
+
 /// Whether a link may be handed to the user's browser.
 ///
 /// **Split out of [`open_in_browser`] so acceptance can be tested.** That one
@@ -364,8 +384,24 @@ pub const VISIT_URL: &str = "https://tinkeratlas.com/";
 /// would open a browser on whoever ran the suite -- which is why the existing
 /// test only ever checks refusals. This is the same question with no side
 /// effect.
-pub(crate) fn leads_to_tinkeratlas(link: &str) -> bool {
-    link.starts_with("https://tinkeratlas.com/") || link == crate::update_check::RELEASE_PAGE
+///
+/// # The rule, which is an invariant and not a heuristic
+///
+/// A link is admitted when it **starts with one of an exact list of prefixes,
+/// each of which ends in `/`**, or when it is exactly [`RELEASE_PAGE`].
+///
+/// The trailing `/` is the whole guarantee. `https://tinkeratlas.com` without
+/// it would admit `https://tinkeratlas.com.example.net/`, which is a different
+/// site that merely starts with the same characters. Any prefix added here must
+/// keep that property, and anything that cannot be expressed as such a prefix
+/// -- the release page, which is one exact page and not a subtree -- goes in as
+/// an equality test instead.
+///
+/// Renamed from `leads_to_tinkeratlas`, which stopped being true the day the
+/// release page was admitted: a name that describes the old rule is how the
+/// next person justifies bolting a second exception onto it.
+pub(crate) fn may_be_opened(link: &str) -> bool {
+    link.starts_with(VISIT_URL) || link == RELEASE_PAGE
 }
 
 /// Hand a link to whatever the desktop opens links with.
@@ -374,7 +410,7 @@ pub(crate) fn leads_to_tinkeratlas(link: &str) -> bool {
 /// spawns a process the same way, and a browser-opening dependency would be a
 /// second one to audit for the sake of one command.
 pub fn open_in_browser(link: &str) -> Result<(), String> {
-    if !leads_to_tinkeratlas(link) {
+    if !may_be_opened(link) {
         return Err("that link does not lead to TinkerAtlas".to_string());
     }
     // **One of these three, and no shell.** `xdg-open` exists only on Linux,
@@ -492,16 +528,12 @@ mod tests {
         // line without being added here, so "get it" refused itself on every
         // press and said the release page does not lead to TinkerAtlas --
         // which is true, and is why the allowlist has to name it.
-        assert!(
-            leads_to_tinkeratlas(crate::update_check::RELEASE_PAGE),
-            "the update button would be refused: {}",
-            crate::update_check::RELEASE_PAGE
-        );
+        assert!(may_be_opened(RELEASE_PAGE), "the update button would be refused: {RELEASE_PAGE}");
         // Still refused: the exception is that ONE page, not GitHub.
-        assert!(!leads_to_tinkeratlas("https://github.com/MakerViking/brokkrsculpt"));
-        assert!(!leads_to_tinkeratlas("https://github.com/someone/else/releases/tag/beta"));
-        assert!(leads_to_tinkeratlas(JOIN_URL), "the Join button would be refused: {JOIN_URL}");
-        assert!(leads_to_tinkeratlas(VISIT_URL), "the Visit button would be refused: {VISIT_URL}");
+        assert!(!may_be_opened("https://github.com/MakerViking/brokkrsculpt"));
+        assert!(!may_be_opened("https://github.com/someone/else/releases/tag/beta"));
+        assert!(may_be_opened(JOIN_URL), "the Join button would be refused: {JOIN_URL}");
+        assert!(may_be_opened(VISIT_URL), "the Visit button would be refused: {VISIT_URL}");
     }
 
     /// One bad entry must not blank the panel.
