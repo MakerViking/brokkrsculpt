@@ -1242,8 +1242,22 @@ mod tests {
         for mode in [0o777, 0o775, 0o757] {
             std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(mode))
                 .expect("chmod works");
-            let refusal = directory_is_safe(&dir).expect_err("a loose directory must be refused");
-            assert!(matches!(refusal, Refusal::CannotReplace(_)), "mode {mode:o} gave {refusal:?}");
+            let outcome = directory_is_safe(&dir);
+            if cfg!(target_os = "macos") {
+                // **macOS deliberately does not apply this rule**, because the
+                // directory it would refuse is `/Applications`, which the system
+                // ships `root:admin 0775`. Refusing it means never updating, and
+                // it protects nothing: anyone who can write there can replace
+                // the application without our help. Asserted rather than cfg'd
+                // away, so the exemption stays visible and deliberate.
+                assert_eq!(outcome, Ok(()), "macOS accepts mode {mode:o} by design");
+            } else {
+                let refusal = outcome.expect_err("a loose directory must be refused");
+                assert!(
+                    matches!(refusal, Refusal::CannotReplace(_)),
+                    "mode {mode:o} gave {refusal:?}"
+                );
+            }
         }
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).expect("chmod");
         assert_eq!(directory_is_safe(&dir), Ok(()), "0755 is fine");
