@@ -242,6 +242,12 @@ pub enum Refusal {
     /// Windows that means an antivirus quarantined it, which retrying cannot
     /// fix -- a self-rewriting `.exe` is a textbook Defender heuristic, so
     /// deletion is at least as likely as a sharing violation.
+    ///
+    /// Unreachable on macOS, where nothing is ever installed in place: the
+    /// whole apply path is compiled out there, so this variant has no
+    /// constructor. Kept in the enum rather than cfg'd out of it, so `Refusal`
+    /// is the same type on every platform and no match arm has to move.
+    #[cfg_attr(target_os = "macos", allow(dead_code))]
     Quarantined,
 }
 
@@ -804,6 +810,9 @@ pub fn floor_from(text: &str) -> Floor {
 /// Written beside the floor in `update.state`. A failure is dropped rather than
 /// aborting the update: the consequence is that a revert will refuse for want of
 /// a digest, which is the safe direction.
+/// Unreachable on macOS for the same reason as [`Refusal::Quarantined`]: its
+/// only callers are the in-place install paths, and macOS hands over instead.
+#[cfg_attr(target_os = "macos", allow(dead_code))]
 pub fn record_previous(sha256: &str) {
     record_state(Some(sha256), None, None);
 }
