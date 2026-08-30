@@ -283,6 +283,8 @@ should have to discover for themselves.
 | Masking **display** | yes | yes | **wrong — see below** |
 | Stylus pressure and tilt | yes | untested | untested |
 | SpaceMouse | yes | untested | untested |
+| Update check, download and verify | yes | yes | yes |
+| Replacing itself with the update | yes | untested | untested |
 | Installer the OS trusts | n/a | no | no |
 
 - **macOS masking renders wrong.** The tint spreads past the mask and a seam
@@ -290,6 +292,15 @@ should have to discover for themselves.
   unaffected, and so is anything you export — but you cannot trust the blue to
   tell you where it is. A difference in how the Metal backend reads a vertex
   attribute; it is being chased, and Linux and Windows are unaffected.
+- **The update SWAP on Windows and macOS has never run on real hardware.** All
+  three platforms use the same signed manifest, the same download and the same
+  SHA-256 check, and that half has been exercised end to end. What differs is
+  the last step: Linux and Windows replace the executable, macOS replaces the
+  whole `.app`. Only the Linux one has actually been performed. Both of the
+  others keep the build they replaced and write a `RECOVER-BROKKRSCULPT.txt`
+  beside the application saying how to put it back, and
+  `BROKKR_NO_SELF_UPDATE=1` downloads and verifies without installing — which
+  is what to set if you would rather not be the first.
 - **Stylus and SpaceMouse on Windows and macOS are written but have never met
   the hardware.** Windows reads them through Raw Input, macOS through IOKit,
   and both compile on their own platform — but nobody involved owns a tablet or

@@ -101,12 +101,20 @@ channel; they reach the same person.
 
 ## Updates, signing and trust
 
-**Read this as a design, not as a description of what your copy does today.**
-The shipped beta only *notices* that a different build has been published; it
-downloads nothing and replaces nothing. What follows is the updater being
-built, written down here because two of its properties are the reason to trust
-it and one of them is something you can do yourself. The full reasoning, with
-what was measured and what was assumed, is in `docs/AUTOUPDATE-PLAN.md`.
+**This describes what the shipped beta does, as of build 1020.** It checks for
+updates on launch, downloads them, verifies them, and — on Linux and Windows —
+replaces its own executable; on macOS it replaces the whole `.app` bundle. The
+check has a tick on the welcome screen and in the Help menu and is on by
+default. `BROKKR_NO_SELF_UPDATE=1` downloads and verifies without installing,
+and `check_for_updates = never` in `update.conf` stops it entirely.
+
+One thing to weigh, stated here rather than buried: **the swap itself has only
+been performed for real on Linux.** Windows and macOS share the same signed
+manifest, the same download and the same digest check; what has not been
+exercised on real hardware is the replacement step. Both keep the build they
+replaced and write a `RECOVER-BROKKRSCULPT.txt` beside the application saying
+how to restore it. The full reasoning, with what was measured and what was
+assumed, is in `docs/AUTOUPDATE-PLAN.md`.
 
 ### The trust model
 

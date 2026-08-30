@@ -391,9 +391,19 @@ pub enum Message {
     ArticlesLoaded(Result<Vec<crate::articles::Article>, String>),
     /// Ask again after a failure.
     ArticlesRetried,
-    /// The answer from the update check: `Some` when the published beta was
-    /// built from a different commit than this binary. Never an error --
-    /// see `update_check::check` for why a failure is silence.
+    /// The answer from the update check: `Some` when a build worth telling the
+    /// user about is published. Never an error.
+    ///
+    /// **A different ordinal, not a different commit.** The old check compared
+    /// git SHAs, which have no order, so it could only ever say *different*.
+    /// This compares build ordinals from a signed manifest, so it can say which
+    /// is newer -- and during a rollback the offer names a LOWER one, which is
+    /// why the wording comes from [`crate::update::Offer::headline`] rather
+    /// than being written at the call site.
+    ///
+    /// A failure is silence, deliberately: an update check that reports its own
+    /// network problems is a check that interrupts people to tell them about
+    /// GitHub. See `update::check`.
     UpdateChecked(Option<crate::update::Offer>),
     /// Accept a verified offer: download the payload and stop there.
     ///
