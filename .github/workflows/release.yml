@@ -329,6 +329,20 @@ jobs:
             are read straight from the Linux kernel today; the other two platforms
             fall back to full pressure and no puck.
 
+          ## Updates
+
+          This build can update itself. The tick is on the welcome screen and in
+          the Help menu, on by default, and turning it off stops the check as
+          well as the offer. Every update is signed and verified before anything
+          is written.
+
+          **The swap has only been run for real on Linux.** Windows and macOS
+          share the same verified download and the same checks; what is untested
+          there is the replacement itself. Both keep the previous build and leave
+          a `RECOVER-BROKKRSCULPT.txt` beside the application saying how to
+          restore it. `BROKKR_NO_SELF_UPDATE=1` downloads and verifies but never
+          installs.
+
           ## Reporting
 
           Help > Report a bug sends straight from the app, anonymously unless you

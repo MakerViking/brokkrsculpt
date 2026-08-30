@@ -43,6 +43,29 @@ real hardware.
   above the Send button says which before you press it.
 - **A bug button in the corner of the viewport**, so reporting something does
   not require finding a menu.
+- **Updates, checked and applied.** The application asks GitHub which build is
+  published, and can download and install it for you. Three things are worth
+  knowing before you decide whether you want that.
+
+  It is **on by default and there is a tick to turn it off** — on the welcome
+  screen, and in the Help menu so it stays reachable once you have turned the
+  welcome screen off. Turning it off stops the check as well as the offer;
+  nothing phones home to display nothing.
+
+  Every update is **signed**, and the signature is checked before anything is
+  written. What is signed is a manifest carrying the length and the SHA-256 of
+  each download, so the bytes are bound to the release they claim to belong to
+  rather than merely being someone's bytes. The public key is compiled into the
+  application; the private half has never been on a build server.
+
+  **Linux is the only platform where the swap itself has been run.** Windows and
+  macOS use the same verified download and the same checks, and their
+  replacement step has been tested against everything except real hardware —
+  which, on those two, is the part that can go wrong. Each keeps a copy of the
+  build it replaced and writes a `RECOVER-BROKKRSCULPT.txt` beside the
+  application saying how to put it back. Set `BROKKR_NO_SELF_UPDATE=1` and the
+  update is downloaded and verified but never installed, which is what macOS did
+  before this and what to fall back to if the swap ever misbehaves.
 - **Stylus and SpaceMouse on Windows and macOS.** Written, compiled on each
   platform, and never yet connected to hardware by anyone involved. The PEN and
   PUCK panels say which state they are in — listening, or actually reading — so
