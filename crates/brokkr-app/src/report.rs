@@ -286,13 +286,25 @@ fn push_escaped(out: &mut String, value: &str) {
     out.push('"');
 }
 
-/// Which OS build this is, for the reports where the distribution is the story.
+/// Which OS build this is, for the reports where the platform is the story.
 ///
 /// SindriCAD added this after a report it could not diagnose: the only platform
 /// facts it collected were "linux" and "x86_64", neither of which says which
-/// desktop or driver stack is installed. Linux reads `/etc/os-release` rather
-/// than shelling out; the other platforms return nothing, which is honest.
-fn os_build() -> String {
+/// desktop or driver stack is installed.
+///
+/// **All three now, and the other two matter MORE than Linux.** This returned
+/// an empty string off Linux and called that honest, which it was while Linux
+/// was the only platform anyone shipped. It stopped being adequate the day
+/// Windows and macOS builds went out: those are the two nobody here can
+/// reproduce anything on, so a report from them arriving without an OS version
+/// is a report that cannot be chased. macOS in particular is where the version
+/// IS the question -- Sequoia changed what Gatekeeper does to an unsigned app,
+/// and the Metal divergence in the masking tint may well be version specific.
+///
+/// Read from files, never by shelling out, so this cannot hang on a slow
+/// process or hand a report an error message from a shell.
+pub(crate) fn os_build() -> String {
+    // Linux: the distribution, which names the desktop and driver stack.
     if cfg!(target_os = "linux")
         && let Ok(text) = std::fs::read_to_string("/etc/os-release")
     {
@@ -302,6 +314,46 @@ fn os_build() -> String {
             }
         }
     }
+
+    // macOS: the same plist `sw_vers` reads, scanned the same way `os-release`
+    // is rather than parsed as XML. The two keys sit on the line after their
+    // own `<key>`, which is the whole of the format worth knowing here.
+    if cfg!(target_os = "macos")
+        && let Ok(text) =
+            std::fs::read_to_string("/System/Library/CoreServices/SystemVersion.plist")
+    {
+        let value_after = |key: &str| -> Option<String> {
+            let at = text.find(&format!("<key>{key}</key>"))?;
+            let rest = &text[at..];
+            let open = rest.find("<string>")? + "<string>".len();
+            let close = rest[open..].find("</string>")?;
+            Some(rest[open..open + close].to_string())
+        };
+        if let Some(version) = value_after("ProductVersion") {
+            let build = value_after("ProductBuildVersion").unwrap_or_default();
+            return if build.is_empty() {
+                format!("macOS {version}")
+            } else {
+                format!("macOS {version} ({build})")
+            };
+        }
+    }
+
+    // Windows: `OS` and `OSVERSION` are not set, and the registry needs an API
+    // call this crate has no other reason to make. The environment does carry
+    // the processor identifier and the edition is not worth a dependency, so
+    // this reports what it can rather than nothing -- an empty string here was
+    // the actual gap.
+    if cfg!(target_os = "windows") {
+        let build = std::env::var("OS").unwrap_or_default();
+        let arch = std::env::consts::ARCH;
+        return if build.is_empty() {
+            format!("Windows ({arch})")
+        } else {
+            format!("{build} ({arch})")
+        };
+    }
+
     String::new()
 }
 
@@ -494,21 +546,34 @@ const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 /// filesystem call in this application already lives. An async client would
 /// mean an async runtime, and the whole request is one round trip.
 ///
-/// **No account, no token, no identifier.** SindriCAD attaches a bearer token
-/// when one happens to be cached and sends the report anonymously otherwise,
-/// because "the application is broken" usually comes before signing in. This
-/// application has no sign-in at all, so every report is anonymous and there is
-/// no credential in this workspace to store, leak or get wrong. The only thing
-/// tying two reports together is the fingerprint, which is a hash of the build
-/// and the first line.
-pub(crate) fn send(report: Report, base: &str) -> Result<String, String> {
+/// **Anonymous unless the user is signed in, and they are told which.**
+/// `authorization` is `None` for a signed-out user and nothing about that path
+/// has changed: no account, no token, no identifier, and the only thing tying
+/// two reports together is the fingerprint, which is a hash of the build and
+/// the first line.
+///
+/// Signed in, the report carries a bearer token and TinkerAtlas files it under
+/// that account -- which is the entire point of the sign-in, because a report
+/// nobody can reply to is one that often cannot be acted on. That is a real
+/// change in what leaves the machine, so the dialog says whose name it goes
+/// out under BEFORE the send button, rather than leaving the user to infer it
+/// from having signed in on a different screen. See `panel.rs`'s
+/// `bug_report_card`.
+pub(crate) fn send(
+    report: Report,
+    base: &str,
+    authorization: Option<&str>,
+) -> Result<String, String> {
     let body = report.to_json();
-    let response = ureq::post(&endpoint(base))
+    let mut request = ureq::post(&endpoint(base))
         .config()
         .timeout_global(Some(TIMEOUT))
         .build()
-        .header("content-type", "application/json")
-        .send(&body);
+        .header("content-type", "application/json");
+    if let Some(value) = authorization {
+        request = request.header("authorization", value);
+    }
+    let response = request.send(&body);
 
     match response {
         Ok(_) => Ok("report sent — thank you".to_string()),
@@ -599,7 +664,7 @@ mod wire_tests {
     #[test]
     fn a_report_arrives_as_a_json_post_carrying_the_payload() {
         let (base, server) = serve_once("200 OK", r#"{"success":true}"#);
-        let outcome = send(sample_report(), &base);
+        let outcome = send(sample_report(), &base, None);
         let request = server.join().expect("the stub server panicked");
 
         assert!(outcome.is_ok(), "a 200 was not treated as success: {outcome:?}");
@@ -616,10 +681,41 @@ mod wire_tests {
         );
     }
 
+    /// **Signed out sends no `Authorization` header at all**, which is the
+    /// property the anonymity claim rests on. An empty or malformed header
+    /// would be a different thing from no header, and the server treats them
+    /// differently.
+    #[test]
+    fn a_signed_out_report_carries_no_authorization_header() {
+        let (base, server) = serve_once("200 OK", r#"{"ok":true}"#);
+        send(sample_report(), &base, None).expect("the server accepted it");
+        let request = server.join().expect("the server thread");
+        assert!(
+            !request.to_lowercase().contains("authorization:"),
+            "an anonymous report carried an Authorization header:\n{request}"
+        );
+    }
+
+    /// And signed in it goes out verbatim, because a header that is dropped
+    /// silently turns an attributed report back into an anonymous one -- with
+    /// the dialog still telling the user it went out under their name.
+    #[test]
+    fn a_signed_in_report_carries_the_bearer_token() {
+        let (base, server) = serve_once("200 OK", r#"{"ok":true}"#);
+        send(sample_report(), &base, Some("Bearer ta_bskt_testvalue")).expect("accepted");
+        let request = server.join().expect("the server thread");
+        let lower = request.to_lowercase();
+        assert!(lower.contains("authorization:"), "no Authorization header:\n{request}");
+        assert!(
+            request.contains("Bearer ta_bskt_testvalue"),
+            "the token was altered on the way out:\n{request}"
+        );
+    }
+
     #[test]
     fn a_rate_limit_says_so_rather_than_reporting_a_generic_failure() {
         let (base, server) = serve_once("429 Too Many Requests", r#"{"error":"slow down"}"#);
-        let outcome = send(sample_report(), &base);
+        let outcome = send(sample_report(), &base, None);
         let _ = server.join();
         let why = outcome.expect_err("a 429 is not a success");
         assert!(why.contains("try again in an hour"), "unhelpful message: {why}");
@@ -628,7 +724,7 @@ mod wire_tests {
     #[test]
     fn an_oversized_report_is_told_what_to_do_about_it() {
         let (base, server) = serve_once("413 Payload Too Large", "{}");
-        let outcome = send(sample_report(), &base);
+        let outcome = send(sample_report(), &base, None);
         let _ = server.join();
         let why = outcome.expect_err("a 413 is not a success");
         assert!(why.contains("untick"), "the message does not say what to do: {why}");
@@ -638,8 +734,8 @@ mod wire_tests {
     fn an_unreachable_server_reads_as_a_network_problem() {
         // Port 1 on loopback: nothing listens, and the connection is refused
         // immediately rather than hanging.
-        let why =
-            send(sample_report(), "http://127.0.0.1:1").expect_err("nothing is listening there");
+        let why = send(sample_report(), "http://127.0.0.1:1", None)
+            .expect_err("nothing is listening there");
         assert!(why.contains("could not reach"), "unhelpful message: {why}");
     }
 
@@ -666,7 +762,7 @@ mod wire_tests {
             "test harness",
         );
         println!("fingerprint {}", report.fingerprint);
-        match send(report, TINKERATLAS) {
+        match send(report, TINKERATLAS, None) {
             Ok(note) => println!("accepted: {note}"),
             Err(why) => panic!("the real endpoint refused it: {why}"),
         }

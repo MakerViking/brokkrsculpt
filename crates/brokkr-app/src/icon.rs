@@ -170,6 +170,39 @@ const INFO: Glyph = Glyph {
     ],
 };
 
+/// Bug: a beetle seen from above, for the report button.
+///
+/// A beetle rather than the other convention, an insect silhouette in a
+/// circle. At the size this is drawn -- the same 24 grid as everything else,
+/// rendered at chrome size in a corner -- a circle around it eats half the
+/// width and what is left inside is a smudge. The legs are what make it read
+/// as a bug at all, so they get the space.
+///
+/// The shell seam down the middle is not decoration: without it the body is an
+/// oval and the whole thing reads as an ant. One line is the difference.
+const BUG: Glyph = Glyph {
+    subs: &[
+        // Shell.
+        Sub { segs: &[Seg::Circle { cx: 12.0, cy: 13.2, r: 5.6 }], ink: Ink::Stroke },
+        // The seam, stopping short of the rim at both ends so it reads as a
+        // join rather than as a line drawn over the top of the body.
+        Sub { segs: &[Seg::Move(12.0, 8.4), Seg::Line(12.0, 18.4)], ink: Ink::Stroke },
+        // Head and antennae.
+        Sub { segs: &[Seg::Circle { cx: 12.0, cy: 6.3, r: 2.1 }], ink: Ink::Stroke },
+        Sub { segs: &[Seg::Move(10.5, 4.8), Seg::Line(9.0, 3.2)], ink: Ink::Stroke },
+        Sub { segs: &[Seg::Move(13.5, 4.8), Seg::Line(15.0, 3.2)], ink: Ink::Stroke },
+        // Six legs, three a side, angled fore and aft so the middle pair is
+        // horizontal and the outer two splay -- an insect's actual stance, and
+        // the thing that stops six parallel lines reading as a comb.
+        Sub { segs: &[Seg::Move(6.7, 10.4), Seg::Line(3.4, 8.6)], ink: Ink::Stroke },
+        Sub { segs: &[Seg::Move(6.4, 13.2), Seg::Line(2.9, 13.2)], ink: Ink::Stroke },
+        Sub { segs: &[Seg::Move(6.7, 16.0), Seg::Line(3.4, 17.8)], ink: Ink::Stroke },
+        Sub { segs: &[Seg::Move(17.3, 10.4), Seg::Line(20.6, 8.6)], ink: Ink::Stroke },
+        Sub { segs: &[Seg::Move(17.6, 13.2), Seg::Line(21.1, 13.2)], ink: Ink::Stroke },
+        Sub { segs: &[Seg::Move(17.3, 16.0), Seg::Line(20.6, 17.8)], ink: Ink::Stroke },
+    ],
+};
+
 // --- the timeline's transport ------------------------------------------------
 
 /// Play: a solid triangle.
@@ -754,6 +787,7 @@ pub enum IconName {
     Minimise,
     Maximise,
     Info,
+    Bug,
     Play,
     Stop,
     CaretDown,
@@ -793,11 +827,12 @@ impl IconName {
     /// set's index, and anything that needs the whole set rather than one icon
     /// starts here.
     #[allow(dead_code)]
-    pub const ALL: [IconName; 31] = [
+    pub const ALL: [IconName; 32] = [
         IconName::Close,
         IconName::Minimise,
         IconName::Maximise,
         IconName::Info,
+        IconName::Bug,
         IconName::Play,
         IconName::Stop,
         IconName::CaretDown,
@@ -866,6 +901,7 @@ impl IconName {
             IconName::Minimise => &MINIMISE,
             IconName::Maximise => &MAXIMISE,
             IconName::Info => &INFO,
+            IconName::Bug => &BUG,
             IconName::Play => &PLAY,
             IconName::Stop => &STOP,
             IconName::CaretDown => &CARET_DOWN,

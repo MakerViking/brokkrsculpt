@@ -568,6 +568,64 @@ impl Brokkr {
             }
         }
 
+        // **The account row, and signing in is optional.** It buys one thing
+        // and the copy says which: a bug report that can be answered. Nothing
+        // else in the application changes when it is empty -- see
+        // [`crate::account`] and `report::send`.
+        left = left.push(space::vertical().height(theme::S3));
+        left = left.push(match &self.account {
+            Some(account) => column![
+                {
+                    // The picture is optional in the strongest sense: a
+                    // profile with none, a host that will not answer and a
+                    // format we do not decode all arrive here as `None`, and
+                    // in every one of them the row is the name alone. A
+                    // missing face must never cost the account row.
+                    let mut who = row![].spacing(theme::S2).align_y(Alignment::Center);
+                    if let Some(handle) = &self.avatar {
+                        who = who.push(
+                            container(
+                                iced::widget::image(handle.clone())
+                                    .width(Length::Fixed(AVATAR_ROW_PX))
+                                    .content_fit(iced::ContentFit::Cover),
+                            )
+                            .clip(true)
+                            .width(Length::Fixed(AVATAR_ROW_PX))
+                            .height(Length::Fixed(AVATAR_ROW_PX)),
+                        );
+                    }
+                    who.push(
+                        text(account.label().to_string()).size(theme::TEXT_SIZE).color(theme::TEXT),
+                    )
+                },
+                button(text("Sign out").size(theme::TEXT_SIZE_SMALL))
+                    .padding(Padding {
+                        top: theme::S1,
+                        bottom: theme::S1,
+                        left: theme::S3,
+                        right: theme::S3
+                    })
+                    .style(theme::tool_button)
+                    .on_press(Message::SignOutRequested),
+            ]
+            .spacing(theme::S1),
+            None => column![
+                action(
+                    if self.signing_in {
+                        "Waiting for the browser…"
+                    } else {
+                        "Sign in with TinkerAtlas"
+                    },
+                    Message::SignInRequested,
+                    theme::tool_button,
+                ),
+                text("Optional. Lets us reply to your bug reports.")
+                    .size(theme::CAPTION_SIZE)
+                    .color(theme::TEXT_MUTE),
+            ]
+            .spacing(theme::S1),
+        });
+
         // **The articles, which is what SindriCAD's right column is.** It
         // embeds the site in an iframe; there is no webview here, so the same
         // articles arrive as data and are drawn with the same widgets as
@@ -704,11 +762,55 @@ impl Brokkr {
         .spacing(theme::S3)
         .width(Length::Fill);
 
+        // **The wording comes from the offer, because the direction is not
+        // always forward.** A rollback publishes a higher `seq` naming a LOWER
+        // build, so the user can legitimately be offered an older ordinal and
+        // calling that an upgrade would be a small lie told on every launch.
+        // `headline` is the one place that decides; see `update::Offer`.
+        let update: Element<'_, Message> = match &self.offer {
+            Some(offer) => button(
+                text(if self.downloaded_update.is_some() {
+                    format!("Build {} is ready — install and restart", offer.build)
+                } else {
+                    format!("{} — get it", offer.headline())
+                })
+                .size(theme::TEXT_SIZE_SMALL)
+                .color(theme::ACCENT),
+            )
+            .padding(0)
+            .style(theme::tool_button)
+            // Three states, in the order a user meets them: install what is
+            // already verified on disk, download it, or -- for a build that
+            // needs the whole archive -- the release page, which is the honest
+            // answer rather than handing over a bare executable that will not
+            // work on its own.
+            .on_press(if self.downloaded_update.is_some() {
+                Message::UpdateInstallPressed
+            } else if offer.payload.is_some() && !offer.requires_reinstall {
+                Message::UpdateDownloadRequested
+            } else {
+                Message::LinkOpened(crate::articles::RELEASE_PAGE.to_string())
+            })
+            .into(),
+            None => space::horizontal().into(),
+        };
+
         let foot = row![
             checkbox(self.welcome_on_startup)
                 .label("Show this screen on startup")
                 .on_toggle(Message::WelcomeOnStartupSet)
                 .text_size(theme::TEXT_SIZE_SMALL),
+            // Beside the screen's own tick, because it governs the same kind of
+            // thing: an outbound connection. The property this card is meant to
+            // hold is that **every outbound connection has exactly one visible
+            // switch** -- see `articles.rs`. The articles and the avatar are
+            // governed by the tick to its left; this one governs the updater.
+            checkbox(self.update_settings.when != crate::update::When::Never)
+                .label("Check for updates")
+                .on_toggle(Message::UpdateCheckSet)
+                .text_size(theme::TEXT_SIZE_SMALL),
+            space::horizontal(),
+            update,
             space::horizontal(),
             button(text("Close").size(theme::TEXT_SIZE))
                 .padding(Padding {
@@ -824,9 +926,24 @@ impl Brokkr {
                     .label("attach the diagnostics and what this session did")
                     .on_toggle(Message::BugReportDetailToggled)
                     .text_size(theme::CAPTION_SIZE),
-                text("Sent anonymously to tinkeratlas.com. Home directories are removed.")
-                    .size(theme::CAPTION_SIZE)
-                    .color(theme::TEXT_MUTE),
+                // **Says which of the two it is, before the Send button.**
+                // Signing in changes what leaves the machine -- the report
+                // stops being anonymous and is filed under a name -- and a
+                // user who signed in on a different screen should not have to
+                // infer that here. Signed out, the old sentence stands
+                // unchanged because the old behaviour is unchanged.
+                text(match &self.account {
+                    Some(account) => format!(
+                        "Sent to tinkeratlas.com as {}, so we can reply. \
+                         Home directories are removed.",
+                        account.label()
+                    ),
+                    None => "Sent anonymously to tinkeratlas.com. \
+                             Home directories are removed."
+                        .to_string(),
+                })
+                .size(theme::CAPTION_SIZE)
+                .color(theme::TEXT_MUTE),
                 preview,
                 row![
                     action(
@@ -970,6 +1087,40 @@ impl Brokkr {
                     .color(theme::TEXT_MUTE),
                 text("AGPL-3.0-only").size(theme::CAPTION_SIZE).color(theme::TEXT_MUTE),
                 separator(),
+                // Freshness, not enforcement. A channel that went quiet is
+                // indistinguishable from a maintainer who did, and this design
+                // refuses to guess which -- so it says how long it has been and
+                // stops there. Nothing anywhere expires on the user.
+                text(self.update_freshness.clone())
+                    .size(theme::CAPTION_SIZE)
+                    .color(theme::TEXT_MUTE),
+                // **The update tick's second home.** The default is `always`,
+                // so the switch has to be reachable without the welcome screen
+                // -- a control only on a screen the user turned off is not a
+                // control. Both surfaces write the same file through the same
+                // message, so they cannot drift.
+                checkbox(self.update_settings.when != crate::update::When::Never)
+                    .label("Check for updates")
+                    .on_toggle(Message::UpdateCheckSet)
+                    .text_size(theme::TEXT_SIZE_SMALL),
+                separator(),
+                // Only when there is something to go back TO: a pending crash
+                // report, a running ordinal matching what we installed, and a
+                // kept copy still on disk with a matching digest.
+                {
+                    // A fixed phrase, for the same reason `PendingAction::describe`
+                    // returns `&'static str`: `entry` borrows its label, so a
+                    // formatted one cannot outlive the call. The ordinal goes to
+                    // the status line, where the outcome is already reported.
+                    let revert: Element<'_, Message> = match self.crash_revert {
+                        Some(_) => {
+                            entry("Go back to the previous build", Message::UpdateRevertRequested)
+                                .into()
+                        }
+                        None => space::vertical().height(0).into(),
+                    };
+                    revert
+                },
                 entry("Welcome screen", Message::WelcomeOpened),
                 entry("Copy diagnostics", Message::DiagnosticsCopied),
                 entry("Report a bug…", Message::BugReportOpened),
@@ -1053,7 +1204,40 @@ impl Brokkr {
             stacked = stacked.push(self.mask_card(card));
         }
 
-        container(stacked).padding(theme::S4).into()
+        // **Bottom right, and a `stack!` rather than a corner of the column
+        // above.** The column grows downward from the top left -- stats,
+        // overflow warning, mask card -- so anything appended to it lands
+        // under whatever happens to be showing, which is a different place
+        // every session. A second layer pinned to the opposite corner is
+        // somewhere a user can learn.
+        //
+        // The `Fill` container does NOT capture: it is a `container`, whose
+        // `mouse_interaction` is `None`, so `Stack` lets presses through to the
+        // shader behind it and a drag started over empty viewport still
+        // sculpts. The `Button` inside captures, and only inside its own
+        // bounds. That is the rule this file records for `mask_card`, applied
+        // the other way round -- see [`Self::mask_card`] and [`modal_layer`].
+        let bug = container(
+            button(icon::icon(icon::IconName::Bug, theme::ICON_CHROME, theme::TEXT_DIM))
+                .padding(theme::S2)
+                .style(theme::tool_button)
+                .on_press(Message::BugReportOpened),
+        )
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .align_x(Alignment::End)
+        .align_y(Alignment::End)
+        .padding(theme::S4);
+
+        // **The FILL layer goes first, and that is not cosmetic.** `Stack`
+        // takes its size from its base layer and lays the rest out inside it
+        // (`iced_widget-0.14.2` `Stack::layout`). With the top-left column
+        // first the stack was shrink-sized to that column, so this layer's
+        // "bottom right" was the bottom right of a box about one button
+        // across -- and the bug drew directly on top of the info toggle. One
+        // button visible, wrong glyph, and nothing at all in the corner it was
+        // written for.
+        stack![bug, container(stacked).padding(theme::S4)].into()
     }
 
     /// The standing mask card, over the viewport, whenever anything is masked.
@@ -3308,6 +3492,13 @@ const GRID_HEIGHT_PX: f32 = 440.0;
 
 /// How many article cards sit side by side.
 const GRID_COLUMNS: usize = 2;
+
+/// How big the avatar is drawn in the account row, in logical pixels.
+///
+/// Smaller than the 64 asked of the server, which is deliberate: the row is
+/// one line of text tall, and a picture with pixels to spare stays sharp on a
+/// HiDPI output instead of being upscaled.
+const AVATAR_ROW_PX: f32 = 28.0;
 
 /// Cut a path down so it cannot push a column wider than it was given.
 ///

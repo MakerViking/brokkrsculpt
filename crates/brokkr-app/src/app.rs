@@ -375,6 +375,43 @@ pub struct Brokkr {
     /// which is what makes "the volume" stop being a thing a call site can mean
     /// by accident.
     doc: Document,
+    /// A build worth telling the user about, once the check has answered.
+    /// `None` until then, and `None` for ever if there is nothing to say.
+    ///
+    /// Not necessarily a *newer* build: during a rollback the offer names a
+    /// LOWER ordinal, and the wording must not call that an upgrade.
+    offer: Option<crate::update::Offer>,
+    /// The update preference, read once at startup and written through on every
+    /// change. Held rather than re-read so the two tick surfaces cannot
+    /// disagree about what is currently set.
+    update_settings: crate::update::Settings,
+    /// A download is in flight. Guarded rather than merely disabled in the
+    /// view, for the reason `signing_in` is: a second press would start a
+    /// second 33 MB transfer into the same file.
+    downloading_update: bool,
+    /// Where a verified payload landed, once one has. Only this is installable.
+    downloaded_update: Option<std::path::PathBuf>,
+    /// The executable to replace, resolved ONCE at startup.
+    ///
+    /// **An invariant, not a convenience.** After a swap, `current_exe`
+    /// resolves through the running inode, which is no longer at the target
+    /// name -- Linux reports the old path with ` (deleted)` appended. A second
+    /// update in one session that re-resolved would overwrite the rollback copy
+    /// and never touch the real binary.
+    exe: Option<crate::update::apply::Target>,
+    /// A marker left by an update that has not yet proved it starts. Cleared on
+    /// the first drawn frame; still present on the next launch means the build
+    /// installed here died before drawing anything.
+    update_pending_marker: Option<std::path::PathBuf>,
+    /// Whether the update card is up. Cleared before `guard` is called, so the
+    /// unsaved-work prompt is never drawn underneath it.
+    offer_modal: bool,
+    /// One line for the Help panel saying how stale the last successful check
+    /// is. Computed at startup rather than per frame: it changes once a day.
+    update_freshness: String,
+    /// A build to offer going back to, when a crash report and the update
+    /// state agree that the build which crashed is the one we installed.
+    crash_revert: Option<u64>,
     camera: OrbitCamera,
     brush: Brush,
     symmetry: Symmetry,
@@ -600,6 +637,21 @@ pub struct Brokkr {
     /// The TinkerAtlas articles that screen shows. See [`crate::articles`] for
     /// why this is fetched only while the screen is actually up.
     feed: crate::articles::Feed,
+    /// The signed-in TinkerAtlas account, if there is one. See
+    /// [`crate::account`]: optional throughout, and its only effect on
+    /// behaviour is that a bug report goes out under this name instead of
+    /// anonymously.
+    account: Option<crate::account::Account>,
+    /// Whether a sign-in is waiting on the browser, so the button can say so
+    /// and cannot be pressed into starting a second listener.
+    signing_in: bool,
+    /// The signed-in user's picture, once it has arrived.
+    ///
+    /// Held here and not on [`crate::account::Account`] so that module stays
+    /// free of the renderer: the account is an identity, this is a decoded
+    /// texture. It is also why it is not in the stored file -- a `Handle` is
+    /// not something to persist, and the URL it came from already is.
+    avatar: Option<iced::widget::image::Handle>,
     /// The cube part under the pointer, lit so a click's effect is visible
     /// before the click.
     cube_hover: Option<navcube::Part>,
@@ -1048,6 +1100,17 @@ pub(crate) enum PendingAction {
     /// Carries the window, because with `exit_on_close_request(false)` the
     /// close has to be issued by us against that specific window.
     Quit(iced::window::Id),
+    /// Install a downloaded update and restart into it.
+    ///
+    /// **The update question is NOT asked here.** That is its own always-shown
+    /// modal, because `guard` only prompts `if would_lose_work`, so routing the
+    /// whole thing through it would restart the app under anyone whose document
+    /// happened to be saved. What goes through `guard` is the *consequence* --
+    /// the work question, asked only when there is work -- which is exactly what
+    /// this gate is for.
+    ///
+    /// Carries the window for the same reason `Quit` does.
+    Restart(iced::window::Id),
 }
 
 impl PendingAction {
@@ -1059,6 +1122,9 @@ impl PendingAction {
             PendingAction::RecoverAutosave => "Recovering the autosave",
             PendingAction::Import => "Importing a mesh in place of every body",
             PendingAction::Quit(_) => "Quitting",
+            // A fixed phrase, not the ordinal: `describe` returns `&'static
+            // str` and has one call site.
+            PendingAction::Restart(_) => "Restarting into the new build",
         }
     }
 }
@@ -1088,6 +1154,29 @@ pub const ISSUE_URL: &str = "https://github.com/MakerViking/brokkrsculpt/issues/
 /// artifact to it. `unknown` in a local build, which is honest.
 pub fn build_commit() -> &'static str {
     option_env!("BROKKR_COMMIT").unwrap_or("unknown")
+}
+
+/// The build ordinal, if this binary came from the release pipeline.
+///
+/// **A total order over builds, which [`build_commit`] cannot provide.** A git
+/// SHA orders nothing, so a commit stamp can only answer "is the published
+/// build different from mine". This answers "which is newer", which is what an
+/// updater needs before it will replace anything.
+///
+/// `None` on every local build, every source build, and any build whose stamp
+/// failed to parse. That is the load-bearing case rather than the fallback:
+/// `None` is what makes the updater structurally inert on a developer's
+/// machine, so a stray keypress cannot overwrite the binary they are working
+/// on with a CI artefact. `release.yml` sets `BROKKR_BUILD` to
+/// `1000 + github.run_number` and then reads this value back out of the binary
+/// it just built, because the way this goes wrong -- a cached build script
+/// serving the previous run's ordinal -- is otherwise silent.
+///
+/// Deliberately NOT saturating or defaulting on a bad parse: a stamp that says
+/// `banana` must not compare as build zero, which would sort below every real
+/// release for ever.
+pub fn build_number() -> Option<u64> {
+    option_env!("BROKKR_BUILD")?.trim().parse().ok()
 }
 
 /// The extension a sculpt is saved with.
@@ -1590,10 +1679,102 @@ impl Brokkr {
         // be drawn underneath it and be unreachable.
         app.welcome_on_startup = crate::welcome::on_startup();
         app.welcome = app.welcome_on_startup;
+        // Read here for the same reason the welcome flag is: `with_devices` is
+        // what the tests build through, and a test that picked up whoever is
+        // signed in on the machine running it would pass or fail on that.
+        app.account = crate::account::load();
         // The screen is up, so its articles are wanted. The only other place
         // that raises it, `Message::WelcomeOpened`, asks for them too.
-        let boot = if app.welcome { app.fetch_articles() } else { Task::none() };
-        (app, boot)
+        let mut boot =
+            if app.welcome { vec![app.fetch_articles(), app.fetch_avatar()] } else { Vec::new() };
+        // **Asked whether the welcome screen is up or not**, unlike the
+        // articles. The user who most needs to hear that their build is stale
+        // is the one who turned the welcome screen off, and the answer goes to
+        // the status line as well as the card.
+        //
+        // In `new` and not in `with_devices`, for the same reason as the two
+        // above: `with_devices` is what the tests build through, and a suite
+        // that reached out to GitHub on every construction would be slow,
+        // rate limited, and would fail on a machine with no network.
+        //
+        // Read here rather than inside the task so the file access is on this
+        // thread with the other startup reads, and so a test that ever does
+        // reach `new` fails loudly rather than racing a background reader.
+        // Resolved here and not in `with_devices`, for the same reason the
+        // update check is: `with_devices` is what ~640 tests build through, and
+        // a suite that resolved the test binary's own path would be one
+        // mistake away from a test that swaps it.
+        app.exe = crate::update::apply::Target::resolve().ok();
+        // Sweep whatever a killed attempt left beside the binary before doing
+        // anything else, so a failed update does not leak a 33 MB inode for ever.
+        if let Some(target) = &app.exe {
+            crate::update::apply::sweep(&target.directory);
+        }
+        // **Did the last update start?** Everything here is code inside the
+        // NEW build, so it only ever runs for a payload that starts and then
+        // dies. A payload that cannot `exec` at all runs none of it, which is
+        // what `RECOVER-BROKKRSCULPT.txt` beside the binary is for.
+        if let Some(target) = &app.exe
+            && let Some(marker) = crate::update::apply::marker_path(target)
+            && let Ok(text) = std::fs::read_to_string(&marker)
+            && let Some(pending) = crate::update::apply::marker_from(&text)
+        {
+            if pending.attempt == 0 {
+                // First launch after the swap. Record the attempt and let the
+                // frame tick clear it.
+                let _ = crate::update::apply::write_marker(
+                    &marker,
+                    &crate::update::apply::Pending { attempt: 1, ..pending.clone() },
+                );
+                app.update_pending_marker = Some(marker);
+                // The document the user had open, back where they left it.
+                if let Some(resume) = &pending.resume {
+                    app.open_project(resume);
+                }
+            } else {
+                // The previous launch died before it drew anything.
+                let recorded = crate::paths::state_file("update.state")
+                    .and_then(|path| std::fs::read_to_string(path).ok())
+                    .and_then(|text| crate::update::previous_sha256_from(&text));
+                match recorded {
+                    Some(digest) => match crate::update::apply::revert(target, &digest) {
+                        Ok(()) => {
+                            // Stop revert -> notify -> update -> crash -> revert
+                            // becoming a loop with a network fetch per cycle.
+                            app.update_settings.skip_build = Some(pending.build);
+                            crate::update::store(&app.update_settings);
+                            app.status = format!(
+                                "build {} would not start, so the build you had is back",
+                                pending.build
+                            );
+                        }
+                        Err(why) => app.status = why.to_string(),
+                    },
+                    None => {
+                        app.status = format!(
+                            "build {} would not start, and there is no verified copy to go back to",
+                            pending.build
+                        );
+                    }
+                }
+                let _ = std::fs::remove_file(&marker);
+            }
+        }
+        app.update_freshness = crate::update::freshness_line();
+        let settings = crate::update::settings();
+        app.update_settings = settings.clone();
+        let floor = crate::update::floor();
+        let running = build_number();
+        let welcome_up = app.welcome;
+        if settings.when != crate::update::When::Never
+            && (settings.when == crate::update::When::Always || welcome_up)
+        {
+            boot.push(Task::perform(
+                async move { crate::update::check(running, &settings, floor).ok().flatten() },
+                Message::UpdateChecked,
+            ));
+        }
+        (app, Task::batch(boot))
     }
 
     /// Build with a given pressure source and an inert puck, which is what
@@ -1636,6 +1817,18 @@ impl Brokkr {
         let doc = Document::from_volume(volume);
         let mut app = Self {
             model_radius_body: doc.active(),
+            offer: None,
+            // Default rather than a read: `with_devices` is what the tests
+            // build through, and a suite that picked up the config of whoever
+            // ran it would pass or fail by machine. `new` overwrites this.
+            update_settings: crate::update::Settings::default(),
+            downloading_update: false,
+            downloaded_update: None,
+            exe: None,
+            update_pending_marker: None,
+            offer_modal: false,
+            update_freshness: String::new(),
+            crash_revert: None,
             doc,
             camera: OrbitCamera::framing(Vec3::ZERO, MODEL_RADIUS_MM),
             brush: Brush::default(),
@@ -1698,6 +1891,9 @@ impl Brokkr {
             welcome: false,
             welcome_on_startup: true,
             feed: crate::articles::Feed::default(),
+            account: None,
+            signing_in: false,
+            avatar: None,
             cube_hover: None,
             flight: None,
             menu: None,
@@ -1801,6 +1997,26 @@ impl Brokkr {
                 }
                 None => log::warn!("the previous session crashed: {summary}"),
             }
+
+            // **The failure the automatic revert structurally cannot catch.**
+            //
+            // The marker is cleared on the first drawn frame, so a build that
+            // starts fine and then dies -- opening the user's document, on a
+            // second GPU init, on one particular tablet -- legitimately cleared
+            // its own marker and will never be reverted automatically. No
+            // amount of keeping `.old` longer changes that; the signal has to
+            // be the crash report, which already exists and was not being used.
+            //
+            // **Offered, not performed.** The application drew a frame, the
+            // user is at a window, and they can decide. The automatic path
+            // exists precisely for the user who never got one.
+            if let Some(target) = &app.exe
+                && crate::update::apply::target_is_the_installed_build(target)
+                && let Ok(old) = std::fs::metadata(target.old())
+                && old.is_file()
+            {
+                app.crash_revert = crate::update::installed_build();
+            }
         }
         app
     }
@@ -1883,6 +2099,85 @@ impl Brokkr {
             // application (`iced_winit` sends `Control::Exit` once the window
             // manager is empty), so this really does quit.
             PendingAction::Quit(id) => iced::window::close(id),
+            PendingAction::Restart(id) => self.install_and_restart(id),
+        }
+    }
+
+    /// Swap the binary and relaunch, or say why not.
+    ///
+    /// Everything before the `rename` inside `apply::install` is
+    /// non-destructive, so every refusal here leaves the install exactly as it
+    /// was. Runs on the interface thread deliberately: the download already
+    /// happened, so what is left is a handful of filesystem operations, and
+    /// doing them in a task would mean the window could be closed underneath a
+    /// half-finished swap.
+    fn install_and_restart(&mut self, id: iced::window::Id) -> Task<Message> {
+        let Some(staged) = self.downloaded_update.clone() else {
+            self.status = "there is no downloaded update to install".to_string();
+            return Task::none();
+        };
+        let Some(offer) = self.offer.clone() else {
+            return Task::none();
+        };
+        // Never waited on: the user is looking at a modal, and a blocking wait
+        // behind another instance's download is a hung window.
+        let lock = match crate::update::apply::Lock::take() {
+            Ok(lock) => lock,
+            Err(why) => {
+                self.status = why.to_string();
+                return Task::none();
+            }
+        };
+        let Some(target) = self.exe.clone() else {
+            self.status = "this copy cannot update itself".to_string();
+            return Task::none();
+        };
+        if let Err(why) = crate::update::apply::gates(&target, build_number(), build_commit()) {
+            self.status = why.to_string();
+            return Task::none();
+        }
+        // What we are reverting TO, recorded before anything moves.
+        let previous = match crate::update::apply::sha256_of(&target.path) {
+            Ok(digest) => digest,
+            Err(why) => {
+                self.status = why.to_string();
+                return Task::none();
+            }
+        };
+        if let Err(why) = crate::update::apply::install(&target, &staged, &previous) {
+            self.status = why.to_string();
+            return Task::none();
+        }
+        // The marker the next launch reads. `resume` is the channel that
+        // survives the restart -- argv would not, because a rollback can spawn
+        // an OLDER binary that has never heard of the flag.
+        if let Some(marker) = crate::update::apply::marker_path(&target) {
+            let _ = crate::update::apply::write_marker(
+                &marker,
+                &crate::update::apply::Pending {
+                    build: offer.build,
+                    attempt: 0,
+                    resume: self.project_path.clone(),
+                    path: target.path.clone(),
+                },
+            );
+        }
+        // Released before the spawn: the child opens its own handle and would
+        // otherwise race the parent's exit and be refused its own first write.
+        lock.release();
+
+        // **Spawn first, and only exit if it worked.** A user who clicked
+        // restart and got a closed window with nothing coming back has no
+        // terminal and no way to tell whether their install survived.
+        match std::process::Command::new(&target.path).spawn() {
+            Ok(_) => iced::window::close(id),
+            Err(why) => {
+                self.status = format!(
+                    "build {} is installed, but starting it failed ({why}) -- this window is                      still the old build; close it and start BrokkrSculpt again",
+                    offer.build
+                );
+                Task::none()
+            }
         }
     }
 
@@ -5160,12 +5455,37 @@ impl Brokkr {
         use std::fmt::Write;
         let mut out = String::new();
         let _ = writeln!(out, "BrokkrSculpt {} ({})", env!("CARGO_PKG_VERSION"), build_commit());
+        // **The build ordinal and the updater's own state, in every report.**
+        // Costs two lines and turns every future "it stopped updating" into a
+        // one-message diagnosis instead of a conversation: which build they are
+        // on, whether it came from the updater, and when the channel last
+        // answered. A commit stamp alone cannot say any of that, because a SHA
+        // has no order.
         let _ = writeln!(
             out,
-            "session: {} on {}",
-            std::env::var("XDG_SESSION_TYPE").unwrap_or_else(|_| "unknown".into()),
-            std::env::var("XDG_CURRENT_DESKTOP").unwrap_or_else(|_| "unknown".into()),
+            "build: {}",
+            build_number()
+                .map_or_else(|| "none (not a release build)".to_string(), |n| n.to_string())
         );
+        let _ = writeln!(out, "updates: {}", crate::update::outcome_line());
+        // **The OS line, and it is not the same question on each platform.**
+        // `XDG_SESSION_TYPE` and `XDG_CURRENT_DESKTOP` answer "Wayland or X11,
+        // and which compositor", which is the first thing to know about a
+        // Linux graphics report. They are unset everywhere else, so this used
+        // to print "unknown on unknown" on Windows and macOS -- noise shaped
+        // like data, in the one place a reader is scanning for facts. Off
+        // Linux the version is the useful thing instead, and `report`'s
+        // `os_build` already knows it.
+        if cfg!(target_os = "linux") {
+            let _ = writeln!(
+                out,
+                "session: {} on {}",
+                std::env::var("XDG_SESSION_TYPE").unwrap_or_else(|_| "unknown".into()),
+                std::env::var("XDG_CURRENT_DESKTOP").unwrap_or_else(|_| "unknown".into()),
+            );
+        } else {
+            let _ = writeln!(out, "os: {}", crate::report::os_build());
+        }
         let _ = writeln!(out, "wgpu: {}", self.shared.adapter_summary());
         let _ = writeln!(
             out,
@@ -7271,6 +7591,25 @@ impl Brokkr {
         Task::perform(async { crate::articles::fetch() }, Message::ArticlesLoaded)
     }
 
+    /// Ask for the signed-in user's picture, if there is one to ask for.
+    ///
+    /// Fetched when the welcome screen goes up rather than at startup, for the
+    /// same reason the articles are: the account row is the only place it is
+    /// drawn, so a session that never opens that screen never makes the
+    /// request. Once held it is kept -- it is the same picture.
+    fn fetch_avatar(&self) -> Task<Message> {
+        if self.avatar.is_some() {
+            return Task::none();
+        }
+        let Some(url) = self.account.as_ref().map(|a| a.avatar_url.clone()) else {
+            return Task::none();
+        };
+        if url.is_empty() {
+            return Task::none();
+        }
+        Task::perform(async move { crate::articles::fetch_avatar(&url) }, Message::AvatarLoaded)
+    }
+
     /// Whether a modal card is up, and therefore owns the input.
     ///
     /// One list, read by both halves of the guard: `on_key` for the keyboard
@@ -7837,6 +8176,17 @@ impl Brokkr {
             Message::Pointer(event) => self.on_pointer(event),
             Message::Frame => {
                 let elapsed_ms = self.perf.record_frame();
+                // **The update took.** Cleared on the first drawn frame, which
+                // is the earliest honest evidence that this build starts. A
+                // build that dies before here leaves the marker behind, and the
+                // next launch reverts. The cost is stated in the plan and is the
+                // right way round: a session killed inside its first frame --
+                // a broken driver, a headless run, a window closed instantly --
+                // reverts a good update, and being stuck on an older build
+                // beats being stuck with one that will not start.
+                if let Some(marker) = self.update_pending_marker.take() {
+                    let _ = std::fs::remove_file(marker);
+                }
                 if !self.facts_recorded {
                     self.facts_recorded = true;
                     self.record_session_facts();
@@ -7884,7 +8234,7 @@ impl Brokkr {
                 // the screen is dismissed.
                 self.top_menu = None;
                 self.welcome = true;
-                return self.fetch_articles();
+                return Task::batch([self.fetch_articles(), self.fetch_avatar()]);
             }
             Message::ArticlesRetried => return self.fetch_articles(),
             Message::ArticlesLoaded(answer) => {
@@ -7892,6 +8242,25 @@ impl Brokkr {
                     Ok(articles) => crate::articles::Feed::Ready(articles),
                     Err(why) => crate::articles::Feed::Failed(why),
                 };
+            }
+            Message::UpdateChecked(answer) => {
+                // Also to the status line, and ONLY when the card is not up.
+                // The card carries the same notice with a button on it, so
+                // saying it twice would be noise -- and the person who needs
+                // the status line is exactly the one who turned the card off.
+                //
+                // `status.is_empty()` guards it because the startup crash and
+                // autosave notices are already in the line by now, and those
+                // have something for the user to DO. An update is the least
+                // urgent thing that can be said here.
+                if let Some(offer) = &answer
+                    && !self.welcome
+                    && self.status.is_empty()
+                {
+                    self.status =
+                        format!("{} -- {}", offer.headline(), crate::articles::RELEASE_PAGE);
+                }
+                self.offer = answer;
             }
             Message::LinkOpened(link) => {
                 // The screen stays up: reading an article is not choosing what
@@ -7905,10 +8274,164 @@ impl Brokkr {
             // before dispatch, which is what closes it for every other button
             // on the card too.
             Message::WelcomeClosed => {}
+            Message::UpdateDownloadRequested => {
+                if self.downloading_update {
+                    return Task::none();
+                }
+                let Some(offer) = self.offer.clone() else {
+                    return Task::none();
+                };
+                // A build that cannot be reached by replacing one file is not
+                // downloadable here at all: the payload is a bare executable and
+                // that user needs the full archive. Say so and send them to the
+                // page rather than handing them something that will not work.
+                if offer.requires_reinstall || offer.payload.is_none() {
+                    self.status = format!(
+                        "build {} needs a full download -- {}",
+                        offer.build,
+                        crate::articles::RELEASE_PAGE
+                    );
+                    return Task::none();
+                }
+                // **Beside the binary when we can replace it, in the state
+                // directory when we cannot.** `install` ends with
+                // `rename(staged, target)`, and a cross-filesystem rename
+                // degrades to a copy -- exactly the operation that fails against
+                // a running image. So the destination is decided by whether this
+                // install is replaceable at all, and the gates answer that
+                // BEFORE 33 MB is transferred rather than after.
+                let replaceable = self
+                    .exe
+                    .as_ref()
+                    .filter(|target| {
+                        crate::update::apply::gates(target, build_number(), build_commit()).is_ok()
+                    })
+                    .map(|target| target.staging_directory());
+                let Some(into) = replaceable.or_else(crate::update::download_directory) else {
+                    self.status = "there is nowhere to put the download".to_string();
+                    return Task::none();
+                };
+                self.downloading_update = true;
+                self.status = format!("downloading build {}…", offer.build);
+                return Task::perform(
+                    async move { crate::update::download(&offer, &into).map_err(|why| why.to_string()) },
+                    Message::UpdateDownloaded,
+                );
+            }
+            Message::UpdateDownloaded(answer) => {
+                self.downloading_update = false;
+                self.status = match answer {
+                    // **Where it is, not just that it worked.** A user handed a
+                    // verified file and not told where it landed has been given
+                    // nothing they can act on, and there is no terminal here to
+                    // go looking with.
+                    Ok(path) => {
+                        let where_it_is = format!("verified and saved to {}", path.display());
+                        self.downloaded_update = Some(path);
+                        where_it_is
+                    }
+                    Err(why) => why,
+                };
+            }
+            Message::UpdateRevertRequested => {
+                let Some(build) = self.crash_revert.take() else {
+                    return Task::none();
+                };
+                let Some(target) = self.exe.clone() else {
+                    return Task::none();
+                };
+                let recorded = crate::paths::state_file("update.state")
+                    .and_then(|path| std::fs::read_to_string(path).ok())
+                    .and_then(|text| crate::update::previous_sha256_from(&text));
+                let Some(digest) = recorded else {
+                    self.status = "there is no verified copy to go back to".to_string();
+                    return Task::none();
+                };
+                match crate::update::apply::revert(&target, &digest) {
+                    Ok(()) => {
+                        // Stop revert -> notify -> update -> crash -> revert
+                        // becoming a loop with a network fetch per cycle.
+                        self.update_settings.skip_build = Some(build);
+                        crate::update::store(&self.update_settings);
+                        self.status = format!(
+                            "went back from build {build} — restart BrokkrSculpt to use it"
+                        );
+                    }
+                    Err(why) => self.status = why.to_string(),
+                }
+            }
+            Message::UpdateInstallPressed => {
+                return iced::window::latest()
+                    .and_then(|id| Task::done(Message::UpdateInstallRequested(id)));
+            }
+            Message::UpdateInstallRequested(id) => {
+                if self.downloaded_update.is_none() {
+                    self.status = "download the update first".to_string();
+                    return Task::none();
+                }
+                // The update modal comes down BEFORE `guard` is called:
+                // `panel.rs` picks its overlay from an early-return chain, not a
+                // stack, so an update card left up would hide the unsaved-work
+                // prompt -- raised, invisible and unanswerable.
+                self.offer_modal = false;
+                return self.guard(PendingAction::Restart(id));
+            }
+            Message::UpdateCheckSet(on) => {
+                // `Always` rather than `Welcome` when switched back on, matching
+                // the default settled 2026-08-30: the person who most needs to
+                // hear their build is stale is the one who turned the welcome
+                // screen off, so tying the check to that screen would silence it
+                // for exactly them.
+                self.update_settings.when =
+                    if on { crate::update::When::Always } else { crate::update::When::Never };
+                crate::update::store(&self.update_settings);
+                // Turning it off also clears what a past check said. Leaving the
+                // card up would be an update notice on a screen whose switch
+                // now reads "off", which is the sort of thing that gets filed as
+                // "it still checks".
+                if !on {
+                    self.offer = None;
+                }
+            }
             Message::WelcomeOnStartupSet(show) => {
                 self.welcome_on_startup = show;
                 crate::welcome::set_on_startup(show);
             }
+            Message::SignInRequested => {
+                // Guarded rather than merely disabled in the view: a second
+                // press would bind a second listener and open a second tab,
+                // and only one of them could ever be answered.
+                if self.signing_in {
+                    return Task::none();
+                }
+                self.signing_in = true;
+                self.status = "waiting for the browser…".to_string();
+                return Task::perform(async { crate::account::sign_in() }, Message::SignInFinished);
+            }
+            Message::SignInFinished(outcome) => {
+                self.signing_in = false;
+                match outcome {
+                    Ok(account) => {
+                        self.status = format!("signed in as {}", account.label());
+                        self.account = Some(account);
+                        return self.fetch_avatar();
+                    }
+                    // "could not" is what colours the status line as an error;
+                    // see `panel.rs`.
+                    Err(why) => self.status = format!("could not sign in: {why}"),
+                }
+            }
+            Message::AvatarLoaded(handle) => self.avatar = handle,
+            Message::SignOutRequested => match crate::account::sign_out() {
+                Ok(()) => {
+                    self.account = None;
+                    // Or the next person to sign in on this machine gets the
+                    // last one's face beside their name.
+                    self.avatar = None;
+                    self.status = "signed out".to_string();
+                }
+                Err(why) => self.status = why,
+            },
             Message::SymmetryAxisToggled(axis) => self.toggle_mirror(axis),
             Message::PatternChanged(kind) => self.brush.pattern.kind = kind,
             Message::PatternScaleChanged(scale) => self.brush.pattern.scale_mm = scale,
@@ -8016,8 +8539,17 @@ impl Brokkr {
                     draft.sending = true;
                 }
                 self.status = "sending the report…".to_string();
+                // Built here and not inside the task: the account lives on
+                // `self`, and the task has to own everything it touches.
+                let authorization = self.account.as_ref().map(|a| a.authorization());
                 return Task::perform(
-                    async move { crate::report::send(report, crate::report::TINKERATLAS) },
+                    async move {
+                        crate::report::send(
+                            report,
+                            crate::report::TINKERATLAS,
+                            authorization.as_deref(),
+                        )
+                    },
                     Message::BugReportFinished,
                 );
             }
@@ -9798,6 +10330,12 @@ mod tests {
     #[test]
     fn the_screens_own_controls_do_not_dismiss_it() {
         assert!(!dismisses_the_welcome(&Message::WelcomeOnStartupSet(false)));
+        // The update tick sits on the same card and must behave the same way.
+        // It is deliberately in none of the three classifiers, exactly like the
+        // tick beside it: an unlisted variant commits an in-flight rename and
+        // disarms the gizmo, and that is what the sibling control already does.
+        assert!(!dismisses_the_welcome(&Message::UpdateCheckSet(false)));
+        assert!(!dismisses_the_welcome(&Message::UpdateCheckSet(true)));
         assert!(!dismisses_the_welcome(&Message::WelcomeOnStartupSet(true)));
         assert!(
             !dismisses_the_welcome(&Message::LinkOpened("https://tinkeratlas.com/x".into())),
@@ -12740,9 +13278,21 @@ mod export_tests {
     fn the_diagnostics_carry_what_a_bug_report_needs() {
         let app = app();
         let report = app.diagnostics();
-        for expected in ["BrokkrSculpt", "session:", "model:", "view:", "tablet:", "spacemouse:"] {
+        for expected in ["BrokkrSculpt", "model:", "view:", "tablet:", "spacemouse:"] {
             assert!(report.contains(expected), "diagnostics are missing {expected}:\n{report}");
         }
+        // The platform line is one or the other, never neither. `session:`
+        // answers "Wayland or X11, and which compositor", which only Linux can
+        // be asked; everywhere else the OS version is the useful fact and
+        // `os:` carries it. Asserting the pair rather than one name is what
+        // stops a future platform silently reporting no platform at all --
+        // this test demanded `session:` on every OS and passed for a year
+        // because only one OS was built.
+        let platform = if cfg!(target_os = "linux") { "session:" } else { "os:" };
+        assert!(
+            report.contains(platform),
+            "diagnostics name no platform; expected {platform}:\n{report}"
+        );
         // The commit is what ties a binary to its source, which is an AGPL
         // obligation rather than a nicety.
         assert!(report.contains(build_commit()));

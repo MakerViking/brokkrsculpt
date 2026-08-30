@@ -26,12 +26,22 @@
 //! **Only while the welcome screen is actually on screen.** Everything else
 //! this application does is local: the bug reporter talks to the network when a
 //! user asks it to, and `printer.rs` talks to a machine on the LAN. A fetch on
-//! every launch would be a new outbound connection nobody asked for, and this
-//! application has deliberately no account and no stored credential.
+//! every launch would be a new outbound connection nobody asked for.
 //!
 //! Tying it to the screen makes the control honest: **turning the welcome
 //! screen off also turns this off**, with no second setting to find, and the
 //! tick that does it is on the screen itself.
+//!
+//! That is the rule for *this* module and not for the application. It used to
+//! say the application "has deliberately no account and no stored credential",
+//! which stopped being true when sign-in landed: `account::load` reads a stored
+//! credential at startup and `fetch_avatar` fetches the avatar it names, which
+//! is a second connection this tick governs. The updater is a third, and it has
+//! its own switch rather than this one, because the person who most needs to
+//! hear their build is stale is the one who turned this screen off. The
+//! property that actually holds, and the one worth defending, is **every
+//! outbound connection has exactly one visible switch** -- not "the network is
+//! only touched while the welcome screen is up".
 
 use std::io::Read;
 use std::time::Duration;
@@ -226,17 +236,43 @@ const THUMB_HEIGHT: u32 = 180;
 ///
 /// Only ever the storage host, over TLS. These bytes are fed to a decoder, so
 /// where they come from is a security question and not a tidiness one.
-fn thumbnail_url(enclosure: &str) -> Option<String> {
+fn render_url(stored: &str, width: u32, height: u32) -> Option<String> {
     const PREFIX: &str = "https://api.tinkeratlas.com/storage/v1/object/public/";
     const RENDER: &str = "https://api.tinkeratlas.com/storage/v1/render/image/public/";
-    let rest = enclosure.strip_prefix(PREFIX)?;
+    let rest = stored.strip_prefix(PREFIX)?;
     // A query of its own would be appended to ours and could override the size.
     if rest.contains('?') {
         return None;
     }
-    Some(format!(
-        "{RENDER}{rest}?width={THUMB_WIDTH}&height={THUMB_HEIGHT}&resize=cover&quality=70"
-    ))
+    Some(format!("{RENDER}{rest}?width={width}&height={height}&resize=cover&quality=70"))
+}
+
+/// The 16:9 URL for an article thumbnail.
+fn thumbnail_url(enclosure: &str) -> Option<String> {
+    render_url(enclosure, THUMB_WIDTH, THUMB_HEIGHT)
+}
+
+/// How big an avatar is asked for. Square, because the row draws it in a
+/// square: the article size is 16:9 and an avatar through that comes back a
+/// letterbox with the top and bottom of someone's head cropped off.
+const AVATAR_PX: u32 = 64;
+
+/// Fetch the signed-in user's avatar, or nothing.
+///
+/// **The same allowlisted prefix and the same decoder path as an article
+/// picture**, deliberately: the profile URL Supabase stores is under exactly
+/// the storage prefix [`render_url`] already accepts, and it carries no query
+/// of its own, so nothing here widens what may be fed to a decoder. If a
+/// future avatar lives somewhere else, the answer is no picture, not a wider
+/// allowlist.
+///
+/// `None` for every failure. A missing avatar must never cost the row its
+/// name -- see the account row in `panel.rs`.
+pub fn fetch_avatar(stored_url: &str) -> Option<iced::widget::image::Handle> {
+    let url = render_url(stored_url, AVATAR_PX, AVATAR_PX)?;
+    let agent: ureq::Agent =
+        ureq::Agent::config_builder().timeout_global(Some(TIMEOUT)).build().into();
+    fetch_picture(&agent, &url, AVATAR_PX, AVATAR_PX)
 }
 
 /// Fetch and decode one thumbnail. `None` on any failure, which is ordinary.
@@ -246,17 +282,31 @@ fn thumbnail_url(enclosure: &str) -> Option<String> {
 /// propagates. The one thing it will not do is decode something enormous: the
 /// server was asked for 240 pixels, and anything far larger than that is not
 /// the picture that was requested.
-fn fetch_thumbnail(agent: &ureq::Agent, url: &str) -> Option<iced::widget::image::Handle> {
+fn fetch_picture(
+    agent: &ureq::Agent,
+    url: &str,
+    asked_width: u32,
+    asked_height: u32,
+) -> Option<iced::widget::image::Handle> {
     let mut response = agent.get(url).call().ok()?;
     let mut bytes = Vec::new();
     response.body_mut().as_reader().take(MAX_THUMB_BYTES).read_to_end(&mut bytes).ok()?;
 
     let decoded = image::load_from_memory(&bytes).ok()?;
     let (width, height) = (decoded.width(), decoded.height());
-    if width == 0 || height == 0 || width > THUMB_WIDTH * 4 || height > THUMB_HEIGHT * 4 {
+    // Four times what was ASKED FOR, not four times an article thumbnail: the
+    // check is "this is not remotely the picture we requested", so it has to
+    // scale with the request or it stops meaning that. A 64-pixel avatar
+    // measured against the article ceiling would wave through a 1280x720.
+    if width == 0 || height == 0 || width > asked_width * 4 || height > asked_height * 4 {
         return None;
     }
     Some(iced::widget::image::Handle::from_rgba(width, height, decoded.into_rgba8().into_raw()))
+}
+
+/// An article thumbnail at the article size.
+fn fetch_thumbnail(agent: &ureq::Agent, url: &str) -> Option<iced::widget::image::Handle> {
+    fetch_picture(agent, url, THUMB_WIDTH, THUMB_HEIGHT)
 }
 
 /// A ceiling on what will be read for one thumbnail.
@@ -317,6 +367,16 @@ fn shorten(text: &str) -> String {
 pub const JOIN_URL: &str = "https://tinkeratlas.com/signup";
 pub const VISIT_URL: &str = "https://tinkeratlas.com/";
 
+/// Where a user is sent to get a build.
+///
+/// Here rather than in the updater for the reason above: this is one of the
+/// prefixes [`may_be_opened`] admits, and a URL that lives apart from the rule
+/// admitting it is a URL that will one day stop being admitted. It was in
+/// `update_check.rs` until the updater replaced that module, and moving it was
+/// not optional -- the allowlist and its test both read it, so deleting the old
+/// module without moving this first does not compile.
+pub const RELEASE_PAGE: &str = "https://github.com/MakerViking/brokkrsculpt/releases/tag/beta";
+
 /// Whether a link may be handed to the user's browser.
 ///
 /// **Split out of [`open_in_browser`] so acceptance can be tested.** That one
@@ -324,20 +384,55 @@ pub const VISIT_URL: &str = "https://tinkeratlas.com/";
 /// would open a browser on whoever ran the suite -- which is why the existing
 /// test only ever checks refusals. This is the same question with no side
 /// effect.
-pub(crate) fn leads_to_tinkeratlas(link: &str) -> bool {
-    link.starts_with("https://tinkeratlas.com/")
+///
+/// # The rule, which is an invariant and not a heuristic
+///
+/// A link is admitted when it **starts with one of an exact list of prefixes,
+/// each of which ends in `/`**, or when it is exactly [`RELEASE_PAGE`].
+///
+/// The trailing `/` is the whole guarantee. `https://tinkeratlas.com` without
+/// it would admit `https://tinkeratlas.com.example.net/`, which is a different
+/// site that merely starts with the same characters. Any prefix added here must
+/// keep that property, and anything that cannot be expressed as such a prefix
+/// -- the release page, which is one exact page and not a subtree -- goes in as
+/// an equality test instead.
+///
+/// Renamed from `leads_to_tinkeratlas`, which stopped being true the day the
+/// release page was admitted: a name that describes the old rule is how the
+/// next person justifies bolting a second exception onto it.
+pub(crate) fn may_be_opened(link: &str) -> bool {
+    link.starts_with(VISIT_URL) || link == RELEASE_PAGE
 }
 
 /// Hand a link to whatever the desktop opens links with.
 ///
-/// `xdg-open` rather than a crate: this is Linux-first, `slicer.rs` already
+/// The platform's own opener rather than a crate: `slicer.rs` already
 /// spawns a process the same way, and a browser-opening dependency would be a
 /// second one to audit for the sake of one command.
 pub fn open_in_browser(link: &str) -> Result<(), String> {
-    if !leads_to_tinkeratlas(link) {
+    if !may_be_opened(link) {
         return Err("that link does not lead to TinkerAtlas".to_string());
     }
-    std::process::Command::new("xdg-open")
+    // **One of these three, and no shell.** `xdg-open` exists only on Linux,
+    // so every link in the application -- Join, Visit, each article, and the
+    // release page -- was dead on the other two platforms the day they
+    // shipped. macOS has `open`; Windows has no single-word equivalent, and
+    // the usual `cmd /C start` puts a SHELL between us and a URL that came out
+    // of an RSS feed. `rundll32 url.dll,FileProtocolHandler` is what the
+    // shell's `start` ends up calling anyway, and it takes the argument
+    // directly.
+    let (program, leading) = if cfg!(target_os = "macos") {
+        ("open", None)
+    } else if cfg!(target_os = "windows") {
+        ("rundll32.exe", Some("url.dll,FileProtocolHandler"))
+    } else {
+        ("xdg-open", None)
+    };
+    let mut command = std::process::Command::new(program);
+    if let Some(first) = leading {
+        command.arg(first);
+    }
+    command
         .arg(link)
         .spawn()
         .map(|_| ())
@@ -428,8 +523,17 @@ mod tests {
     /// rejects.
     #[test]
     fn the_welcome_buttons_lead_somewhere_the_guard_allows() {
-        assert!(leads_to_tinkeratlas(JOIN_URL), "the Join button would be refused: {JOIN_URL}");
-        assert!(leads_to_tinkeratlas(VISIT_URL), "the Visit button would be refused: {VISIT_URL}");
+        // **Every button that opens a link, not just the two added together.**
+        // The release page was added to the welcome card and to the status
+        // line without being added here, so "get it" refused itself on every
+        // press and said the release page does not lead to TinkerAtlas --
+        // which is true, and is why the allowlist has to name it.
+        assert!(may_be_opened(RELEASE_PAGE), "the update button would be refused: {RELEASE_PAGE}");
+        // Still refused: the exception is that ONE page, not GitHub.
+        assert!(!may_be_opened("https://github.com/MakerViking/brokkrsculpt"));
+        assert!(!may_be_opened("https://github.com/someone/else/releases/tag/beta"));
+        assert!(may_be_opened(JOIN_URL), "the Join button would be refused: {JOIN_URL}");
+        assert!(may_be_opened(VISIT_URL), "the Visit button would be refused: {VISIT_URL}");
     }
 
     /// One bad entry must not blank the panel.

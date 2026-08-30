@@ -130,6 +130,9 @@ without a menu of every combination.
 
 **[Download the open beta](https://github.com/MakerViking/brokkrsculpt/releases/tag/beta)**
 — Linux, Windows and macOS, rebuilt from `main` on every change.
+[`CHANGELOG.md`](CHANGELOG.md) says what moved since you last looked, which
+matters here: the download link never changes, so two people running "the beta"
+may not be running the same thing.
 
 Nothing is signed, so both Windows and macOS will warn you about it. Read
 [What works on which platform](#what-works-on-which-platform) before you start:
@@ -228,16 +231,21 @@ validates perfectly and prints in one colour.
 
 ## The bug reporter shows you what it sends
 
-*Help > Report a bug* files a report against TinkerAtlas. Three things about it
-are worth stating plainly, because you can check every one of them in the
-source:
+The bug button in the corner of the viewport — or *Help > Report a bug* — files
+a report against TinkerAtlas. Three things about it are worth stating plainly,
+because you can check every one of them in the source:
 
 - **The dialog shows you the exact payload before it goes**, assembled by the
   same function that sends it — not a description of it.
 - **Your home directory is stripped out first.**
-- **There is no account and no stored credential.** The report is anonymous.
-  SindriCAD attaches a token when it has one cached; this deliberately has no
-  sign-in at all, which leaves nothing on disk to leak.
+- **Anonymous unless you have signed in, and the dialog says which.** Signed
+  out, the report carries no account and no credential and there is nothing on
+  disk to leak. Signed in, it goes under your name so the report can be replied
+  to — and the line above the Send button names you before you press it, rather
+  than leaving you to infer it from a sign-in you did on a different screen.
+
+Signing in is optional and exists for one reason: an anonymous report cannot be
+answered. Nothing else in the application needs it.
 
 ## Masking
 

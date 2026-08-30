@@ -17,6 +17,12 @@ brokkr-gpu = { path = "crates/brokkr-gpu" }
 
 bytemuck = { version = "1", features = ["derive"] }
 fast-surface-nets = "0.2"
+# Randomness for the sign-in nonce. **Already in the graph**: iced pulls winit
+# pulls ahash pulls exactly this crate at exactly this version, so naming it
+# here adds no code to the build and no second supply chain to audit -- it
+# pins what is already compiled. `/dev/urandom` did the job on Linux and does
+# not exist on Windows, which is where the nonce test failed.
+getrandom = "0.3"
 # Raw Input and the HID parsers, for the Windows stylus. **Already in the graph
 # on that target** -- winit pulls this same version -- so the cost here is the
 # extra feature surface being compiled, not a new crate. Linux and macOS never
