@@ -113,26 +113,30 @@ impl Target {
 /// refusal after a 33 MB transfer is a worse experience than a refusal before
 /// one, and because the whole point is that nothing destructive begins.
 pub fn gates(target: &Target, build: Option<u64>, commit: &str) -> Result<(), Refusal> {
-    // Checked first, so the download is routed to the state directory for
+    // **Inert unless this is a stamped release build**, and this is checked
+    // FIRST because it is the more specific answer. A developer running a dirty
+    // build on a Mac should be told that their build does not update itself,
+    // not that their platform hands over -- both are true, and only one of them
+    // tells them something about what they are running. An earlier cut had the
+    // platform check first and three tests disagreed with it on macOS.
+    //
+    // Any one of these alone would nearly do; together they are the difference
+    // between "inert" and "one keypress away from overwriting the developer's
+    // own binary with a CI artefact".
+    if build.is_none() || commit == "unknown" || commit.ends_with("-dirty") {
+        return Err(Refusal::NotAReleaseBuild);
+    }
+    // A binary running out of a build directory is a developer's, whatever its
+    // stamp says.
+    if target.path.components().any(|part| part.as_os_str() == "target") {
+        return Err(Refusal::NotAReleaseBuild);
+    }
+    // Then the platform, so a download is routed to the state directory for
     // hand-over rather than staged inside a bundle it must never edit.
     if is_in_app_bundle(&target.path) || cfg!(target_os = "macos") {
         return Err(Refusal::HandOverOnly);
     }
-    {
-        // **Inert unless this is a stamped release build.** Any one of these alone
-        // would nearly do; together they are the difference between "inert" and
-        // "one keypress away from overwriting the developer's own binary with a CI
-        // artefact".
-        if build.is_none() || commit == "unknown" || commit.ends_with("-dirty") {
-            return Err(Refusal::NotAReleaseBuild);
-        }
-        // A binary running out of a build directory is a developer's, whatever its
-        // stamp says.
-        if target.path.components().any(|part| part.as_os_str() == "target") {
-            return Err(Refusal::NotAReleaseBuild);
-        }
-        directory_is_safe(&target.directory)
-    }
+    directory_is_safe(&target.directory)
 }
 
 /// Whether the build running now is the one this install put in place.
@@ -995,7 +999,7 @@ mod tests {
         assert_eq!(gates(&target, Some(1005), "unknown"), Err(Refusal::NotAReleaseBuild));
         assert_eq!(gates(&target, Some(1005), "abc1234-dirty"), Err(Refusal::NotAReleaseBuild));
         // A stamped build in a normal directory passes.
-        assert_eq!(gates(&target, Some(1005), "abc1234"), Ok(()));
+        assert_eq!(gates(&target, Some(1005), "abc1234"), gates_pass());
     }
 
     /// A bare writability test passes on a loose `/opt`, where anyone in the
@@ -1006,15 +1010,19 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         let dir = scratch("loose");
         let target = fake_target(&dir);
+        // `directory_is_safe` directly rather than through `gates`: on macOS the
+        // platform refusal comes first and this check is never reached, so
+        // going through `gates` would assert nothing there. The unit is the
+        // same on every platform, and that is what is being tested.
         for mode in [0o777, 0o775, 0o757] {
             std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(mode))
                 .expect("chmod works");
-            let refusal =
-                gates(&target, Some(1005), "abc1234").expect_err("mode {mode:o} must be refused");
+            let refusal = directory_is_safe(&dir).expect_err("a loose directory must be refused");
             assert!(matches!(refusal, Refusal::CannotReplace(_)), "mode {mode:o} gave {refusal:?}");
         }
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).expect("chmod");
-        assert_eq!(gates(&target, Some(1005), "abc1234"), Ok(()), "0755 is fine");
+        assert_eq!(directory_is_safe(&dir), Ok(()), "0755 is fine");
+        assert_eq!(gates(&target, Some(1005), "abc1234"), gates_pass(), "and so is the whole gate");
     }
 
     #[test]
@@ -1088,9 +1096,9 @@ mod tests {
     fn a_read_only_directory_is_refused_with_something_a_user_can_act_on() {
         use std::os::unix::fs::PermissionsExt;
         let dir = scratch("readonly");
-        let target = fake_target(&dir);
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).expect("chmod");
-        let refusal = gates(&target, Some(1005), "abc1234").expect_err("read-only must refuse");
+        // Directly, for the same reason as the test above.
+        let refusal = directory_is_safe(&dir).expect_err("read-only must refuse");
         let said = refusal.to_string();
         // Restore before asserting, so a failure does not leave an undeletable
         // directory behind for the next run.
@@ -1326,6 +1334,15 @@ mod tests {
         });
         assert!(outcome.is_err());
         assert!(started.elapsed() < std::time::Duration::from_secs(3), "it must bound itself");
+    }
+
+    /// What `gates` returns for a release build in a directory it may write.
+    ///
+    /// `Ok` almost everywhere; on macOS the platform refusal is the correct
+    /// answer and asserting it is real coverage, so these tests keep running
+    /// there rather than being cfg'd away.
+    fn gates_pass() -> Result<(), Refusal> {
+        if cfg!(target_os = "macos") { Err(Refusal::HandOverOnly) } else { Ok(()) }
     }
 
     /// The bundle test runs on every platform, which is the point of making it
