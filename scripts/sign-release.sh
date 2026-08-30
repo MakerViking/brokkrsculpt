@@ -179,6 +179,7 @@ for slug in linux-x86_64 windows-x86_64 macos-arm64; do
     if ! gh release download "$TAG" --repo "$REPO" --pattern "$name" \
             --dir "$work" >/dev/null 2>&1; then
         echo "no $name in the release -- omitting $slug"
+        MISSING="${MISSING:-} $slug"
         continue
     fi
 
@@ -221,6 +222,28 @@ for slug in linux-x86_64 windows-x86_64 macos-arm64; do
 done
 
 [ "$found" -gt 0 ] || die "no payloads for build $BUILD are attached to $REPO@$TAG; there is nothing to sign"
+
+# **A missing platform is legitimate; a missing platform going UNSAID is not.**
+# A `continue` above treats an absent payload exactly as the client treats an
+# absent block -- "no update for this platform" -- which is right when a runner
+# genuinely failed and is silent in the case that matters: someone renames one
+# platform's artefact in release.yml, this signs a correct manifest without it,
+# and every client on that platform reads an ordinary no-op for ever. Nothing on
+# either end says a word.
+#
+# There is no way to tell those two apart from here, so this does not refuse.
+# It makes the operator say it out loud, which is the same reason
+# --requires-reinstall has no default.
+if [ "$found" -lt 3 ]; then
+    echo
+    echo "WARNING: only $found of 3 platforms have a payload for build $BUILD."
+    echo "Missing:${MISSING:- none}"
+    echo "That is correct if a runner failed. If a payload was RENAMED, this"
+    echo "will publish a manifest that silently never updates that platform."
+    printf 'type "yes" if that is expected: '
+    read -r sure
+    [ "$sure" = "yes" ] || die "aborted; nothing was signed"
+fi
 
 # --- show it, then ask -------------------------------------------------------
 

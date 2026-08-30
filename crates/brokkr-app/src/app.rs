@@ -409,6 +409,10 @@ pub struct Brokkr {
     /// A build to offer going back to, when a crash report and the update
     /// state agree that the build which crashed is the one we installed.
     crash_revert: Option<u64>,
+    /// A crash report was found at startup. Set in `with_devices`, which is
+    /// where the report is consumed, and read in `new`, which is where `exe`
+    /// exists -- the two halves of a decision that cannot be made in one place.
+    crashed_last_session: bool,
     camera: OrbitCamera,
     brush: Brush,
     symmetry: Symmetry,
@@ -1757,6 +1761,33 @@ impl Brokkr {
                 let _ = std::fs::remove_file(&marker);
             }
         }
+        // **The failure the automatic revert structurally cannot catch.**
+        //
+        // The marker is cleared on the first drawn frame, so a build that starts
+        // fine and then dies -- opening the user's document, on a second GPU
+        // init, on one particular tablet -- legitimately cleared its own marker
+        // and will never be reverted automatically. No amount of keeping `.old`
+        // longer changes that; the signal has to be the crash report, which
+        // already exists and was not being used.
+        //
+        // **Offered, not performed.** The application drew a frame, the user is
+        // at a window, and they can decide. The automatic path exists precisely
+        // for the user who never got one.
+        //
+        // Decided HERE and not beside the crash notice that sets the flag: this
+        // needs `app.exe`, and `new` resolves that after `with_devices` has
+        // already returned. An earlier revision made the decision there, where
+        // `exe` is unconditionally `None`, so the offer could never appear in
+        // any build -- correct logic whose caller never ran, which is the same
+        // shape as the anti-rollback floor that never advanced.
+        if app.crashed_last_session
+            && let Some(target) = &app.exe
+            && crate::update::apply::target_is_the_installed_build(target)
+            && std::fs::metadata(target.old()).is_ok_and(|old| old.is_file())
+        {
+            app.crash_revert = crate::update::installed_build();
+        }
+
         app.update_freshness = crate::update::freshness_line();
         let settings = crate::update::settings();
         app.update_settings = settings.clone();
@@ -1825,6 +1856,7 @@ impl Brokkr {
             update_pending_marker: None,
             update_freshness: String::new(),
             crash_revert: None,
+            crashed_last_session: false,
             doc,
             camera: OrbitCamera::framing(Vec3::ZERO, MODEL_RADIUS_MM),
             brush: Brush::default(),
@@ -1994,25 +2026,10 @@ impl Brokkr {
                 None => log::warn!("the previous session crashed: {summary}"),
             }
 
-            // **The failure the automatic revert structurally cannot catch.**
-            //
-            // The marker is cleared on the first drawn frame, so a build that
-            // starts fine and then dies -- opening the user's document, on a
-            // second GPU init, on one particular tablet -- legitimately cleared
-            // its own marker and will never be reverted automatically. No
-            // amount of keeping `.old` longer changes that; the signal has to
-            // be the crash report, which already exists and was not being used.
-            //
-            // **Offered, not performed.** The application drew a frame, the
-            // user is at a window, and they can decide. The automatic path
-            // exists precisely for the user who never got one.
-            if let Some(target) = &app.exe
-                && crate::update::apply::target_is_the_installed_build(target)
-                && let Ok(old) = std::fs::metadata(target.old())
-                && old.is_file()
-            {
-                app.crash_revert = crate::update::installed_build();
-            }
+            // A crash report was pending. Whether that becomes an OFFER to go
+            // back is decided in `new`, because it needs `exe`, which is not
+            // resolved until then -- see `crashed_last_session`.
+            app.crashed_last_session = true;
         }
         app
     }
@@ -10323,6 +10340,34 @@ mod tests {
     /// preference round-trips is
     /// `welcome::tests::the_preference_survives_being_written_and_read_back`,
     /// which uses a path of its own for the same reason.
+    /// **`with_devices` must not resolve the executable, and the crash-revert
+    /// offer must therefore not be decided there.**
+    ///
+    /// This pins a trap that already cost the feature. The offer was originally
+    /// decided at the tail of `with_devices`, guarded on `app.exe` -- which
+    /// `new` does not assign until after `with_devices` has returned. So `exe`
+    /// was unconditionally `None` at that point, the guard never passed, and
+    /// "Go back to the previous build" could not appear in any build ever
+    /// shipped. Correct logic, unit-tested in isolation, whose caller never ran.
+    ///
+    /// The suite could not have caught it, because ~640 tests build through
+    /// `with_devices` and it leaves `exe: None` by design -- resolving a path
+    /// and sweeping a directory is startup work, not test-construction work.
+    /// So the invariant is pinned from the other side: if someone later makes
+    /// `with_devices` resolve `exe`, this fails and they are pointed at the
+    /// decision in `new` that assumes it does not.
+    #[test]
+    fn with_devices_leaves_the_executable_unresolved_so_new_decides_the_revert() {
+        let app = Brokkr::with_tablet(Tablet::inert());
+        assert!(
+            app.exe.is_none(),
+            "`with_devices` must not resolve the executable -- `new` does, and the crash-revert \
+             offer is decided there because it needs it"
+        );
+        assert!(app.crash_revert.is_none(), "and nothing may offer a revert before that");
+        assert!(!app.crashed_last_session, "a scratch-dir construction has no crash report");
+    }
+
     #[test]
     fn the_screens_own_controls_do_not_dismiss_it() {
         assert!(!dismisses_the_welcome(&Message::WelcomeOnStartupSet(false)));
