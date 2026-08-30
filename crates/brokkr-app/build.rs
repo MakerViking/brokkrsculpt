@@ -24,6 +24,29 @@ fn main() {
     println!("cargo:rerun-if-changed=../../.git/HEAD");
     println!("cargo:rerun-if-env-changed=BROKKR_COMMIT");
 
+    // **The build ordinal, and it MUST be emitted before the early return
+    // below.** A git SHA has no order, so `BROKKR_COMMIT` can answer "is the
+    // published build different from mine" and never "is it newer". The release
+    // workflow sets this to `1000 + github.run_number`; nothing sets it locally,
+    // and `None` is what makes the updater structurally inert on a developer's
+    // machine rather than one keystroke away from overwriting their own binary.
+    //
+    // The ordering is not stylistic. CI sets `BROKKR_COMMIT`, so an emission
+    // placed after that guard would never run in exactly the case that needs
+    // it, and `Swatinem/rust-cache` would then serve a warm build-script output
+    // and publish a binary reporting the PREVIOUS run's ordinal -- silently,
+    // and self-perpetuating from then on. `release.yml` reads the ordinal back
+    // out of the built binary for the same reason: this comment is a request,
+    // and that check is the enforcement.
+    println!("cargo:rerun-if-env-changed=BROKKR_BUILD");
+    if let Some(build) = std::env::var_os("BROKKR_BUILD") {
+        // Passed through as text and parsed at the far end. A build script
+        // cannot fail usefully here -- `panic!` would break `cargo build` for a
+        // typo in an environment variable -- and `build_number` refusing to
+        // parse it has the same effect as never setting it: an inert updater.
+        println!("cargo:rustc-env=BROKKR_BUILD={}", build.to_string_lossy());
+    }
+
     // An explicit value wins, so a release pipeline that knows better than git
     // -- a tag, a build number -- can say so.
     if std::env::var_os("BROKKR_COMMIT").is_some() {

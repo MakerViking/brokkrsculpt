@@ -36,7 +36,7 @@ mod tablet;
 mod theme;
 mod thumbnails;
 mod timeline;
-mod update_check;
+mod update;
 mod viewport;
 mod welcome;
 
@@ -50,6 +50,30 @@ fn app_theme(_state: &Brokkr) -> iced::Theme {
 }
 
 fn main() -> iced::Result {
+    // **The channel CI reads the build ordinal back out of.**
+    //
+    // `release.yml` stamps `BROKKR_BUILD` and then greps this output for it,
+    // because the way that stamp goes wrong is silent: `build.rs` returns early
+    // when `BROKKR_COMMIT` is set, and a cached build-script output would ship a
+    // binary reporting the previous run's ordinal with nothing anywhere saying
+    // so. Compiling proves nothing; asking the artefact does.
+    //
+    // Flat `key = value`, the same shape `paths::entries` parses, so the update
+    // files, the signed manifest and this output all read alike.
+    //
+    // This is not the "hidden flag pointing the updater elsewhere" that the plan
+    // forbids: it takes no argument, opens no socket and writes nothing. Before
+    // `crash::install()`, like its two neighbours, so keep it to `option_env!`
+    // reads and printing -- there is no panic handler installed yet. Printing
+    // the commit is also the AGPL corresponding-source answer.
+    if std::env::args().any(|argument| argument == "--version") {
+        // Formatted in `update::version_report` rather than here, so it can be
+        // unit tested: this crate is binary-only, so nothing in `main.rs` is
+        // reachable from a test, and CI greps this exact output for the build
+        // ordinal. A reworded line would break the release pipeline silently.
+        print!("{}", update::version_report());
+        return Ok(());
+    }
     // A tablet that does not work is hard to diagnose from inside a running
     // application, so the same detection logic is available without one.
     if std::env::args().any(|argument| argument == "--tablets") {

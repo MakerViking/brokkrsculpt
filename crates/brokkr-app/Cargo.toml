@@ -37,7 +37,28 @@ iced = { workspace = true, features = ["advanced", "wgpu", "debug", "canvas", "i
 # feed carries JPEG and PNG, and the render endpoint keeps a PNG a PNG.
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
 log.workspace = true
+# The updater's signature check, and the only new crate the updater costs.
+# ZERO transitive dependencies -- Ed25519 and Blake2b are implemented inline in
+# about 2.5k lines, MIT. Version pinned exactly rather than caret-bounded:
+# cargo has no release-age gate the way npm and bun do on this machine, so the
+# lockfile diff for this one gets read by hand.
+#
+# `ed25519-dalek` was the alternative and is rejected: it gives a bare
+# primitive, so the container format, the key-id check and the prehash would
+# all have to be reinvented here, badly, in the one code path whose output gets
+# made executable.
+minisign-verify = "=0.2.5"
 rfd.workspace = true
+# SHA-256 for the update payload. **+0 compiled crates**: `ring 0.17.14` is
+# already in the graph as rustls' backend (Cargo.lock:3040), so this is a
+# declaration rather than a dependency -- but it IS a new direct line, because
+# being in the lockfile does not let you `use` it.
+#
+# Hand-rolling SHA-256 here is forbidden. This tree has form for hand-rolling
+# (FNV-1a in `report.rs`, the 3MF ZIP writer, the IOKit externs) and this is the
+# single worst place in the codebase to be clever: it is the check that decides
+# whether network bytes get the execute bit.
+ring = "0.17"
 serde_json = "1.0.151"
 # The bug report's one and only network call. `default-features = false` with
 # just `rustls` is what keeps this to a measured 17 compiled crates for this

@@ -762,20 +762,35 @@ impl Brokkr {
         .spacing(theme::S3)
         .width(Length::Fill);
 
-        // **"Different", not "newer", and that is the whole wording.** The
-        // rolling tag means the check compares commits, and two commits do not
-        // say which came first -- see `update_check`. Claiming a newer version
-        // exists when all that is known is that the published one differs
-        // would be a small lie told on every launch.
-        let update: Element<'_, Message> = match &self.newer_build {
-            Some(newer) => button(
-                text(format!("A different beta is published ({}) — get it", newer.commit))
+        // **The wording comes from the offer, because the direction is not
+        // always forward.** A rollback publishes a higher `seq` naming a LOWER
+        // build, so the user can legitimately be offered an older ordinal and
+        // calling that an upgrade would be a small lie told on every launch.
+        // `headline` is the one place that decides; see `update::Offer`.
+        let update: Element<'_, Message> = match &self.offer {
+            Some(offer) => button(
+                text(if self.downloaded_update.is_some() {
+                    format!("Build {} is ready — install and restart", offer.build)
+                } else {
+                    format!("{} — get it", offer.headline())
+                })
                     .size(theme::TEXT_SIZE_SMALL)
                     .color(theme::ACCENT),
             )
             .padding(0)
             .style(theme::tool_button)
-            .on_press(Message::LinkOpened(crate::update_check::RELEASE_PAGE.to_string()))
+            // Three states, in the order a user meets them: install what is
+            // already verified on disk, download it, or -- for a build that
+            // needs the whole archive -- the release page, which is the honest
+            // answer rather than handing over a bare executable that will not
+            // work on its own.
+            .on_press(if self.downloaded_update.is_some() {
+                Message::UpdateInstallPressed
+            } else if offer.payload.is_some() && !offer.requires_reinstall {
+                Message::UpdateDownloadRequested
+            } else {
+                Message::LinkOpened(crate::articles::RELEASE_PAGE.to_string())
+            })
             .into(),
             None => space::horizontal().into(),
         };
@@ -784,6 +799,15 @@ impl Brokkr {
             checkbox(self.welcome_on_startup)
                 .label("Show this screen on startup")
                 .on_toggle(Message::WelcomeOnStartupSet)
+                .text_size(theme::TEXT_SIZE_SMALL),
+            // Beside the screen's own tick, because it governs the same kind of
+            // thing: an outbound connection. The property this card is meant to
+            // hold is that **every outbound connection has exactly one visible
+            // switch** -- see `articles.rs`. The articles and the avatar are
+            // governed by the tick to its left; this one governs the updater.
+            checkbox(self.update_settings.when != crate::update::When::Never)
+                .label("Check for updates")
+                .on_toggle(Message::UpdateCheckSet)
                 .text_size(theme::TEXT_SIZE_SMALL),
             space::horizontal(),
             update,
@@ -1063,6 +1087,40 @@ impl Brokkr {
                     .color(theme::TEXT_MUTE),
                 text("AGPL-3.0-only").size(theme::CAPTION_SIZE).color(theme::TEXT_MUTE),
                 separator(),
+                // Freshness, not enforcement. A channel that went quiet is
+                // indistinguishable from a maintainer who did, and this design
+                // refuses to guess which -- so it says how long it has been and
+                // stops there. Nothing anywhere expires on the user.
+                text(self.update_freshness.clone())
+                    .size(theme::CAPTION_SIZE)
+                    .color(theme::TEXT_MUTE),
+                // **The update tick's second home.** The default is `always`,
+                // so the switch has to be reachable without the welcome screen
+                // -- a control only on a screen the user turned off is not a
+                // control. Both surfaces write the same file through the same
+                // message, so they cannot drift.
+                checkbox(self.update_settings.when != crate::update::When::Never)
+                    .label("Check for updates")
+                    .on_toggle(Message::UpdateCheckSet)
+                    .text_size(theme::TEXT_SIZE_SMALL),
+                separator(),
+                // Only when there is something to go back TO: a pending crash
+                // report, a running ordinal matching what we installed, and a
+                // kept copy still on disk with a matching digest.
+                {
+                    // A fixed phrase, for the same reason `PendingAction::describe`
+                    // returns `&'static str`: `entry` borrows its label, so a
+                    // formatted one cannot outlive the call. The ordinal goes to
+                    // the status line, where the outcome is already reported.
+                    let revert: Element<'_, Message> = match self.crash_revert {
+                        Some(_) => {
+                            entry("Go back to the previous build", Message::UpdateRevertRequested)
+                                .into()
+                        }
+                        None => space::vertical().height(0).into(),
+                    };
+                    revert
+                },
                 entry("Welcome screen", Message::WelcomeOpened),
                 entry("Copy diagnostics", Message::DiagnosticsCopied),
                 entry("Report a bug…", Message::BugReportOpened),
