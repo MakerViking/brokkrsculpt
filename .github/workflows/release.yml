@@ -43,7 +43,17 @@ env:
   #
   # Four digits also makes a stale ordinal visible by eye: a number that could
   # be mistaken for a run number or a version is one nobody double-takes at.
-  BROKKR_BUILD: ${{ 1000 + github.run_number }}
+  #
+  # **The sum is done in a step, not here.** `BROKKR_BUILD: ${{ 1000 +
+  # github.run_number }}` looks obvious and does not compile: ARITHMETIC in a
+  # workflow-level `env` value fails the whole workflow before any job is
+  # created, so nothing runs and the run is reported against the file path
+  # rather than the `name:`. Measured 2026-08-30 by bisecting it on a scratch
+  # branch -- `${{ github.run_number }}` alone is fine there and `${{ 1000 + 14
+  # }}` alone is not, so it is the operator and not the context. A broken
+  # workflow also reports a failed run on every push to EVERY branch, which is
+  # what makes it look like something else.
+  BROKKR_BUILD_BASE: "1000"
 
 jobs:
   build:
@@ -95,6 +105,10 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
             libx11-dev libxkbcommon-dev libwayland-dev libxcursor-dev \
             libxrandr-dev libxi-dev libgl1-mesa-dev
+
+      - name: Compute the build ordinal
+        shell: bash
+        run: echo "BROKKR_BUILD=$((BROKKR_BUILD_BASE + GITHUB_RUN_NUMBER))" >> "$GITHUB_ENV"
 
       - name: Build
         run: cargo build --release -p brokkr-app
@@ -253,6 +267,10 @@ jobs:
         uses: actions/attest-build-provenance@v2
         with:
           subject-path: dist/payload/*
+
+      - name: Compute the build ordinal
+        shell: bash
+        run: echo "BROKKR_BUILD=$((BROKKR_BUILD_BASE + GITHUB_RUN_NUMBER))" >> "$GITHUB_ENV"
 
       - name: Publish
         env:
