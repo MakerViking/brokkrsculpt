@@ -874,8 +874,7 @@ pub fn sweep(directory: &Path) {
     for entry in entries.flatten() {
         let name = entry.file_name();
         let name = name.to_string_lossy();
-        if name.starts_with(".brokkrsculpt") && (name.ends_with(".part") || name.ends_with(".link"))
-        {
+        if is_sweepable(&name) {
             let _ = std::fs::remove_file(entry.path());
         }
     }
@@ -892,6 +891,34 @@ pub fn sweep(directory: &Path) {
 /// *narrow* exposure; creating at `0755` and then filling it with unverified
 /// network bytes inverts the point of that rule, and `~/.local/bin` is on `PATH`
 /// on most distributions.
+/// Whether a name in the install directory is ours to remove at startup.
+///
+/// Three kinds, and the third is the one that was missing.
+///
+/// `.part` and `.link` are half-finished staging left by an attempt that died;
+/// a `.link` in particular is a second name on the superseded inode, so leaving
+/// one leaks a whole binary per crashed attempt.
+///
+/// **A COMPLETED payload is also dead.** `brokkrsculpt-1024-windows-x86_64.exe`
+/// is what a finished download leaves beside the binary, and it is only ever
+/// useful to the session that fetched it: the path is held in memory and is not
+/// persisted, so after a restart nothing can find it and the next check
+/// downloads again. Until now nothing removed it, so a user who downloaded an
+/// update and did not install it kept 19-33 MB per attempt for ever. A Windows
+/// tester whose install click did nothing has exactly one of these.
+///
+/// The match is deliberately narrow: `brokkrsculpt-` followed by a DIGIT. The
+/// running binary is `brokkrsculpt` or `brokkrsculpt.exe` and never has an
+/// ordinal in it, and the kept copy starts with a dot, so neither can be caught
+/// by this.
+fn is_sweepable(name: &str) -> bool {
+    if name.starts_with(".brokkrsculpt") && (name.ends_with(".part") || name.ends_with(".link")) {
+        return true;
+    }
+    name.strip_prefix("brokkrsculpt-")
+        .is_some_and(|rest| rest.starts_with(|c: char| c.is_ascii_digit()))
+}
+
 /// Stage in a named directory. The directory decides whether the rename that
 /// follows stays on one filesystem, which is the whole point -- see the caller.
 pub fn stage_in(directory: &Path, name: &str) -> Result<(PathBuf, std::fs::File), Refusal> {
@@ -1203,17 +1230,65 @@ mod tests {
     /// A kill between the link and the rename leaves a name on the superseded
     /// inode. Without the sweep that is one leaked 33 MB binary per attempt.
     #[test]
-    fn the_sweep_takes_both_part_and_link_and_leaves_everything_else() {
+    fn the_sweep_takes_staging_and_dead_payloads_and_leaves_everything_else() {
         let dir = scratch("sweep");
-        for name in [".brokkrsculpt.1.part", ".brokkrsculpt.2.link", ".brokkrsculpt.old"] {
+        for name in [
+            ".brokkrsculpt.1.part",
+            ".brokkrsculpt.2.link",
+            ".brokkrsculpt.old",
+            // A finished download nobody installed. Dead on the next launch,
+            // because the path to it is held in memory and never persisted.
+            "brokkrsculpt-1024-windows-x86_64.exe",
+            "brokkrsculpt-1024-linux-x86_64",
+            "brokkrsculpt-1024-macos-arm64.zip",
+        ] {
             std::fs::write(dir.join(name), b"x").expect("writable");
         }
         std::fs::write(dir.join("brokkrsculpt"), b"x").expect("writable");
+        std::fs::write(dir.join("brokkrsculpt.exe"), b"x").expect("writable");
         sweep(&dir);
+
         assert!(!dir.join(".brokkrsculpt.1.part").exists(), ".part must be swept");
         assert!(!dir.join(".brokkrsculpt.2.link").exists(), ".link must be swept too");
-        assert!(dir.join(".brokkrsculpt.old").exists(), "the rollback copy must survive a sweep");
-        assert!(dir.join("brokkrsculpt").exists(), "the binary must survive a sweep");
+        for dead in [
+            "brokkrsculpt-1024-windows-x86_64.exe",
+            "brokkrsculpt-1024-linux-x86_64",
+            "brokkrsculpt-1024-macos-arm64.zip",
+        ] {
+            assert!(!dir.join(dead).exists(), "{dead} is a dead download and must be swept");
+        }
+        // **The three that must never be touched.**
+        assert!(dir.join(".brokkrsculpt.old").exists(), "the rollback copy must survive");
+        assert!(dir.join("brokkrsculpt").exists(), "the binary must survive");
+        assert!(dir.join("brokkrsculpt.exe").exists(), "and its Windows name");
+    }
+
+    /// The matcher decides whether a file is deleted from the directory holding
+    /// the application, so its edges are worth pinning individually.
+    #[test]
+    fn only_an_ordinal_named_payload_is_treated_as_a_dead_download() {
+        for dead in [
+            "brokkrsculpt-1024-linux-x86_64",
+            "brokkrsculpt-1-windows-x86_64.exe",
+            "brokkrsculpt-999999-macos-arm64.zip",
+            ".brokkrsculpt.x.part",
+            ".brokkrsculpt.x.link",
+        ] {
+            assert!(is_sweepable(dead), "{dead} should be swept");
+        }
+        for keep in [
+            "brokkrsculpt",
+            "brokkrsculpt.exe",
+            ".brokkrsculpt.old",
+            ".brokkrsculpt.exe.old",
+            "RECOVER-BROKKRSCULPT.txt",
+            // No ordinal: not something this application produced.
+            "brokkrsculpt-backup",
+            "brokkrsculpt-old.exe",
+            "my-brokkrsculpt-1024-linux-x86_64",
+        ] {
+            assert!(!is_sweepable(keep), "{keep} must NOT be swept");
+        }
     }
 
     #[test]
