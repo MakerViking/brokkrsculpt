@@ -19,8 +19,31 @@ on:
     branches: [main]
   workflow_dispatch:
 
+# **Two pushes to `main` in quick succession would otherwise race.** Both jobs
+# upload fixed-name assets with `--clobber`, so without this the reachable
+# states include a new binary beside an old manifest, and a sweep from one run
+# deleting the payloads the other's manifest names. `cancel-in-progress: false`
+# rather than true: a half-finished publish is worse than a queued one, and the
+# expensive part is the build, not the wait.
+concurrency:
+  group: release
+  cancel-in-progress: false
+
 env:
   CARGO_TERM_COLOR: always
+  # **The build ordinal, and the only thing in this file that orders releases.**
+  # `CARGO_PKG_VERSION` is frozen at 0.0.1 and a git SHA has no order, so this
+  # is what the updater compares. `BASE` is the literal 1000, chosen on
+  # 2026-08-30 against a `run_number` of 4, so the first stamped build is 1005.
+  #
+  # **`github.run_number` restarts at 1 if this workflow file is renamed or
+  # recreated.** If that ever happens, bump the literal to the next multiple of
+  # 1000 above the highest ordinal ever published, or new builds sort below old
+  # ones for ever and every installed copy refuses them.
+  #
+  # Four digits also makes a stale ordinal visible by eye: a number that could
+  # be mistaken for a run number or a version is one nobody double-takes at.
+  BROKKR_BUILD: ${{ 1000 + github.run_number }}
 
 jobs:
   build:
@@ -33,13 +56,32 @@ jobs:
         include:
           - os: ubuntu-latest
             asset: brokkrsculpt-linux-x86_64.tar.gz
+            # The raw, build-stamped executable the updater downloads. Named
+            # separately from `asset` because the two have different jobs: this
+            # one is named by the signed manifest and must never be replaced in
+            # place, while `asset` is the fixed-name human download and is
+            # clobbered on every push.
+            slug: linux-x86_64
           - os: windows-latest
             asset: brokkrsculpt-windows-x86_64.zip
+            slug: windows-x86_64
           - os: macos-latest
             asset: brokkrsculpt-macos-arm64.zip
+            slug: macos-arm64
     runs-on: ${{ matrix.os }}
+    # **This job compiles the entire dependency tree, with build scripts and
+    # proc macros.** It has no business holding a token that can write to the
+    # repository, and until now it inherited the repository default because it
+    # declared nothing. The `publish` job below is where write access belongs.
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@v5
+        with:
+          # `actions/checkout` otherwise leaves a credential in
+          # `.git/config` for the rest of the job, reachable by anything the
+          # build runs. Nothing here needs to talk to git after the clone.
+          persist-credentials: false
 
       - uses: Swatinem/rust-cache@v2
 
@@ -57,11 +99,32 @@ jobs:
       - name: Build
         run: cargo build --release -p brokkr-app
 
-      # A plain tarball rather than an AppImage or a .deb. Both are worth having
-      # and neither is worth blocking a beta on: a tarball runs on every distro,
-      # needs no packaging toolchain in CI, and the `.desktop` file beside it is
-      # what a user copies into ~/.local/share/applications if they want a menu
-      # entry.
+      # **Read the ordinal back out of the binary that was just built.**
+      #
+      # This step exists because of one specific, silent failure. `build.rs`
+      # returns early when `BROKKR_COMMIT` is set -- which this workflow sets --
+      # so a `BROKKR_BUILD` emission placed after that guard never runs; and
+      # `Swatinem/rust-cache` will happily serve a warm build-script output, so
+      # a binary can be published reporting the PREVIOUS run's ordinal with
+      # nothing anywhere saying so. That failure is self-perpetuating: every
+      # later release inherits it. Compiling successfully proves nothing here.
+      # Only asking the artefact what it thinks it is does.
+      #
+      # `-x` so `1005` cannot match inside `10050`. `:?` so an unset variable
+      # fails the step rather than comparing the empty string against itself --
+      # a check that quietly compares nothing to nothing reproduces exactly the
+      # bug it is guarding. `shell: bash` because the Windows job's other steps
+      # are `pwsh`. Nothing is cross compiled, so every runner can execute what
+      # it just built.
+      - name: Verify the stamped ordinal
+        shell: bash
+        run: |
+          set -euo pipefail
+          exe=target/release/brokkrsculpt
+          [ "${{ matrix.os }}" = "windows-latest" ] && exe=target/release/brokkrsculpt.exe
+          "$exe" --version
+          "$exe" --version | grep -qx "build = ${BROKKR_BUILD:?}"
+
       - name: Package (Linux)
         if: matrix.os == 'ubuntu-latest'
         run: |
@@ -116,10 +179,43 @@ jobs:
           cp README.md LICENSE stage/
           ditto -c -k --keepParent "$APP" "${{ matrix.asset }}"
 
+      # The updater's payload: the raw executable, build-stamped, beside the
+      # human-facing archive. Raw rather than an archive so the signed SHA-256
+      # is the digest of the exact bytes that get made executable -- there is no
+      # window between "verified the archive" and "installed whatever came out
+      # of it", and no tar or zip parser has to be written for the one code path
+      # whose output is executed.
+      #
+      # macOS is the exception and gets the bundle zip unchanged: that platform
+      # is download-and-hand-over, so the client never opens it.
+      - name: Stage the build-stamped payload
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p payload
+          case "${{ matrix.slug }}" in
+            linux-x86_64)   cp target/release/brokkrsculpt "payload/brokkrsculpt-${BROKKR_BUILD:?}-linux-x86_64" ;;
+            windows-x86_64) cp target/release/brokkrsculpt.exe "payload/brokkrsculpt-${BROKKR_BUILD:?}-windows-x86_64.exe" ;;
+            macos-arm64)    cp "${{ matrix.asset }}" "payload/brokkrsculpt-${BROKKR_BUILD:?}-macos-arm64.zip" ;;
+          esac
+          ls -l payload
+
+      # A plain tarball rather than an AppImage or a .deb. Both are worth having
+      # and neither is worth blocking a beta on: a tarball runs on every distro,
+      # needs no packaging toolchain in CI, and the `.desktop` file beside it is
+      # what a user copies into ~/.local/share/applications if they want a menu
+      # entry.
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.asset }}
-          path: ${{ matrix.asset }}
+          # Both halves of what this platform produced: the fixed-name archive a
+          # human downloads, and the build-stamped payload the updater does.
+          # `payload/` keeps them apart so the publish job can treat them
+          # differently -- the archive is clobbered every push, the payload is
+          # written once and never replaced.
+          path: |
+            ${{ matrix.asset }}
+            payload/
           if-no-files-found: error
 
   publish:
@@ -132,13 +228,31 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+      # For `actions/attest-build-provenance`. Free, and it is an independent
+      # trust root that a locally-held signing key cannot provide: the minisign
+      # key proves Thomas signed a manifest, while an attestation proves THIS
+      # workflow, at THIS commit, produced these bytes. `sign-release.sh` checks
+      # it before signing, which is what stops a compromised runner uploading a
+      # backdoored payload that then gets faithfully signed.
+      id-token: write
+      attestations: write
     steps:
       - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
 
       - uses: actions/download-artifact@v4
         with:
           path: dist
           merge-multiple: true
+
+      # Before the upload, so an artefact that cannot be attested is never
+      # published in the first place.
+      - name: Attest the payloads
+        if: hashFiles('dist/payload/*') != ''
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: dist/payload/*
 
       - name: Publish
         env:
@@ -147,12 +261,18 @@ jobs:
           SHA: ${{ github.sha }}
         run: |
           set -euo pipefail
-          files=$(find dist -type f \( -name '*.tar.gz' -o -name '*.zip' \))
+          # The two sets are uploaded differently and must not be globbed
+          # together. `-maxdepth 1` keeps the fixed-name human archives from
+          # sweeping up the build-stamped payloads, which live in dist/payload
+          # and include a macOS `.zip` that would otherwise match.
+          files=$(find dist -maxdepth 1 -type f \( -name '*.tar.gz' -o -name '*.zip' \))
+          payloads=$(find dist/payload -maxdepth 1 -type f 2>/dev/null || true)
           if [ -z "$files" ]; then
             echo "no artifacts were built, so there is nothing to publish"
             exit 1
           fi
           echo "attaching:"; echo "$files"
+          echo "payloads:"; echo "${payloads:-none}"
 
           cat > notes.md <<'NOTES'
           **An open beta, and unsigned.** Both matter to what you are about to see.
@@ -239,3 +359,103 @@ jobs:
           # asset, so lifetime totals are not recoverable either way.
           # shellcheck disable=SC2086
           gh release upload beta $files --repo "$R" --clobber
+
+          # **Payloads are uploaded WITHOUT `--clobber`, deliberately.** Their
+          # names carry the build ordinal, so a name collision means this run is
+          # republishing an ordinal that already exists -- which is a bug worth
+          # failing on, not something to overwrite. It is also what lets the
+          # signed manifest name an immutable object: `latest.conf` is then the
+          # only mutable thing in the release.
+          if [ -n "$payloads" ]; then
+            # shellcheck disable=SC2086
+            gh release upload beta $payloads --repo "$R"
+          fi
+
+          # **Move the `beta` tag to the commit these assets were built from.**
+          #
+          # `gh release edit --target` updates the release RECORD and leaves the
+          # tag object where it is, which is why the tag had been frozen at the
+          # first publish while the assets were replaced on every push since --
+          # measured 2026-08-30, the tag pointed at a commit that was not even an
+          # ancestor of `main`. Anyone exercising their AGPL right to the
+          # corresponding source got source that never built this binary.
+          #
+          # Patched through the API rather than `git push --force`, because the
+          # build job now checks out with `persist-credentials: false` and this
+          # job has `contents: write` on `GH_TOKEN` anyway. `force=true` because
+          # a rolling tag moves backwards during a rollback.
+          if gh api "repos/$R/git/ref/tags/beta" >/dev/null 2>&1; then
+            gh api -X PATCH "repos/$R/git/refs/tags/beta" -f sha="$SHA" -F force=true >/dev/null
+          else
+            gh api -X POST "repos/$R/git/refs" -f ref=refs/tags/beta -f sha="$SHA" >/dev/null
+          fi
+          echo "beta tag now at $SHA"
+
+          # **Sweep old payloads, and never the one the live manifest names.**
+          #
+          # Retention is the only reason rollback is possible: mechanism 2 for
+          # stopping a bad build is "publish seq+1 naming the last good build",
+          # and that needs the last good build's payload to still be there.
+          # Twenty sets, settled 2026-08-30 -- GitHub caps neither release size
+          # nor bandwidth, the binding limit is 1000 assets per release, and the
+          # measured cadence is four releases in an afternoon, so three sets
+          # would have been less than one afternoon of rollback range.
+          #
+          # The keep list is read back out of the PUBLISHED manifest rather than
+          # computed here, so a sweep can never delete the payload the signed
+          # manifest points at -- the one deletion that would break every
+          # client at once. Signing happens on Thomas's machine, so at this
+          # point `latest.conf` still names the PREVIOUS build; that is exactly
+          # why it must be protected explicitly rather than assumed old.
+          KEEP=20
+          live_build=$(gh release download beta --repo "$R" --pattern latest.conf \
+                         --output - 2>/dev/null | sed -n 's/^build *= *//p' | head -1 || true)
+          echo "live manifest names build: ${live_build:-none}"
+
+          # Every build-stamped payload, newest ordinal first.
+          mapfile -t ordinals < <(
+            gh release view beta --repo "$R" --json assets \
+              --jq '.assets[].name' 2>/dev/null \
+            | sed -n 's/^brokkrsculpt-\([0-9]\{1,\}\)-.*$/\1/p' | sort -rnu
+          )
+          echo "retained ordinals: ${ordinals[*]:-none}"
+
+          dropped=0
+          for i in "${!ordinals[@]}"; do
+            [ "$i" -lt "$KEEP" ] && continue
+            ordinal="${ordinals[$i]}"
+            # Never the build the live manifest names, however old it is.
+            if [ -n "$live_build" ] && [ "$ordinal" = "$live_build" ]; then
+              echo "keeping $ordinal: the live manifest names it"
+              continue
+            fi
+            for name in $(gh release view beta --repo "$R" --json assets \
+                            --jq ".assets[].name | select(startswith(\"brokkrsculpt-$ordinal-\"))"); do
+              echo "sweeping $name"
+              gh release delete-asset beta "$name" --repo "$R" --yes
+              dropped=$((dropped + 1))
+            done
+          done
+          # Said out loud rather than silently: a cap that quietly drops things
+          # reads as "we kept everything" when someone later needs a rollback.
+          echo "swept $dropped asset(s); keeping the newest $KEEP build(s)"
+
+          # **Signing happens on Thomas's machine, so a release is not live
+          # until he signs it.** That is deliberate -- nothing spreads on
+          # autopilot -- but it is also a step that will eventually be
+          # forgotten, and the symptom is silence: clients keep being handed an
+          # older manifest and nothing anywhere says why. So say it here, where
+          # someone reading the run will see it.
+          live_seq=$(gh release download beta --repo "$R" --pattern latest.conf \
+                       --output - 2>/dev/null | sed -n 's/^seq *= *//p' | head -1 || true)
+          if [ -z "${live_build:-}" ]; then
+            echo "::warning::no signed manifest is published yet, so no client will see build ${BROKKR_BUILD}. Run scripts/sign-release.sh."
+          elif [ "${live_build}" != "${BROKKR_BUILD}" ]; then
+            behind=$(( BROKKR_BUILD - live_build ))
+            if [ "$behind" -gt 1 ]; then
+              echo "::warning::the signed manifest still names build ${live_build} (seq ${live_seq:-?}) while ${BROKKR_BUILD} is published -- ${behind} builds behind. Run scripts/sign-release.sh."
+            else
+              echo "the signed manifest names build ${live_build}; sign ${BROKKR_BUILD} when ready"
+            fi
+          fi
+
