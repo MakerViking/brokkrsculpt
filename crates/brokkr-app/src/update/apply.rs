@@ -1223,7 +1223,7 @@ mod tests {
         assert_eq!(gates(&target, Some(1005), "unknown"), Err(Refusal::NotAReleaseBuild));
         assert_eq!(gates(&target, Some(1005), "abc1234-dirty"), Err(Refusal::NotAReleaseBuild));
         // A stamped build in a normal directory passes.
-        assert_eq!(gates(&target, Some(1005), "abc1234"), gates_pass());
+        assert_eq!(gates(&target, Some(1005), "abc1234"), Ok(()));
     }
 
     /// A bare writability test passes on a loose `/opt`, where anyone in the
@@ -1246,7 +1246,7 @@ mod tests {
         }
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).expect("chmod");
         assert_eq!(directory_is_safe(&dir), Ok(()), "0755 is fine");
-        assert_eq!(gates(&target, Some(1005), "abc1234"), gates_pass(), "and so is the whole gate");
+        assert_eq!(gates(&target, Some(1005), "abc1234"), Ok(()), "and so is the whole gate");
     }
 
     #[test]
@@ -1558,15 +1558,6 @@ mod tests {
         });
         assert!(outcome.is_err());
         assert!(started.elapsed() < std::time::Duration::from_secs(3), "it must bound itself");
-    }
-
-    /// What `gates` returns for a release build in a directory it may write.
-    ///
-    /// `Ok` almost everywhere; on macOS the platform refusal is the correct
-    /// answer and asserting it is real coverage, so these tests keep running
-    /// there rather than being cfg'd away.
-    fn gates_pass() -> Result<(), Refusal> {
-        if cfg!(target_os = "macos") { Err(Refusal::HandOverOnly) } else { Ok(()) }
     }
 
     /// Self-replacement ships ON; the escape hatch is opt-out and off by
