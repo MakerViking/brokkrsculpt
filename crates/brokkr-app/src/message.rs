@@ -407,24 +407,31 @@ pub enum Message {
     UpdateChecked(Option<crate::update::Offer>),
     /// Accept a verified offer: download the payload and stop there.
     ///
-    /// **Downloads, and does not install.** Phase 2 verifies the bytes and
-    /// tells the user where they are; nothing is made executable and nothing
-    /// restarts. That is the permanent macOS answer and the interim one
-    /// everywhere else.
+    /// **Downloads, and does not install.** The bytes are verified against the
+    /// signed manifest and left on disk; nothing is made executable and nothing
+    /// restarts until [`Self::UpdateInstallPressed`].
     UpdateDownloadRequested,
-    /// Install the downloaded build and restart into it.
+    /// Take the offer to go back to the build that was replaced.
     ///
-    /// Its own always-shown modal rather than `guard`'s, because `guard` only
-    /// prompts when there is work to lose -- routing the update question
-    /// through it would restart the app under anyone whose document happened to
-    /// be saved. The work question is asked afterwards, by `guard`, which is
-    /// what that gate is actually for.
+    /// Raised only when a crash report is pending, the running ordinal matches
+    /// what this install put in place, and the kept copy is still there with a
+    /// matching digest. Offered rather than performed: the application drew a
+    /// frame, so the user is at a window and can decide. The automatic revert
+    /// exists for the user who never got one.
+    UpdateRevertRequested,
     /// The Install button. Resolves the window the way `WindowClose` does --
     /// the view has no window id to hand, and `iced::window::latest()` is how
     /// this application gets one.
-    /// Take the offer to go back to the build that was replaced.
-    UpdateRevertRequested,
     UpdateInstallPressed,
+    /// Install the downloaded build and restart into it.
+    ///
+    /// **The update question is asked by the button, not by a modal; the WORK
+    /// question goes through `guard`.** That split is the point. `guard` only
+    /// prompts `if would_lose_work`, so routing the whole thing through it
+    /// would restart the app under anyone whose document happened to be saved --
+    /// but the consequence of pressing Install is exactly what `guard` is for,
+    /// so `PendingAction::Restart` goes through it and nothing touches the disk
+    /// until the work question is settled.
     UpdateInstallRequested(iced::window::Id),
     /// Where the verified payload landed, or why it did not.
     UpdateDownloaded(Result<std::path::PathBuf, String>),

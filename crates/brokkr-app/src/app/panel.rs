@@ -1103,6 +1103,31 @@ impl Brokkr {
                     .label("Check for updates")
                     .on_toggle(Message::UpdateCheckSet)
                     .text_size(theme::TEXT_SIZE_SMALL),
+                // **The offer's second home, for the same reason as the tick.**
+                // The `always` default is justified by the user who turned the
+                // welcome screen off -- and until this existed, that user was
+                // told a build was out and given nowhere to act on it. A status
+                // line and a URL is not an answer when the application already
+                // has the verified bytes on disk.
+                //
+                // A fixed phrase per state rather than the ordinal, because
+                // `entry` borrows its label and a formatted one cannot outlive
+                // the call; the numbers are in the status line and on the card.
+                {
+                    let offer: Element<'_, Message> = if self.downloaded_update.is_some() {
+                        entry("Install the update and restart", Message::UpdateInstallPressed)
+                            .into()
+                    } else if self
+                        .offer
+                        .as_ref()
+                        .is_some_and(|o| o.payload.is_some() && !o.requires_reinstall)
+                    {
+                        entry("Download the update", Message::UpdateDownloadRequested).into()
+                    } else {
+                        space::vertical().height(0).into()
+                    };
+                    offer
+                },
                 separator(),
                 // Only when there is something to go back TO: a pending crash
                 // report, a running ordinal matching what we installed, and a

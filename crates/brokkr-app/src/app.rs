@@ -403,9 +403,6 @@ pub struct Brokkr {
     /// the first drawn frame; still present on the next launch means the build
     /// installed here died before drawing anything.
     update_pending_marker: Option<std::path::PathBuf>,
-    /// Whether the update card is up. Cleared before `guard` is called, so the
-    /// unsaved-work prompt is never drawn underneath it.
-    offer_modal: bool,
     /// One line for the Help panel saying how stale the last successful check
     /// is. Computed at startup rather than per frame: it changes once a day.
     update_freshness: String,
@@ -1826,7 +1823,6 @@ impl Brokkr {
             downloaded_update: None,
             exe: None,
             update_pending_marker: None,
-            offer_modal: false,
             update_freshness: String::new(),
             crash_revert: None,
             doc,
@@ -8374,11 +8370,6 @@ impl Brokkr {
                     self.status = "download the update first".to_string();
                     return Task::none();
                 }
-                // The update modal comes down BEFORE `guard` is called:
-                // `panel.rs` picks its overlay from an early-return chain, not a
-                // stack, so an update card left up would hide the unsaved-work
-                // prompt -- raised, invisible and unanswerable.
-                self.offer_modal = false;
                 return self.guard(PendingAction::Restart(id));
             }
             Message::UpdateCheckSet(on) => {

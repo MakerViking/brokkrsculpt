@@ -50,8 +50,13 @@ In scope:
   administrator exactly as `0600` admits root. Sign out deletes the file.
 - **the update check on startup.** Two unauthenticated GETs to ordinary
   release-asset URLs on `github.com` — a signed manifest and its signature —
-  which together say which build is currently published. It downloads no
-  payload and executes nothing.
+  which together say which build is currently published.
+
+  **If one names a newer build and you accept it, the payload is downloaded,
+  its SHA-256 checked against the signed manifest, and the application replaced
+  with it** — the executable on Linux and Windows, the whole `.app` on macOS.
+  Nothing is made executable before the digest matches. `BROKKR_NO_SELF_UPDATE=1`
+  downloads and verifies without installing.
 
   It has **its own switch**, on the welcome screen and in the Help menu, and it
   is on by default. Two surfaces on purpose: the default is to check on every

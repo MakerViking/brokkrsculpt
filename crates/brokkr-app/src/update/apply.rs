@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
-//! Replacing the running executable, on Linux.
+//! Putting a verified file in place, on all three platforms.
 //!
 //! This is the only code in the project that can turn a working install into a
 //! broken one, so every step below is either non-destructive or is the single
@@ -410,7 +410,21 @@ fn directory_is_safe(directory: &Path) -> Result<(), Refusal> {
         // `/usr/local` -- and there, anyone in the group can put a file at the
         // name we are about to make executable. The rollback copy sits in the
         // same directory, so this also protects what we revert to.
-        if mode & 0o022 != 0 {
+        // **Except on macOS, where the directory in question is /Applications.**
+        // The system ships it `root:admin 0775` -- group-writable and owned by
+        // root -- so the two rules below refuse it, and a Mac would download 33
+        // MB and only then say "/Applications belongs to another user". That is
+        // not a safer outcome, it is no updates plus a late confusing message,
+        // and it is reached by following the in-app instruction to move the app
+        // to Applications in the first place.
+        //
+        // Skipping them there costs nothing real: anyone who can write
+        // /Applications can replace the application whether or not this code
+        // helps, so the refusal was never what stood between them and it. The
+        // rules stay everywhere a per-user install directory is the norm, which
+        // is where a loose /opt or a shared /usr/local actually is the hazard.
+        // The writability probe below still runs on every platform.
+        if !cfg!(target_os = "macos") && mode & 0o022 != 0 {
             return Err(Refusal::CannotReplace(format!(
                 "{} is writable by other users, so replacing a binary there would not be safe",
                 directory.display()
@@ -419,7 +433,7 @@ fn directory_is_safe(directory: &Path) -> Result<(), Refusal> {
         // Someone else's directory is not ours to write in, whatever the bits
         // say about us.
         let uid = unsafe { libc_getuid() };
-        if metadata.uid() != uid {
+        if !cfg!(target_os = "macos") && metadata.uid() != uid {
             return Err(Refusal::CannotReplace(format!(
                 "{} belongs to another user",
                 directory.display()
@@ -519,20 +533,6 @@ impl Lock {
 /// The order is the whole design. Everything before the final `rename` is
 /// non-destructive, and the `rename` is the only irreversible step.
 pub fn install(target: &Target, staged: &Path, previous_sha256: &str) -> Result<(), Refusal> {
-    // **macOS never replaces itself, and this is a hard refusal rather than a
-    // policy someone can talk themselves out of.**
-    //
-    // The unit of replacement there is the whole `.app`. Any edit inside a
-    // signed bundle invalidates the signature, and on Apple Silicon an invalid
-    // signature is SIGKILL at exec -- not a warning, not a prompt. Sequoia
-    // removed the Control-click bypass, and a fully unsigned app does not even
-    // appear in Privacy & Security to be excused. So a self-replace there takes
-    // a working install and can make it permanently unlaunchable, which is the
-    // one outcome worse than never updating.
-    //
-    // This costs nothing today: `install_unix` would happily rewrite the
-    // executable inside `BrokkrSculpt.app/Contents/MacOS/`, and everything
-    // above this line would have said it worked.
     if self_update_disabled() {
         return Err(Refusal::HandOverOnly);
     }
@@ -892,7 +892,8 @@ pub fn sweep(directory: &Path) {
 /// *narrow* exposure; creating at `0755` and then filling it with unverified
 /// network bytes inverts the point of that rule, and `~/.local/bin` is on `PATH`
 /// on most distributions.
-/// Stage in a named directory. See [`stage`] for why the directory matters.
+/// Stage in a named directory. The directory decides whether the rename that
+/// follows stays on one filesystem, which is the whole point -- see the caller.
 pub fn stage_in(directory: &Path, name: &str) -> Result<(PathBuf, std::fs::File), Refusal> {
     let path = directory.join(format!(".{name}.part"));
     let mut options = std::fs::OpenOptions::new();

@@ -10,15 +10,17 @@
 //! requests an hour per address, so one makerspace behind one NAT broke it for
 //! everyone there, silently, because failure here is deliberately silence.
 //!
-//! # What this module is, and what it deliberately is not
+//! # What this module is
 //!
-//! It is **notify-only**. Nothing here downloads a payload, nothing writes to
-//! the install directory, and nothing restarts anything. That is Phase 2 and
-//! Phase 3 of `docs/AUTOUPDATE-PLAN.md`. What lands here is the part that has to
-//! be right in the *first* shipped binary, because it cannot be retrofitted onto
-//! copies already in the field: the key list and its epochs, the anti-rollback
-//! floor and which number space it lives in, the rule that unknown manifest keys
-//! are ignored, and `requires_reinstall`.
+//! Checking, fetching and verifying: the manifest, its signature, the key list
+//! and its epochs, the anti-rollback floor, and the payload download with its
+//! digest. Putting a verified file in place is [`apply`], which is where every
+//! platform difference lives.
+//!
+//! Four things here had to be right in the *first* shipped binary because they
+//! cannot be retrofitted onto copies already in the field: the key list and its
+//! epochs, the anti-rollback floor and which number space it lives in, unknown
+//! manifest keys being ignored rather than rejected, and `requires_reinstall`.
 //!
 //! # Two number spaces, and they must never be compared to each other
 //!
@@ -47,7 +49,7 @@
 
 use std::fmt;
 
-/// Replacing the running binary in place. Linux only for now; see the module.
+/// Putting a verified file in place, on all three platforms. See the module.
 pub mod apply;
 
 /// The keys that may sign a manifest, each with the epoch it *is* -- never the
@@ -233,21 +235,18 @@ pub enum Refusal {
     CannotReplace(String),
     /// Another copy of the application holds the update lock.
     AlreadyUpdating,
-    /// This platform downloads and hands over rather than replacing itself.
-    /// macOS, permanently, until there is an Apple Developer ID: the unit of
-    /// replacement there is a signed `.app` bundle, and editing inside one is
-    /// SIGKILL at exec on Apple Silicon.
+    /// This copy downloads and hands over rather than replacing itself.
+    ///
+    /// Three ways to get here: `BROKKR_NO_SELF_UPDATE=1`; a `.app` bundle on a
+    /// platform with no whole-bundle path, since editing one in place would
+    /// leave a half-swapped application; and any future platform with no
+    /// replacement of its own.
     HandOverOnly,
     /// The staged file vanished between writing it and installing it. On
     /// Windows that means an antivirus quarantined it, which retrying cannot
     /// fix -- a self-rewriting `.exe` is a textbook Defender heuristic, so
     /// deletion is at least as likely as a sharing violation.
     ///
-    /// Unreachable on macOS, where nothing is ever installed in place: the
-    /// whole apply path is compiled out there, so this variant has no
-    /// constructor. Kept in the enum rather than cfg'd out of it, so `Refusal`
-    /// is the same type on every platform and no match arm has to move.
-    #[cfg_attr(target_os = "macos", allow(dead_code))]
     Quarantined,
 }
 
@@ -554,19 +553,6 @@ pub fn version_report() -> String {
     )
 }
 
-// **Phase 2's core, verified but not yet called.** These three items are the
-// security-critical half of "download and hand over": the compiled-in prefix,
-// the absolute byte ceiling, and the streaming digest. They are written and
-// tested now because they are what the manifest format commits us to, and
-// because a digest check written under time pressure next to a working download
-// is how the check ends up trusting the download. What is missing is the
-// surrounding Phase 2 work -- somewhere to put the file, a message, and a way to
-// tell the user where it went -- not anything about the verification itself.
-//
-// The `allow` is a phase boundary and nothing else. If Phase 2 is abandoned
-// rather than finished, DELETE this block; do not leave it sitting here
-// unreachable, because an unused verification routine is the kind of thing that
-// later gets called by something that assumes it does more than it does.
 /// The URL a verified payload is fetched from.
 ///
 /// Built here and nowhere else, so the compiled-in prefix is the only thing that
@@ -815,9 +801,6 @@ pub fn floor_from(text: &str) -> Floor {
 /// Written beside the floor in `update.state`. A failure is dropped rather than
 /// aborting the update: the consequence is that a revert will refuse for want of
 /// a digest, which is the safe direction.
-/// Unreachable on macOS for the same reason as [`Refusal::Quarantined`]: its
-/// only callers are the in-place install paths, and macOS hands over instead.
-#[cfg_attr(target_os = "macos", allow(dead_code))]
 pub fn record_previous(sha256: &str) {
     record_state(Some(sha256), None, None);
 }
@@ -942,6 +925,12 @@ pub fn installed_build() -> Option<u64> {
 }
 
 /// The Help panel's one line about update freshness.
+///
+/// Read once at startup and not refreshed, so a check that succeeds during this
+/// session does not change it until the next launch. That is a deliberate
+/// trade -- it changes once a day and re-reading a file per frame to say so
+/// would be absurd -- but it means a first run reads "no update check has
+/// succeeded yet" for the whole session even after one has.
 pub fn freshness_line() -> String {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1033,14 +1022,6 @@ fn host_of(url: &str) -> Option<&str> {
 }
 
 /// GET a small file, following redirects by hand.
-///
-/// **By hand, because the obvious mechanism silently does not work.** ureq's
-/// middleware hook wraps `run()` and the redirect loop lives *inside* `run()`,
-/// so a middleware allowlist would see the first request and no other while
-/// looking entirely correct. `max_redirects(0)` returns the 3xx as an ordinary
-/// response instead, so the host can be checked on every hop -- and each hop
-/// being its own call is also what makes `https_only` bite per hop rather than
-/// once.
 ///
 /// Nothing stores the redirect target. GitHub's 302 lands on a signed URL good
 /// for about an hour, so a cached one is a bug with a one-hour fuse: green in
