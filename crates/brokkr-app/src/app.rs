@@ -1157,6 +1157,18 @@ pub fn build_commit() -> &'static str {
     option_env!("BROKKR_COMMIT").unwrap_or("unknown")
 }
 
+/// What the Help panel and the About line call this build.
+///
+/// `build 1023 (9535407)` for a release build; `build 9535407` for anything
+/// else, because an unstamped build has no ordinal and inventing one would be
+/// worse than omitting it.
+pub fn build_label() -> String {
+    match build_number() {
+        Some(build) => format!("build {build} ({})", build_commit()),
+        None => format!("build {}", build_commit()),
+    }
+}
+
 /// The build ordinal, if this binary came from the release pipeline.
 ///
 /// **A total order over builds, which [`build_commit`] cannot provide.** A git

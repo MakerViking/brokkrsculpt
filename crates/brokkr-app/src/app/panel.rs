@@ -1082,9 +1082,14 @@ impl Brokkr {
                 text(format!("BrokkrSculpt {}", env!("CARGO_PKG_VERSION")))
                     .size(theme::TEXT_SIZE_SMALL)
                     .color(theme::TEXT),
-                text(format!("build {}", super::build_commit()))
-                    .size(theme::CAPTION_SIZE)
-                    .color(theme::TEXT_MUTE),
+                // **The ordinal first, then the commit.** This line said
+                // `build <commit>` back when there was no build number, which
+                // was merely imprecise -- and became actively misleading the day
+                // an ordinal existed, because a tester asked "which build are
+                // you on?" reads a git SHA and answers with that. Both are
+                // wanted: the ordinal is what the updater compares and what a
+                // user can say out loud, the commit is what a bug report needs.
+                text(super::build_label()).size(theme::CAPTION_SIZE).color(theme::TEXT_MUTE),
                 text("AGPL-3.0-only").size(theme::CAPTION_SIZE).color(theme::TEXT_MUTE),
                 separator(),
                 // Freshness, not enforcement. A channel that went quiet is

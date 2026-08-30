@@ -1960,6 +1960,31 @@ mod tests {
         );
     }
 
+    /// A tester asked "which build are you on?" must be able to answer from
+    /// the Help panel. It said `build <commit>` until 2026-08-30, so the answer
+    /// was a git SHA -- which has no order and cannot be compared to anything.
+    #[test]
+    fn the_build_label_leads_with_the_ordinal_when_there_is_one() {
+        let label = crate::app::build_label();
+        assert!(label.starts_with("build "), "got {label}");
+        assert!(
+            label.contains(crate::app::build_commit()),
+            "the commit must stay, for bug reports"
+        );
+        match crate::app::build_number() {
+            Some(n) => {
+                assert!(label.contains(&n.to_string()), "the ordinal must be there: {label}");
+                assert!(
+                    label.find(&n.to_string()) < label.find(crate::app::build_commit()),
+                    "the ordinal leads, the commit follows: {label}"
+                );
+            }
+            // Unstamped: no ordinal to show, and inventing one would be worse
+            // than omitting it.
+            None => assert_eq!(label, format!("build {}", crate::app::build_commit())),
+        }
+    }
+
     /// CI runs `--version | grep -qx "build = $BROKKR_BUILD"`. If this shape
     /// changes, the release pipeline stops verifying the stamp and starts
     /// failing every build -- or worse, keeps passing while checking nothing.

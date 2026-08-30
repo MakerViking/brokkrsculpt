@@ -2,6 +2,28 @@
 
 //! BrokkrSculpt: a voxel and SDF based 3D sculpting application.
 
+// **No console window on Windows.** Without this the binary is built for the
+// console subsystem, so double-clicking it opens a black terminal beside the
+// application and leaves it there for the session. A Windows tester's first
+// screenshot on 2026-08-30 had exactly that in it.
+//
+// Redirected output still works: the subsystem flag governs whether a console
+// is ALLOCATED, not whether inherited handles are written to. So
+// `brokkrsculpt.exe --version | grep ...` -- which is how `release.yml` reads
+// the build ordinal back out of what it just built -- keeps working, because
+// its stdout is a pipe. What is lost is running `--version` interactively in
+// an existing `cmd` window, where the output goes nowhere: attaching to a
+// parent console needs `AttachConsole` and is not worth it for a flag whose
+// only consumer is CI.
+//
+// Release builds only. A debug build keeps its console, because that is where
+// `env_logger` output goes while developing.
+//
+// If this is wrong, CI fails loudly at the readback rather than shipping
+// something broken -- which is the safe direction for a change that cannot be
+// tested from this machine.
+#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
+
 mod account;
 mod app;
 mod articles;
