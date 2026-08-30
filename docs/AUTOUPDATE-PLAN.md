@@ -34,7 +34,7 @@ Four items, none of which can be closed by writing more:
 1. ~~The production keys have never signed anything this code verified.~~ **Done 2026-08-30.** Both secret halves signed a manifest, and both are checked through `verify_manifest` against `TRUSTED_KEYS` as compiled, by a permanent test. A future edit to that list now fails in CI rather than in the field.
 2. **The standby is backed up and drilled — from one location.** Its restored copy signed a manifest the compiled-in epoch 1 key accepted, which proves the bytes and that the passphrase reproduces. Copies exist in more than one place; the others are **not yet drilled**, and until they are, the original stays on the build machine. Deleting the only proven copy while the rest are unverified is how a recovery key is lost for good. Locations and the drill are in `handoff.md`.
 3. **Nothing has been published**, so the fetch path has never run against the real endpoint, and `sign-release.sh` has never run at all. Publishing is outward-facing.
-4. **Phase 4 is written but off by default**, behind `BROKKR_WINDOWS_SELF_UPDATE=1`, because its human gate cannot currently be met — there is no Windows desktop on this project. Windows therefore behaves as Phase 2, like macOS. Phase 5 needs Apple enrolment. Neither is a matter of effort, and neither is a matter of code.
+4. **Phase 4 ships unproven, by decision.** Its human gate cannot be met — there is no Windows desktop on this project — and Thomas chose to ship rather than hold. `BROKKR_NO_SELF_UPDATE=1` is the escape hatch. macOS remains hand-over, which is not the same call: there the failure mode is an unlaunchable bundle, and it stays that way until Apple enrolment. Neither is a matter of effort, and neither is a matter of code.
 
 **Not verified, and the list matters more than the list above.** No signed manifest has been published, so the fetch path has never run against the real endpoint; the production keys have never signed anything this code has checked; the standby key is still on the build machine and has never been restore-drilled; and there has been no scratch-repo rehearsal of the publish half.
 
@@ -703,24 +703,31 @@ SAC is also becoming *more* common, not less: since KB5083769 (April 2026) it ca
 be enabled without a clean install, and there is no per-app bypass — only "turn
 SAC off" or "sign it".
 
-**Amended 2026-08-30, and the amendment is about availability, not evidence.**
-Everything above still holds: self-update genuinely removes a SmartScreen
-dialog rather than adding one, and SAC cannot strand a user who was previously
-fine. What cannot be satisfied is the *other* half of the answer — this phase's
-human gate. Nobody on this project has a Windows desktop, so nobody can take
-the hop, and a green `windows-latest` runner is not a substitute: different
-security context, no Mark-of-the-Web written, and silent about SmartScreen and
-Smart App Control on a real machine.
+**Amended twice on 2026-08-30. Final answer: Phase 4 ships, unproven, by
+decision.** The evidence above still holds — self-update genuinely removes a
+SmartScreen dialog rather than adding one, and SAC cannot strand a user who was
+previously fine. What could not be satisfied is this phase's human gate: there
+is no Windows desktop on this project, so nobody can take the hop, and a green
+`windows-latest` runner is not a substitute (different security context, no
+Mark-of-the-Web written, silent about SmartScreen and Smart App Control).
 
-Shipping it on by default would make the first human through that path
-whichever user updated first. So **Windows holds at Phase 2** — download,
-verify, hand over — which is exactly the alternative Q2 offered and called
-defensible. The Phase 4 code stays: written, compile-checked on the target,
-and exercised through its probe seam. It is reached only by setting
-`BROKKR_WINDOWS_SELF_UPDATE=1`, deliberately awkward for an application people
-double-click, because the person setting it is volunteering to be the first
-one through. When someone has taken the hop and said so, the default flips and
-this paragraph becomes history.
+An intermediate revision held Windows at hand-over for exactly that reason.
+Thomas overrode it: all platforms that can self-replace, do. **That is a
+deliberate acceptance of an unverified path, recorded here so it is not later
+read as an oversight.** What is being accepted, precisely: a Windows build that
+Smart App Control declines to execute leaves an application that will not start
+and no code of ours running to fix it, because nothing of ours is allowed to
+execute. `RECOVER-BROKKRSCULPT.txt` beside the binary is the entire remedy for
+that case — which is why it is written *before* the swap and never deleted, and
+why deleting it was the first defect this document had to correct.
+
+What ships alongside it: `BROKKR_NO_SELF_UPDATE=1`, an opt-OUT that drops back
+to download-and-hand-over without also silencing the check. `check_for_updates
+= never` is the bigger hammer and a worse fit — a user in trouble wants the
+swap to stop, not the news.
+
+The first Windows user through this path is still the first human through it.
+That is now a known cost rather than an unknown one.
 
 The narrow case is unrecoverable in-app, and this document defeated its own fix:
 **Windows step 7 deleted `RECOVER-BROKKRSCULPT.txt` on success**, which is
