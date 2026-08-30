@@ -61,6 +61,8 @@ scripts/sign-release.sh <build> --requires-reinstall <0|1> [options]
   --key-epoch N               sign with ~/.minisign/brokkrsculpt-N.key
                               and declare epoch N (default 0, the live key)
   --no-attestation            skip `gh attestation verify`
+  --yes                       do not ask; for CI, which has nobody to ask
+  --secret-key PATH           sign with this key instead of ~/.minisign/...
 USAGE
 }
 
@@ -71,6 +73,11 @@ REQUIRES_REINSTALL=""
 MINIMUM_BUILD=0
 KEY_EPOCH=0
 ATTEST=1
+# Non-interactive, for the release workflow. A human running this still gets the
+# manifest printed and the typed confirmation; only CI skips it, and only
+# because there is nobody there to type.
+ASSUME_YES=0
+SECRET_KEY_OVERRIDE=""
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -78,6 +85,8 @@ while [ $# -gt 0 ]; do
         --minimum-build)      MINIMUM_BUILD="${2:-}"; shift 2 ;;
         --key-epoch)          KEY_EPOCH="${2:-}"; shift 2 ;;
         --no-attestation)     ATTEST=0; shift ;;
+        --yes)                ASSUME_YES=1; shift ;;
+        --secret-key)         SECRET_KEY_OVERRIDE="${2:-}"; shift 2 ;;
         -h|--help)            usage; exit 0 ;;
         -*)                   usage >&2; die "unknown option: $1" ;;
         *)
@@ -107,7 +116,7 @@ is_number "$KEY_EPOCH" || die "--key-epoch must be a number, got '$KEY_EPOCH'"
 # manifest signed by one key and declaring another is refused by the client at
 # step 2d -- not as an attack, but because it would otherwise persist a
 # floor_epoch that no key can ever satisfy again.
-SECRET_KEY="$HOME/.minisign/brokkrsculpt-${KEY_EPOCH}.key"
+SECRET_KEY="${SECRET_KEY_OVERRIDE:-$HOME/.minisign/brokkrsculpt-${KEY_EPOCH}.key}"
 PUBLIC_KEY="$HOME/.minisign/brokkrsculpt-${KEY_EPOCH}.pub"
 
 # --- preflight ---------------------------------------------------------------
@@ -122,7 +131,8 @@ done
 [ -f "$SECRET_KEY" ] || die "no secret key at $SECRET_KEY"
 
 # A signing script that cannot ask a question must not sign.
-[ -t 0 ] || die "not a terminal: this script requires a typed confirmation"
+[ "$ASSUME_YES" -eq 1 ] || [ -t 0 ] \
+    || die "not a terminal: this script requires a typed confirmation (or --yes, which is for CI)"
 
 work=$(mktemp -d /tmp/brokkr-sign-XXXXXX)
 trap 'rm -rf "$work"' EXIT
@@ -240,9 +250,13 @@ if [ "$found" -lt 3 ]; then
     echo "Missing:${MISSING:- none}"
     echo "That is correct if a runner failed. If a payload was RENAMED, this"
     echo "will publish a manifest that silently never updates that platform."
-    printf 'type "yes" if that is expected: '
-    read -r sure
-    [ "$sure" = "yes" ] || die "aborted; nothing was signed"
+    if [ "$ASSUME_YES" -eq 1 ]; then
+        echo "::warning::signing build $BUILD with only $found of 3 platforms:${MISSING:- none}"
+    else
+        printf 'type "yes" if that is expected: '
+        read -r sure
+        [ "$sure" = "yes" ] || die "aborted; nothing was signed"
+    fi
 fi
 
 # --- show it, then ask -------------------------------------------------------
@@ -259,8 +273,13 @@ echo "  platforms:          $found of 3"
 [ "$REQUIRES_REINSTALL" -eq 0 ] || echo "  requires_reinstall: 1 -- clients will NOT self-update to this build"
 [ "$MINIMUM_BUILD" -eq 0 ] || echo "  minimum_build:      $MINIMUM_BUILD -- every client below this is warned"
 echo
-printf 'type "sign" to sign and upload, anything else to abort: '
-read -r reply
+if [ "$ASSUME_YES" -eq 1 ]; then
+    reply=sign
+    echo 'signing without asking (--yes)'
+else
+    printf 'type "sign" to sign and upload, anything else to abort: '
+    read -r reply
+fi
 [ "$reply" = "sign" ] || die "aborted; nothing was uploaded"
 
 # --- sign --------------------------------------------------------------------
@@ -277,7 +296,19 @@ read -r reply
 # of the distribution binary at this version. Passing it explicitly is what
 # makes the output independent of which of those is on PATH -- which is the
 # reason to keep both the flag and the readback below.
-minisign -S -H -s "$SECRET_KEY" -m "$manifest" -x "$manifest.minisig"
+# The passphrase comes from the environment when there is one, so this can run
+# unattended; minisign reads it from stdin, verified against 0.12. When
+# MINISIGN_PASSWORD is unset -- a human at a terminal -- minisign prompts as
+# usual and nothing about the interactive path changes.
+#
+# Deliberately NOT a passphrase-less key for CI: the encrypted key and its
+# passphrase are two separate secrets, so a runner compromise has to take both.
+if [ -n "${MINISIGN_PASSWORD:-}" ]; then
+    printf '%s\n' "$MINISIGN_PASSWORD" \
+        | minisign -S -H -s "$SECRET_KEY" -m "$manifest" -x "$manifest.minisig"
+else
+    minisign -S -H -s "$SECRET_KEY" -m "$manifest" -x "$manifest.minisig"
+fi
 
 # Read the algorithm back out of the signature we just wrote rather than
 # trusting the flag. The two bytes at the head of the base64 payload are the

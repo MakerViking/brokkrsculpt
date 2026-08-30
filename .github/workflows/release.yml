@@ -240,6 +240,12 @@ jobs:
     # lets the notes say which ones are actually attached.
     if: always() && github.event_name != 'pull_request'
     runs-on: ubuntu-latest
+    # **The signing key lives here, scoped to an environment.** An environment
+    # keeps the secret out of every other job and workflow in the repository and
+    # gives the release its own audit trail, which a bare repo secret does not.
+    # Add a branch protection rule on it limiting deployments to `main`; this
+    # workflow has no tag trigger, so there is nothing else to reach it.
+    environment: release
     permissions:
       contents: write
       # For `actions/attest-build-provenance`. Free, and it is an independent
@@ -423,6 +429,7 @@ jobs:
           fi
           echo "beta tag now at $SHA"
 
+
           # **Sweep old payloads, and never the one the live manifest names.**
           #
           # Retention is the only reason rollback is possible: mechanism 2 for
@@ -491,3 +498,62 @@ jobs:
             fi
           fi
 
+      # **Signed here, after the payloads are uploaded**, because the signer
+      # reads them back off the release and hashes what is actually published
+      # rather than what this job happened to build. Ordering matters: run this
+      # before `Publish` and there is nothing to hash.
+      - name: Sign the manifest
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          R: ${{ github.repository }}
+          MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
+          MINISIGN_PASSWORD: ${{ secrets.MINISIGN_PASSWORD }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # Guarded in bash rather than in a step `if:`, because the `secrets`
+          # context is NOT available there -- and a workflow expression that is
+          # not allowed where it sits fails the whole file to compile, with no
+          # jobs and a run reported against the file path. That already happened
+          # once in this file, with arithmetic in workflow-level `env`.
+          #
+          # Skipped rather than failed when the key is absent, so a fork or a
+          # repo before the secret is configured still publishes. The check at
+          # the end of `Publish` then reports the manifest as behind, which is
+          # the honest signal -- a signing step that silently does nothing is
+          # how a release channel stops working with nobody noticing.
+          if [ -z "${MINISIGN_SECRET_KEY:-}" ]; then
+            echo "::warning::no MINISIGN_SECRET_KEY configured, so build ${BROKKR_BUILD} was published but NOT signed. No client will be offered it."
+            exit 0
+          fi
+
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq minisign
+
+          # Written 0600 and shredded on the way out whatever happens. It never
+          # reaches a log: written from the environment, never echoed, and no
+          # `set -x` anywhere in this file.
+          key=$(mktemp)
+          chmod 600 "$key"
+          trap 'shred -u "$key" 2>/dev/null || rm -f "$key"' EXIT
+          printf '%s\n' "$MINISIGN_SECRET_KEY" > "$key"
+
+          # **Epoch 0 only, and that is the whole reason this is survivable.**
+          # The standby at epoch 1 is deliberately NOT here: it is the recovery
+          # path, and a recovery path kept beside the thing it recovers from is
+          # not one. If this runner is ever compromised, epoch 1 signs from
+          # Thomas's own backups and every client that takes that build refuses
+          # epoch 0 for ever after.
+          #
+          # What CI signing gives up, said once so it is not rediscovered: the
+          # local script downloads and hashes payloads so a compromised runner
+          # cannot get a backdoored build signed. Here the runner IS the signer,
+          # so that protection is gone and provenance attestation plus the epoch
+          # rotation are what remain.
+          BROKKR_RELEASE_REPO="$R" ./scripts/sign-release.sh \
+            "${BROKKR_BUILD:?}" \
+            --requires-reinstall 0 \
+            --key-epoch 0 \
+            --secret-key "$key" \
+            --yes

@@ -658,7 +658,34 @@ Say the cost rather than pretend the refusal is free. Against someone who genuin
 
 **A hidden flag in the shipped binary that points the updater somewhere else.** See the selftest section.
 
-**Signing in CI.** See key custody.
+**~~Signing in CI.~~ Reversed 2026-08-30, deliberately, by Thomas.** The
+argument below still stands and is left intact rather than rewritten, because
+the cost is real and should stay legible. What changed is the weighting: a
+manual signature per release is friction on the one person who has to do it,
+every time, for ever — and friction on a maintainer is not a security control,
+it is a thing that eventually stops happening.
+
+Three things make the reversal survivable, and they are why this is a trade
+rather than a capitulation:
+
+- **Only epoch 0 goes to CI.** The standby at epoch 1 is not there and never
+  will be. A recovery path stored beside the thing it recovers from is not one.
+  If the runner is compromised, epoch 1 signs from Thomas's own backups and
+  every client that takes that build refuses epoch 0 for ever. This is exactly
+  what the epoch mechanism was put in v1 for, and it is the difference between
+  a bad day and an unrecoverable one.
+- **Two secrets, not one.** The key stays passphrase-encrypted and the
+  passphrase is a separate secret; minisign reads it from stdin (verified
+  against 0.12). An attacker needs both.
+- **An environment, not a bare repository secret**, so the key is out of reach
+  of every other job and workflow and the release gets its own audit trail.
+
+What is genuinely given up, stated once so nobody rediscovers it as a surprise:
+`sign-release.sh` downloads and hashes payloads locally precisely so a
+compromised runner cannot get a backdoored build signed. When the runner IS the
+signer that protection is gone. Provenance attestation and the epoch rotation
+are what remain, and neither replaces it. The local script keeps working and
+stays the tool for a rollback and for anything signed with the standby.
 
 **Auto-install, and a startup modal that installs by default.** SindriCAD raises a blocking modal 8 seconds into every session, focuses the install button and does not remember a refusal. We notify on surfaces that already exist, default the focus to Later, and persist `skip_build`.
 
