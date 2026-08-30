@@ -317,12 +317,24 @@ pub fn install(target: &Target, staged: &Path, previous_sha256: &str) -> Result<
     // This costs nothing today: `install_unix` would happily rewrite the
     // executable inside `BrokkrSculpt.app/Contents/MacOS/`, and everything
     // above this line would have said it worked.
-    if is_in_app_bundle(&target.path) || cfg!(target_os = "macos") {
+    // The path test first, so a bundled install is refused on EVERY platform
+    // and the refusal stays reachable and testable off macOS.
+    if is_in_app_bundle(&target.path) {
         return Err(Refusal::HandOverOnly);
+    }
+    // Then one arm per platform, each with a definite return. An earlier cut
+    // wrote the macOS case as `|| cfg!(target_os = "macos")` on the line above
+    // and let both arms below be compiled out -- which on macOS left the
+    // function falling off its end with no value, and only CI said so, because
+    // `ring` will not cross-build its C for darwin from a Linux host.
+    #[cfg(target_os = "macos")]
+    {
+        let _ = (staged, previous_sha256);
+        Err(Refusal::HandOverOnly)
     }
     #[cfg(windows)]
     {
-        return swap_windows(target, staged, previous_sha256, &exclusive_probe);
+        swap_windows(target, staged, previous_sha256, &exclusive_probe)
     }
     #[cfg(all(not(windows), not(target_os = "macos")))]
     install_unix(target, staged, previous_sha256)
@@ -517,7 +529,7 @@ fn retry<T>(
 }
 
 /// The Unix swap: hard-link aside, then one atomic rename.
-#[cfg(any(all(not(windows), not(target_os = "macos")), test))]
+#[cfg(all(not(windows), not(target_os = "macos")))]
 fn install_unix(target: &Target, staged: &Path, previous_sha256: &str) -> Result<(), Refusal> {
     // A staged file that has vanished between verifying it and installing it is
     // worth its own answer on every platform: on Windows that is antivirus
@@ -831,6 +843,11 @@ mod tests {
 
     /// A hard link is a second NAME for one inode: nothing is removed, so there
     /// is no window in which the target is absent.
+    // macOS refuses the swap by design -- `install` returns `HandOverOnly`
+    // there -- so a test that expects it to succeed is asking the wrong
+    // question on that platform. The refusal has its own test, which does
+    // run everywhere: `a_bundled_install_is_refused_the_swap_on_every_platform`.
+    #[cfg(not(target_os = "macos"))]
     #[test]
     fn parking_the_old_build_never_leaves_the_target_missing() {
         let dir = scratch("park");
@@ -850,6 +867,11 @@ mod tests {
 
     /// `link(2)` fails EEXIST rather than clobbering, so a second update would
     /// break on the one step whose job is making the next failure survivable.
+    // macOS refuses the swap by design -- `install` returns `HandOverOnly`
+    // there -- so a test that expects it to succeed is asking the wrong
+    // question on that platform. The refusal has its own test, which does
+    // run everywhere: `a_bundled_install_is_refused_the_swap_on_every_platform`.
+    #[cfg(not(target_os = "macos"))]
     #[test]
     fn a_second_update_in_one_install_still_parks_the_build_it_replaces() {
         let dir = scratch("twice");
@@ -868,6 +890,11 @@ mod tests {
     }
 
     /// A revert must refuse to run whatever happens to be sitting at `.old`.
+    // macOS refuses the swap by design -- `install` returns `HandOverOnly`
+    // there -- so a test that expects it to succeed is asking the wrong
+    // question on that platform. The refusal has its own test, which does
+    // run everywhere: `a_bundled_install_is_refused_the_swap_on_every_platform`.
+    #[cfg(not(target_os = "macos"))]
     #[test]
     fn a_revert_refuses_a_kept_copy_whose_digest_does_not_match() {
         let dir = scratch("revert-digest");
@@ -885,6 +912,11 @@ mod tests {
         assert_eq!(std::fs::read(&target.path).unwrap(), b"the new build");
     }
 
+    // macOS refuses the swap by design -- `install` returns `HandOverOnly`
+    // there -- so a test that expects it to succeed is asking the wrong
+    // question on that platform. The refusal has its own test, which does
+    // run everywhere: `a_bundled_install_is_refused_the_swap_on_every_platform`.
+    #[cfg(not(target_os = "macos"))]
     #[test]
     fn a_revert_with_a_matching_digest_puts_the_old_build_back() {
         let dir = scratch("revert-ok");
@@ -924,14 +956,17 @@ mod tests {
     fn finish_staging_makes_it_executable_only_after_it_is_written() {
         let dir = scratch("chmod");
         let target = fake_target(&dir);
-        let (path, mut file) =
+        let (staged_path, mut file) =
             stage_in(&target.directory, "brokkrsculpt.bbb").expect("staging works");
         file.write_all(b"verified bytes").expect("writable");
         finish_staging(&file).expect("chmod and flush work");
+        // The mode assertion is Unix-only; Windows has no mode, which is the
+        // same reason `write_private` in account.rs sets one only there.
+        assert!(staged_path.exists(), "the staged file must survive being finished");
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+            let mode = std::fs::metadata(&staged_path).unwrap().permissions().mode();
             assert_eq!(mode & 0o777, 0o755);
         }
     }
@@ -1068,6 +1103,11 @@ mod tests {
 
     /// The whole cycle a user would live through: install, the build does not
     /// start, the next launch puts back what they had.
+    // macOS refuses the swap by design -- `install` returns `HandOverOnly`
+    // there -- so a test that expects it to succeed is asking the wrong
+    // question on that platform. The refusal has its own test, which does
+    // run everywhere: `a_bundled_install_is_refused_the_swap_on_every_platform`.
+    #[cfg(not(target_os = "macos"))]
     #[test]
     fn a_build_that_will_not_start_is_reverted_with_the_document_still_named() {
         let dir = scratch("cycle");
