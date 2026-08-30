@@ -767,31 +767,52 @@ impl Brokkr {
         // build, so the user can legitimately be offered an older ordinal and
         // calling that an upgrade would be a small lie told on every launch.
         // `headline` is the one place that decides; see `update::Offer`.
+        // **A real button, not a coloured line of text.** This was
+        // `.padding(0)` with `tool_button`, which drew no fill and gave the
+        // pointer almost nothing to hit -- a Windows tester clicked it and
+        // reported that nothing happened. Accent-filled and padded like every
+        // other primary action in the application, so it reads as pressable and
+        // has a target worth aiming at.
         let update: Element<'_, Message> = match &self.offer {
-            Some(offer) => button(
-                text(if self.downloaded_update.is_some() {
-                    format!("Build {} is ready — install and restart", offer.build)
+            Some(offer) => {
+                let busy = self.downloading_update || self.installing_update;
+                let label = if self.installing_update {
+                    format!("Installing build {}…", offer.build)
+                } else if self.downloading_update {
+                    format!("Downloading build {}…", offer.build)
+                } else if self.downloaded_update.is_some() {
+                    format!("Install build {} and restart", offer.build)
                 } else {
                     format!("{} — get it", offer.headline())
-                })
-                .size(theme::TEXT_SIZE_SMALL)
-                .color(theme::ACCENT),
-            )
-            .padding(0)
-            .style(theme::tool_button)
-            // Three states, in the order a user meets them: install what is
-            // already verified on disk, download it, or -- for a build that
-            // needs the whole archive -- the release page, which is the honest
-            // answer rather than handing over a bare executable that will not
-            // work on its own.
-            .on_press(if self.downloaded_update.is_some() {
-                Message::UpdateInstallPressed
-            } else if offer.payload.is_some() && !offer.requires_reinstall {
-                Message::UpdateDownloadRequested
-            } else {
-                Message::LinkOpened(crate::articles::RELEASE_PAGE.to_string())
-            })
-            .into(),
+                };
+                // Three states, in the order a user meets them: install what is
+                // already verified on disk, download it, or -- for a build that
+                // needs the whole archive -- the release page, which is the
+                // honest answer rather than handing over a bare executable that
+                // will not work on its own.
+                let action = if self.downloaded_update.is_some() {
+                    Message::UpdateInstallPressed
+                } else if offer.payload.is_some() && !offer.requires_reinstall {
+                    Message::UpdateDownloadRequested
+                } else {
+                    Message::LinkOpened(crate::articles::RELEASE_PAGE.to_string())
+                };
+                let mut pressable = button(text(label).size(theme::TEXT_SIZE_SMALL))
+                    .padding(Padding {
+                        top: theme::S2,
+                        bottom: theme::S2,
+                        left: theme::S4,
+                        right: theme::S4,
+                    })
+                    .style(theme::tool_button_active);
+                // **No `on_press` while busy**, which is what actually disables
+                // an iced button -- and the swap can take a minute on Windows,
+                // where it waits for antivirus to release the staged file.
+                if !busy {
+                    pressable = pressable.on_press(action);
+                }
+                pressable.into()
+            }
             None => space::horizontal().into(),
         };
 

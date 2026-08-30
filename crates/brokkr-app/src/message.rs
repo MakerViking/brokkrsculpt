@@ -433,6 +433,9 @@ pub enum Message {
     /// so `PendingAction::Restart` goes through it and nothing touches the disk
     /// until the work question is settled.
     UpdateInstallRequested(iced::window::Id),
+    /// The swap finished, or said why not. Carries the window because only the
+    /// interface thread may close it, and the swap does not run there.
+    UpdateInstalled(iced::window::Id, Result<u64, String>),
     /// Where the verified payload landed, or why it did not.
     UpdateDownloaded(Result<std::path::PathBuf, String>),
     /// The update-check tick, from either surface that carries it.

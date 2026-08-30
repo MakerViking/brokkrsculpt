@@ -389,6 +389,10 @@ pub struct Brokkr {
     /// view, for the reason `signing_in` is: a second press would start a
     /// second 33 MB transfer into the same file.
     downloading_update: bool,
+    /// An install is in flight. The Windows path can spend up to a minute
+    /// waiting for antivirus to let go of the staged file, so a second press
+    /// during that window would start a second swap.
+    installing_update: bool,
     /// Where a verified payload landed, once one has. Only this is installable.
     downloaded_update: Option<std::path::PathBuf>,
     /// The executable to replace, resolved ONCE at startup.
@@ -1863,6 +1867,7 @@ impl Brokkr {
             // ran it would pass or fail by machine. `new` overwrites this.
             update_settings: crate::update::Settings::default(),
             downloading_update: false,
+            installing_update: false,
             downloaded_update: None,
             exe: None,
             update_pending_marker: None,
@@ -2136,6 +2141,19 @@ impl Brokkr {
     /// happened, so what is left is a handful of filesystem operations, and
     /// doing them in a task would mean the window could be closed underneath a
     /// half-finished swap.
+    /// Swap the binary and relaunch, or say why not.
+    ///
+    /// **Off the interface thread, and that is not an optimisation.** An earlier
+    /// revision did all of this inline, reasoning that after the download only
+    /// "a handful of filesystem operations" remain. True on Linux. On Windows
+    /// the sequence opens the staged file for exclusive access first and retries
+    /// for up to sixty seconds, which is where antivirus interference is
+    /// absorbed -- so inline meant the window froze solid for up to a minute
+    /// with nothing drawn and nothing said. A Windows tester clicked install and
+    /// reported that nothing happened, which is exactly what that looks like.
+    ///
+    /// Everything before the rename is non-destructive, so a refusal here leaves
+    /// the install exactly as it was.
     fn install_and_restart(&mut self, id: iced::window::Id) -> Task<Message> {
         let Some(staged) = self.downloaded_update.clone() else {
             self.status = "there is no downloaded update to install".to_string();
@@ -2144,71 +2162,72 @@ impl Brokkr {
         let Some(offer) = self.offer.clone() else {
             return Task::none();
         };
-        // Never waited on: the user is looking at a modal, and a blocking wait
-        // behind another instance's download is a hung window.
-        let lock = match crate::update::apply::Lock::take() {
-            Ok(lock) => lock,
-            Err(why) => {
-                self.status = why.to_string();
-                return Task::none();
-            }
-        };
         let Some(target) = self.exe.clone() else {
             self.status = "this copy cannot update itself".to_string();
             return Task::none();
         };
-        if let Err(why) = crate::update::apply::gates(&target, build_number(), build_commit()) {
-            self.status = why.to_string();
+        if self.installing_update {
             return Task::none();
         }
-        // What we are reverting TO, recorded before anything moves.
-        let previous = match crate::update::apply::sha256_of(&target.path) {
-            Ok(digest) => digest,
-            Err(why) => {
-                self.status = why.to_string();
-                return Task::none();
-            }
-        };
-        if let Err(why) = crate::update::apply::install(&target, &staged, &previous) {
-            self.status = why.to_string();
-            return Task::none();
-        }
-        // **The floor rises here and nowhere else.** Only a completed apply may
-        // move it, so merely being shown a manifest cannot. Written after the
-        // swap rather than before: a floor raised for an update that then failed
-        // would refuse the very manifest that could fix it.
-        crate::update::record_applied(offer.seq, offer.key_epoch, offer.build);
-        // The marker the next launch reads. `resume` is the channel that
-        // survives the restart -- argv would not, because a rollback can spawn
-        // an OLDER binary that has never heard of the flag.
-        if let Some(marker) = crate::update::apply::marker_path(&target) {
-            let _ = crate::update::apply::write_marker(
-                &marker,
-                &crate::update::apply::Pending {
-                    build: offer.build,
-                    attempt: 0,
-                    resume: self.project_path.clone(),
-                    path: target.path.clone(),
-                },
-            );
-        }
-        // Released before the spawn: the child opens its own handle and would
-        // otherwise race the parent's exit and be refused its own first write.
-        lock.release();
+        self.installing_update = true;
+        // Said before the work starts, because the work can take a minute and a
+        // button that does nothing visible is indistinguishable from a broken
+        // one -- which is how this was reported.
+        self.status = format!("installing build {}…", offer.build);
 
-        // **Spawn first, and only exit if it worked.** A user who clicked
-        // restart and got a closed window with nothing coming back has no
-        // terminal and no way to tell whether their install survived.
-        match std::process::Command::new(&target.path).spawn() {
-            Ok(_) => iced::window::close(id),
-            Err(why) => {
-                self.status = format!(
-                    "build {} is installed, but starting it failed ({why}) -- this window is                      still the old build; close it and start BrokkrSculpt again",
-                    offer.build
-                );
-                Task::none()
-            }
-        }
+        let running_build = build_number();
+        let running_commit = build_commit();
+        let resume = self.project_path.clone();
+        Task::perform(
+            async move {
+                // Never waited on: another copy mid-apply means this one says so
+                // rather than blocking behind someone else's 33 MB.
+                let lock = crate::update::apply::Lock::take().map_err(|why| why.to_string())?;
+                crate::update::apply::gates(&target, running_build, running_commit)
+                    .map_err(|why| why.to_string())?;
+                // What we are reverting TO, recorded before anything moves.
+                let previous =
+                    crate::update::apply::sha256_of(&target.path).map_err(|why| why.to_string())?;
+                crate::update::apply::install(&target, &staged, &previous)
+                    .map_err(|why| why.to_string())?;
+                // **The floor rises here and nowhere else.** Only a completed
+                // apply may move it, so merely being shown a manifest cannot.
+                // After the swap rather than before: a floor raised for an update
+                // that then failed would refuse the manifest that could fix it.
+                crate::update::record_applied(offer.seq, offer.key_epoch, offer.build);
+                // `resume` is the channel that survives the restart -- argv would
+                // not, because a rollback can spawn an OLDER binary that has
+                // never heard of the flag.
+                if let Some(marker) = crate::update::apply::marker_path(&target) {
+                    let _ = crate::update::apply::write_marker(
+                        &marker,
+                        &crate::update::apply::Pending {
+                            build: offer.build,
+                            attempt: 0,
+                            resume,
+                            path: target.path.clone(),
+                        },
+                    );
+                }
+                // Released before the spawn: the child opens its own handle and
+                // would otherwise race the parent's exit and be refused its own
+                // first state write.
+                lock.release();
+                // **Spawn first; the caller exits only if this worked.** A user
+                // who clicked restart and got a closed window with nothing
+                // coming back has no terminal and no way to tell whether their
+                // install survived.
+                std::process::Command::new(&target.path).spawn().map_err(|why| {
+                    format!(
+                        "build {} is installed, but starting it failed ({why}) -- this window is \
+                         still the old build; close it and start BrokkrSculpt again",
+                        offer.build
+                    )
+                })?;
+                Ok(offer.build)
+            },
+            move |outcome: Result<u64, String>| Message::UpdateInstalled(id, outcome),
+        )
     }
 
     /// Do `action`, or ask first if there is work to lose.
@@ -8388,6 +8407,13 @@ impl Brokkr {
                         );
                     }
                     Err(why) => self.status = why.to_string(),
+                }
+            }
+            Message::UpdateInstalled(id, outcome) => {
+                self.installing_update = false;
+                match outcome {
+                    Ok(_) => return iced::window::close(id),
+                    Err(why) => self.status = why,
                 }
             }
             Message::UpdateInstallPressed => {
