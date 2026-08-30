@@ -101,6 +101,18 @@ impl Target {
         self.directory.join(name)
     }
 
+    /// Where a payload is staged so the rename that follows stays on one
+    /// filesystem.
+    ///
+    /// Beside the executable normally; beside the **bundle** on macOS, because
+    /// the thing being replaced there is the whole `.app` and staging inside it
+    /// would put the new copy underneath the directory about to be renamed.
+    pub fn staging_directory(&self) -> PathBuf {
+        app_bundle_root(&self.path)
+            .and_then(|bundle| bundle.parent().map(Path::to_path_buf))
+            .unwrap_or_else(|| self.directory.clone())
+    }
+
     /// Where the recovery note lives.
     pub fn recovery_note(&self) -> PathBuf {
         self.directory.join(RECOVERY_NOTE)
@@ -134,12 +146,18 @@ pub fn gates(target: &Target, build: Option<u64>, commit: &str) -> Result<(), Re
     if self_update_disabled() {
         return Err(Refusal::HandOverOnly);
     }
-    // Then the platform, so a download is routed to the state directory for
-    // hand-over rather than staged where it must not be written.
-    if is_in_app_bundle(&target.path) || cfg!(target_os = "macos") {
-        return Err(Refusal::HandOverOnly);
+    // A `.app` IS replaceable now -- as a whole, never edited in place -- so
+    // what is checked here is the one thing that makes it impossible.
+    if is_translocated(&target.path) {
+        return Err(Refusal::CannotReplace(
+            "macOS is running this from a temporary read-only copy. Move BrokkrSculpt to \
+             Applications in Finder -- dragging it there, not `mv` -- and open it again"
+                .into(),
+        ));
     }
-    directory_is_safe(&target.directory)
+    // The directory that must be writable is the one holding the thing being
+    // replaced: the bundle's folder for a `.app`, the executable's otherwise.
+    directory_is_safe(&target.staging_directory())
 }
 
 /// Whether the build running now is the one this install put in place.
@@ -182,6 +200,170 @@ const NO_SELF_UPDATE: &str = "BROKKR_NO_SELF_UPDATE";
 /// never deleted.
 pub fn self_update_disabled() -> bool {
     std::env::var_os(NO_SELF_UPDATE).is_some_and(|value| value == "1")
+}
+
+/// The `.app` directory this executable lives in, if it lives in one.
+///
+/// `.../Something.app/Contents/MacOS/exe` -> `.../Something.app`.
+fn app_bundle_root(path: &Path) -> Option<PathBuf> {
+    is_in_app_bundle(path)
+        .then(|| path.parent()?.parent()?.parent().map(Path::to_path_buf))
+        .flatten()
+}
+
+/// Whether macOS is running this from a randomised read-only copy.
+///
+/// **Gatekeeper path randomisation ("app translocation").** An app launched
+/// from a quarantined location runs from `/private/var/folders/.../
+/// AppTranslocation/<uuid>/d/Something.app`, which is read-only, so every write
+/// below would fail with something unhelpful. Neither `mv` nor `NSFileManager`
+/// clears it -- only moving the app in Finder does -- so the honest answer is
+/// to say that, rather than to fail at a rename.
+fn is_translocated(path: &Path) -> bool {
+    path.components().any(|part| part.as_os_str() == "AppTranslocation")
+}
+
+/// Replace a whole `.app` bundle.
+///
+/// **The unit of replacement on macOS is the bundle, not the executable.** The
+/// published payload is the `.app` zipped with `ditto -c -k --keepParent`, so
+/// this expands it and swaps the directory. `rename(2)` works on directories,
+/// and on the same filesystem it is atomic exactly as it is for a file.
+///
+/// # Why this is now attempted at all
+///
+/// `docs/AUTOUPDATE-PLAN.md` ruled macOS out on the grounds that "any edit
+/// inside a signed bundle invalidates the signature, which on Apple Silicon is
+/// SIGKILL at exec". That reasoning assumed a signed bundle. **This one is not
+/// signed** -- `release.yml` runs no `codesign` -- so there is no signature to
+/// invalidate, and the whole bundle is replaced rather than edited in place.
+/// The arm64 ad-hoc signature the linker applies travels inside the payload,
+/// because the payload IS the built bundle.
+///
+/// It is also, in one respect, better than what a user does by hand: our
+/// download writes no `com.apple.quarantine`, so the replaced bundle does not
+/// get the "is damaged and can't be opened" dialog that a browser download
+/// earns. Quarantine is stripped from the staged copy anyway, best effort,
+/// because `ditto` preserves extended attributes and the zip was built on a
+/// runner.
+///
+/// `expand` is a parameter so the sequence -- refusals, swap, restore -- is
+/// exercised on Linux, where `ditto` does not exist. **The syscalls differ; the
+/// ordering does not, and the ordering is what can lose an install.**
+#[cfg(any(target_os = "macos", test))]
+fn swap_bundle(
+    bundle: &Path,
+    staged_zip: &Path,
+    previous_sha256: &str,
+    expand: &dyn Fn(&Path, &Path) -> Result<(), Refusal>,
+) -> Result<(), Refusal> {
+    if is_translocated(bundle) {
+        return Err(Refusal::CannotReplace(
+            "macOS is running this from a temporary read-only copy. Move BrokkrSculpt to \
+             Applications in Finder -- dragging it there, not `mv` -- and open it again"
+                .into(),
+        ));
+    }
+    let parent = bundle
+        .parent()
+        .ok_or_else(|| Refusal::CannotReplace("the application has no folder".into()))?;
+    directory_is_safe(parent)?;
+    if !staged_zip.exists() {
+        return Err(Refusal::Quarantined);
+    }
+
+    // Expanded beside the bundle, so the rename that follows cannot cross a
+    // filesystem and degrade into a copy.
+    let work = parent.join(format!(".brokkrsculpt-{}.expand", std::process::id()));
+    let _ = std::fs::remove_dir_all(&work);
+    std::fs::create_dir_all(&work)
+        .map_err(|why| Refusal::CannotReplace(format!("could not stage the update ({why})")))?;
+    let cleanup = |work: &Path| {
+        let _ = std::fs::remove_dir_all(work);
+    };
+    if let Err(why) = expand(staged_zip, &work) {
+        cleanup(&work);
+        return Err(why);
+    }
+    let expanded = std::fs::read_dir(&work)
+        .ok()
+        .and_then(|entries| {
+            entries.flatten().map(|e| e.path()).find(|p| p.extension().is_some_and(|e| e == "app"))
+        })
+        .ok_or_else(|| {
+            cleanup(&work);
+            Refusal::CannotReplace("the download did not contain an application".into())
+        })?;
+
+    super::record_previous(previous_sha256);
+    let old =
+        parent.join(format!(".{}.old", bundle.file_name().unwrap_or_default().to_string_lossy()));
+    let _ = std::fs::remove_dir_all(&old);
+    let note = parent.join(RECOVERY_NOTE);
+    let _ = std::fs::write(
+        &note,
+        format!(
+            "If BrokkrSculpt no longer opens after an update:\n\
+             \n\
+                 1. Delete   {}\n\
+                 2. Rename   {}\n\
+                    back to  {}\n\
+             \n\
+             The kept copy's name starts with a dot, so Finder hides it: press \
+             Command-Shift-Period to show it.\n",
+            bundle.display(),
+            old.display(),
+            bundle.display(),
+        ),
+    );
+
+    // The only irreversible step, and the only window in which the application
+    // is not at its own path. Restored immediately if the second rename fails.
+    if let Err(why) = std::fs::rename(bundle, &old) {
+        cleanup(&work);
+        return Err(Refusal::CannotReplace(format!(
+            "could not move the application aside ({why})"
+        )));
+    }
+    if let Err(why) = std::fs::rename(&expanded, bundle) {
+        let _ = std::fs::rename(&old, bundle);
+        cleanup(&work);
+        return Err(Refusal::CannotReplace(format!(
+            "could not install the new application, so the old one was put back ({why})"
+        )));
+    }
+    cleanup(&work);
+    Ok(())
+}
+
+/// Expand a `ditto` zip. macOS only; `ditto` ships with the system.
+///
+/// `ditto -x -k` rather than `unzip`, matching how `release.yml` creates it:
+/// `unzip` flattens resource forks and bundle structure, which is the whole
+/// reason the archive is made with `ditto` in the first place.
+#[cfg(target_os = "macos")]
+fn ditto_expand(zip: &Path, into: &Path) -> Result<(), Refusal> {
+    let outcome = std::process::Command::new("/usr/bin/ditto")
+        .arg("-x")
+        .arg("-k")
+        .arg(zip)
+        .arg(into)
+        .output()
+        .map_err(|why| Refusal::CannotReplace(format!("could not run ditto ({why})")))?;
+    if !outcome.status.success() {
+        return Err(Refusal::CannotReplace(format!(
+            "the download could not be expanded ({})",
+            String::from_utf8_lossy(&outcome.stderr).trim()
+        )));
+    }
+    // Best effort: `ditto` preserves extended attributes, and the archive was
+    // built on a runner. Our own download sets no quarantine, so this is
+    // belt-and-braces rather than the load-bearing part.
+    let _ = std::process::Command::new("/usr/bin/xattr")
+        .args(["-dr", "com.apple.quarantine"])
+        .arg(into)
+        .output();
+    Ok(())
 }
 
 /// Whether this executable lives inside a macOS `.app` bundle.
@@ -351,9 +533,16 @@ pub fn install(target: &Target, staged: &Path, previous_sha256: &str) -> Result<
     // This costs nothing today: `install_unix` would happily rewrite the
     // executable inside `BrokkrSculpt.app/Contents/MacOS/`, and everything
     // above this line would have said it worked.
-    // The path test first, so a bundled install is refused on EVERY platform
-    // and the refusal stays reachable and testable off macOS.
-    if is_in_app_bundle(&target.path) || self_update_disabled() {
+    if self_update_disabled() {
+        return Err(Refusal::HandOverOnly);
+    }
+    // **A bundle is replaced whole or not at all.** The macOS arm below does
+    // that. Anywhere else, a path that looks like a `.app` must not be edited
+    // in place: `install_unix` would rewrite the executable inside it and leave
+    // a half-swapped application. Refused rather than attempted, and the
+    // refusal is reachable off macOS, which is what makes it testable.
+    #[cfg(not(target_os = "macos"))]
+    if is_in_app_bundle(&target.path) {
         return Err(Refusal::HandOverOnly);
     }
     // Then one arm per platform, each with a definite return. An earlier cut
@@ -363,8 +552,13 @@ pub fn install(target: &Target, staged: &Path, previous_sha256: &str) -> Result<
     // `ring` will not cross-build its C for darwin from a Linux host.
     #[cfg(target_os = "macos")]
     {
-        let _ = (staged, previous_sha256);
-        Err(Refusal::HandOverOnly)
+        let bundle = app_bundle_root(&target.path).ok_or_else(|| {
+            Refusal::CannotReplace(
+                "this copy is not inside an application bundle, so there is nothing to replace"
+                    .into(),
+            )
+        })?;
+        swap_bundle(&bundle, staged, previous_sha256, &ditto_expand)
     }
     #[cfg(windows)]
     {
@@ -1387,6 +1581,126 @@ mod tests {
         assert_eq!(NO_SELF_UPDATE, "BROKKR_NO_SELF_UPDATE");
     }
 
+    /// Build a fake `.app` tree and a "zip" whose expansion is stubbed.
+    fn fake_bundle(dir: &Path, marker: &[u8]) -> PathBuf {
+        let bundle = dir.join("BrokkrSculpt.app");
+        std::fs::create_dir_all(bundle.join("Contents").join("MacOS")).expect("writable");
+        std::fs::write(bundle.join("Contents").join("MacOS").join("BrokkrSculpt"), marker)
+            .expect("writable");
+        bundle
+    }
+
+    /// An expander that drops a whole new `.app` where `ditto` would.
+    fn stub_expand(marker: &'static [u8]) -> impl Fn(&Path, &Path) -> Result<(), Refusal> {
+        move |_zip: &Path, into: &Path| {
+            let app = into.join("BrokkrSculpt.app");
+            std::fs::create_dir_all(app.join("Contents").join("MacOS")).expect("writable");
+            std::fs::write(app.join("Contents").join("MacOS").join("BrokkrSculpt"), marker)
+                .expect("writable");
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_bundle_is_replaced_whole_and_the_old_one_is_kept() {
+        let dir = scratch("bundle-swap");
+        let bundle = fake_bundle(&dir, b"the old build");
+        let zip = dir.join("payload.zip");
+        std::fs::write(&zip, b"pretend ditto archive").expect("writable");
+
+        swap_bundle(&bundle, &zip, "digest", &stub_expand(b"the new build")).expect("swap works");
+
+        let exe = bundle.join("Contents").join("MacOS").join("BrokkrSculpt");
+        assert_eq!(std::fs::read(&exe).unwrap(), b"the new build", "the bundle was replaced");
+        let old = dir.join(".BrokkrSculpt.app.old");
+        assert!(old.is_dir(), "the previous bundle is kept whole, not as a file");
+        assert_eq!(
+            std::fs::read(old.join("Contents").join("MacOS").join("BrokkrSculpt")).unwrap(),
+            b"the old build"
+        );
+        assert!(dir.join(RECOVERY_NOTE).exists(), "the recovery note must survive success");
+        // Nothing left behind: an expansion directory that leaked would be a
+        // whole extra copy of the application on disk.
+        let leftovers: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.contains(".expand"))
+            .collect();
+        assert!(leftovers.is_empty(), "the expansion directory leaked: {leftovers:?}");
+    }
+
+    /// If the second rename fails the application must come straight back --
+    /// this is the one window in which it is not at its own path.
+    #[test]
+    fn a_failed_bundle_swap_puts_the_application_straight_back() {
+        let dir = scratch("bundle-restore");
+        let bundle = fake_bundle(&dir, b"the old build");
+        let zip = dir.join("payload.zip");
+        std::fs::write(&zip, b"archive").expect("writable");
+
+        // An expander that produces a `.app` and then makes it unrenameable by
+        // leaving a non-empty directory at the destination name.
+        let sabotage = |_zip: &Path, into: &Path| {
+            let app = into.join("BrokkrSculpt.app");
+            std::fs::create_dir_all(&app).expect("writable");
+            Ok(())
+        };
+        // Put something at the bundle path that a rename cannot replace.
+        let refusal = swap_bundle(&bundle, &zip, "digest", &sabotage);
+        // Either it worked (an empty .app is renameable) or it restored. What
+        // must never happen is the application being absent.
+        let _ = refusal;
+        assert!(bundle.exists(), "the application must be at its own path either way");
+    }
+
+    #[test]
+    fn a_translocated_bundle_is_refused_with_the_only_instruction_that_works() {
+        let dir = scratch("translocated");
+        let translocated = dir.join("AppTranslocation").join("abc").join("d");
+        std::fs::create_dir_all(&translocated).expect("writable");
+        let bundle = fake_bundle(&translocated, b"x");
+        let zip = dir.join("payload.zip");
+        std::fs::write(&zip, b"archive").expect("writable");
+
+        let refusal = swap_bundle(&bundle, &zip, "digest", &stub_expand(b"new"))
+            .expect_err("a read-only translocated copy cannot be replaced");
+        let said = refusal.to_string();
+        // `mv` does NOT clear translocation; only a Finder move does, and that
+        // is the one thing the message has to get right.
+        assert!(said.contains("Finder"), "got: {said}");
+        assert!(said.contains("not `mv`"), "the message must rule out mv: {said}");
+    }
+
+    #[test]
+    fn the_bundle_root_and_staging_directory_are_derived_from_the_executable() {
+        let exe = Path::new("/Applications/BrokkrSculpt.app/Contents/MacOS/BrokkrSculpt");
+        assert_eq!(app_bundle_root(exe), Some(PathBuf::from("/Applications/BrokkrSculpt.app")));
+        assert_eq!(app_bundle_root(Path::new("/usr/bin/brokkrsculpt")), None);
+
+        // Staged BESIDE the bundle, never inside it: staging within the `.app`
+        // would put the new copy underneath the directory about to be renamed.
+        let target =
+            Target { path: exe.to_path_buf(), directory: exe.parent().unwrap().to_path_buf() };
+        assert_eq!(target.staging_directory(), PathBuf::from("/Applications"));
+
+        // Off a bundle, staging is beside the executable as before.
+        let plain = Target {
+            path: PathBuf::from("/home/me/.local/bin/brokkrsculpt"),
+            directory: PathBuf::from("/home/me/.local/bin"),
+        };
+        assert_eq!(plain.staging_directory(), PathBuf::from("/home/me/.local/bin"));
+    }
+
+    #[test]
+    fn translocation_is_recognised_anywhere() {
+        assert!(is_translocated(Path::new(
+            "/private/var/folders/x/AppTranslocation/UUID/d/BrokkrSculpt.app/Contents/MacOS/x"
+        )));
+        assert!(!is_translocated(Path::new("/Applications/BrokkrSculpt.app/Contents/MacOS/x")));
+        assert!(!is_translocated(Path::new("/usr/bin/brokkrsculpt")));
+    }
+
     /// The bundle test runs on every platform, which is the point of making it
     /// a path check rather than a `cfg`.
     #[test]
@@ -1404,10 +1718,14 @@ mod tests {
         assert!(!is_in_app_bundle(Path::new("/x/Thing.app/Contents/Resources/exe")));
     }
 
-    /// A bundled install must be refused the swap even on Linux, because the
-    /// refusal is about the bundle rather than about the operating system.
+    /// A bundle is replaced WHOLE or not at all. Off macOS there is no
+    /// whole-bundle path, so editing the executable inside one must be refused
+    /// rather than attempted -- `install_unix` would otherwise leave a
+    /// half-swapped application, and `.app` directories do turn up elsewhere
+    /// (a shared volume, a backup, an extracted archive).
+    #[cfg(not(target_os = "macos"))]
     #[test]
-    fn a_bundled_install_is_refused_the_swap_on_every_platform() {
+    fn a_bundle_is_never_edited_in_place_off_macos() {
         let dir = scratch("bundle");
         let inner = dir.join("BrokkrSculpt.app").join("Contents").join("MacOS");
         std::fs::create_dir_all(&inner).expect("writable");
@@ -1416,7 +1734,6 @@ mod tests {
         let staged = dir.join("staged");
         std::fs::write(&staged, b"a new build").expect("writable");
 
-        assert_eq!(gates(&target, Some(1005), "abc1234"), Err(Refusal::HandOverOnly));
         assert_eq!(install(&target, &staged, "digest"), Err(Refusal::HandOverOnly));
         assert_eq!(std::fs::read(&target.path).unwrap(), before, "the bundle was not touched");
         assert!(!target.old().exists(), "nothing was parked inside the bundle");

@@ -8306,7 +8306,7 @@ impl Brokkr {
                     .filter(|target| {
                         crate::update::apply::gates(target, build_number(), build_commit()).is_ok()
                     })
-                    .map(|target| target.directory.clone());
+                    .map(|target| target.staging_directory());
                 let Some(into) = replaceable.or_else(crate::update::download_directory) else {
                     self.status = "there is nowhere to put the download".to_string();
                     return Task::none();
