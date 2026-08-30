@@ -257,7 +257,9 @@ impl fmt::Display for Refusal {
             Self::Unreachable(why) => write!(f, "could not check for updates ({why})"),
             Self::TooLarge { what, cap } => write!(f, "the {what} was larger than {cap} bytes"),
             Self::MalformedSignature(why) => write!(f, "the update signature is malformed ({why})"),
-            Self::NotSignedByUs(why) => write!(f, "the update was not signed by BrokkrSculpt ({why})"),
+            Self::NotSignedByUs(why) => {
+                write!(f, "the update was not signed by BrokkrSculpt ({why})")
+            }
             Self::BadField(why) => write!(f, "the update manifest is malformed ({why})"),
             Self::EpochDisagrees { declared, signed_by } => {
                 write!(f, "the update names key {declared} but was signed by key {signed_by}")
@@ -268,7 +270,9 @@ impl fmt::Display for Refusal {
             Self::EpochBelowFloor { epoch, floor } => {
                 write!(f, "ignoring an update signed by key {epoch}: this install requires {floor}")
             }
-            Self::SeqImplausible(seq) => write!(f, "the update claims an implausible number ({seq})"),
+            Self::SeqImplausible(seq) => {
+                write!(f, "the update claims an implausible number ({seq})")
+            }
             Self::PayloadSizeMismatch { declared, actual } => {
                 write!(f, "the download was {actual} bytes, not the {declared} it should be")
             }
@@ -411,7 +415,9 @@ fn parse_manifest(text: &str, _signed_by: u32) -> Result<Manifest, Refusal> {
     let mut fields: Vec<(&str, &str)> = Vec::new();
     for (key, value) in crate::paths::entries(text) {
         if key.len() > MAX_FIELD_BYTES || value.len() > MAX_FIELD_BYTES {
-            return Err(Refusal::BadField(format!("`{key}` is longer than {MAX_FIELD_BYTES} bytes")));
+            return Err(Refusal::BadField(format!(
+                "`{key}` is longer than {MAX_FIELD_BYTES} bytes"
+            )));
         }
         if fields.iter().any(|(seen, _)| *seen == key) {
             return Err(Refusal::BadField(format!("`{key}` appears twice")));
@@ -440,7 +446,9 @@ fn parse_manifest(text: &str, _signed_by: u32) -> Result<Manifest, Refusal> {
         0 => false,
         1 => true,
         other => {
-            return Err(Refusal::BadField(format!("`requires_reinstall` must be 0 or 1, not {other}")))
+            return Err(Refusal::BadField(format!(
+                "`requires_reinstall` must be 0 or 1, not {other}"
+            )));
         }
     };
 
@@ -455,7 +463,9 @@ fn parse_manifest(text: &str, _signed_by: u32) -> Result<Manifest, Refusal> {
                 None => None,
                 Some(name) => {
                     if !valid_payload_name(name) {
-                        return Err(Refusal::BadField(format!("`{name_key}` is not a plain filename: {name:?}")));
+                        return Err(Refusal::BadField(format!(
+                            "`{name_key}` is not a plain filename: {name:?}"
+                        )));
                     }
                     let size = number(&format!("{slug}.size"))?;
                     let sha_key = format!("{slug}.sha256");
@@ -862,9 +872,7 @@ pub fn outcome_line() -> String {
     };
     let installed = installed_build()
         .map_or_else(|| "never self-updated".to_string(), |n| format!("installed build {n}"));
-    let skipped = settings
-        .skip_build
-        .map_or_else(String::new, |n| format!(", skipping {n}"));
+    let skipped = settings.skip_build.map_or_else(String::new, |n| format!(", skipping {n}"));
     format!("{when}, {installed}{skipped}, {}", freshness_line())
 }
 
@@ -1037,7 +1045,12 @@ fn follow_to_body(
 }
 
 /// GET a small file whole, under an absolute cap.
-fn get_capped(agent: &ureq::Agent, url: &str, cap: u64, what: &'static str) -> Result<Vec<u8>, Refusal> {
+fn get_capped(
+    agent: &ureq::Agent,
+    url: &str,
+    cap: u64,
+    what: &'static str,
+) -> Result<Vec<u8>, Refusal> {
     use std::io::Read;
 
     let mut response = follow_to_body(agent, url, what)?;
@@ -1063,7 +1076,11 @@ fn get_capped(agent: &ureq::Agent, url: &str, cap: u64, what: &'static str) -> R
 /// Returns `Ok(None)` for "nothing to say", which is the common case and is not
 /// an error. Every refusal is named so the caller can decide what is worth a
 /// status line -- most are not.
-pub fn check(running: Option<u64>, settings: &Settings, floor: Floor) -> Result<Option<Offer>, Refusal> {
+pub fn check(
+    running: Option<u64>,
+    settings: &Settings,
+    floor: Floor,
+) -> Result<Option<Offer>, Refusal> {
     // **The updater is structurally inert on anything but a release build.**
     // `None` covers a local build, a source build and a failed stamp; the dirty
     // and unknown checks are free and they are the difference between "inert"
@@ -1103,9 +1120,7 @@ pub fn check(running: Option<u64>, settings: &Settings, floor: Floor) -> Result<
     let known_bad = below_minimum(&manifest, running);
     // The offer is suppressed by `skip_build`; the warning is not. "Not now" is
     // an answer to an offer and not to "the build you are on is broken".
-    if !known_bad
-        && (manifest.build == running || Some(manifest.build) == settings.skip_build)
-    {
+    if !known_bad && (manifest.build == running || Some(manifest.build) == settings.skip_build) {
         return Ok(None);
     }
     Ok(Some(Offer {
@@ -1138,10 +1153,7 @@ pub fn download_directory() -> Option<std::path::PathBuf> {
 /// Returns where the file landed, so the caller can tell the user. A user who
 /// is handed a verified file and not told where it is has been given nothing.
 pub fn download(offer: &Offer, into: &std::path::Path) -> Result<std::path::PathBuf, Refusal> {
-    let payload = offer
-        .payload
-        .as_ref()
-        .ok_or(Refusal::UnsupportedPlatform)?;
+    let payload = offer.payload.as_ref().ok_or(Refusal::UnsupportedPlatform)?;
     // **Which directory is a correctness question, not a tidiness one.**
     // `install` finishes with `rename(staged, target)`, and a cross-filesystem
     // rename degrades to a copy -- which is precisely the operation that fails
@@ -1235,8 +1247,8 @@ mod tests {
     /// exercise the real code path without the production keys' secret halves
     /// existing anywhere a test could reach.
     fn verify_with(keys: &[(u32, &str)], body: &[u8], sig: &[u8]) -> Result<Manifest, Refusal> {
-        let signature = std::str::from_utf8(sig)
-            .map_err(|why| Refusal::MalformedSignature(why.to_string()))?;
+        let signature =
+            std::str::from_utf8(sig).map_err(|why| Refusal::MalformedSignature(why.to_string()))?;
         let decoded = minisign_verify::Signature::decode(signature)
             .map_err(|why| Refusal::MalformedSignature(why.to_string()))?;
         let mut last = String::new();
@@ -1302,8 +1314,9 @@ mod tests {
 
     #[test]
     fn a_legacy_signature_is_refused() {
-        let refusal = verify_with(&[(0, TEST_PUB)], BODY.as_bytes(), SIG_LEGACY_ALGORITHM.as_bytes())
-            .expect_err("allow_legacy is false");
+        let refusal =
+            verify_with(&[(0, TEST_PUB)], BODY.as_bytes(), SIG_LEGACY_ALGORITHM.as_bytes())
+                .expect_err("allow_legacy is false");
         assert!(
             matches!(refusal, Refusal::NotSignedByUs(_) | Refusal::MalformedSignature(_)),
             "got {refusal:?}"
@@ -1325,12 +1338,9 @@ mod tests {
     fn the_epoch_comes_from_the_key_that_verified_not_from_its_position() {
         // The test key is registered at epoch 4, at index 1. Verification must
         // report 4, and the manifest's own `key_epoch = 0` must then disagree.
-        let refusal = verify_with(
-            &[(3, OTHER_PUB), (4, TEST_PUB)],
-            BODY.as_bytes(),
-            SIG.as_bytes(),
-        )
-        .expect_err("the manifest declares epoch 0 but epoch 4 signed it");
+        let refusal =
+            verify_with(&[(3, OTHER_PUB), (4, TEST_PUB)], BODY.as_bytes(), SIG.as_bytes())
+                .expect_err("the manifest declares epoch 0 but epoch 4 signed it");
         assert_eq!(refusal, Refusal::EpochDisagrees { declared: 0, signed_by: 4 });
     }
 
@@ -1338,7 +1348,10 @@ mod tests {
     fn a_duplicated_key_is_refused_rather_than_last_wins() {
         let doubled = format!("{BODY}build = 1019\n");
         let refusal = parse_manifest(&doubled, 0).expect_err("two build lines");
-        assert!(matches!(&refusal, Refusal::BadField(why) if why.contains("twice")), "got {refusal:?}");
+        assert!(
+            matches!(&refusal, Refusal::BadField(why) if why.contains("twice")),
+            "got {refusal:?}"
+        );
     }
 
     #[test]
@@ -1368,7 +1381,10 @@ mod tests {
     fn a_non_numeric_ordinal_is_refused_rather_than_defaulted() {
         let bad = BODY.replace("seq = 7", "seq = banana");
         let refusal = parse_manifest(&bad, 0).expect_err("banana is not a number");
-        assert!(matches!(&refusal, Refusal::BadField(why) if why.contains("seq")), "got {refusal:?}");
+        assert!(
+            matches!(&refusal, Refusal::BadField(why) if why.contains("seq")),
+            "got {refusal:?}"
+        );
     }
 
     #[test]
@@ -1507,7 +1523,10 @@ mod tests {
     fn a_manifest_with_too_many_lines_is_refused() {
         let many = "# comment\n".repeat(MAX_MANIFEST_LINES + 1);
         let refusal = parse_manifest(&many, 0).expect_err("over the line cap");
-        assert!(matches!(&refusal, Refusal::BadField(why) if why.contains("lines")), "got {refusal:?}");
+        assert!(
+            matches!(&refusal, Refusal::BadField(why) if why.contains("lines")),
+            "got {refusal:?}"
+        );
     }
 
     /// The production entry point must refuse the production fixtures too --
@@ -1563,7 +1582,10 @@ mod tests {
         assert_eq!(host_of("https://github.com/a/b"), Some("github.com"));
         assert_eq!(host_of("https://github.com"), Some("github.com"));
         assert_eq!(host_of("https://github.com:443/x"), Some("github.com"));
-        assert_eq!(host_of("https://release-assets.githubusercontent.com/x?se=1"), Some("release-assets.githubusercontent.com"));
+        assert_eq!(
+            host_of("https://release-assets.githubusercontent.com/x?se=1"),
+            Some("release-assets.githubusercontent.com")
+        );
         // Userinfo is the classic trick: the real host here is evil.example.
         // Refused outright rather than parsed, so it can never be mistaken.
         assert_eq!(host_of("https://github.com@evil.example/x"), None);
@@ -1923,15 +1945,33 @@ mod tests {
     /// that matters most.
     #[test]
     fn the_offer_wording_never_claims_a_direction_it_does_not_have() {
-        let up = Offer { build: 1018, running: 1012, known_bad: false, requires_reinstall: false, payload: None };
+        let up = Offer {
+            build: 1018,
+            running: 1012,
+            known_bad: false,
+            requires_reinstall: false,
+            payload: None,
+        };
         assert!(up.headline().contains("1018"));
         assert!(up.headline().starts_with("Build 1018 is out"));
 
         // A rollback offers a LOWER ordinal. It must not read as an upgrade.
-        let down = Offer { build: 1012, running: 1018, known_bad: false, requires_reinstall: false, payload: None };
+        let down = Offer {
+            build: 1012,
+            running: 1018,
+            known_bad: false,
+            requires_reinstall: false,
+            payload: None,
+        };
         assert!(!down.headline().contains("is out"), "got {:?}", down.headline());
 
-        let bad = Offer { build: 1031, running: 1012, known_bad: true, requires_reinstall: false, payload: None };
+        let bad = Offer {
+            build: 1031,
+            running: 1012,
+            known_bad: true,
+            requires_reinstall: false,
+            payload: None,
+        };
         assert!(bad.headline().contains("known problem"));
         assert!(bad.headline().contains("1012") && bad.headline().contains("1031"));
     }

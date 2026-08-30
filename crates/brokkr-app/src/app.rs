@@ -5464,7 +5464,8 @@ impl Brokkr {
         let _ = writeln!(
             out,
             "build: {}",
-            build_number().map_or_else(|| "none (not a release build)".to_string(), |n| n.to_string())
+            build_number()
+                .map_or_else(|| "none (not a release build)".to_string(), |n| n.to_string())
         );
         let _ = writeln!(out, "updates: {}", crate::update::outcome_line());
         // **The OS line, and it is not the same question on each platform.**
@@ -8285,8 +8286,11 @@ impl Brokkr {
                 // that user needs the full archive. Say so and send them to the
                 // page rather than handing them something that will not work.
                 if offer.requires_reinstall || offer.payload.is_none() {
-                    self.status =
-                        format!("build {} needs a full download -- {}", offer.build, crate::articles::RELEASE_PAGE);
+                    self.status = format!(
+                        "build {} needs a full download -- {}",
+                        offer.build,
+                        crate::articles::RELEASE_PAGE
+                    );
                     return Task::none();
                 }
                 // **Beside the binary when we can replace it, in the state
@@ -8310,9 +8314,7 @@ impl Brokkr {
                 self.downloading_update = true;
                 self.status = format!("downloading build {}…", offer.build);
                 return Task::perform(
-                    async move {
-                        crate::update::download(&offer, &into).map_err(|why| why.to_string())
-                    },
+                    async move { crate::update::download(&offer, &into).map_err(|why| why.to_string()) },
                     Message::UpdateDownloaded,
                 );
             }

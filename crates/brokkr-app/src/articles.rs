@@ -528,10 +528,7 @@ mod tests {
         // line without being added here, so "get it" refused itself on every
         // press and said the release page does not lead to TinkerAtlas --
         // which is true, and is why the allowlist has to name it.
-        assert!(
-            may_be_opened(RELEASE_PAGE),
-            "the update button would be refused: {RELEASE_PAGE}"
-        );
+        assert!(may_be_opened(RELEASE_PAGE), "the update button would be refused: {RELEASE_PAGE}");
         // Still refused: the exception is that ONE page, not GitHub.
         assert!(!may_be_opened("https://github.com/MakerViking/brokkrsculpt"));
         assert!(!may_be_opened("https://github.com/someone/else/releases/tag/beta"));

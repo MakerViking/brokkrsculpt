@@ -119,19 +119,19 @@ pub fn gates(target: &Target, build: Option<u64>, commit: &str) -> Result<(), Re
         return Err(Refusal::HandOverOnly);
     }
     {
-    // **Inert unless this is a stamped release build.** Any one of these alone
-    // would nearly do; together they are the difference between "inert" and
-    // "one keypress away from overwriting the developer's own binary with a CI
-    // artefact".
-    if build.is_none() || commit == "unknown" || commit.ends_with("-dirty") {
-        return Err(Refusal::NotAReleaseBuild);
-    }
-    // A binary running out of a build directory is a developer's, whatever its
-    // stamp says.
-    if target.path.components().any(|part| part.as_os_str() == "target") {
-        return Err(Refusal::NotAReleaseBuild);
-    }
-    directory_is_safe(&target.directory)
+        // **Inert unless this is a stamped release build.** Any one of these alone
+        // would nearly do; together they are the difference between "inert" and
+        // "one keypress away from overwriting the developer's own binary with a CI
+        // artefact".
+        if build.is_none() || commit == "unknown" || commit.ends_with("-dirty") {
+            return Err(Refusal::NotAReleaseBuild);
+        }
+        // A binary running out of a build directory is a developer's, whatever its
+        // stamp says.
+        if target.path.components().any(|part| part.as_os_str() == "target") {
+            return Err(Refusal::NotAReleaseBuild);
+        }
+        directory_is_safe(&target.directory)
     }
 }
 
@@ -594,8 +594,9 @@ pub fn revert(target: &Target, expected_sha256: &str) -> Result<(), Refusal> {
             "the kept copy is not the build it should be, so it was left alone".into(),
         ));
     }
-    std::fs::rename(&old, &target.path)
-        .map_err(|why| Refusal::CannotReplace(format!("could not put the old build back ({why})")))?;
+    std::fs::rename(&old, &target.path).map_err(|why| {
+        Refusal::CannotReplace(format!("could not put the old build back ({why})"))
+    })?;
     // The note described a recovery that has now happened.
     let _ = std::fs::remove_file(target.recovery_note());
     Ok(())
@@ -604,14 +605,15 @@ pub fn revert(target: &Target, expected_sha256: &str) -> Result<(), Refusal> {
 /// SHA-256 of a file on disk.
 pub fn sha256_of(path: &Path) -> Result<String, Refusal> {
     use std::io::Read;
-    let mut file = std::fs::File::open(path)
-        .map_err(|why| Refusal::CannotReplace(format!("could not read {} ({why})", path.display())))?;
+    let mut file = std::fs::File::open(path).map_err(|why| {
+        Refusal::CannotReplace(format!("could not read {} ({why})", path.display()))
+    })?;
     let mut context = ring::digest::Context::new(&ring::digest::SHA256);
     let mut buffer = [0u8; 64 * 1024];
     loop {
-        let read = file
-            .read(&mut buffer)
-            .map_err(|why| Refusal::CannotReplace(format!("could not read {} ({why})", path.display())))?;
+        let read = file.read(&mut buffer).map_err(|why| {
+            Refusal::CannotReplace(format!("could not read {} ({why})", path.display()))
+        })?;
         if read == 0 {
             break;
         }
@@ -696,8 +698,9 @@ pub fn finish_staging(file: &std::fs::File) -> Result<(), Refusal> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        file.set_permissions(std::fs::Permissions::from_mode(0o755))
-            .map_err(|why| Refusal::CannotReplace(format!("could not make it executable ({why})")))?;
+        file.set_permissions(std::fs::Permissions::from_mode(0o755)).map_err(|why| {
+            Refusal::CannotReplace(format!("could not make it executable ({why})"))
+        })?;
     }
     file.sync_all()
         .map_err(|why| Refusal::CannotReplace(format!("could not flush the update ({why})")))
@@ -713,7 +716,8 @@ pub fn finish_staging(file: &std::fs::File) -> Result<(), Refusal> {
 /// wrong means one install reverting itself on the other's evidence. A filename
 /// makes the collision impossible rather than merely checked.
 pub fn marker_path(target: &Target) -> Option<PathBuf> {
-    let digest = ring::digest::digest(&ring::digest::SHA256, target.path.as_os_str().as_encoded_bytes());
+    let digest =
+        ring::digest::digest(&ring::digest::SHA256, target.path.as_os_str().as_encoded_bytes());
     let key: String = digest.as_ref()[..8].iter().map(|byte| format!("{byte:02x}")).collect();
     crate::paths::state_file(&format!("update-pending-{key}"))
 }
@@ -791,8 +795,11 @@ mod tests {
     use super::*;
 
     fn scratch(name: &str) -> PathBuf {
-        let path = std::env::temp_dir()
-            .join(format!("brokkr-apply-{name}-{}-{:?}", std::process::id(), std::thread::current().id()));
+        let path = std::env::temp_dir().join(format!(
+            "brokkr-apply-{name}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
         let _ = std::fs::remove_dir_all(&path);
         std::fs::create_dir_all(&path).expect("temp is writable");
         path
@@ -851,7 +858,8 @@ mod tests {
         for (n, bytes) in [(1u8, &b"build two"[..]), (2, &b"build three"[..])] {
             let staged = dir.join(format!("staged{n}"));
             std::fs::write(&staged, bytes).expect("writable");
-            install(&target, &staged, "x").unwrap_or_else(|why| panic!("install {n} failed: {why:?}"));
+            install(&target, &staged, "x")
+                .unwrap_or_else(|why| panic!("install {n} failed: {why:?}"));
             assert_eq!(std::fs::read(&target.path).unwrap(), bytes);
         }
         // `.old` is now build two, not build one: it tracks the build most
@@ -966,8 +974,8 @@ mod tests {
         for mode in [0o777, 0o775, 0o757] {
             std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(mode))
                 .expect("chmod works");
-            let refusal = gates(&target, Some(1005), "abc1234")
-                .expect_err("mode {mode:o} must be refused");
+            let refusal =
+                gates(&target, Some(1005), "abc1234").expect_err("mode {mode:o} must be refused");
             assert!(matches!(refusal, Refusal::CannotReplace(_)), "mode {mode:o} gave {refusal:?}");
         }
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).expect("chmod");
@@ -987,7 +995,10 @@ mod tests {
     /// collision is impossible rather than merely checked.
     #[test]
     fn two_installs_get_different_marker_names() {
-        let a = Target { path: PathBuf::from("/usr/bin/brokkrsculpt"), directory: PathBuf::from("/usr/bin") };
+        let a = Target {
+            path: PathBuf::from("/usr/bin/brokkrsculpt"),
+            directory: PathBuf::from("/usr/bin"),
+        };
         let b = Target {
             path: PathBuf::from("/home/someone/.local/bin/brokkrsculpt"),
             directory: PathBuf::from("/home/someone/.local/bin"),

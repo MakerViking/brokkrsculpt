@@ -774,8 +774,8 @@ impl Brokkr {
                 } else {
                     format!("{} — get it", offer.headline())
                 })
-                    .size(theme::TEXT_SIZE_SMALL)
-                    .color(theme::ACCENT),
+                .size(theme::TEXT_SIZE_SMALL)
+                .color(theme::ACCENT),
             )
             .padding(0)
             .style(theme::tool_button)
