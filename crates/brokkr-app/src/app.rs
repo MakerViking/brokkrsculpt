@@ -2148,6 +2148,11 @@ impl Brokkr {
             self.status = why.to_string();
             return Task::none();
         }
+        // **The floor rises here and nowhere else.** Only a completed apply may
+        // move it, so merely being shown a manifest cannot. Written after the
+        // swap rather than before: a floor raised for an update that then failed
+        // would refuse the very manifest that could fix it.
+        crate::update::record_applied(offer.seq, offer.key_epoch, offer.build);
         // The marker the next launch reads. `resume` is the channel that
         // survives the restart -- argv would not, because a rollback can spawn
         // an OLDER binary that has never heard of the flag.

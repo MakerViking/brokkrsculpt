@@ -664,6 +664,11 @@ pub struct Offer {
     /// ordinary outcome: the offer is still worth showing, it just cannot be
     /// acted on here.
     pub payload: Option<Payload>,
+    /// The manifest's own counter, carried so a successful apply can raise the
+    /// anti-rollback floor to it. **Manifest space, never build space.**
+    pub seq: u64,
+    /// Which key signed the manifest this offer came from, for the same reason.
+    pub key_epoch: u32,
 }
 
 impl Offer {
@@ -847,6 +852,43 @@ fn record_state(previous: Option<&str>, installed: Option<u64>, checked: Option<
         text.push_str(&format!("installed_build = {installed}\n"));
     }
     if let Some(checked) = checked {
+        text.push_str(&format!("last_check = {checked}\n"));
+    }
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::write(path, text);
+}
+
+/// Record a successful apply: raise the floor, and remember what was installed.
+///
+/// **The floor advances here and nowhere else.** Not on merely seeing an offer,
+/// which is what stops someone who can show a client a manifest from moving its
+/// floor by doing so — and not never, which is what an earlier revision did.
+/// The first real update on this machine installed correctly and left
+/// `floor_seq = 0`, so the install would have accepted an older manifest
+/// afterwards. Nothing in the suite caught it, because every test drove the
+/// pure functions rather than the apply path.
+///
+/// `installed_build` is written in the same breath because the crash-driven
+/// revert offer compares the running ordinal against it, and an absent value
+/// silently means "never offer".
+pub fn record_applied(seq: u64, key_epoch: u32, build: u64) {
+    let Some(path) = crate::paths::state_file("update.state") else {
+        return;
+    };
+    let existing = std::fs::read_to_string(&path).unwrap_or_default();
+    let keep = |name: &str| {
+        crate::paths::entries(&existing)
+            .find(|(key, _)| *key == name)
+            .map(|(_, value)| value.to_string())
+    };
+    let mut text =
+        format!("floor_epoch = {key_epoch}\nfloor_seq = {seq}\ninstalled_build = {build}\n");
+    if let Some(previous) = keep("previous_sha256") {
+        text.push_str(&format!("previous_sha256 = {previous}\n"));
+    }
+    if let Some(checked) = keep("last_check") {
         text.push_str(&format!("last_check = {checked}\n"));
     }
     if let Some(parent) = path.parent() {
@@ -1138,6 +1180,8 @@ pub fn check(
         known_bad,
         requires_reinstall: manifest.requires_reinstall,
         payload: manifest.payload,
+        seq: manifest.seq,
+        key_epoch: manifest.key_epoch,
     }))
 }
 
@@ -1728,6 +1772,8 @@ mod tests {
             known_bad: false,
             requires_reinstall: false,
             payload: None,
+            seq: 1,
+            key_epoch: 0,
         };
         // The directory is irrelevant: an offer with no payload must refuse
         // before a socket is opened or a directory is created.
@@ -1903,6 +1949,36 @@ mod tests {
         );
     }
 
+    /// **The floor must rise on a successful apply, and only then.**
+    ///
+    /// Found by running the first real update on this machine: it installed
+    /// correctly and left `floor_seq = 0`, so the install would have accepted an
+    /// older manifest afterwards. Nothing in the suite caught it because every
+    /// other test drives the pure functions rather than the apply path — which
+    /// is exactly why the hop was worth doing by hand.
+    #[test]
+    fn a_successful_apply_raises_the_floor_and_names_what_it_installed() {
+        // The state file is per-install and this test must not write the real
+        // one, so the shape is asserted through the parsers that read it.
+        let after =
+            "floor_epoch = 0\nfloor_seq = 7\ninstalled_build = 1019\nprevious_sha256 = abc\n";
+        assert_eq!(floor_from(after), Floor { epoch: 0, seq: 7 }, "the floor must be the seq");
+        assert_eq!(
+            previous_sha256_from(after).as_deref(),
+            Some("abc"),
+            "the revert digest survives"
+        );
+
+        // And a manifest at or below that floor is then refused, which is the
+        // whole point of raising it.
+        let manifest = verify_with(&[(0, TEST_PUB)], BODY.as_bytes(), SIG.as_bytes()).unwrap();
+        assert_eq!(manifest.seq, 7);
+        assert_eq!(
+            admissible(&manifest, floor_from(after)),
+            Err(Refusal::BelowFloor { seq: 7, floor: 7 })
+        );
+    }
+
     /// CI runs `--version | grep -qx "build = $BROKKR_BUILD"`. If this shape
     /// changes, the release pipeline stops verifying the stamp and starts
     /// failing every build -- or worse, keeps passing while checking nothing.
@@ -1960,6 +2036,8 @@ mod tests {
             known_bad: false,
             requires_reinstall: false,
             payload: None,
+            seq: 1,
+            key_epoch: 0,
         };
         assert!(up.headline().contains("1018"));
         assert!(up.headline().starts_with("Build 1018 is out"));
@@ -1971,6 +2049,8 @@ mod tests {
             known_bad: false,
             requires_reinstall: false,
             payload: None,
+            seq: 1,
+            key_epoch: 0,
         };
         assert!(!down.headline().contains("is out"), "got {:?}", down.headline());
 
@@ -1980,6 +2060,8 @@ mod tests {
             known_bad: true,
             requires_reinstall: false,
             payload: None,
+            seq: 1,
+            key_epoch: 0,
         };
         assert!(bad.headline().contains("known problem"));
         assert!(bad.headline().contains("1012") && bad.headline().contains("1031"));
