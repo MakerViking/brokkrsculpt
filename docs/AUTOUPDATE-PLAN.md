@@ -31,8 +31,8 @@ Verified by running it, not by reading it. **667 tests pass, 69 of them the upda
 
 Four items, none of which can be closed by writing more:
 
-1. **The production keys have never signed anything this code verified.** One command, prepared at `/tmp/brokkr-keyproof`. Needs a passphrase that must not pass through an agent transcript. This is the highest-consequence unverified item in the project: a mistranscribed key means every install refuses every release for ever, through a channel the fix would have to travel down.
-2. **The standby key is still on the build machine and has never been restore-drilled.** Decision 3. A printed key that has never been read back is a belief about a piece of paper.
+1. ~~The production keys have never signed anything this code verified.~~ **Done 2026-08-30.** Both secret halves signed a manifest, and both are checked through `verify_manifest` against `TRUSTED_KEYS` as compiled, by a permanent test. A future edit to that list now fails in CI rather than in the field.
+2. **The standby is backed up and drilled — from one location.** Its restored copy signed a manifest the compiled-in epoch 1 key accepted, which proves the bytes and that the passphrase reproduces. Copies exist in more than one place; the others are **not yet drilled**, and until they are, the original stays on the build machine. Deleting the only proven copy while the rest are unverified is how a recovery key is lost for good. Locations and the drill are in `handoff.md`.
 3. **Nothing has been published**, so the fetch path has never run against the real endpoint, and `sign-release.sh` has never run at all. Publishing is outward-facing.
 4. **Phase 4 does not ship until a person with a Windows desktop has taken the hop once**, and Phase 5 needs Apple enrolment. Both are gates this document wrote for itself, deliberately, and neither is a matter of effort.
 
