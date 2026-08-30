@@ -1820,6 +1820,58 @@ mod tests {
         assert!(!emitted.contains('#'), "a `#` in a value would break the number parse");
     }
 
+    /// **The production keys, proven against real signatures they made.**
+    ///
+    /// Every other test here uses a throwaway key, which proves the algorithm
+    /// and nothing about the two constants at the top of this file. If either
+    /// public key were mistranscribed -- one character, in a base64 blob nobody
+    /// reads -- everything would still compile, every other test would still
+    /// pass, and every installed copy would refuse every release for ever,
+    /// through the exact channel the fix would have to travel down. It is the
+    /// one failure in this design with no recovery path.
+    ///
+    /// So: two manifests signed on 2026-08-30 with the real secret halves, and
+    /// checked here through `verify_manifest` -- the production entry point,
+    /// against `TRUSTED_KEYS` as compiled. `minisign -V` passing proves only
+    /// that the `.pub` FILES match; this proves the binary does.
+    ///
+    /// The epoch 1 signature additionally comes from the RESTORED backup rather
+    /// than the original, so this doubles as the standby's restore drill.
+    #[test]
+    fn the_compiled_in_keys_accept_manifests_the_real_secret_halves_signed() {
+        let body = |epoch: u32| {
+            format!(
+                "seq = 1\nbuild = 1005\nkey_epoch = {epoch}\nminimum_build = 0\n\
+                 requires_reinstall = 0\n\
+                 linux-x86_64.name = brokkrsculpt-1005-linux-x86_64\n\
+                 linux-x86_64.size = 33543336\n\
+                 linux-x86_64.sha256 = {}\n",
+                "1".repeat(64)
+            )
+        };
+        const SIG_EPOCH0: &str = "untrusted comment: signature from minisign secret key\nRURMzxH8+lnQtvUIc7Bh4jWYiMPTYr9tr/fpfjQz9dPbM421l4QwQtWR+RRLuxaWlqarg9qAJveooz3lBWf5Xd5jNUkSw8NAoA4=\ntrusted comment: timestamp:1788053461\tfile:keyproof.conf\thashed\nwStbyW/pP1tGX6E9xY5oSNqymfRt7Mc375bEfKyCOpyCXsrGuUlNnaIF7x3cYpjyVBbjzkS8mxBcJJaKfevGAg==\n";
+        const SIG_EPOCH1: &str = "untrusted comment: signature from minisign secret key\nRUT9wJerF4yzvU3v29yVaSGkhBqRG5AZz5lNR7xGiHTqupiC6MbDbFzhw5JpB42OAFA6cE9edx9iZI20x0R+2a45Gqf0d+jfwQw=\ntrusted comment: timestamp:1788053470\tfile:keyproof-epoch1.conf\thashed\nUJbBsg1CVeyslgN1uvl/ZIfd1qq1CcuM1qRog+PnQPf2fsbYVsapNmBNhtRAsxgUkC6fDoNV2zC7JpEXrrSKAQ==\n";
+
+        // The live key.
+        let live = verify_manifest(body(0).as_bytes(), SIG_EPOCH0.as_bytes())
+            .expect("TRUSTED_KEYS[0] must accept what the epoch 0 secret half signed");
+        assert_eq!(live.key_epoch, 0);
+        assert_eq!(live.build, 1005);
+
+        // The standby, signed by the copy restored from backup.
+        let standby = verify_manifest(body(1).as_bytes(), SIG_EPOCH1.as_bytes())
+            .expect("TRUSTED_KEYS[1] must accept what the restored epoch 1 key signed");
+        assert_eq!(standby.key_epoch, 1);
+
+        // A signature does not travel between manifests: the epoch 1 signature
+        // over the epoch 0 body must fail, or the anti-rollback floor could be
+        // fed a body its signature never covered.
+        assert!(
+            verify_manifest(body(0).as_bytes(), SIG_EPOCH1.as_bytes()).is_err(),
+            "a signature must not verify against a body it did not sign"
+        );
+    }
+
     /// CI runs `--version | grep -qx "build = $BROKKR_BUILD"`. If this shape
     /// changes, the release pipeline stops verifying the stamp and starts
     /// failing every build -- or worse, keeps passing while checking nothing.
