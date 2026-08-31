@@ -1073,7 +1073,56 @@ pub fn write_marker(path: &Path, pending: &Pending) -> std::io::Result<()> {
 mod tests {
     use super::*;
 
-    fn scratch(name: &str) -> PathBuf {
+    /// A scratch directory that removes itself when the test ends.
+    ///
+    /// **Clearing on entry is not enough, and that is the whole reason this
+    /// type exists.** The name carries the process id and the thread id, which
+    /// it must -- the suite runs in parallel, and two threads sharing a
+    /// directory would delete each other's fixtures. But that also means a
+    /// later run never revisits an earlier run's names, so entry-clearing only
+    /// ever protects against a rerun that lands on the same pid AND the same
+    /// thread id. In practice nothing was ever cleaned: 1353 directories and
+    /// 11 MB had built up in `/tmp` by 2026-08-31 before anyone looked. No test
+    /// failed, which is why it survived so long.
+    ///
+    /// Entry-clearing stays as well, for the case Drop cannot cover: a hard
+    /// kill mid-test, where no destructor runs.
+    ///
+    /// `Deref` to `Path` so the call sites read exactly as they did when this
+    /// was a bare `PathBuf` -- `dir.join(..)` and `&dir` both still work.
+    ///
+    /// A test that makes its directory unreadable must put the mode back
+    /// itself; removal needs write permission on the directory to clear its
+    /// contents, and Drop deliberately does not fight for it. See
+    /// `a_read_only_directory_is_refused_with_something_a_user_can_act_on`,
+    /// which restores before asserting for this reason.
+    struct Scratch(PathBuf);
+
+    impl std::ops::Deref for Scratch {
+        type Target = Path;
+
+        fn deref(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    /// `AsRef` as well as `Deref`, because deref coercion does not reach a
+    /// generic `impl AsRef<Path>` parameter -- `std::fs::set_permissions(&dir,
+    /// ..)` needs this one, `dir.join(..)` needs the other. Both, so no call
+    /// site has to know which kind of function it is calling.
+    impl AsRef<Path> for Scratch {
+        fn as_ref(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn scratch(name: &str) -> Scratch {
         let path = std::env::temp_dir().join(format!(
             "brokkr-apply-{name}-{}-{:?}",
             std::process::id(),
@@ -1081,7 +1130,20 @@ mod tests {
         ));
         let _ = std::fs::remove_dir_all(&path);
         std::fs::create_dir_all(&path).expect("temp is writable");
-        path
+        Scratch(path)
+    }
+
+    /// The cleanup itself, pinned. Without this the leak is invisible again the
+    /// moment someone returns a bare `PathBuf` from `scratch`.
+    #[test]
+    fn a_scratch_directory_removes_itself_when_the_test_that_made_it_ends() {
+        let path = {
+            let dir = scratch("selfclean");
+            std::fs::write(dir.join("a file"), b"contents").expect("writable");
+            assert!(dir.exists(), "it must exist while it is in scope");
+            dir.to_path_buf()
+        };
+        assert!(!path.exists(), "{} must be gone once dropped", path.display());
     }
 
     fn fake_target(dir: &Path) -> Target {
