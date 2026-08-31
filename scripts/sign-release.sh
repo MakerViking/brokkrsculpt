@@ -177,10 +177,20 @@ manifest="$work/latest.conf"
 found=0
 for slug in linux-x86_64 windows-x86_64 macos-arm64; do
     case "$slug" in
-        linux-x86_64)   name="brokkrsculpt-${BUILD}-linux-x86_64" ;;
-        windows-x86_64) name="brokkrsculpt-${BUILD}-windows-x86_64.exe" ;;
-        macos-arm64)    name="brokkrsculpt-${BUILD}-macos-arm64.zip" ;;
+        linux-x86_64)   suffix="linux-x86_64" ;;
+        windows-x86_64) suffix="windows-x86_64.exe" ;;
+        macos-arm64)    suffix="macos-arm64.zip" ;;
     esac
+    # **Two spellings, and the old one is not dead weight.** Payloads were
+    # renamed `brokkrsculpt-<build>-…` -> `update-<build>-…` on 2026-08-31 so
+    # they sort below the human downloads on the release page. Builds published
+    # before that keep their old names, and signing a manifest that names an
+    # OLD build is exactly what a rollback is -- so dropping the legacy spelling
+    # here would disable rollback for every build still in the release. The
+    # manifest records whichever name was actually found, because the client
+    # joins that name to its compiled-in prefix verbatim.
+    name="update-${BUILD}-${suffix}"
+    legacy="brokkrsculpt-${BUILD}-${suffix}"
 
     # An absent payload means "no update for this platform", not an error: the
     # release matrix has fail-fast off precisely so a two-platform release is
@@ -188,9 +198,15 @@ for slug in linux-x86_64 windows-x86_64 macos-arm64; do
     # the same way.
     if ! gh release download "$TAG" --repo "$REPO" --pattern "$name" \
             --dir "$work" >/dev/null 2>&1; then
-        echo "no $name in the release -- omitting $slug"
-        MISSING="${MISSING:-} $slug"
-        continue
+        if gh release download "$TAG" --repo "$REPO" --pattern "$legacy" \
+                --dir "$work" >/dev/null 2>&1; then
+            echo "found $legacy (pre-rename build)"
+            name="$legacy"
+        else
+            echo "no $name in the release -- omitting $slug"
+            MISSING="${MISSING:-} $slug"
+            continue
+        fi
     fi
 
     file="$work/$name"

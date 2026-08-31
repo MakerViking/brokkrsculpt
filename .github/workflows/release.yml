@@ -65,7 +65,22 @@ jobs:
       matrix:
         include:
           - os: ubuntu-latest
-            asset: brokkrsculpt-linux-x86_64.tar.gz
+            # **Capitalised, and deliberately NOT starting with `brokkrsculpt`.**
+            # GitHub lists release assets alphabetically, so while these were
+            # named `brokkrsculpt-linux-x86_64.tar.gz` they sorted BELOW every
+            # `brokkrsculpt-<ordinal>-…` payload -- 33 near-identical names in
+            # front of the three a person actually wants. No name beginning
+            # `brokkrsculpt` can win that sort, because the comparison reaches
+            # `1` against `l`/`w`/`m` and the digit sorts first. Hence a
+            # different first letter for the human downloads and `update-` for
+            # the payloads: `B` < `l` < `u` under both a case-sensitive and a
+            # case-insensitive sort, so the ordering holds either way.
+            #
+            # This is not cosmetic. A Windows tester on 2026-08-31 downloaded a
+            # bare payload `.exe` instead of this archive and ran it out of his
+            # Downloads folder, which is why his install directory was somewhere
+            # the updater had to reason about at all.
+            asset: BrokkrSculpt-Linux-x86_64.tar.gz
             # The raw, build-stamped executable the updater downloads. Named
             # separately from `asset` because the two have different jobs: this
             # one is named by the signed manifest and must never be replaced in
@@ -73,10 +88,10 @@ jobs:
             # clobbered on every push.
             slug: linux-x86_64
           - os: windows-latest
-            asset: brokkrsculpt-windows-x86_64.zip
+            asset: BrokkrSculpt-Windows-x86_64.zip
             slug: windows-x86_64
           - os: macos-latest
-            asset: brokkrsculpt-macos-arm64.zip
+            asset: BrokkrSculpt-macOS-arm64.zip
             slug: macos-arm64
     runs-on: ${{ matrix.os }}
     # **This job compiles the entire dependency tree, with build scripts and
@@ -207,10 +222,17 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p payload
+          # **`update-`, so these sort below the human downloads.** The name is
+          # carried in the signed manifest as DATA -- the client joins it to a
+          # compiled-in URL prefix -- so renaming the scheme is safe for copies
+          # already installed: a rollback manifest naming a pre-rename build
+          # still resolves, because those payloads keep their old names and stay
+          # in the release until the sweep ages them out. `sign-release.sh`
+          # therefore looks for both spellings, and the sweep counts both.
           case "${{ matrix.slug }}" in
-            linux-x86_64)   cp target/release/brokkrsculpt "payload/brokkrsculpt-${BROKKR_BUILD:?}-linux-x86_64" ;;
-            windows-x86_64) cp target/release/brokkrsculpt.exe "payload/brokkrsculpt-${BROKKR_BUILD:?}-windows-x86_64.exe" ;;
-            macos-arm64)    cp "${{ matrix.asset }}" "payload/brokkrsculpt-${BROKKR_BUILD:?}-macos-arm64.zip" ;;
+            linux-x86_64)   cp target/release/brokkrsculpt "payload/update-${BROKKR_BUILD:?}-linux-x86_64" ;;
+            windows-x86_64) cp target/release/brokkrsculpt.exe "payload/update-${BROKKR_BUILD:?}-windows-x86_64.exe" ;;
+            macos-arm64)    cp "${{ matrix.asset }}" "payload/update-${BROKKR_BUILD:?}-macos-arm64.zip" ;;
           esac
           ls -l payload
 
@@ -299,6 +321,18 @@ jobs:
           echo "payloads:"; echo "${payloads:-none}"
 
           cat > notes.md <<'NOTES'
+          ## Download
+
+          | | |
+          |---|---|
+          | **Windows** (64-bit) | [BrokkrSculpt-Windows-x86_64.zip](https://github.com/MakerViking/brokkrsculpt/releases/download/beta/BrokkrSculpt-Windows-x86_64.zip) |
+          | **macOS** (Apple silicon) | [BrokkrSculpt-macOS-arm64.zip](https://github.com/MakerViking/brokkrsculpt/releases/download/beta/BrokkrSculpt-macOS-arm64.zip) |
+          | **Linux** (64-bit) | [BrokkrSculpt-Linux-x86_64.tar.gz](https://github.com/MakerViking/brokkrsculpt/releases/download/beta/BrokkrSculpt-Linux-x86_64.tar.gz) |
+
+          Those three links always point at the newest build. Everything in the
+          asset list below named `update-…` is for the built-in updater to
+          fetch; you never need to download one by hand.
+
           **An open beta, and unsigned.** Both matter to what you are about to see.
 
           ## The dialog your OS will show you
@@ -398,6 +432,22 @@ jobs:
           # shellcheck disable=SC2086
           gh release upload beta $files --repo "$R" --clobber
 
+          # **One-time migration, 2026-08-31: drop the pre-rename human
+          # archives.** They were `brokkrsculpt-<platform>.…` and are now
+          # `BrokkrSculpt-<Platform>.…`. Nothing clobbers the old names any
+          # more, so left alone they would sit in the release for ever frozen at
+          # whatever build was current when the rename landed -- a download link
+          # that silently stops advancing is worse than one that 404s. Removed
+          # AFTER the new names are uploaded, so there is no moment with no
+          # archive to download. Safe to delete this block once it has run.
+          for stale in brokkrsculpt-linux-x86_64.tar.gz \
+                       brokkrsculpt-windows-x86_64.zip \
+                       brokkrsculpt-macos-arm64.zip; do
+            if gh release delete-asset beta "$stale" --repo "$R" --yes 2>/dev/null; then
+              echo "removed the pre-rename archive $stale"
+            fi
+          done
+
           # **Payloads are uploaded WITHOUT `--clobber`, deliberately.** Their
           # names carry the build ordinal, so a name collision means this run is
           # republishing an ordinal that already exists -- which is a bug worth
@@ -435,27 +485,38 @@ jobs:
           # Retention is the only reason rollback is possible: mechanism 2 for
           # stopping a bad build is "publish seq+1 naming the last good build",
           # and that needs the last good build's payload to still be there.
-          # Twenty sets, settled 2026-08-30 -- GitHub caps neither release size
-          # nor bandwidth, the binding limit is 1000 assets per release, and the
-          # measured cadence is four releases in an afternoon, so three sets
-          # would have been less than one afternoon of rollback range.
+          #
+          # **Five sets, cut from twenty on 2026-08-31.** Twenty was sized as
+          # though rollback were the normal repair, and it is not: pushing a fix
+          # forward reaches everyone and needs no retention at all. Rollback is
+          # only for "the new build is too broken to use and I cannot fix it
+          # right now", and there you go back one build, not twenty. Five keeps
+          # a full day of range at the measured cadence of four releases in an
+          # afternoon, and the failure mode if it is ever not enough is not data
+          # loss -- an older build can be rebuilt from its commit and published
+          # under a new ordinal. What twenty cost was real: sixty payloads in
+          # front of the three files a person came to download.
           #
           # The keep list is read back out of the PUBLISHED manifest rather than
           # computed here, so a sweep can never delete the payload the signed
           # manifest points at -- the one deletion that would break every
-          # client at once. Signing happens on Thomas's machine, so at this
+          # client at once. Signing is a LATER STEP of this same run, so at this
           # point `latest.conf` still names the PREVIOUS build; that is exactly
           # why it must be protected explicitly rather than assumed old.
-          KEEP=20
+          KEEP=5
           live_build=$(gh release download beta --repo "$R" --pattern latest.conf \
                          --output - 2>/dev/null | sed -n 's/^build *= *//p' | head -1 || true)
           echo "live manifest names build: ${live_build:-none}"
 
-          # Every build-stamped payload, newest ordinal first.
+          # Every build-stamped payload, newest ordinal first. **Both spellings**
+          # -- `update-<n>-…` is what this workflow publishes now, and
+          # `brokkrsculpt-<n>-…` is what it published before 2026-08-31. Counting
+          # only one of them would either retain the old ones for ever or sweep
+          # the new ones on the wrong schedule.
           mapfile -t ordinals < <(
             gh release view beta --repo "$R" --json assets \
               --jq '.assets[].name' 2>/dev/null \
-            | sed -n 's/^brokkrsculpt-\([0-9]\{1,\}\)-.*$/\1/p' | sort -rnu
+            | sed -nE 's/^(update|brokkrsculpt)-([0-9]+)-.*$/\2/p' | sort -rnu
           )
           echo "retained ordinals: ${ordinals[*]:-none}"
 
@@ -468,8 +529,11 @@ jobs:
               echo "keeping $ordinal: the live manifest names it"
               continue
             fi
+            # Both spellings again, for the same reason as the scan above. The
+            # human archives are safe from this: they are `BrokkrSculpt-…`, and
+            # neither prefix matches them at any case.
             for name in $(gh release view beta --repo "$R" --json assets \
-                            --jq ".assets[].name | select(startswith(\"brokkrsculpt-$ordinal-\"))"); do
+                            --jq ".assets[].name | select(startswith(\"update-$ordinal-\") or startswith(\"brokkrsculpt-$ordinal-\"))"); do
               echo "sweeping $name"
               gh release delete-asset beta "$name" --repo "$R" --yes
               dropped=$((dropped + 1))
@@ -479,22 +543,24 @@ jobs:
           # reads as "we kept everything" when someone later needs a rollback.
           echo "swept $dropped asset(s); keeping the newest $KEEP build(s)"
 
-          # **Signing happens on Thomas's machine, so a release is not live
-          # until he signs it.** That is deliberate -- nothing spreads on
-          # autopilot -- but it is also a step that will eventually be
-          # forgotten, and the symptom is silence: clients keep being handed an
-          # older manifest and nothing anywhere says why. So say it here, where
-          # someone reading the run will see it.
+          # **Signing is the NEXT STEP of this run, not a human errand.** It
+          # moved into CI on 2026-08-31. So at this point `latest.conf` still
+          # names the previous build and that is normal -- what this report
+          # catches is the signing step having failed or been skipped, whose
+          # symptom is otherwise silence: clients keep being handed an older
+          # manifest and nothing anywhere says why. Read the numbers below
+          # against the "Sign the manifest" step that follows, not against a
+          # command anyone is expected to run by hand.
           live_seq=$(gh release download beta --repo "$R" --pattern latest.conf \
                        --output - 2>/dev/null | sed -n 's/^seq *= *//p' | head -1 || true)
           if [ -z "${live_build:-}" ]; then
-            echo "::warning::no signed manifest is published yet, so no client will see build ${BROKKR_BUILD}. Run scripts/sign-release.sh."
+            echo "::warning::no signed manifest is published yet, so no client will see build ${BROKKR_BUILD} unless the signing step below succeeds."
           elif [ "${live_build}" != "${BROKKR_BUILD}" ]; then
             behind=$(( BROKKR_BUILD - live_build ))
             if [ "$behind" -gt 1 ]; then
-              echo "::warning::the signed manifest still names build ${live_build} (seq ${live_seq:-?}) while ${BROKKR_BUILD} is published -- ${behind} builds behind. Run scripts/sign-release.sh."
+              echo "::warning::the signed manifest still names build ${live_build} (seq ${live_seq:-?}) while ${BROKKR_BUILD} is published -- ${behind} builds behind, so signing has been failing. Check the step below."
             else
-              echo "the signed manifest names build ${live_build}; sign ${BROKKR_BUILD} when ready"
+              echo "the signed manifest names build ${live_build}; the signing step below should take it to ${BROKKR_BUILD}"
             fi
           fi
 

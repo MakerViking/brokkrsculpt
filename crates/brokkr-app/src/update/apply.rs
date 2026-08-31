@@ -918,16 +918,34 @@ pub fn sweep(directory: &Path) {
 /// update and did not install it kept 19-33 MB per attempt for ever. A Windows
 /// tester whose install click did nothing has exactly one of these.
 ///
-/// The match is deliberately narrow: `brokkrsculpt-` followed by a DIGIT. The
+/// The match is deliberately narrow: a payload prefix followed by a DIGIT. The
 /// running binary is `brokkrsculpt` or `brokkrsculpt.exe` and never has an
 /// ordinal in it, and the kept copy starts with a dot, so neither can be caught
 /// by this.
+///
+/// **Two payload prefixes, and both are load-bearing.** Release payloads were
+/// renamed `brokkrsculpt-<build>-…` -> `update-<build>-…` on 2026-08-31 so they
+/// stop burying the three human downloads on the release page. The name a
+/// download lands under is whatever the signed manifest called it (`update.rs`
+/// stages `.{name}.part` and finishes at `{name}`), so matching only the old
+/// spelling would silently stop sweeping every future abandoned download --
+/// reinstating the 19-33 MB-per-attempt leak this function exists to end, on
+/// every user's disk, with nothing failing anywhere. The old spelling stays
+/// because copies installed before the rename still have those files beside
+/// them, and a rollback can still hand out an old-named payload.
 fn is_sweepable(name: &str) -> bool {
-    if name.starts_with(".brokkrsculpt") && (name.ends_with(".part") || name.ends_with(".link")) {
-        return true;
+    const PAYLOAD_PREFIXES: [&str; 2] = ["update-", "brokkrsculpt-"];
+
+    // Half-finished staging: `.{payload name}.part` or `.link`. `.brokkrsculpt`
+    // without a dash is included on purpose -- that is the hard-link aside in
+    // `install_unix`, which is named after the RUNNING binary rather than after
+    // a payload, and it covers `.brokkrsculpt-<n>-….part` as well.
+    if name.ends_with(".part") || name.ends_with(".link") {
+        return name.starts_with(".update-") || name.starts_with(".brokkrsculpt");
     }
-    name.strip_prefix("brokkrsculpt-")
-        .is_some_and(|rest| rest.starts_with(|c: char| c.is_ascii_digit()))
+    PAYLOAD_PREFIXES.iter().any(|prefix| {
+        name.strip_prefix(prefix).is_some_and(|rest| rest.starts_with(|c: char| c.is_ascii_digit()))
+    })
 }
 
 /// Stage in a named directory. The directory decides whether the rename that
@@ -1346,6 +1364,15 @@ mod tests {
             "brokkrsculpt-999999-macos-arm64.zip",
             ".brokkrsculpt.x.part",
             ".brokkrsculpt.x.link",
+            // **The name payloads carry from 2026-08-31 onwards.** Missing
+            // these would not fail anything -- it would quietly leave every
+            // abandoned download on disk for ever, which is the leak this
+            // matcher was written to end.
+            "update-1029-linux-x86_64",
+            "update-1029-windows-x86_64.exe",
+            "update-1029-macos-arm64.zip",
+            ".update-1029-linux-x86_64.part",
+            ".update-1029-windows-x86_64.exe.part",
         ] {
             assert!(is_sweepable(dead), "{dead} should be swept");
         }
@@ -1359,6 +1386,14 @@ mod tests {
             "brokkrsculpt-backup",
             "brokkrsculpt-old.exe",
             "my-brokkrsculpt-1024-linux-x86_64",
+            "update-notes.txt",
+            "updater",
+            "my-update-1029-linux-x86_64",
+            // The human downloads, which a user may well have left in the same
+            // folder. Capitalised, so the lowercase prefixes cannot reach them.
+            "BrokkrSculpt-Linux-x86_64.tar.gz",
+            "BrokkrSculpt-Windows-x86_64.zip",
+            "BrokkrSculpt-macOS-arm64.zip",
         ] {
             assert!(!is_sweepable(keep), "{keep} must NOT be swept");
         }

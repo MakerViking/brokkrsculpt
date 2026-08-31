@@ -128,8 +128,19 @@ without a menu of every combination.
 
 ## Get it
 
-**[Download the open beta](https://github.com/MakerViking/brokkrsculpt/releases/tag/beta)**
-— Linux, Windows and macOS, rebuilt from `main` on every change.
+| Platform | Download |
+|---|---|
+| **Windows** (64-bit) | [BrokkrSculpt-Windows-x86_64.zip](https://github.com/MakerViking/brokkrsculpt/releases/download/beta/BrokkrSculpt-Windows-x86_64.zip) |
+| **macOS** (Apple silicon) | [BrokkrSculpt-macOS-arm64.zip](https://github.com/MakerViking/brokkrsculpt/releases/download/beta/BrokkrSculpt-macOS-arm64.zip) |
+| **Linux** (64-bit) | [BrokkrSculpt-Linux-x86_64.tar.gz](https://github.com/MakerViking/brokkrsculpt/releases/download/beta/BrokkrSculpt-Linux-x86_64.tar.gz) |
+
+Those links always point at the newest build, which is rebuilt from `main` on
+every change. The app updates itself after that, so this is a one-time
+download. If you would rather see the whole release, it is
+[here](https://github.com/MakerViking/brokkrsculpt/releases/tag/beta) — the
+files named `update-…` there are what the built-in updater fetches, and you
+never need one by hand.
+
 [`CHANGELOG.md`](CHANGELOG.md) says what moved since you last looked, which
 matters here: the download link never changes, so two people running "the beta"
 may not be running the same thing.

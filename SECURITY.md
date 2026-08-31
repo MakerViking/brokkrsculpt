@@ -175,7 +175,7 @@ Four mechanisms, in the order they should be reached for:
    and it is the only one available when I am unreachable.
 2. **Publish the next manifest naming the last good build.** Everyone walks
    backwards. This works only because payloads are stamped with their build
-   ordinal and twenty sets of them are retained.
+   ordinal and five sets of them are retained.
 3. **`minimum_build`.** Warns every client below a named build, naming both
    numbers. It never blocks launching: refusing to start a sculpting
    application that someone already has installed is worse than the bug.
