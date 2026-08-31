@@ -14,9 +14,9 @@
 use std::time::{Duration, Instant};
 
 use brokkr_core::{
-    BRICK_DIM, BrickCoord, BrickMesh, Brush, BrushDirection, BrushKind, BrushScratch, Document,
-    Entry, FalloffCurve, History, MaskField, MeshScratch, Pattern, PatternKind, Stamp, Stroke,
-    Symmetry, UndoOutcome, Volume,
+    BRICK_DIM, BrickCoord, BrickMesh, Brush, BrushDirection, BrushKind, BrushScratch, ClipCounts,
+    ClipPlane, Document, Entry, FalloffCurve, History, INSIDE, MaskField, MeshScratch, NARROW_BAND,
+    OUTSIDE, Pattern, PatternKind, Stamp, Stroke, Symmetry, UndoOutcome, Volume,
 };
 use glam::{IVec3, Vec3};
 
@@ -95,6 +95,12 @@ const MASKED_EDIT_BUDGET: Duration = Duration::from_micros(5_000);
 const LARGE_BRUSH_EDIT_BUDGET: Duration = Duration::from_micros(8_000);
 /// Remeshing whatever the edit dirtied.
 const REMESH_BUDGET: Duration = Duration::from_micros(8_000);
+
+/// Sides a decimated cut hull is allowed, from the cut tool plan.
+///
+/// The budget rows use the ceiling rather than a typical stroke: a gate set at
+/// the average passes while the worst case a user can actually draw does not.
+const MAX_CUT_PLANES: usize = 16;
 
 /// Voxels across the model, which is the M0 target size.
 const EFFECTIVE_RESOLUTION: f32 = 256.0;
@@ -654,12 +660,368 @@ fn main() {
         after.resident_bytes as f64 / (1024.0 * 1024.0)
     );
 
+    measure_the_cut(voxel_size);
+
     if passed {
         println!("\nall budgets met");
     } else {
         eprintln!("\nBUDGET EXCEEDED: see the lines marked OVER above");
         std::process::exit(1);
     }
+}
+
+/// What one cut cost, in the eight quantities the cut tool plan asks for.
+///
+/// **A baseline and not a gate**, deliberately. Nothing here folds into
+/// `passed`: before this function there was no measurement of `clip` at all, so
+/// every number it prints is the first of its kind, and a threshold invented on
+/// the same day as the first measurement is not a budget -- it is the
+/// measurement with a pass mark drawn around it. The budgets are shown beside
+/// the timings so the distance is legible; turning any of them into a gate is a
+/// later decision made against a run, and the shaped cut's own phases are where
+/// that happens.
+///
+/// The eighth quantity the plan lists -- the `MeshPool` vertices watermark --
+/// is **not here and cannot be**: the pool lives in `brokkr-gpu`, which depends
+/// on this crate rather than the other way round, and it needs a real device.
+/// It is measured in `brokkr-gpu`'s own bench, against the same thirty-cut
+/// scenario, and saying so here is cheaper than leaving a reader to wonder
+/// whether it was forgotten.
+struct CutMeasurement {
+    counts: ClipCounts,
+    dirtied: usize,
+    /// Of those, how many meshed to no triangles at all.
+    empty: usize,
+    /// Heap the recorder held at the moment the cut finished, before the
+    /// run-length encoding that `end_stroke` does. See
+    /// [`Volume::recorder_bytes`].
+    recorder_bytes: usize,
+    /// What the undo entry costs once encoded, which is what the history budget
+    /// actually charges -- printed beside the peak precisely because the two
+    /// differ by a factor nobody had written down.
+    entry_bytes: usize,
+    clip: Duration,
+    /// Turning the recorder's raw bricks into a run-length-encoded entry.
+    ///
+    /// Separated from the clip because it is not obviously part of it, and it
+    /// turned out to be most of what `Document::clip` costs.
+    encode: Duration,
+    remesh: Duration,
+}
+
+/// Cut `volume` once and report everything about it.
+///
+/// Brackets the stroke here rather than going through `Document::clip` because
+/// the recorder peak is only observable while the recorder is open, and
+/// `Document::clip` opens and closes it internally. What it costs to be a
+/// document rather than a volume -- the per body box gate and the entry
+/// assembly -- is measured separately below.
+/// Repetitions of each cut scenario, of which the FASTEST is reported.
+///
+/// The minimum and not the median, and that is a considered choice for this
+/// particular measurement. Contention only ever makes a run slower -- a
+/// scheduler that takes the core away adds time and never gives any back -- so
+/// on a machine that is doing anything else the minimum is the closest estimate
+/// of the work itself, where a median mostly reports how busy the machine was.
+///
+/// The brush rows above take p95 instead, and correctly: they measure per-event
+/// latency during a stroke, where the tail IS the user experience. This measures
+/// how expensive an operation is, which is a different question.
+///
+/// It does not make a loaded machine's numbers publishable. It makes two of them
+/// comparable to each other, which is what a before-and-after needs.
+const CUT_REPEATS: usize = 5;
+
+/// The fastest of [`CUT_REPEATS`] runs of one cut, on a fresh fixture each time.
+///
+/// Every run reseeds, because a cut is destructive: repeating it on the same
+/// volume would measure a first cut and then four cuts through a hole.
+fn fastest_cut(
+    fixture: impl Fn() -> Volume,
+    planes: &[ClipPlane],
+    meshes: &mut Vec<BrickMesh>,
+) -> CutMeasurement {
+    let mut best: Option<CutMeasurement> = None;
+    for _ in 0..CUT_REPEATS {
+        let mut volume = fixture();
+        let run = cut_once_convex(&mut volume, planes, meshes);
+        // Compared on the clip alone: it is the number the plane count moves,
+        // and taking the min of each column independently would report a run
+        // that never happened.
+        if best.as_ref().is_none_or(|best| run.clip + run.encode < best.clip + best.encode) {
+            best = Some(run);
+        }
+    }
+    best.expect("CUT_REPEATS is not zero")
+}
+
+fn cut_once(volume: &mut Volume, plane: ClipPlane, meshes: &mut Vec<BrickMesh>) -> CutMeasurement {
+    cut_once_convex(volume, std::slice::from_ref(&plane), meshes)
+}
+
+/// The sides of a regular prism whose axis runs along `direction`.
+///
+/// [`MAX_CUT_PLANES`]-sided, because that is the ceiling the plan sets on hull
+/// decimation and the ceiling is what a budget has to be measured at. Normals
+/// point INWARD, so the intersection is the prism's interior.
+fn prism_sides(centre: Vec3, direction: Vec3, radius: f32) -> Vec<ClipPlane> {
+    let axis = direction.normalize();
+    // Any two unit vectors across the axis.
+    let helper = if axis.x.abs() < 0.9 { Vec3::X } else { Vec3::Y };
+    let u = axis.cross(helper).normalize();
+    let v = axis.cross(u);
+
+    (0..MAX_CUT_PLANES)
+        .map(|side| {
+            let angle = side as f32 / MAX_CUT_PLANES as f32 * std::f32::consts::TAU;
+            let (sin, cos) = angle.sin_cos();
+            let outward = u * cos + v * sin;
+            ClipPlane::new(centre + outward * radius, -outward).expect("a unit normal")
+        })
+        .collect()
+}
+
+/// A prism capped front and back: the bounded cutter, in full.
+fn prism(centre: Vec3, direction: Vec3, radius: f32, depth: f32) -> Vec<ClipPlane> {
+    let axis = direction.normalize();
+    let mut planes = prism_sides(centre, axis, radius);
+    planes.push(ClipPlane::new(centre - axis * depth, axis).expect("a unit normal"));
+    planes.push(ClipPlane::new(centre + axis * depth, -axis).expect("a unit normal"));
+    planes
+}
+
+fn cut_once_convex(
+    volume: &mut Volume,
+    planes: &[ClipPlane],
+    meshes: &mut Vec<BrickMesh>,
+) -> CutMeasurement {
+    let mut dirty = Vec::new();
+    // Anything left over from seeding would be charged to the cut.
+    volume.take_dirty(&mut dirty);
+
+    volume.begin_stroke();
+    let started = Instant::now();
+    let counts = volume.clip_convex(planes);
+    let clip = started.elapsed();
+    let recorder_bytes = volume.recorder_bytes();
+    let started = Instant::now();
+    let entry_bytes = volume.end_stroke().map_or(0, |edit| edit.bytes());
+    let encode = started.elapsed();
+
+    dirty.clear();
+    volume.take_dirty(&mut dirty);
+    // `mesh_bricks` and not a loop over `mesh_brick`, because that is what the
+    // application calls and the two are not the same measurement -- the plural
+    // form is where the parallelism is, and timing the serial one would report
+    // a remesh cost no user ever pays.
+    while meshes.len() < dirty.len() {
+        meshes.push(BrickMesh::default());
+    }
+    let started = Instant::now();
+    volume.mesh_bricks(&dirty, &mut meshes[..dirty.len()]);
+    let remesh = started.elapsed();
+    // How much of that remesh produced nothing at all. A cut removes material,
+    // so many of the bricks it dirties end up with no surface in them -- and
+    // `mesh_brick` has no early out, so each of those still costs a 34-cubed
+    // apron gather and a full surface-nets pass to emit zero triangles.
+    let empty = meshes[..dirty.len()].iter().filter(|mesh| mesh.is_empty()).count();
+
+    CutMeasurement {
+        counts,
+        dirtied: dirty.len(),
+        empty,
+        recorder_bytes,
+        entry_bytes,
+        clip,
+        encode,
+        remesh,
+    }
+}
+
+fn print_cut(label: &str, m: &CutMeasurement) {
+    println!(
+        "  {:<20} classified {:>6}  crossed {:>5}  removed {:>5}  changed {:>5}  dirtied {:>6} ({} empty)",
+        label,
+        m.counts.classified,
+        m.counts.crossed,
+        m.counts.removed,
+        m.counts.changed,
+        m.dirtied,
+        m.empty
+    );
+    println!(
+        "  {:<20} clip {:>7.3} ms   encode {:>7.3} ms   remesh {:>7.3} ms   peak {:>6.1} MB   entry {:>5.2} MB",
+        "",
+        millis(m.clip),
+        millis(m.encode),
+        millis(m.remesh),
+        m.recorder_bytes as f64 / (1024.0 * 1024.0),
+        m.entry_bytes as f64 / (1024.0 * 1024.0)
+    );
+}
+
+/// Seed the fixture the cut rows measure: one ball with spurs sticking out of
+/// it.
+///
+/// The spurs are the point. A ball alone measures a plane through a solid,
+/// which is the cheap and uninteresting case; what the cut tool is *for* is
+/// lopping something off that sticks out, and a fixture without protrusions
+/// cannot measure thirty of those in a row. They are seeded at descending
+/// latitudes around the equator so no two share a brick column, which is what
+/// keeps thirty successive cuts thirty separate pieces of work rather than one
+/// piece done thirty times.
+fn ball_with_spurs(voxel_size: f32, centre: Vec3, radius: f32, spurs: usize) -> Volume {
+    let mut volume = Volume::new(voxel_size);
+    volume.seed_sphere(centre, radius);
+    for index in 0..spurs {
+        let angle = index as f32 / spurs as f32 * std::f32::consts::TAU;
+        let tilt = (index as f32 * 0.37).sin() * 0.7;
+        let direction =
+            Vec3::new(angle.cos() * tilt.cos(), tilt.sin(), angle.sin() * tilt.cos()).normalize();
+        // Straddling the surface, so each spur is a lump attached to the body
+        // rather than a free floating ball the cut would find nothing holding.
+        //
+        // **Unioned rather than seeded, and that is not a detail.**
+        // `seed_sphere` clears every brick its box touches before writing, so
+        // seeding a small sphere onto a large one carves a MOAT around it: the
+        // fixture would be a ball with thirty pits in it, and a bench measuring
+        // "thirty cuts trimming spurs" would be measuring thirty cuts through
+        // craters. A union is `min` of the two fields.
+        let spur = centre + direction * radius;
+        let spur_radius = radius * 0.12;
+        let band = NARROW_BAND * voxel_size;
+        let (lo, hi) = volume
+            .voxel_bounds(spur - (spur_radius + band * 2.0), spur + (spur_radius + band * 2.0));
+        volume.edit_voxels(lo, hi, |_, position, value| {
+            let outside = (position.distance(spur) - spur_radius) / voxel_size;
+            value.min(outside).clamp(INSIDE, OUTSIDE)
+        });
+    }
+    volume.mark_everything_dirty();
+    volume
+}
+
+/// The cut baseline: what a plane costs today, before the shaped cut exists.
+fn measure_the_cut(voxel_size: f32) {
+    const SPURS: usize = 30;
+
+    let centre = Vec3::splat(EFFECTIVE_RESOLUTION * voxel_size * 0.5);
+    let radius = EFFECTIVE_RESOLUTION * voxel_size * 0.47;
+    let mut meshes: Vec<BrickMesh> = Vec::new();
+
+    println!();
+    println!("cut baseline (report only -- see `measure_the_cut`)");
+    // Seeded once for the census, and again per row: `Volume` has no `Clone`
+    // on purpose, and re-seeding is deterministic and outside every timed
+    // region, so it is the honest way to give each row the same fixture.
+    let stats = ball_with_spurs(voxel_size, centre, radius, SPURS).stats();
+    println!(
+        "  fixture: {} bricks ({} dense, {} uniform), {:.1} MB resident, {SPURS} spurs",
+        stats.dense_bricks + stats.uniform_bricks,
+        stats.dense_bricks,
+        stats.uniform_bricks,
+        stats.resident_bytes as f64 / (1024.0 * 1024.0)
+    );
+    println!(
+        "  budgets for scale: edit {:.0} ms, remesh {:.0} ms",
+        millis(EDIT_BUDGET),
+        millis(REMESH_BUDGET)
+    );
+
+    let fixture = || ball_with_spurs(voxel_size, centre, radius, SPURS);
+    let far = centre + Vec3::X * (radius * 10.0);
+    let spur = centre + Vec3::X * radius;
+
+    for (label, cutter) in [
+        // Through the middle: the expensive shape. Half the bricks are dropped
+        // whole and a sheet of them straight through the model is promoted
+        // dense.
+        ("plane, midline", vec![ClipPlane::new(centre, Vec3::X).unwrap()]),
+        // A plane that misses. This is the row to watch when the cut takes a
+        // shape: it is pure classification, over a body it never touches.
+        ("plane, misses", vec![ClipPlane::new(far, Vec3::X).unwrap()]),
+        // The shape, at the limit the plan sets: a sixteen-sided prism with two
+        // depth caps. Three rows, because they answer different questions --
+        // what the classification costs when it must reject, what it costs when
+        // it must resolve, and what the depth caps are worth.
+        ("16-plane, misses", prism(far + Vec3::X * radius, Vec3::X, radius * 0.2, radius * 0.4)),
+        ("16-plane, over a spur", prism(spur, Vec3::X, radius * 0.2, radius * 0.4)),
+        // Same silhouette as the row above with no depth cap, which isolates
+        // what the caps are worth.
+        ("16-plane, through", prism_sides(spur, Vec3::X, radius * 0.2)),
+    ] {
+        print_cut(label, &fastest_cut(fixture, &cutter, &mut meshes));
+    }
+
+    // Thirty in a row, which is the scenario the plan singles out: a cut only
+    // ever shrinks the meshes it touches, so every one of these orphans mesh
+    // pool blocks that nothing in an editing session ever reclaims. The core
+    // cannot see the pool -- the counts below are the input to that failure,
+    // and `brokkr-gpu`'s bench measures the failure itself.
+    let mut trimmed = ball_with_spurs(voxel_size, centre, radius, SPURS);
+    let mut worst = Duration::ZERO;
+    let mut total_dirty = 0usize;
+    let mut peak_recorder = 0usize;
+    let mut first = None;
+    let mut last = None;
+    for index in 0..SPURS {
+        let angle = index as f32 / SPURS as f32 * std::f32::consts::TAU;
+        let tilt = (index as f32 * 0.37).sin() * 0.7;
+        let direction =
+            Vec3::new(angle.cos() * tilt.cos(), tilt.sin(), angle.sin() * tilt.cos()).normalize();
+        // Just inside the spur's root, facing out: today's plane cuts the whole
+        // model, so this also takes whatever else is beyond it -- which is
+        // exactly the unbounded behaviour the shaped cut is being built to fix,
+        // and it is worth the baseline carrying the cost of it.
+        let plane = ClipPlane::new(centre + direction * (radius * 0.98), direction).unwrap();
+        let m = cut_once(&mut trimmed, plane, &mut meshes);
+        worst = worst.max(m.clip);
+        total_dirty += m.dirtied;
+        peak_recorder = peak_recorder.max(m.recorder_bytes);
+        if index == 0 {
+            first = Some(m);
+        } else if index == SPURS - 1 {
+            last = Some(m);
+        }
+    }
+    if let Some(m) = &first {
+        print_cut("30 cuts, first", m);
+    }
+    if let Some(m) = &last {
+        print_cut("30 cuts, last", m);
+    }
+    let after = trimmed.stats();
+    println!(
+        "  {:<20} worst clip {:.3} ms   {} brick-dirties total   recorder peak {:.1} MB",
+        "30 cuts, summed",
+        millis(worst),
+        total_dirty,
+        peak_recorder as f64 / (1024.0 * 1024.0)
+    );
+    println!(
+        "  {:<20} {} dense, {} uniform, {:.1} MB resident after",
+        "",
+        after.dense_bricks,
+        after.uniform_bricks,
+        after.resident_bytes as f64 / (1024.0 * 1024.0)
+    );
+
+    // What being a document costs on top of being a volume: the per body box
+    // gate that rejects a body the plane cannot reach, and assembling one undo
+    // entry across all of them.
+    let mut doc = Document::from_volume(ball_with_spurs(voxel_size, centre, radius, SPURS));
+    let visible = vec![true; doc.nodes().len()];
+    let started = Instant::now();
+    let outcome = doc.clip(ClipPlane::new(centre, Vec3::X).unwrap(), &visible);
+    println!(
+        "  {:<20} {:.3} ms for {} bricks across {} of {} bodies crossed",
+        "Document::clip",
+        millis(started.elapsed()),
+        outcome.bricks,
+        outcome.bodies_cut.len(),
+        outcome.bodies_crossed
+    );
+    println!();
 }
 
 /// Grow a brick list by one in every direction, the way the renderer must so

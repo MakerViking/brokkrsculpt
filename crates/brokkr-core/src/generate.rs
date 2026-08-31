@@ -340,6 +340,40 @@ impl Volume {
     /// dense, and a mask over half a dragon costs its boundary rather than its
     /// volume.
     fn halfspace_mask(&self, plane: ClipPlane, feather_mm: f32) -> MaskField {
+        self.cutter_mask(std::slice::from_ref(&plane), feather_mm)
+    }
+
+    /// Protection over the convex region every plane agrees on.
+    ///
+    /// [`Volume::halfspace_mask`] is this with one plane, and it is a wrapper
+    /// rather than a second implementation for the same reason
+    /// [`Volume::clip`] is: `min` over one element is the element, so a
+    /// single-plane mask is not merely equivalent to the one that shipped, it
+    /// is the same arithmetic.
+    ///
+    /// This is the ctrl half of the cut. The same drag, the same hull, the same
+    /// brick classification -- writing protection instead of removing material,
+    /// so that circling a lump SELECTS it and [`Document::split_masked`] can
+    /// then lift it off as its own body. That is the layers model the panel
+    /// already presents, and it is what the research found users prefer over a
+    /// destructive trim for exactly this task.
+    ///
+    /// # The feather is not optional
+    ///
+    /// `mask.rs` records the rule in one line -- every path that writes the
+    /// mask writes a feathered edge, never a step -- and names lasso masks
+    /// writing hard values as the prior-art failure that broke Blender's border
+    /// detection for years. The feather here is the region's own distance,
+    /// which is why it is the SAME `min` the cut uses: a mask whose edge sat
+    /// anywhere other than where the cut would have gone would make ctrl and
+    /// no-ctrl disagree about what the gesture selected.
+    pub fn cutter_mask(&self, planes: &[ClipPlane], feather_mm: f32) -> MaskField {
+        if planes.is_empty() {
+            // No region protects nothing. The alternative reading -- the
+            // intersection of no half-spaces is everything -- would protect the
+            // whole model from a gesture whose construction failed.
+            return self.mask().generated(Vec::new());
+        }
         let voxel_size = self.voxel_size();
         // A feather narrower than a voxel is a step by another name, so the
         // floor is one voxel however small the caller asked for.
@@ -356,13 +390,25 @@ impl Volume {
             .filter_map(|coord| {
                 let origin = coord.origin();
                 let centre = origin.as_vec3() * voxel_size + half;
-                let (nearest, farthest) = plane.range_over_box(centre, half);
-                if farthest <= -feather {
-                    // Wholly on the kept side: no entry at all, which is what
-                    // keeps this proportional to the boundary.
-                    return None;
+                // The same three-way classification the cut makes, against
+                // the feather instead of the narrow band, and with the same
+                // per-brick pruning: a plane already saturated across this
+                // brick writes `PROTECTED` there whatever the others say, so
+                // dropping it from the minimum cannot change a byte.
+                let mut active: Vec<ClipPlane> = Vec::with_capacity(planes.len());
+                for plane in planes {
+                    let (nearest, farthest) = plane.range_over_box(centre, half);
+                    if farthest <= -feather {
+                        // Wholly on the kept side of ONE plane is wholly
+                        // outside the region: no entry at all, which is what
+                        // keeps this proportional to the boundary.
+                        return None;
+                    }
+                    if nearest < feather {
+                        active.push(*plane);
+                    }
                 }
-                if nearest >= feather {
+                if active.is_empty() {
                     return Some((*coord, MaskBrick::Uniform(PROTECTED)));
                 }
                 let mut brick = MaskBrick::dense_filled(UNMASKED);
@@ -372,7 +418,8 @@ impl Volume {
                         for x in 0..BRICK_DIM {
                             let at = (origin + IVec3::new(x as i32, y as i32, z as i32)).as_vec3()
                                 * voxel_size;
-                            data[brick_index(x, y, z)] = feathered(plane.distance(at) / feather);
+                            data[brick_index(x, y, z)] =
+                                feathered(crate::clip::cut_distance(&active, at) / feather);
                         }
                     }
                 }
@@ -1023,6 +1070,134 @@ mod tests {
             MaskRecipe::Halfspace { plane, feather_mm: 1.0 },
         ] {
             assert!(volume.generated_mask(recipe).is_free(), "{recipe:?} invented a mask");
+        }
+    }
+
+    /// **The feather's midpoint lands on the SELECTED side, by one rounding
+    /// step, and nothing else in the codebase says so.**
+    ///
+    /// The chain is three links long and each is in a different file.
+    /// `feathered(0.0)` is `smoothstep(0.5) * 255`, which is 127.5; `f32::round`
+    /// takes halves away from zero, so it is 128; and `split_masked` thresholds
+    /// at `MASKED_ENOUGH_TO_SPLIT`, which is 128, with `>=`.
+    ///
+    /// Change the constant, the curve, or the comparison to `>` and the
+    /// boundary voxel silently changes sides -- which on a ctrl-lasso split is
+    /// a one-voxel slot along the seam between the two bodies, on a model that
+    /// is otherwise correct and passes every printability check there is.
+    #[test]
+    fn the_feather_midpoint_lands_on_the_selected_side() {
+        let middle = feathered(0.0);
+        assert_eq!(middle, 128, "the feather's midpoint moved off 128");
+        assert_eq!(
+            middle,
+            crate::split::MASKED_ENOUGH_TO_SPLIT,
+            "the feather's midpoint and the split threshold have drifted apart"
+        );
+        assert!(
+            middle >= crate::split::MASKED_ENOUGH_TO_SPLIT,
+            "the boundary voxel changed sides: split_masked compares with `>=`"
+        );
+        // And the two sides really are either side of it, so the test above is
+        // about a boundary rather than about a constant that happens to match.
+        assert!(feathered(-0.01) < middle, "just outside the region is not less protected");
+        assert!(feathered(0.01) > middle, "just inside the region is not more protected");
+    }
+
+    /// The voxel a world point falls in, at this module's test voxel size.
+    fn cell(at: Vec3) -> IVec3 {
+        (at / VOXEL).round().as_ivec3()
+    }
+
+    /// The ctrl half of the cut: circling a lump protects the lump and nothing
+    /// else, and touches no voxel of the field.
+    #[test]
+    fn a_cutter_mask_protects_what_is_inside_it_and_leaves_the_field_alone() {
+        use crate::testing::assert_same_field;
+
+        let mut volume = Volume::new(VOXEL);
+        volume.seed_sphere(Vec3::ZERO, 20.0);
+        volume.mark_everything_dirty();
+
+        let mut untouched = Volume::new(VOXEL);
+        untouched.seed_sphere(Vec3::ZERO, 20.0);
+        untouched.mark_everything_dirty();
+
+        // A box around the +X cap, inward normals, exactly as the cut builds
+        // its region.
+        let (low, high) = (Vec3::new(8.0, -30.0, -30.0), Vec3::new(30.0, 30.0, 30.0));
+        let mut planes = Vec::new();
+        for axis in [Vec3::X, Vec3::Y, Vec3::Z] {
+            planes.push(ClipPlane::new(low, axis).unwrap());
+            planes.push(ClipPlane::new(high, -axis).unwrap());
+        }
+
+        let mask = volume.cutter_mask(&planes, VOXEL * 2.0);
+        assert!(!mask.is_free(), "the cutter mask protected nothing at all");
+        assert_eq!(
+            mask.at(cell(Vec3::new(15.0, 0.0, 0.0))),
+            PROTECTED,
+            "the middle of the region is not protected"
+        );
+        assert_eq!(
+            mask.at(cell(Vec3::new(-15.0, 0.0, 0.0))),
+            UNMASKED,
+            "protection leaked outside the region"
+        );
+
+        // Writing a mask must not move one voxel of the field, which is the
+        // whole difference between ctrl and no ctrl.
+        assert_same_field(&volume, &untouched, "writing a cutter mask");
+    }
+
+    /// A region drawn somewhere else must leave a hand-painted mask alone.
+    ///
+    /// `mask_cutter` skips a body whose generated mask `is_free()`, and this is
+    /// the property that skip exists for: without it, circling something on one
+    /// body wipes the protection painted on every other body on screen.
+    #[test]
+    fn a_cutter_that_misses_generates_a_free_mask() {
+        let mut volume = Volume::new(VOXEL);
+        volume.seed_sphere(Vec3::ZERO, 20.0);
+        volume.mark_everything_dirty();
+
+        let (low, high) = (Vec3::splat(500.0), Vec3::splat(540.0));
+        let mut planes = Vec::new();
+        for axis in [Vec3::X, Vec3::Y, Vec3::Z] {
+            planes.push(ClipPlane::new(low, axis).unwrap());
+            planes.push(ClipPlane::new(high, -axis).unwrap());
+        }
+
+        assert!(
+            volume.cutter_mask(&planes, VOXEL * 2.0).is_free(),
+            "a region far from the model still generated protection"
+        );
+    }
+
+    /// One plane through `cutter_mask` is the half-space mask, which is what
+    /// makes the wrapper a wrapper rather than a second implementation.
+    #[test]
+    fn one_plane_through_the_cutter_mask_is_the_half_space_mask() {
+        let mut volume = Volume::new(VOXEL);
+        volume.seed_sphere(Vec3::ZERO, 20.0);
+        volume.mark_everything_dirty();
+
+        let plane = ClipPlane::new(Vec3::new(2.0, -1.0, 3.0), Vec3::new(1.0, 2.0, -0.5)).unwrap();
+        let feather = VOXEL * 2.0;
+        let recipe = volume.generated_mask(MaskRecipe::Halfspace { plane, feather_mm: feather });
+        let direct = volume.cutter_mask(std::slice::from_ref(&plane), feather);
+
+        for probe in [
+            Vec3::new(10.0, 0.0, 0.0),
+            Vec3::new(-10.0, 0.0, 0.0),
+            Vec3::new(2.0, -1.0, 3.0),
+            Vec3::new(0.0, 5.0, -5.0),
+        ] {
+            assert_eq!(
+                recipe.at(cell(probe)),
+                direct.at(cell(probe)),
+                "the two paths disagree at {probe:?}"
+            );
         }
     }
 }

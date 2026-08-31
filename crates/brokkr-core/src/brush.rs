@@ -1245,10 +1245,20 @@ impl Brush {
                 // blending brushes below keep a legal lerp factor -- which is what
                 // makes smooth, flatten and clay converge on their target instead
                 // of extrapolating away from it.
-                let weight = shaped * pattern.weight(position) * free;
-                if weight <= 0.0 {
+                //
+                // **Kept apart from the mask, because two brushes cannot fold it
+                // in.** See the `Flatten` and `Clay` arms: their target is a
+                // plane distance that can be far outside the narrow band, and
+                // scaling the lerp factor by the mask does not scale the RESULT
+                // when both the masked and the unmasked blend overshoot the band
+                // and clamp to the same edge. Everything else here is either a
+                // displacement, where a factor on the weight is a factor on the
+                // move, or blends toward a target already in band.
+                let patterned = shaped * pattern.weight(position);
+                if patterned <= 0.0 || free <= 0.0 {
                     return value;
                 }
+                let weight = patterned * free;
 
                 match kind {
                     BrushKind::Inflate => value + field_sign * weight * displacement,
@@ -1299,9 +1309,35 @@ impl Brush {
                         region.sample((position + pull) / voxel_size)
                     }
 
+                    // **The mask is applied to the RESULT, not to the lerp
+                    // factor, and this is the one brush family where that
+                    // distinction has teeth.**
+                    //
+                    // `plane` is the signed distance to the stroke's reference
+                    // plane in voxels and is unbounded -- a voxel at the rim of a
+                    // wide brush on a curved surface is tens of voxels from it.
+                    // Folding the mask into `weight` then means the masked blend
+                    // overshoots the narrow band just as the unmasked one does,
+                    // and `edit_voxels_where`'s clamp puts both on the same edge:
+                    // a half protected voxel was carved exactly as hard as an
+                    // unprotected one. Measured before this changed: 505 of
+                    // 15,536 moved Flatten voxels and 2,783 of 28,444 Clay voxels
+                    // took the full unmasked effect through half protection.
+                    //
+                    // So the unmasked result is computed first and clamped to
+                    // what the field can actually hold, and the mask then chooses
+                    // a point between the voxel's own value and that. Both ends
+                    // are in band, so the result is too.
+                    //
+                    // **Unmasked is bit-identical**, which is what made this
+                    // safe to change in a shipped brush: an unmasked edit resolves
+                    // `free` to exactly 1.0 through `Freedom::OPEN`, so `weight`
+                    // was already `patterned`, and the `free >= 1.0` arm returns
+                    // the clamped value the caller's own clamp produced anyway.
                     BrushKind::Flatten => {
                         let plane = (position - plane_point).dot(stroke_normal) / voxel_size;
-                        value + (plane - value) * weight
+                        let target = (value + (plane - value) * patterned).clamp(INSIDE, OUTSIDE);
+                        admit(value, target, free)
                     }
 
                     BrushKind::Move => {
@@ -1310,21 +1346,55 @@ impl Brush {
                         value
                     }
 
+                    // The same shape as `Flatten` above, and the same reason.
                     BrushKind::Clay => {
                         let plane = (position - plane_point).dot(stroke_normal) / voxel_size;
-                        let blended = value + (plane - value) * weight;
+                        let blended = value + (plane - value) * patterned;
                         // Keep only the half of the operation that moves material
                         // the way the user asked for. Without this, clay carves
                         // away any bump standing above its plane.
-                        match direction {
+                        //
+                        // Applied to the UNMASKED blend, before the mask admits
+                        // a fraction of it. The other order would let the mask
+                        // pull a voxel back across `value` and turn the direction
+                        // guard into the thing it was guarding against.
+                        let kept = match direction {
                             BrushDirection::Add => blended.min(value),
                             BrushDirection::Subtract => blended.max(value),
-                        }
+                        };
+                        admit(value, kept.clamp(INSIDE, OUTSIDE), free)
                     }
                 }
             },
         );
     }
+}
+
+/// How much of a finished edit the mask lets through.
+///
+/// `target` is what the brush would have written with no mask at all, already
+/// clamped to what the field can hold; the result is that far from `value` in
+/// proportion to `free`. Both ends are in band, so the answer is too.
+///
+/// **This exists because a factor on the lerp is not a factor on the result.**
+/// Most of the brushes fold the mask into their weight and are right to: a
+/// displacement scaled by `free` moves `free` as far, and a blend toward a
+/// target that is already in band cannot overshoot. Flatten and Clay blend
+/// toward a plane distance that is unbounded, so scaling their weight scales an
+/// overshoot that the clamp then flattens back to the same band edge either way
+/// -- which is a mask that does nothing.
+///
+/// # Why `free >= 1.0` takes `target` rather than the lerp
+///
+/// Bit identity, and the same reason `clip::cut_voxel` has the same branch:
+/// `value + (target - value) * 1.0` is not `target` in binary floating point
+/// whenever `target - value` rounds. An unmasked edit resolves `free` to
+/// exactly 1.0 through `Freedom::OPEN`, so without this arm every unmasked
+/// Flatten and Clay stroke in every model would shift in the last bit on the
+/// build that introduced it.
+#[inline]
+fn admit(value: f32, target: f32, free: f32) -> f32 {
+    if free >= 1.0 { target } else { value + (target - value) * free }
 }
 
 /// Whether clay's and flatten's blend toward a plane provably clamps straight
@@ -3368,6 +3438,126 @@ mod skipping_tests {
                 from_plain > 1.0e-3,
                 "{kind} {direction:?} ignored a half mask: it did exactly what it does unmasked"
             );
+        }
+    }
+
+    /// **`admit` must hand back its target untouched at full freedom**, which
+    /// is the whole reason an unmasked Flatten or Clay stroke is unchanged by
+    /// the mask moving out of their weight.
+    ///
+    /// `value + (target - value) * 1.0` is NOT `target` in binary floating
+    /// point whenever `target - value` rounds -- the same fact `clip::cut_voxel`
+    /// documents and branches on. An unmasked edit resolves `free` to exactly
+    /// 1.0 through `Freedom::OPEN`, so losing this arm would shift the last bit
+    /// of every voxel of every unmasked Flatten and Clay stroke in every model,
+    /// and no geometric assertion in this file would notice.
+    ///
+    /// Verified once against the real thing rather than only here: stamping
+    /// both brushes unmasked, before and after this change, produced identical
+    /// checksums over the whole affected box for both directions.
+    #[test]
+    fn full_freedom_admits_the_target_to_the_bit() {
+        let mut rng = crate::testing::Noise::seeded(0x5ee_d10);
+        for _ in 0..200_000 {
+            // Values across the band and a little past it, since `target`
+            // arrives clamped but `value` is whatever the field held.
+            let value = INSIDE + (rng.below(1_000_001) as f32 / 1_000_000.0) * (OUTSIDE - INSIDE);
+            let target = INSIDE + (rng.below(1_000_001) as f32 / 1_000_000.0) * (OUTSIDE - INSIDE);
+            assert_eq!(
+                admit(value, target, 1.0).to_bits(),
+                target.to_bits(),
+                "admit({value}, {target}, 1.0) did not return the target unchanged"
+            );
+        }
+        // And it really does interpolate below that, or the branch above would
+        // be hiding a mask that does nothing.
+        assert!((admit(-3.0, 3.0, 0.5) - 0.0).abs() < 1.0e-6);
+        assert_eq!(admit(-3.0, 3.0, 0.0), -3.0);
+    }
+
+    /// **A half-protected voxel must get half the stroke, and for the two
+    /// brushes that blend toward a PLANE it did not.**
+    ///
+    /// The mask enters as a factor on the brush weight, and for a lerp toward a
+    /// target that is the right place for it -- as long as the target is in
+    /// range. Flatten and Clay blend toward the signed distance to the stroke's
+    /// reference plane, in voxels, which is unbounded: a voxel near the edge of
+    /// a wide brush on a curved surface can be tens of voxels from that plane.
+    /// The blend then overshoots the narrow band by so much that halving it
+    /// still overshoots, and the clamp in `edit_voxels_where` puts both the
+    /// masked and the unmasked result on the same band edge. The mask does
+    /// nothing at all for those voxels.
+    ///
+    /// Measured before the fix: 505 of 15,536 moved Flatten voxels and 2,783 of
+    /// 28,444 Clay voxels took the FULL unmasked effect through half
+    /// protection.
+    ///
+    /// **`a_fully_masked_block_feels_no_brush_at_all` cannot see this.** Its
+    /// half-protected arm asserts only that the result differs from both the
+    /// untouched fixture and the unmasked stamp -- which is true of a result
+    /// that is 99% of the way to the unmasked one. This asserts the fraction.
+    ///
+    /// Smooth is the control: it blends toward a local average, which is in
+    /// band by construction, so it was always right and must stay right.
+    #[test]
+    fn a_half_masked_stroke_moves_a_voxel_half_way() {
+        // A byte of 127 out of 255 leaves `1.0 - 127/255` of the stroke.
+        const HELD: u8 = PROTECTED / 2;
+        let free = 1.0 - HELD as f32 / 255.0;
+
+        let at = ON_THE_BALL;
+        // Wide enough that the reference plane is far from the voxels at the
+        // rim, which is the only place the overshoot happens.
+        let radius = 24.0;
+        let reach = Vec3::splat(radius + 2.0);
+        let (lo, hi) = ball().voxel_bounds(at - reach, at + reach);
+
+        for kind in [BrushKind::Flatten, BrushKind::Clay, BrushKind::Smooth] {
+            for direction in [BrushDirection::Add, BrushDirection::Subtract] {
+                let brush = Brush { kind, radius, strength: 1.0, ..Brush::default() };
+                let untouched = ball();
+                let normal = untouched.gradient_world(at);
+                let stamp = stamp_at(at, normal, direction);
+
+                let mut unmasked = ball();
+                brush.apply(&mut unmasked, &stamp, &mut BrushScratch::new());
+
+                let mut masked = ball();
+                paint_bricks(&mut masked, lo, hi, |_| HELD);
+                brush.apply(&mut masked, &stamp, &mut BrushScratch::new());
+
+                let mut moved = 0usize;
+                let mut worst = 0.0f32;
+                let mut worst_at = None;
+                for z in lo.z..=hi.z {
+                    for y in lo.y..=hi.y {
+                        for x in lo.x..=hi.x {
+                            let cell = IVec3::new(x, y, z);
+                            let was = untouched.sample_voxel(cell);
+                            let full = unmasked.sample_voxel(cell);
+                            // Only voxels the stroke actually moved can say
+                            // anything about what a fraction of it does.
+                            if (full - was).abs() < 0.05 {
+                                continue;
+                            }
+                            moved += 1;
+                            let got = masked.sample_voxel(cell);
+                            let want = was + (full - was) * free;
+                            if (got - want).abs() > worst {
+                                worst = (got - want).abs();
+                                worst_at = Some((cell, was, full, got, want));
+                            }
+                        }
+                    }
+                }
+
+                assert!(moved > 100, "{kind} {direction:?} moved only {moved} voxels unmasked");
+                assert!(
+                    worst < 1.0e-3,
+                    "{kind} {direction:?}: a half protected voxel is {worst} away from half \
+                     the stroke, worst at {worst_at:?}"
+                );
+            }
         }
     }
 

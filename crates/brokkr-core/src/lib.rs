@@ -78,7 +78,7 @@ pub use project::{
     Keyframe, MAX_NAME_BYTES, MAX_VOLUME_BYTES, Outline, ProjectError, ProjectState, View,
     name_that_fits,
 };
-pub use raycast::{Hit, raycast};
+pub use raycast::{Hit, SolidSpans, Span, first_solid_spans, raycast};
 pub use region::FieldRegion;
 pub use similarity::{Bake, Similarity};
 pub use split::{

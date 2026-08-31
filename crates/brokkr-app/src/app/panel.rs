@@ -1234,9 +1234,24 @@ impl Brokkr {
             // work: hiding a body is a draw-time skip and it keeps every slice
             // it holds. A user reading "the pool is full" and reaching for the
             // eye would see the count stay exactly where it is.
+            //
+            // **And there are two ways to be full, which need different
+            // sentences.** The allocator never splits or merges blocks and it
+            // is the bump watermark, not what is live, that fails a request --
+            // so an editing session that only ever SHRINKS meshes walks the
+            // watermark up while the live total falls. Thirty trims measures
+            // 1.45x on the render bench. In that state "delete a body or
+            // resample coarser" is advice about a problem the user does not
+            // have: there is room, it is just stranded, and only a full rebuild
+            // of the view gets it back.
+            let fragmented = pool.vertices_watermark > (pool.vertices as u64).saturating_mul(5) / 4;
+            let remedy = if fragmented {
+                "the pool is fragmented by editing, not full -- reopen the file to recover it"
+            } else {
+                "delete a body or resample coarser -- hiding one frees nothing"
+            };
             let warning = format!(
-                "MESH POOL FULL: {} bricks missing from the view\ndelete a body or resample \
-                 coarser -- hiding one frees nothing",
+                "MESH POOL FULL: {} bricks missing from the view\n{remedy}",
                 pool.overflowed
             );
             stacked = stacked.push(

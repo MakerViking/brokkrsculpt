@@ -12,7 +12,7 @@
 
 use std::time::{Duration, Instant};
 
-use brokkr_core::{BrickCoord, BrickMesh, Volume};
+use brokkr_core::{BrickCoord, BrickMesh, ClipPlane, Volume};
 use brokkr_gpu::{
     Frustum, PixelRect, SculptRenderer, SlotKey, THE_ONLY_BODY, THUMBNAIL_SIZE, Uniforms,
 };
@@ -52,6 +52,127 @@ fn view_projection(distance: f32) -> Mat4 {
         distance + MODEL_RADIUS * 4.0,
     );
     projection * view
+}
+
+/// Add a sphere to whatever is already there.
+///
+/// **Not `seed_sphere`, which OVERWRITES**: seeding clears every brick its box
+/// touches before writing, so seeding a small sphere onto a large one carves a
+/// moat around it instead of adding a lump to it.
+fn union_sphere(volume: &mut Volume, centre: Vec3, radius: f32) {
+    let voxel_size = volume.voxel_size();
+    let band = brokkr_core::NARROW_BAND * voxel_size;
+    let (lo, hi) =
+        volume.voxel_bounds(centre - (radius + band * 2.0), centre + (radius + band * 2.0));
+    volume.edit_voxels(lo, hi, |_, position, value| {
+        let outside = (position.distance(centre) - radius) / voxel_size;
+        value.min(outside).clamp(brokkr_core::INSIDE, brokkr_core::OUTSIDE)
+    });
+}
+
+/// **Thirty cuts in a row, watching the mesh pool's bump pointer.**
+///
+/// This is the one failure mode the cut tool's design names as a live risk, and
+/// it is invisible from `brokkr-core`: the pool's `BlockAllocator` never splits
+/// or merges blocks, a freed block is reusable only by a request rounding to
+/// the same granule count, and it is the bump `watermark` -- not `live` -- that
+/// fails an allocation. A cut only ever SHRINKS the meshes it touches, so every
+/// changed brick can orphan a block in a large granule class and take a fresh
+/// one off the bump. `MeshPool::reset` is the only cure and, in the whole
+/// application, is reached from `rebuild_everything` and from nothing else --
+/// no editing operation calls it.
+///
+/// So: trim thirty spurs, re-uploading what changed each time exactly as the
+/// application does, and report whether the watermark climbs while `live`
+/// stays flat. A watermark that ends near `live` means the allocator is
+/// reusing; one that ends far above it is the shape of `MESH POOL FULL` with
+/// most of the pool empty.
+fn measure_repeated_cuts(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    renderer: &mut SculptRenderer,
+) {
+    const SPURS: usize = 30;
+    const RADIUS: f32 = 30.0;
+    // Coarser than the render rows above: this measures allocator behaviour
+    // over thirty edits, and the thirty edits are the expensive part.
+    const VOXEL: f32 = 0.25;
+
+    let mut volume = Volume::new(VOXEL);
+    volume.seed_sphere(Vec3::ZERO, RADIUS);
+    let mut directions = Vec::with_capacity(SPURS);
+    for index in 0..SPURS {
+        let angle = index as f32 / SPURS as f32 * std::f32::consts::TAU;
+        let tilt = (index as f32 * 0.37).sin() * 0.7;
+        let direction =
+            Vec3::new(angle.cos() * tilt.cos(), tilt.sin(), angle.sin() * tilt.cos()).normalize();
+        union_sphere(&mut volume, direction * RADIUS, RADIUS * 0.12);
+        directions.push(direction);
+    }
+    volume.mark_everything_dirty();
+
+    let mut coords: Vec<BrickCoord> = Vec::new();
+    let mut meshes: Vec<BrickMesh> = Vec::new();
+    let publish = |renderer: &mut SculptRenderer,
+                   volume: &mut Volume,
+                   coords: &mut Vec<BrickCoord>,
+                   meshes: &mut Vec<BrickMesh>| {
+        coords.clear();
+        volume.take_dirty(coords);
+        while meshes.len() < coords.len() {
+            meshes.push(BrickMesh::default());
+        }
+        volume.mesh_bricks(coords, &mut meshes[..coords.len()]);
+        for (coord, mesh) in coords.iter().zip(meshes.iter()) {
+            renderer.upload_brick(
+                device,
+                queue,
+                SlotKey { body: THE_ONLY_BODY, coord: *coord },
+                mesh,
+            );
+        }
+        coords.len()
+    };
+
+    publish(renderer, &mut volume, &mut coords, &mut meshes);
+    let seeded = renderer.stats();
+    println!(
+        "
+thirty cuts in a row, mesh pool"
+    );
+    println!(
+        "  after seeding:  {:>9} live, {:>9} watermark",
+        seeded.vertices, seeded.vertices_watermark
+    );
+
+    let mut republished = 0usize;
+    for direction in &directions {
+        let plane =
+            ClipPlane::new(*direction * (RADIUS * 0.94), *direction).expect("a unit normal");
+        // Bounded, as the shaped cut is: a cap a little BEYOND the spur, so
+        // this measures thirty trims rather than thirty cuts through the model.
+        // The two normals face each other and the region removed is the shell
+        // between them -- putting the cap INSIDE the first plane instead makes
+        // the intersection empty and the whole loop a no-op, which reports a
+        // perfectly flat watermark for entirely the wrong reason.
+        let cap = ClipPlane::new(*direction * (RADIUS * 1.25), -*direction).expect("a unit normal");
+        volume.clip_convex(&[plane, cap]);
+        republished += publish(renderer, &mut volume, &mut coords, &mut meshes);
+    }
+
+    let after = renderer.stats();
+    println!(
+        "  after {SPURS} cuts: {:>9} live, {:>9} watermark   ({republished} brick re-uploads)",
+        after.vertices, after.vertices_watermark
+    );
+    let headroom = after.vertices_watermark as f64 / after.vertices.max(1) as f64;
+    println!(
+        "  watermark is {headroom:.2}x live, and the pool fails at {:.0} MB of watermark",
+        after.vertex_capacity as f64 * 24.0 / (1024.0 * 1024.0)
+    );
+    if after.overflowed > 0 {
+        eprintln!("  MESH POOL OVERFLOWED during thirty ordinary cuts");
+    }
 }
 
 fn main() {
@@ -202,6 +323,14 @@ fn main() {
     );
 
     all_passed &= thumbnail_row(&device, &queue, &renderer, &volume, stats.bricks);
+
+    // Its own model and its own pool state, so it cannot be read as a comment
+    // on the rows above. Report only: this is the first measurement of the
+    // allocator under repeated editing, and a pass mark drawn on the same day
+    // as the first measurement is not a budget.
+    let mut cut_renderer = SculptRenderer::new(&device, &queue, TARGET_FORMAT);
+    cut_renderer.resize(&device, WIDTH, HEIGHT);
+    measure_repeated_cuts(&device, &queue, &mut cut_renderer);
 
     if !all_passed {
         eprintln!("\nRENDER BUDGET EXCEEDED");

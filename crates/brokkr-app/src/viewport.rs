@@ -721,6 +721,17 @@ pub(crate) fn shortcut(character: &str, command: bool, shift: bool, alt: bool) -
         // it is up it goes back to sculpting, which `Message::ToolChanged`
         // does for every tool.
         "w" => Some(Message::ToolChanged(Tool::Transform)),
+        // The cut. `c` for cut, which is nobody else's key in particular --
+        // ZBrush reaches its clip family through a modifier chord rather than a
+        // letter, so there is no muscle memory to carry over and the obvious
+        // initial is free. Pressed while the cut is armed it goes back to
+        // sculpting, which `Message::ToolChanged` does for every tool.
+        //
+        // A key rather than a second strip button, deliberately: `panel.rs`
+        // records the tool strip as already over what fits a 768-high window
+        // without scrolling, so a tool that already HAS a button does not get
+        // to add another one.
+        "c" => Some(Message::ToolChanged(Tool::Cut)),
         // Hold to see the mask, whatever the `show mask` toggle says. ZBrush's
         // own mask-visibility key is H, taken rather than invented so muscle
         // memory carries over, and held rather than latched because that is the

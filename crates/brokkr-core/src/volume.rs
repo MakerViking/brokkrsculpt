@@ -8,8 +8,8 @@ use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::apron::ApronBuffer;
 use crate::brick::{
-    BRICK_DIM, BRICK_VOXELS, Brick, BrickCoord, INSIDE, NARROW_BAND, OUTSIDE, StoredBrick,
-    apron_index, brick_index,
+    APRON_VOXELS, BRICK_DIM, BRICK_VOXELS, Brick, BrickCoord, INSIDE, NARROW_BAND, OUTSIDE,
+    StoredBrick, apron_index, brick_index,
 };
 use crate::mask::{MaskBrick, MaskEdit, MaskField, MaskSlab, PROTECTED, UNMASKED};
 use crate::mesh::{BrickMesh, MeshScratch, mesh_apron};
@@ -805,7 +805,28 @@ impl Volume {
     /// shared by both bricks either side of a seam, so there is no halo to
     /// gather and no step at a brick boundary. See [`crate::mask`].
     pub fn mesh_brick(&self, coord: BrickCoord, scratch: &mut MeshScratch, out: &mut BrickMesh) {
+        if self.neighbourhood_has_no_surface(coord) {
+            out.clear();
+            return;
+        }
         self.gather_apron(coord, &mut scratch.apron);
+        if !apron_straddles_zero(scratch.apron.samples()) {
+            // **The second gate, and it catches what the first cannot.**
+            // `neighbourhood_has_no_surface` decides from the stored form alone
+            // and gives up the moment any of the 27 is dense -- which is most
+            // of the bricks along a cut face, since the face itself is dense.
+            // Their aprons still turn out to be all one sign surprisingly
+            // often: an absent brick beside a solid one only owns boundary
+            // quads where the solid's outermost voxel layer actually straddles
+            // within this brick's own apron window, and after a cut it usually
+            // does not.
+            //
+            // The gather has been paid by this point and is mostly `memcpy` of
+            // contiguous runs. What is skipped is surface nets over 35,937
+            // cells, which is the expensive half.
+            out.clear();
+            return;
+        }
         mesh_apron(&scratch.apron, coord, self.voxel_size, &mut scratch.surface_nets, out);
         self.mask.bytes_at_cells(coord, &out.cells, &mut out.mask);
         debug_assert_eq!(
@@ -813,6 +834,93 @@ impl Volume {
             out.vertices.len(),
             "one mask byte per vertex, or the pool writes a short attribute slice"
         );
+    }
+}
+
+/// Whether an apron holds values either side of zero, so a surface can cross it.
+///
+/// Surface nets emits a vertex only where a cell's eight corners straddle zero,
+/// so an apron entirely one side of zero produces nothing at all. Answering that
+/// costs one linear scan of 39,304 floats -- which the CPU does at memory speed
+/// and can vectorise -- against a surface-nets pass over 35,937 cells, which it
+/// cannot.
+///
+/// **Zero counts as being on both sides**, so an apron containing one is sent
+/// down the full path. `>= 0` and `> 0` split the lattice differently and which
+/// convention the mesher uses is not this function's to assume.
+///
+/// The two accumulators are deliberately kept separate rather than short
+/// circuiting on the first sign change: a branch per sample would cost more
+/// than the arithmetic on the overwhelmingly common case, which is an apron
+/// that is entirely one sign and has to be read to the end anyway.
+#[inline]
+fn apron_straddles_zero(samples: &[f32; APRON_VOXELS]) -> bool {
+    let mut any_positive = false;
+    let mut any_non_positive = false;
+    for value in samples {
+        any_positive |= *value > 0.0;
+        any_non_positive |= *value <= 0.0;
+    }
+    any_positive && any_non_positive
+}
+
+impl Volume {
+    /// Whether no surface can pass through a brick, decided from its
+    /// neighbourhood's stored form alone.
+    ///
+    /// **This is the cut's single biggest saving, and it is a saving on the
+    /// remesh rather than on the cut.** Measured on the budget harness: a plane
+    /// through the middle of the fixture dirties 669 bricks and **540 of them
+    /// mesh to nothing** -- 81%. A shaped cut is much the same, 63% to 68%.
+    /// Every one of those still paid a 34-cubed apron gather (39,304 samples
+    /// copied) and a full surface-nets pass over 35,937 cells, to emit zero
+    /// triangles. That is what a cut does: it removes material, so most of what
+    /// it dirties ends up empty on one side or solid on the other.
+    ///
+    /// # Why it is sound
+    ///
+    /// A brick's mesh comes from its apron, and the apron is gathered from
+    /// exactly this brick and its 26 neighbours. If every one of them is stored
+    /// as a single value -- a tile, or absent, which reads as [`OUTSIDE`] --
+    /// then the apron is piecewise constant with no value other than those.
+    /// Surface nets emits a vertex only where a cell's corners straddle zero,
+    /// so if all of those values are strictly one side of zero, no cell can
+    /// straddle and the mesh is empty.
+    ///
+    /// A `Dense` neighbour takes the slow path even if every voxel in it
+    /// happens to share a sign. That is deliberate: proving it would cost the
+    /// 32,768-voxel scan this is trying to avoid, and a dense brick beside a
+    /// changed one is nearly always a brick with surface in it.
+    ///
+    /// **Zero is treated as a crossing**, not as a sign. `>= 0` and `> 0` split
+    /// the lattice differently and the mesher's convention is not this
+    /// function's to assume, so a stored zero anywhere sends the brick down the
+    /// full path rather than guessing which side it belongs to.
+    fn neighbourhood_has_no_surface(&self, coord: BrickCoord) -> bool {
+        let mut positive = 0u32;
+        let mut negative = 0u32;
+        for dz in -1..=1 {
+            for dy in -1..=1 {
+                for dx in -1..=1 {
+                    let neighbour = BrickCoord(coord.0 + IVec3::new(dx, dy, dz));
+                    let value = match self.bricks.get(&neighbour) {
+                        // Absent reads as outside, which is the common case and
+                        // the one this exists for: the air a cut opens up.
+                        None => OUTSIDE,
+                        Some(Brick::Uniform(value)) => *value,
+                        Some(Brick::Dense(_)) => return false,
+                    };
+                    if value > 0.0 {
+                        positive += 1;
+                    } else if value < 0.0 {
+                        negative += 1;
+                    } else {
+                        return false;
+                    }
+                }
+            }
+        }
+        positive == 0 || negative == 0
     }
 
     /// Mesh many bricks at once, across every core.
@@ -1496,6 +1604,33 @@ impl Volume {
         self.recorder.is_some()
     }
 
+    /// Heap bytes the open stroke recorder is holding, or zero when none is.
+    ///
+    /// **This is the transient peak, and it is not the number history budgets
+    /// against.** [`crate::StrokeEdit`] run-length encodes what it is given, so
+    /// [`crate::StrokeEdit::bytes`] reports what the entry costs once it is
+    /// pushed; between [`Volume::begin_stroke`] and [`Volume::end_stroke`] the
+    /// recorder holds every captured brick as it found it, at 128 KB each for a
+    /// dense one. A cut along the widest axis of a large scan therefore peaks at
+    /// hundreds of megabytes that the history budget never sees, is never
+    /// charged for, and would not refuse.
+    ///
+    /// It exists to be measured. Nothing enforces a limit on it today, and a
+    /// limit invented without a measurement is how a legitimate cut on a large
+    /// body starts being refused; anything that does eventually refuse should
+    /// quote this rather than a ratio.
+    pub fn recorder_bytes(&self) -> usize {
+        let Some(recorder) = self.recorder.as_ref() else {
+            return 0;
+        };
+        // The map's own entries are counted too. They are small beside a dense
+        // brick, but a cut that captured ten thousand absent bricks holds ten
+        // thousand entries and no heap at all, and reporting zero for that
+        // would read as "the recorder is empty".
+        let entries = recorder.len() * (size_of::<BrickCoord>() + size_of::<Option<Brick>>());
+        entries + recorder.values().filter_map(Option::as_ref).map(Brick::heap_bytes).sum::<usize>()
+    }
+
     /// Capture a brick's prior contents if a stroke is being recorded and this
     /// is the first time it has been touched. Returns whether it recorded.
     pub(crate) fn record_for_undo(&mut self, coord: BrickCoord) -> bool {
@@ -1889,13 +2024,39 @@ impl Volume {
         self.bricks.remove(&coord)
     }
 
-    /// Drop a brick entirely, so it reads as empty space again.
+    /// Drop a brick, handing its storage straight to the recorder.
     ///
-    /// Used by the plane cut: a brick wholly past the cut is `OUTSIDE`
-    /// everywhere, and an absent brick already reads that way, so removing it
-    /// is both the correct answer and the free one.
-    pub(crate) fn remove_brick(&mut self, coord: BrickCoord) {
-        self.bricks.remove(&coord);
+    /// **The pair it replaces copies 128 KB it did not have to.**
+    /// `record_for_undo` clones the brick out of the map so undo has the prior,
+    /// and a bare remove then throws the original away -- so the clone existed
+    /// only because the two steps could not see each other. Where a brick is
+    /// being dropped rather than rewritten, the original IS the prior, and it
+    /// can be moved into the recorder instead.
+    ///
+    /// A cut is where this pays: it drops whole bricks by the hundred. On the
+    /// budget harness a plane through the middle of the fixture removes 151
+    /// bricks outright, and every dense one of those was a 128 KB memcpy that
+    /// bought nothing.
+    ///
+    /// The first-touch rule is preserved exactly: a brick already in the
+    /// recorder keeps the contents recorded the first time, and this one is
+    /// discarded, which is what makes a stroke that passes over a brick twice
+    /// still restore the state before the stroke rather than before the second
+    /// pass. [`Volume::take_brick`] is the equivalent for rewriting in place,
+    /// where a copy really is needed because the brick is going back.
+    ///
+    /// **There is deliberately no bare remover beside this.** There was, and
+    /// its only caller was the cut, which paired it with `record_for_undo` --
+    /// so every dropped brick was cloned and then discarded. A bare remover is
+    /// exactly the shape a future caller reaches for, and it would pay the same
+    /// cost again, so it is gone rather than kept for symmetry. A caller with
+    /// no recorder open loses nothing by using this one.
+    pub(crate) fn remove_brick_recording(&mut self, coord: BrickCoord) {
+        let prior = self.bricks.remove(&coord);
+        let Some(recorder) = self.recorder.as_mut() else {
+            return;
+        };
+        recorder.entry(coord).or_insert(prior);
     }
 
     /// World space bounds of the SURFACE, or `None` when there is none.
