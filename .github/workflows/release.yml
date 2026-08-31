@@ -426,20 +426,29 @@ jobs:
               --title "BrokkrSculpt open beta" --notes-file notes.md --target "$SHA"
           fi
 
-          # `--clobber` resets each asset's download count, which is the cost of a
-          # rolling tag and is accepted: GitHub keeps no record of a replaced
-          # asset, so lifetime totals are not recoverable either way.
-          # shellcheck disable=SC2086
-          gh release upload beta $files --repo "$R" --clobber
-
           # **One-time migration, 2026-08-31: drop the pre-rename human
-          # archives.** They were `brokkrsculpt-<platform>.…` and are now
-          # `BrokkrSculpt-<Platform>.…`. Nothing clobbers the old names any
-          # more, so left alone they would sit in the release for ever frozen at
-          # whatever build was current when the rename landed -- a download link
-          # that silently stops advancing is worse than one that 404s. Removed
-          # AFTER the new names are uploaded, so there is no moment with no
-          # archive to download. Safe to delete this block once it has run.
+          # archives BEFORE uploading the new ones.**
+          #
+          # They were `brokkrsculpt-<platform>.…` and are now
+          # `BrokkrSculpt-<Platform>.…`. Two reasons this cannot wait until
+          # after the upload, and the first is not optional:
+          #
+          # 1. **GitHub compares asset names case-insensitively.** Uploading
+          #    `BrokkrSculpt-Windows-x86_64.zip` while `brokkrsculpt-windows-
+          #    -x86_64.zip` exists fails with `HTTP 422 ReleaseAsset.name
+          #    already exists`, and `--clobber` does not save it: that looks for
+          #    an EXACT name to delete first, finds none, and uploads into the
+          #    collision. Run 33359951784 failed exactly here.
+          # 2. Left behind, the old names are orphaned -- nothing clobbers them
+          #    any more, so they would sit in the release for ever frozen at
+          #    whatever build was current when the rename landed. A download
+          #    link that silently stops advancing is worse than one that 404s.
+          #
+          # The cost of deleting first is a gap of a few seconds with no human
+          # archive attached, and if the upload below then fails, none until the
+          # next push. That is the lesser risk: payloads and the manifest are
+          # untouched, so self-updating keeps working throughout, and a failed
+          # run is loud. Safe to delete this block once it has run.
           for stale in brokkrsculpt-linux-x86_64.tar.gz \
                        brokkrsculpt-windows-x86_64.zip \
                        brokkrsculpt-macos-arm64.zip; do
@@ -447,6 +456,12 @@ jobs:
               echo "removed the pre-rename archive $stale"
             fi
           done
+
+          # `--clobber` resets each asset's download count, which is the cost of a
+          # rolling tag and is accepted: GitHub keeps no record of a replaced
+          # asset, so lifetime totals are not recoverable either way.
+          # shellcheck disable=SC2086
+          gh release upload beta $files --repo "$R" --clobber
 
           # **Payloads are uploaded WITHOUT `--clobber`, deliberately.** Their
           # names carry the build ordinal, so a name collision means this run is
