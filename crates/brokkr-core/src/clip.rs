@@ -47,6 +47,88 @@
 //! An unmasked body never reaches any of this: the mask is resolved once for the
 //! whole volume, and a body that protects nothing anywhere takes the same
 //! branches, and writes the same bits, as it did before masks existed.
+//!
+//! # What a cut actually costs
+//!
+//! Measured by `benches/budget.rs`'s `measure_the_cut`, on a 256³ effective
+//! volume: a ball of 423 bricks with thirty spurs unioned onto its equator,
+//! 41.9 MB resident. **The machine was not idle**, so the timings are upper
+//! bounds -- each row is the fastest of five runs, since contention only ever
+//! adds time -- and the counts are exact.
+//!
+//! A cut is three costs, and the interesting thing is which one is biggest.
+//! For a plane through the middle of the fixture, before any of the work below:
+//!
+//! | | ms | share |
+//! |---|---|---|
+//! | remesh | 5.17 | 44% |
+//! | undo encode | 3.62 | 31% |
+//! | the cut proper | 2.89 | 25% |
+//!
+//! **The classification was never any of it.** Seventeen planes against a body
+//! they miss costs 0.013 ms, because the `Keeps` early exit rejects almost
+//! every brick on the first plane it tries. Every obvious optimisation aims
+//! there, and there was nothing there to get.
+//!
+//! ## Where it went instead
+//!
+//! | | before | after |
+//! |---|---|---|
+//! | plane, midline: cut / encode / remesh | 2.89 / 3.62 / 5.17 | **2.02 / 1.05 / 2.41** |
+//! | 17-plane prism over a spur | 0.83 / 0.15 / 1.19 | **0.62 / 0.17 / 0.81** |
+//! | 17-plane prism straight through | 2.39 / 0.25 / 2.37 | **1.68 / 0.23 / 1.65** |
+//! | `Document::clip`, midline | 11.9 | **7.4** |
+//!
+//! **81% of the remesh was building nothing.** A plane through the middle
+//! dirties 669 bricks and 540 of them mesh to zero triangles -- a cut removes
+//! material, so most of what it dirties ends up empty on one side or solid on
+//! the other -- and each still paid a 34-cubed apron gather and a full
+//! surface-nets pass to say so. Two gates in `Volume::mesh_brick` now answer
+//! from the neighbourhood's stored form and from a linear scan of the gathered
+//! apron. See `Volume::neighbourhood_has_no_surface`.
+//!
+//! **The undo encode was serial and is embarrassingly parallel.** Every brick
+//! run-length encodes independently and `StrokeEdit::from_recording` did them
+//! one at a time, next door to a `par_iter` doing the identical shape of job.
+//!
+//! **Half the recorded bricks were copied for nothing.** A dropped brick IS the
+//! prior undo needs, and `record_for_undo` + a bare remove cloned 128 KB and
+//! then discarded the original. See `Volume::remove_brick_recording`.
+//!
+//! **Thirty cuts in a row do not degrade here**, and resident bytes go *down*
+//! (41.9 → 39.9 MB). Whatever the repeated-cut risk is, it is not in this
+//! crate -- it is the mesh pool's bump allocator, which lives in `brokkr-gpu`
+//! and is measured there: thirty trims take it from 1.11x to 1.45x watermark
+//! over live.
+//!
+//! # What a SHAPED cut costs, and where THAT cost was
+//!
+//! A sixteen-sided prism -- the ceiling hull decimation allows -- plus a depth
+//! cap, so seventeen planes. Naively that is 20 million dot products for 37
+//! crossing bricks, and it measured **17.8 ms against a 4 ms edit budget**.
+//! Three changes, all bit-exact, took it to 1.68 ms:
+//!
+//! 1. **Per-brick plane pruning** (`classify_active`). A plane already
+//!    saturated across a brick cannot decide any voxel in it. Most bricks a
+//!    hull crosses are straddled by two or three faces, not seventeen.
+//! 2. **Specialised write loops** for one to four planes, which is nearly every
+//!    crossing brick. Each holds its planes as values the compiler keeps in
+//!    registers and makes ONE pass over the brick.
+//! 3. **Plane-major writing** above that (`write_cut_brick_plane_major`): one
+//!    plane per pass over a scratch buffer, so it is still in a register, where
+//!    holding them all at once is no longer possible.
+//!
+//! `several_planes_write_the_minimum_of_their_distances_exactly` compares the
+//! result bit for bit against the definition written out through `edit_voxels`,
+//! because "this optimisation cannot change the answer" is the kind of claim
+//! that is convincing and occasionally wrong.
+//!
+//! The specialisation was found by accident and is worth more than it looks:
+//! routing the SINGLE-plane path through a slice, which is the obvious way to
+//! write this, cost **9.6 ms against 2.2 ms** on the plane through the middle
+//! -- a four-fold regression in the cut that ships today, invisible to every
+//! test, caused by nothing but the plane no longer being a value the compiler
+//! could keep in a register.
 
 use glam::{IVec3, Vec3};
 
@@ -125,6 +207,13 @@ enum Cut {
 /// different things to the user: the first means "your mask stopped this", the
 /// second means "your line missed". [`Document::clip`] carries both up so
 /// the status line can tell them apart.
+///
+/// The three behind them -- `classified`, `crossed`, `removed` -- are not for
+/// the user at all. They are the classification's own census, and they exist
+/// because "the shaped cut is no more expensive than the plane" is a claim
+/// about which arm each brick took, which no count of what *changed* can
+/// settle: a plane and a loop that remove the same bricks can reach that
+/// result having promoted wildly different numbers of them to dense.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ClipCounts {
     /// Bricks whose contents changed.
@@ -138,6 +227,177 @@ pub struct ClipCounts {
     /// the plane only grazed is in neither, so "the mask blocked the cut" is
     /// never said about a cut that had nothing to remove anyway.
     pub spared_by_mask: usize,
+    /// Bricks that reached the plane arithmetic at all.
+    ///
+    /// Today that is every brick in the body, because the classification loop
+    /// walks the whole map. It is counted rather than inferred from
+    /// [`crate::VolumeStats`] because it is about to stop being every brick:
+    /// a bounded cutter can be rejected against a brick's integer coordinate
+    /// before any float touches it, and the only way to say whether such a
+    /// filter is working is to have measured what it filtered.
+    pub classified: usize,
+    /// Bricks the cut had to promote dense and resolve one voxel at a time.
+    ///
+    /// **The cost number.** Everything expensive about a cut is proportional to
+    /// this: the dense promotion, the 128 KB undo record, the per voxel loop,
+    /// and -- through [`crate::Volume::mark_dirty_voxel_range`] -- most of the
+    /// remesh that follows. A cut whose `crossed` grows without its `changed`
+    /// growing is doing work it throws away.
+    pub crossed: usize,
+    /// Bricks dropped whole, without ever being made dense.
+    ///
+    /// The cheap arm, and worth counting separately from
+    /// [`ClipCounts::changed`] (which includes it) because it is the one a
+    /// shape can win: a loop drawn *around* a lump takes bricks whole that a
+    /// plane covering the same silhouette would have had to cross.
+    pub removed: usize,
+}
+
+/// The removed region's signed distance at a point, in millimetres.
+///
+/// The region is the INTERSECTION of the half-spaces, so a point is inside it
+/// only where every plane says so and the distance to the whole is the smallest
+/// of the distances to the parts: `-max_i(-d_i)` is `min_i d_i`.
+///
+/// **The single-plane path is the plane, bit for bit.** The first distance is
+/// taken outright and only the rest go through `min`, so with one plane no
+/// comparison happens at all and the value is character-for-character what
+/// `plane.distance(at)` returned before this function existed. That is not an
+/// optimisation; it is what makes today's cut provably unchanged, and it is why
+/// this is not written as a fold from `f32::INFINITY`.
+///
+/// # Where it over-estimates
+///
+/// Exactly right inside the region and outside a single face, and too large
+/// outside a convex EDGE, where the true distance is to the edge itself and
+/// this reports the distance to the nearer face's plane. At a wedge of interior
+/// angle `t`, at radius `r`, it over-estimates by `r * (1 - sin(t/2))` -- 0.88
+/// of a voxel at a right angle and 2.48 at 20 degrees, taken at the band edge
+/// where `r` is three voxels.
+///
+/// The direction is the good one. Over-estimating the removed region's distance
+/// makes `max` take slightly LESS at the corner, so a cut corner comes out
+/// rounded rather than sharpened, and a knife edge is the printability failure
+/// no watertightness check can see. It is still worth bounding, which is why
+/// the caller drops the sharpest hull vertices first rather than the smallest.
+///
+/// `pub(crate)` for [`crate::generate`]'s cutter mask, which is this same
+/// region written as protection instead of removal -- and sharing it is the
+/// point, for the reason [`ClipPlane::range_over_box`] gives about the
+/// classification: two copies of the arithmetic would let the mask and the cut
+/// disagree about where the region is.
+#[inline]
+pub(crate) fn cut_distance(planes: &[ClipPlane], at: Vec3) -> f32 {
+    let Some((first, rest)) = planes.split_first() else {
+        // No planes is no region. Returning the identity for `min` here would
+        // be `INFINITY`, which `max` would write over every voxel in the model.
+        // Callers refuse an empty set before reaching this; the value below is
+        // the harmless answer if one ever does not.
+        return f32::NEG_INFINITY;
+    };
+    let mut smallest = first.distance(at);
+    for plane in rest {
+        let (held, now) = (smallest, plane.distance(at));
+        debug_assert!(now.is_finite());
+        smallest = if held < now { held } else { now };
+    }
+    smallest
+}
+
+/// What a convex cutter does to one brick, and which of its planes still
+/// matter there.
+///
+/// `half` is the caller's, and must be: it is one voxel SHORT of the nominal
+/// brick size, because a brick spans `BRICK_DIM` sample positions and the
+/// distance from its first to its last is one voxel less than its extent.
+/// Recomputing it here from `BRICK_DIM * voxel_size` would widen every brick by
+/// a voxel and quietly move which ones classify as crossing.
+///
+/// Both verdicts are sound rather than conservative, and each for its own
+/// reason:
+///
+/// * **Keeps** on the first plane whose farthest corner is a full band behind
+///   it. `min_i d_i <= d_j` everywhere, so if one plane puts the whole brick
+///   behind itself the minimum is behind it too, whatever the other planes say.
+///   This is the early exit, and it is the common case: most bricks in a body
+///   are nowhere near the cutter, and most of those are rejected by the first
+///   plane tested.
+/// * **Removes** only when EVERY plane puts the whole brick a full band past
+///   it, which is exactly saturation inside the polyhedron.
+///
+/// The two are tested in the opposite order from the single-plane code this
+/// replaces, which checked `Removes` first. For one plane they are mutually
+/// exclusive -- `nearest <= farthest` and the band is positive -- so the
+/// reorder cannot change a single-plane verdict. For several it must be this
+/// way round: `Keeps` is decidable from one plane and `Removes` is not.
+///
+/// # Why it also narrows the plane set, and why that is exact
+///
+/// **This is where the shaped cut's real cost lives.** A plane whose nearest
+/// corner is already a full band past it contributes at least `OUTSIDE` at
+/// every point of the brick, in voxels. [`cut_voxel`] saturates there:
+/// `max(old, OUTSIDE)` clamped is `OUTSIDE` whatever `old` was, and whatever
+/// the mask lets through, since the blend runs toward that same target. So for
+/// any voxel in this brick either some other plane is smaller -- in which case
+/// the minimum is that one and this plane never mattered -- or none is, in
+/// which case the minimum is still at least `OUTSIDE` and the voxel saturates
+/// identically. Dropping it cannot change one written bit.
+///
+/// The measurement is what made this worth doing rather than the parallel
+/// classification that was originally planned. Classifying a sixteen-plane hull
+/// against a body it misses costs 0.008 ms where one plane costs 0.002 -- the
+/// classification was never the problem. The per voxel minimum was: 33 crossing
+/// bricks at eighteen planes is 19.5 million dot products, and it measured
+/// 17.8 ms against a 4 ms edit budget. Most bricks a hull crosses are straddled
+/// by two or three of its faces, not eighteen.
+///
+/// `active` is cleared and refilled rather than returned, so a cut over
+/// thousands of bricks allocates once. It is meaningful only for
+/// [`Cut::Crosses`]; the other two verdicts leave it in whatever state the scan
+/// reached, and nothing reads it.
+///
+/// **This is where the shaped cut's real cost lives, and dropping a plane here
+/// is exact rather than approximate.** A plane whose nearest corner is already
+/// a full band past it contributes at least `OUTSIDE` at every point of the
+/// brick, in voxels. `cut_voxel` saturates there: `max(old, OUTSIDE)` clamped is
+/// `OUTSIDE` whatever `old` was, and whatever the mask lets through, since the
+/// blend runs toward that same target. So for any voxel in this brick either
+/// some other plane is smaller -- in which case the minimum is that one and this
+/// plane never mattered -- or none is, in which case the minimum is still at
+/// least `OUTSIDE` and the voxel saturates identically. Removing it from the
+/// slice cannot change one written bit.
+///
+/// The measurement is what made this worth doing rather than the parallelism
+/// the plan proposed. Classification of a sixteen-plane hull over a body it
+/// misses costs 0.008 ms against one plane's 0.002 -- it was never the problem.
+/// The per voxel minimum was: 33 crossing bricks at eighteen planes is 19.5
+/// million dot products, and it measured 17.8 ms against a 4 ms edit budget.
+/// Most bricks a hull crosses are straddled by two or three of its faces, not
+/// eighteen.
+///
+/// `active` is cleared and refilled rather than returned, so a cut over
+/// thousands of bricks allocates once. It is left in an unspecified state
+/// unless the verdict is [`Cut::Crosses`]; nothing else reads it.
+fn classify_active(
+    planes: &[ClipPlane],
+    centre: Vec3,
+    half: Vec3,
+    band_mm: f32,
+    active: &mut Vec<ClipPlane>,
+) -> Cut {
+    active.clear();
+    for plane in planes {
+        let (nearest, farthest) = plane.range_over_box(centre, half);
+        if farthest <= -band_mm {
+            return Cut::Keeps;
+        }
+        if nearest < band_mm {
+            active.push(*plane);
+        }
+    }
+    // Every plane saturated positive across the brick, which is exactly the
+    // condition `classify` calls `Removes`.
+    if active.is_empty() { Cut::Removes } else { Cut::Crosses }
 }
 
 /// Whether the cut would move any voxel of a brick it is not allowed to touch.
@@ -155,20 +415,131 @@ fn cut_would_change_a_voxel(
     brick: &Brick,
     origin: IVec3,
     voxel_size: f32,
-    plane: ClipPlane,
+    planes: &[ClipPlane],
 ) -> bool {
     for z in 0..BRICK_DIM {
         for y in 0..BRICK_DIM {
             for x in 0..BRICK_DIM {
                 let at = (origin + IVec3::new(x as i32, y as i32, z as i32)).as_vec3() * voxel_size;
                 let old = brick.get(x, y, z);
-                if cut_voxel(old, plane.distance(at) / voxel_size, 1.0) != old {
+                if cut_voxel(old, cut_distance(planes, at) / voxel_size, 1.0) != old {
                     return true;
                 }
             }
         }
     }
     false
+}
+
+/// Write one dense brick's worth of the cut.
+///
+/// **Generic over how the cut distance is found, and that is the whole point.**
+/// It is instantiated twice -- once with a closure holding a single `Copy`
+/// [`ClipPlane`], once with one that takes the minimum over a slice -- so the
+/// single-plane instance compiles to a loop with the plane's point and normal
+/// live in registers across all 32,768 voxels, which is exactly the code that
+/// shipped before the cut took a shape.
+///
+/// Writing it once and calling it twice is not tidiness. Fusing the two into
+/// one loop that reads the plane out of a slice measured **9.6 ms against
+/// 2.2 ms** on a plane through the middle of the bench fixture: the compiler
+/// cannot keep a slice element in a register across a write to `data`, so it
+/// reloaded the plane for every voxel. Duplicating the loop body instead would
+/// have worked equally well and left two copies of the mask blend, the clamp
+/// and the millimetre-to-voxel conversion to keep in step.
+///
+/// `distance_mm` returns MILLIMETRES, as [`ClipPlane::distance`] does. The
+/// conversion to voxels happens here, once, because the field stores voxels and
+/// mixing the two moves the cut by a factor of the voxel size.
+#[inline]
+fn write_cut_brick(
+    data: &mut [f32; BRICK_DIM * BRICK_DIM * BRICK_DIM],
+    origin: IVec3,
+    voxel_size: f32,
+    freedom: &Freedom,
+    uniform: Option<f32>,
+    distance_mm: impl Fn(Vec3) -> f32,
+) {
+    for z in 0..BRICK_DIM {
+        for y in 0..BRICK_DIM {
+            for x in 0..BRICK_DIM {
+                let at = (origin + IVec3::new(x as i32, y as i32, z as i32)).as_vec3() * voxel_size;
+                let slot = brick_index(x, y, z);
+                let cut = distance_mm(at) / voxel_size;
+                let free = match uniform {
+                    Some(free) => free,
+                    None => freedom.at(slot),
+                };
+                data[slot] = cut_voxel(data[slot], cut, free);
+            }
+        }
+    }
+}
+
+/// Write one dense brick's worth of the cut, taking the minimum PLANE by plane
+/// rather than voxel by voxel.
+///
+/// Same result as calling [`write_cut_brick`] with a closure that minimises over
+/// the slice, and a different shape of loop. Each pass holds exactly one plane,
+/// so its point and normal stay in registers across all 32,768 voxels and the
+/// arithmetic is a straight-line dot product over contiguous memory; the
+/// voxel-major form has to read a different plane out of a slice on every
+/// iteration and cannot keep any of them.
+///
+/// It costs a 128 KB scratch buffer, reused across every brick of the cut, and
+/// it reads and writes that buffer once per plane. That trade only pays when
+/// there are several planes, which is why the single-plane path does not come
+/// through here -- there it would be two passes over 128 KB where one fused
+/// loop does.
+///
+/// The minimum is taken in MILLIMETRES and converted once at the end, so this
+/// and the voxel-major form round identically: neither divides before the min.
+fn write_cut_brick_plane_major(
+    data: &mut [f32; BRICK_DIM * BRICK_DIM * BRICK_DIM],
+    scratch: &mut [f32; BRICK_DIM * BRICK_DIM * BRICK_DIM],
+    origin: IVec3,
+    voxel_size: f32,
+    freedom: &Freedom,
+    uniform: Option<f32>,
+    planes: &[ClipPlane],
+) {
+    let Some((first, rest)) = planes.split_first() else {
+        return;
+    };
+
+    // The first plane fills rather than minimises, which is what makes this
+    // agree with `cut_distance` to the bit: that also takes the first distance
+    // outright instead of folding from an infinity.
+    for z in 0..BRICK_DIM {
+        for y in 0..BRICK_DIM {
+            for x in 0..BRICK_DIM {
+                let at = (origin + IVec3::new(x as i32, y as i32, z as i32)).as_vec3() * voxel_size;
+                scratch[brick_index(x, y, z)] = first.distance(at);
+            }
+        }
+    }
+    for plane in rest {
+        for z in 0..BRICK_DIM {
+            for y in 0..BRICK_DIM {
+                for x in 0..BRICK_DIM {
+                    let at =
+                        (origin + IVec3::new(x as i32, y as i32, z as i32)).as_vec3() * voxel_size;
+                    let slot = brick_index(x, y, z);
+                    let (held, now) = (scratch[slot], plane.distance(at));
+                    debug_assert!(now.is_finite());
+                    scratch[slot] = if held < now { held } else { now };
+                }
+            }
+        }
+    }
+
+    for slot in 0..data.len() {
+        let free = match uniform {
+            Some(free) => free,
+            None => freedom.at(slot),
+        };
+        data[slot] = cut_voxel(data[slot], scratch[slot] / voxel_size, free);
+    }
 }
 
 /// One voxel's new distance: the cut, admitted by as much of itself as the mask
@@ -180,11 +551,36 @@ fn cut_would_change_a_voxel(
 /// given it. A cut can therefore only ever remove less through a mask, never
 /// more and never something else.
 ///
-/// **The clamp is not optional.** `cut` is `plane.distance(at) / voxel_size`
-/// and is unbounded -- a plane a metre away from a quarter millimetre voxel
-/// gives four thousand -- so without it a `free` of 1 writes a distance far
-/// outside the narrow band into the field, which the project loader then
-/// refuses on the next open.
+/// **The clamp is not optional, and it has to happen BEFORE the blend.** `cut`
+/// is `cut_distance(planes, at) / voxel_size` and is unbounded -- a plane a
+/// metre away from a quarter millimetre voxel gives four thousand -- so without
+/// it a `free` of 1 writes a distance far outside the narrow band into the
+/// field, which the project loader then refuses on the next open.
+///
+/// # Why the order matters, and what it cost
+///
+/// Clamping afterwards instead is correct for an unmasked cut and **silently
+/// wrong for every partially masked one**, which is how it shipped. The blend
+/// runs toward `target`, so with the clamp at the end the target is that raw
+/// four thousand: a voxel at `-3` under half protection, with the cut twenty
+/// voxels past it, came out as `-3 + (20 - -3) * 0.5 = 8.5`, clamped to
+/// `OUTSIDE`. It should have come out at `0.0` -- half way from `-3` to the
+/// most a cut can ever write.
+///
+/// So a half-protected voxel was removed as completely as an unprotected one,
+/// and the mask's feathered edge -- the thing `mask.rs` requires every writer
+/// to produce, so that protection is a gradient and not a step -- did nothing
+/// at all except exactly where `free` was zero. The further the cutter was from
+/// a voxel, the more completely the protection was overwhelmed, which is the
+/// opposite of what anyone would predict and is why it survived: the case that
+/// looks correct while you test it, a cut right at the mask's edge, is the one
+/// case where the two orders nearly agree.
+///
+/// Clamping first makes the blend a convex combination of two values that are
+/// both already in the band, so the result is in the band by construction. The
+/// trailing clamp is kept anyway: it costs nothing, it makes the `free >= 1.0`
+/// arm's output obviously in range, and a `free` outside `0..=1` would
+/// otherwise extrapolate.
 ///
 /// # Why `free == 1` takes the plain `max` instead of the blend
 ///
@@ -196,7 +592,7 @@ fn cut_would_change_a_voxel(
 /// masking, in every model, on the first build that shipped masking.
 #[inline]
 fn cut_voxel(old: f32, cut: f32, free: f32) -> f32 {
-    let target = old.max(cut);
+    let target = old.max(cut).clamp(INSIDE, OUTSIDE);
     let new = if free >= 1.0 { target } else { old + (target - old) * free };
     new.clamp(INSIDE, OUTSIDE)
 }
@@ -213,14 +609,41 @@ impl Volume {
     /// change are recorded, so cutting a corner off a large model costs an undo
     /// entry proportional to the corner rather than to the model.
     pub fn clip(&mut self, plane: ClipPlane) -> ClipCounts {
-        self.with_mask_lifted(|volume, mask| volume.clip_masked(plane, mask))
+        self.clip_convex(std::slice::from_ref(&plane))
+    }
+
+    /// Cut away the convex region every plane in `planes` agrees on.
+    ///
+    /// The removed region is the INTERSECTION of the half-spaces -- material
+    /// goes only where every plane says it should. One plane is therefore
+    /// [`Volume::clip`]'s infinite half-space, which is why that is a wrapper
+    /// over this rather than a second implementation: `min` over one element is
+    /// the element, so the arithmetic is not merely equivalent, it is the same
+    /// arithmetic.
+    ///
+    /// **An empty slice removes nothing**, and that is a decision rather than a
+    /// fallback. The intersection of no half-spaces is all of space, so the
+    /// mathematically faithful answer is to delete the entire model -- which is
+    /// never what a caller with an empty list meant. It is what one would get
+    /// from a gesture whose plane construction failed, and there is no gesture
+    /// for which erasing the document is the right recovery.
+    ///
+    /// Bracket a call in [`Volume::begin_stroke`] and [`Volume::end_stroke`] to
+    /// make it undoable, exactly as a brush stroke is. Only bricks that really
+    /// change are recorded, so cutting a corner off a large model costs an undo
+    /// entry proportional to the corner rather than to the model.
+    pub fn clip_convex(&mut self, planes: &[ClipPlane]) -> ClipCounts {
+        if planes.is_empty() {
+            return ClipCounts::default();
+        }
+        self.with_mask_lifted(|volume, mask| volume.clip_convex_masked(planes, mask))
     }
 
     /// The cut proper, with the mask already lifted off the volume.
     ///
     /// Split out only so that [`Volume::with_mask_lifted`] can hold the mask
     /// across it; everything the cut does is here.
-    fn clip_masked(&mut self, plane: ClipPlane, mask: Option<&MaskField>) -> ClipCounts {
+    fn clip_convex_masked(&mut self, planes: &[ClipPlane], mask: Option<&MaskField>) -> ClipCounts {
         let voxel_size = self.voxel_size();
         let band_mm = NARROW_BAND * voxel_size;
         let brick_mm = BRICK_DIM as f32 * voxel_size;
@@ -231,19 +654,18 @@ impl Volume {
         let coords: Vec<BrickCoord> = self.brick_coords().collect();
         let mut counts = ClipCounts::default();
         let mut touched: Vec<BrickCoord> = Vec::new();
+        // Reused across every brick: see `classify_active`.
+        let mut active: Vec<ClipPlane> = Vec::with_capacity(planes.len());
+        // 128 KB, and only ever allocated by a cut that really has more than
+        // one plane crossing a brick -- so a plane cut, which is every cut that
+        // ships today, never pays for it. See `write_cut_brick_plane_major`.
+        let mut scratch: Option<Box<[f32; BRICK_DIM.pow(3)]>> = None;
 
         for coord in coords {
+            counts.classified += 1;
             let origin = coord.origin();
             let centre = origin.as_vec3() * voxel_size + half;
-            let (nearest, farthest) = plane.range_over_box(centre, half);
-
-            let mut verdict = if nearest >= band_mm {
-                Cut::Removes
-            } else if farthest <= -band_mm {
-                Cut::Keeps
-            } else {
-                Cut::Crosses
-            };
+            let mut verdict = classify_active(planes, centre, half, band_mm, &mut active);
 
             // Removing is dropping the brick, which cannot be done by halves, so
             // anything the mask has to say about this brick sends it down the
@@ -258,18 +680,23 @@ impl Volume {
             }
 
             match verdict {
-                // The plane's own contribution is already saturated positive
-                // across the whole brick, so `max` would make every voxel
-                // OUTSIDE. An absent brick reads as OUTSIDE, so dropping it is
-                // both correct and free.
+                // Every plane's contribution is already saturated positive
+                // across the whole brick, so their minimum is too and `max`
+                // would make every voxel OUTSIDE. An absent brick reads as
+                // OUTSIDE, so dropping it is both correct and free.
                 Cut::Removes => {
-                    self.record_for_undo(coord);
-                    self.remove_brick(coord);
+                    // One call, because the brick being dropped IS the prior
+                    // undo needs: recording and then removing copies 128 KB
+                    // and immediately throws the original away. See
+                    // `Volume::remove_brick_recording`.
+                    self.remove_brick_recording(coord);
                     counts.changed += 1;
+                    counts.removed += 1;
                     touched.push(coord);
                 }
-                // `max(field, plane)` is `field` everywhere in here. Touching it
-                // would cost a dense promotion and an undo entry for no change.
+                // `max(field, cutter)` is `field` everywhere in here. Touching
+                // it would cost a dense promotion and an undo entry for no
+                // change.
                 Cut::Keeps => {}
                 Cut::Crosses => {
                     let Some(present) = self.brick(coord) else {
@@ -290,7 +717,23 @@ impl Volume {
                         // the brick is left alone entirely -- which is also what
                         // keeps a downgraded `Removes` brick present instead of
                         // deleted.
-                        if cut_would_change_a_voxel(present, origin, voxel_size, plane) {
+                        // **The full plane set, not the pruned one.** A brick
+                        // the mask downgraded from `Removes` arrives here with
+                        // an EMPTY active set -- empty is precisely how
+                        // `classify_active` says "every plane saturates across
+                        // this brick" -- and the minimum over no planes is
+                        // negative infinity, which reports that the cut would
+                        // have changed nothing. That is the opposite of the
+                        // truth for a brick the cutter would have taken whole,
+                        // and it drops the brick out of `bricks_spared_by_mask`
+                        // -- so the status line says "the cut missed the model"
+                        // over a cut a mask had just blocked completely, which
+                        // is the one message that sends a user off to redraw a
+                        // gesture that was never the problem.
+                        //
+                        // Only fully protected bricks reach this, so paying the
+                        // full plane count here costs nothing anywhere else.
+                        if cut_would_change_a_voxel(present, origin, voxel_size, planes) {
                             counts.spared_by_mask += 1;
                         }
                         continue;
@@ -303,27 +746,35 @@ impl Volume {
                     let Some(mut brick) = self.take_brick(coord) else {
                         continue;
                     };
+                    // Counted here rather than at the verdict, because the two
+                    // arms above reach this match with a `Crosses` verdict and
+                    // cost nothing dense: an absent brick has nothing to
+                    // promote, and a fully protected one is deliberately left
+                    // where it is. What this number is for is the price of the
+                    // promotion, so it counts promotions.
+                    counts.crossed += 1;
                     let data = brick.make_dense();
-                    for z in 0..BRICK_DIM {
-                        for y in 0..BRICK_DIM {
-                            for x in 0..BRICK_DIM {
-                                let at = (origin + IVec3::new(x as i32, y as i32, z as i32))
-                                    .as_vec3()
-                                    * voxel_size;
-                                // Both terms in voxels, which is what the field
-                                // stores. Mixing millimetres in here would move
-                                // the cut by a factor of the voxel size.
-                                let slot = brick_index(x, y, z);
-                                let cut = plane.distance(at) / voxel_size;
-                                let free = match uniform {
-                                    Some(free) => free,
-                                    None => freedom.at(slot),
-                                };
-                                data[slot] = cut_voxel(data[slot], cut, free);
-                            }
+                    // Specialised on the plane count, and it is worth the two
+                    // call sites. See `write_cut_brick`: with one plane the
+                    // closure captures a `Copy` `ClipPlane` that stays in
+                    // registers for all 32,768 voxels, where reading it back
+                    // out of a slice each time measured four times slower.
+                    match active.as_slice() {
+                        [only] => {
+                            let only = *only;
+                            write_cut_brick(data, origin, voxel_size, &freedom, uniform, |at| {
+                                only.distance(at)
+                            });
+                        }
+                        many => {
+                            let scratch =
+                                scratch.get_or_insert_with(|| Box::new([0.0; BRICK_DIM.pow(3)]));
+                            write_cut_brick_plane_major(
+                                data, scratch, origin, voxel_size, &freedom, uniform, many,
+                            );
                         }
                     }
-                    // A brick the plane merely grazed can come out entirely
+                    // A brick the cutter merely grazed can come out entirely
                     // empty, and one it barely entered can come out unchanged.
                     // Collapsing releases the 128 KB either way.
                     // Already recorded and already taken out of the map, so
@@ -342,10 +793,14 @@ impl Volume {
         // Every brick that changed, plus its neighbours: a brick's apron reads
         // one voxel into each of the 26 around it, so remeshing only what was
         // written would leave a seam along the cut face.
+        //
+        // The dedup that keeps this from costing 27 remeshes per changed brick
+        // is the `FxHashSet` inside `mark_dirty_voxel_range`, not anything
+        // here: `touched` is a plain `Vec` and deliberately so, since a brick
+        // reaches it at most once. Measured at 3.03 dirty bricks per brick
+        // changed rather than 27 -- see the module doc.
         for coord in touched {
-            let origin = coord.origin();
-            self.mark_dirty_voxel_range(origin, coord.max_voxel());
-            let _ = origin;
+            self.mark_dirty_voxel_range(coord.origin(), coord.max_voxel());
         }
         counts
     }
@@ -362,9 +817,22 @@ pub struct CutOutcome {
     /// Bricks changed, summed over every body.
     pub bricks: usize,
     /// Bodies at least one brick of which changed.
-    pub bodies_cut: usize,
+    /// The bodies at least one brick of which changed, in node order.
+    ///
+    /// A list rather than a count, for the same reason
+    /// [`CutOutcome::bodies_spared_by_mask`] is one: the caller has real work
+    /// that is proportional to WHICH bodies changed, not how many. Reporting
+    /// loose pieces means a connectivity walk, and walking a body the cut never
+    /// reached costs as much as walking one it did and can only ever find what
+    /// was already there.
+    ///
+    /// The alternative -- asking each body afterwards whether it has anything
+    /// dirty -- reads the same answer off a set that happens not to have been
+    /// drained yet, and would go quietly wrong the day a remesh moved above the
+    /// status line.
+    pub bodies_cut: Vec<NodeId>,
     /// Bodies the half-space reached at all, whether or not it found anything
-    /// there to remove. Always at least `bodies_cut`.
+    /// there to remove. Always at least `bodies_cut.len()`.
     pub bodies_crossed: usize,
     /// Bricks the mask kept whole, summed over every body.
     ///
@@ -416,6 +884,32 @@ impl Document {
     /// [`Volume::clip`] itself still cuts one body; this sums what each of them
     /// reports, both the bricks that changed and the bricks a mask kept whole.
     pub fn clip(&mut self, plane: ClipPlane, visible: &[bool]) -> CutOutcome {
+        self.clip_convex(std::slice::from_ref(&plane), visible)
+    }
+
+    /// Cut every body that is DRAWN with a convex cutter, as one gesture.
+    ///
+    /// [`Document::clip`] is this with one plane, and everything its
+    /// documentation says holds here: the gesture acts on what is drawn, one
+    /// gesture is one [`Entry`], and a body the cutter cannot reach is skipped
+    /// without walking its brick map.
+    ///
+    /// # The body gate generalises by reusing the arm the plane version threw
+    ///   away
+    ///
+    /// The single-plane gate binds `let (_, farthest)` and rejects a body lying
+    /// wholly BEHIND the plane. That is the same test as [`classify`]'s
+    /// `Cut::Keeps`, run over a body's bounds instead of a brick's, and it
+    /// generalises the same way: `min_i d_i <= d_j` everywhere, so a body that
+    /// any single plane puts wholly behind it cannot be reached by the
+    /// intersection either.
+    ///
+    /// What is deliberately NOT done here is the mirror of `Cut::Removes` --
+    /// noticing that the cutter swallows a body whole and dropping every brick
+    /// without looking. It would be sound, but a body that small is already
+    /// cheap to walk, and the arm would be a second place where "the mask can
+    /// veto a whole-brick drop" has to be remembered.
+    pub fn clip_convex(&mut self, planes: &[ClipPlane], visible: &[bool]) -> CutOutcome {
         debug_assert_eq!(
             visible.len(),
             self.nodes().len(),
@@ -425,25 +919,34 @@ impl Document {
         let band_mm = NARROW_BAND * self.voxel_size();
         // Resolved up front, so the loop below can take each body mutably in
         // turn without holding a borrow of the node list.
-        let crossed: Vec<NodeId> = self
-            .nodes()
-            .iter()
-            .enumerate()
-            .filter(|(index, _)| visible.get(*index).copied().unwrap_or(false))
-            .filter_map(|(_, node)| {
-                let (low, high) = node.bounds()?;
-                let centre = (low + high) * 0.5;
-                let (_, farthest) = plane.range_over_box(centre, (high - low) * 0.5);
-                // Wholly behind the plane by at least the band: every brick in
-                // it would classify as `Keeps`, so there is nothing to do and
-                // the line did not reach this body at all.
-                (farthest > -band_mm).then_some(node.id)
-            })
-            .collect();
+        let crossed: Vec<NodeId> = if planes.is_empty() {
+            // No cutter reaches nothing. Returning every visible body here
+            // would report "the cut crossed 3 bodies and found nothing", which
+            // describes a cut that happened.
+            Vec::new()
+        } else {
+            self.nodes()
+                .iter()
+                .enumerate()
+                .filter(|(index, _)| visible.get(*index).copied().unwrap_or(false))
+                .filter_map(|(_, node)| {
+                    let (low, high) = node.bounds()?;
+                    let centre = (low + high) * 0.5;
+                    let half = (high - low) * 0.5;
+                    // Wholly behind ANY ONE plane by at least the band: every
+                    // brick in it would classify as `Keeps`, so there is
+                    // nothing to do and the gesture did not reach this body at
+                    // all.
+                    let reached =
+                        planes.iter().all(|plane| plane.range_over_box(centre, half).1 > -band_mm);
+                    reached.then_some(node.id)
+                })
+                .collect()
+        };
 
         let mut outcome = CutOutcome {
             bricks: 0,
-            bodies_cut: 0,
+            bodies_cut: Vec::new(),
             bodies_crossed: crossed.len(),
             bricks_spared_by_mask: 0,
             bodies_spared_by_mask: Vec::new(),
@@ -456,7 +959,7 @@ impl Document {
                 continue;
             };
             volume.begin_stroke();
-            let counts = volume.clip(plane);
+            let counts = volume.clip_convex(planes);
             let edit = volume.end_stroke();
             // Counted whatever else happened in this body: a cut that removed
             // half a body and was blocked on the other half spared bricks just
@@ -470,7 +973,7 @@ impl Document {
             // nothing.
             if let Some(edit) = edit.filter(|edit| !edit.is_empty()) {
                 outcome.bricks += counts.changed;
-                outcome.bodies_cut += 1;
+                outcome.bodies_cut.push(body);
                 changes.push(Change::Bricks { body, edit });
             }
         }
@@ -740,7 +1243,7 @@ mod across_the_document {
         let visible = shown(&doc);
         let outcome = doc.clip(ClipPlane::new(Vec3::ZERO, Vec3::Y).unwrap(), &visible);
 
-        assert_eq!(outcome.bodies_cut, 2, "the cut reached {} bodies", outcome.bodies_cut);
+        assert_eq!(outcome.bodies_cut.len(), 2, "the cut reached {:?}", outcome.bodies_cut);
         assert_eq!(outcome.bodies_crossed, 2);
         assert!(outcome.bricks > 0);
         for (id, probe) in ids.iter().zip(above) {
@@ -802,7 +1305,7 @@ mod across_the_document {
         let visible = shown(&doc);
         let outcome = doc.clip(ClipPlane::new(Vec3::ZERO, Vec3::Y).unwrap(), &visible);
 
-        assert_eq!(outcome.bodies_cut, 1, "the cut reached the hidden body");
+        assert_eq!(outcome.bodies_cut.len(), 1, "the cut reached the hidden body");
         assert_eq!(outcome.bodies_crossed, 1);
         assert_eq!(
             doc.volume(hidden).unwrap().sample_world(probe),
@@ -822,7 +1325,7 @@ mod across_the_document {
             doc.clip(ClipPlane::new(Vec3::new(0.0, 500.0, 0.0), Vec3::Y).unwrap(), &visible);
 
         assert_eq!(outcome.bricks, 0);
-        assert_eq!(outcome.bodies_cut, 0);
+        assert_eq!(outcome.bodies_cut.len(), 0);
         assert_eq!(outcome.bodies_crossed, 0, "a plane 500 mm away counted as crossing a body");
         assert!(outcome.entry.is_none(), "a cut that changed nothing recorded an entry");
     }
@@ -848,7 +1351,7 @@ mod across_the_document {
         let visible = shown(&doc);
         let outcome = doc.clip(plane, &visible);
         assert_eq!(outcome.bodies_crossed, 1, "the plane did not reach the body's box");
-        assert_eq!(outcome.bodies_cut, 0, "the plane found something to remove in an empty corner");
+        assert_eq!(outcome.bodies_cut.len(), 0, "the plane found something in an empty corner");
         assert_eq!(outcome.bricks, 0);
         assert!(outcome.entry.is_none());
     }
@@ -961,6 +1464,517 @@ mod provenance {
             differing, 0,
             "an unmasked cut no longer writes what the plain max wrote: {differing} voxels \
              differ, first at {worst:?}"
+        );
+    }
+
+    /// One plane through [`Volume::clip_convex`] is [`Volume::clip`], to the
+    /// bit.
+    ///
+    /// The reason this is a test rather than an argument is that the argument
+    /// is *almost* airtight and the gap is exactly where a mistake would live.
+    /// `min` over one element is that element, so no comparison happens and no
+    /// rounding can differ -- provided the single-plane path really does take
+    /// the first distance outright rather than folding from `f32::INFINITY`.
+    /// Folding would be equivalent for every finite value and would silently
+    /// stop being equivalent the day a `NaN` reached it, and nothing else in
+    /// this file would notice.
+    ///
+    /// Oblique on all three axes, because an axis-aligned plane lands its
+    /// distances on lattice values and would pass this test even if the
+    /// arithmetic had changed.
+    #[test]
+    fn a_one_plane_convex_cut_is_the_plane_cut_bit_for_bit() {
+        use crate::testing::assert_same_field;
+
+        let plane = ClipPlane::new(Vec3::new(2.0, -1.0, 3.0), Vec3::new(1.0, 2.0, -0.5)).unwrap();
+
+        let mut singular = Volume::new(0.5);
+        singular.seed_sphere(Vec3::ZERO, 20.0);
+        singular.mark_everything_dirty();
+        let one = singular.clip(plane);
+
+        let mut plural = Volume::new(0.5);
+        plural.seed_sphere(Vec3::ZERO, 20.0);
+        plural.mark_everything_dirty();
+        let many = plural.clip_convex(&[plane]);
+
+        assert!(one.changed > 0, "the fixture was not cut");
+        assert_eq!(one, many, "the two paths disagreed about what they did");
+        assert_same_field(&singular, &plural, "one plane through clip_convex");
+    }
+
+    /// **A half-protected voxel must land half way, not all the way.**
+    ///
+    /// This is the regression test for a bug that shipped: the blend ran toward
+    /// the RAW cut distance, which is unbounded, and only the finished value
+    /// was clamped. So a voxel at `-3` under half protection with the cutter
+    /// twenty voxels past it blended toward 20 rather than toward `OUTSIDE`,
+    /// landed at 8.5, and clamped to 3.0 -- removed exactly as completely as an
+    /// unprotected voxel.
+    ///
+    /// **The effect got WORSE the further the cutter was**, which is why it
+    /// survived: a cut drawn right at the edge of a mask, which is how anyone
+    /// would test this by hand, is the one case where the two orders nearly
+    /// agree. Everything further out was silently unprotected.
+    ///
+    /// The far end of the sweep is the part that bites. `free` of 0.5 with the
+    /// cutter one voxel away is nearly right under either order; at twenty
+    /// voxels the old form is off by the whole band.
+    #[test]
+    fn a_partly_protected_voxel_blends_toward_outside_and_not_beyond_it() {
+        for free in [0.25_f32, 0.5, 0.75] {
+            for cut in [1.0_f32, 4.0, 20.0, 4000.0] {
+                for old in [INSIDE, -1.0, 0.0, 1.0] {
+                    let got = cut_voxel(old, cut, free);
+                    // The most a cut can ever write is OUTSIDE, so a fraction
+                    // `free` of the way there is the answer.
+                    let ceiling = old.max(cut).clamp(INSIDE, OUTSIDE);
+                    let want = old + (ceiling - old) * free;
+                    assert!(
+                        (got - want).abs() < 1.0e-6,
+                        "old {old}, cut {cut}, free {free}: got {got}, wanted {want}"
+                    );
+                    assert!(
+                        got < OUTSIDE || ceiling >= OUTSIDE && free >= 1.0,
+                        "a partly protected voxel was driven fully outside: old {old}, cut \
+                         {cut}, free {free} gave {got}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// And the unmasked path is untouched by that fix, which is the property
+    /// that let it be made at all: clamping a value that is already clamped is
+    /// the identity, so `free >= 1` writes exactly what it always wrote.
+    #[test]
+    fn clamping_before_the_blend_does_not_move_an_unmasked_cut() {
+        for cut in [-4000.0_f32, -3.5, -1.0, 0.0, 1.0, 3.5, 4000.0] {
+            for old in [INSIDE, -1.5, 0.0, 1.5, OUTSIDE] {
+                let got = cut_voxel(old, cut, 1.0);
+                let was = old.max(cut).clamp(INSIDE, OUTSIDE);
+                assert_eq!(got.to_bits(), was.to_bits(), "old {old}, cut {cut}");
+            }
+        }
+    }
+
+    /// A cutter of no planes removes nothing.
+    ///
+    /// The intersection of no half-spaces is all of space, so the faithful
+    /// answer is to erase the model. This pins the unfaithful one, because
+    /// there is no gesture whose failure should be answered by deleting
+    /// everything -- and an empty slice is exactly what a gesture whose plane
+    /// construction failed would hand over.
+    #[test]
+    fn a_cutter_with_no_planes_removes_nothing() {
+        use crate::testing::assert_same_field;
+
+        let mut cut = Volume::new(0.5);
+        cut.seed_sphere(Vec3::ZERO, 20.0);
+        cut.mark_everything_dirty();
+
+        let mut untouched = Volume::new(0.5);
+        untouched.seed_sphere(Vec3::ZERO, 20.0);
+        untouched.mark_everything_dirty();
+
+        assert_eq!(cut.clip_convex(&[]).changed, 0, "an empty cutter removed bricks");
+        assert_same_field(&cut, &untouched, "an empty cutter");
+    }
+}
+
+/// The cut as a convex region rather than a half-space.
+///
+/// What these pin is the one property a plane cannot have: **the cutter stops**.
+/// Every test here is built around material the cutter must leave alone that a
+/// plane covering the same silhouette would have taken, because that is the
+/// entire difference and nothing in the single-plane suite can see it.
+#[cfg(test)]
+mod as_a_convex_region {
+    use super::*;
+
+    const VOXEL: f32 = 0.5;
+
+    /// An axis-aligned box as six half-spaces, normals pointing INWARD.
+    ///
+    /// Inward is the direction that makes the box's interior the region that
+    /// goes: a plane's normal points at the side being removed, so for the
+    /// intersection to be the inside of the box each face must point in.
+    /// Getting this backwards produces the complement -- an unbounded region
+    /// with a box-shaped hole in it -- which removes the entire model except a
+    /// box, and is a failure worth being able to recognise on sight.
+    fn box_cutter(low: Vec3, high: Vec3) -> Vec<ClipPlane> {
+        let mut planes = Vec::with_capacity(6);
+        for axis in [Vec3::X, Vec3::Y, Vec3::Z] {
+            planes.push(ClipPlane::new(low, axis).expect("a unit axis"));
+            planes.push(ClipPlane::new(high, -axis).expect("a unit axis"));
+        }
+        planes
+    }
+
+    /// Two balls, far enough apart that a brick belongs to at most one.
+    fn a_ball_and_a_distant_one() -> Volume {
+        let mut volume = Volume::new(VOXEL);
+        volume.seed_sphere(Vec3::ZERO, 20.0);
+        volume.seed_sphere(Vec3::new(60.0, 0.0, 0.0), 8.0);
+        volume.mark_everything_dirty();
+        volume
+    }
+
+    /// **The headline property.** A bounded cutter takes what is inside it and
+    /// leaves what is behind it, where the plane that removes the same near
+    /// material would go on to remove the far ball as well.
+    ///
+    /// The far ball is not decoration. `a_cut_passes_through_the_whole_model`
+    /// asserts the opposite behaviour on the same shape of fixture, and it must
+    /// keep passing: an infinite half-space is still what one plane means. The
+    /// two tests together are what say the boundedness comes from the extra
+    /// planes and not from a change of heart about what a cut is.
+    #[test]
+    fn a_bounded_cutter_stops_where_a_plane_would_carry_on() {
+        let mut volume = a_ball_and_a_distant_one();
+        let counts = volume
+            .clip_convex(&box_cutter(Vec3::new(10.0, -40.0, -40.0), Vec3::new(40.0, 40.0, 40.0)));
+
+        assert!(counts.changed > 0, "the cutter did nothing");
+        assert!(
+            volume.sample_world(Vec3::new(15.0, 0.0, 0.0)) > 0.0,
+            "material survived inside the cutter"
+        );
+        assert!(
+            volume.sample_world(Vec3::new(-15.0, 0.0, 0.0)) < 0.0,
+            "the cutter reached behind itself"
+        );
+        assert!(
+            volume.sample_world(Vec3::new(60.0, 0.0, 0.0)) < 0.0,
+            "the cutter carried on past its far face and took the distant ball"
+        );
+    }
+
+    /// A cutter that encloses material drops bricks whole rather than resolving
+    /// them one voxel at a time. This is the shape's own payoff: a plane
+    /// covering the same silhouette has to cross every brick along an infinite
+    /// sheet, where a loop drawn around a lump saturates inside it.
+    ///
+    /// Asserted on `removed` directly rather than inferred from a drop in
+    /// resident bytes, because there are TWO ways a brick leaves the map -- the
+    /// whole-brick drop, and a crossed brick that collapses to `OUTSIDE` and is
+    /// reinserted as nothing -- and a bytes measurement cannot tell them apart.
+    #[test]
+    fn a_cutter_that_encloses_material_drops_whole_bricks() {
+        let mut volume = Volume::new(VOXEL);
+        volume.seed_sphere(Vec3::ZERO, 30.0);
+        volume.mark_everything_dirty();
+
+        // Comfortably larger than a brick on every axis (a brick is 32 voxels,
+        // 16 mm here), and wholly inside the ball, so bricks in the middle of
+        // it are saturated past the band on all six faces.
+        let counts = volume.clip_convex(&box_cutter(Vec3::splat(-25.0), Vec3::splat(25.0)));
+
+        assert!(counts.removed > 0, "nothing was dropped whole: {counts:?}");
+    }
+
+    /// The memory point, mirrored from the plane's own version of it: a cutter
+    /// must not promote interior tiles it never reaches.
+    ///
+    /// This is the failure mode the plan singles out as the reason v1 is convex
+    /// only -- a decomposed non-convex region evaluates to exactly zero on its
+    /// internal seams, deep inside the removed region, which forces `Crosses`
+    /// where `Removes` was correct and leaves a 128 KB brick resident in a
+    /// space the user just deleted. A convex cutter cannot do that, and this is
+    /// what says so.
+    #[test]
+    fn a_cutter_does_not_promote_untouched_interior_bricks_to_dense() {
+        let mut volume = Volume::new(VOXEL);
+        volume.seed_sphere(Vec3::ZERO, 40.0);
+        volume.mark_everything_dirty();
+        let before = volume.stats();
+        assert!(before.uniform_bricks > 0, "the fixture has no interior tiles to protect");
+
+        // A small box at one end, so almost every interior tile is untouched.
+        volume.clip_convex(&box_cutter(Vec3::new(30.0, -10.0, -10.0), Vec3::new(50.0, 10.0, 10.0)));
+        let after = volume.stats();
+
+        assert!(
+            after.uniform_bricks >= before.uniform_bricks - 4,
+            "interior tiles were promoted to dense: {} before, {} after",
+            before.uniform_bricks,
+            after.uniform_bricks
+        );
+        assert!(
+            after.resident_bytes < before.resident_bytes * 2,
+            "a small cut doubled the resident bytes: {} before, {} after",
+            before.resident_bytes,
+            after.resident_bytes
+        );
+    }
+
+    /// A convex cutter leaves a printable model, which is not free: it adds
+    /// cut-cut edges where two faces of the cutter meet inside the material,
+    /// and those are new geometry the plane never produced.
+    #[test]
+    fn a_box_cut_model_is_still_printable() {
+        let mut volume = Volume::new(VOXEL);
+        volume.seed_sphere(Vec3::ZERO, 20.0);
+        volume.mark_everything_dirty();
+        volume.clip_convex(&box_cutter(Vec3::new(8.0, -30.0, -30.0), Vec3::new(30.0, 30.0, 30.0)));
+
+        let (mesh, report) = volume.export_mesh();
+        assert!(
+            report.is_printable(),
+            "a box cut left the model unprintable: {} ({} triangles)",
+            report.summary(),
+            mesh.triangles.len()
+        );
+    }
+
+    /// **A convex cutter must not leave the model more non-manifold than the
+    /// plane that covers the same silhouette.**
+    ///
+    /// `is_printable` is the obvious gate and it is structurally blind to what
+    /// this adds. It is `boundary_edges == 0 && inconsistent_edges == 0 &&
+    /// triangles > 0` -- it counts holes and winding, and does NOT count
+    /// `non_manifold_edges` at all. A shaped cut adds sixteen sharp cut-cut
+    /// edges running the full depth of the cutter, plus their corner junctions,
+    /// which is exactly the geometry `is_printable` cannot see; and this file
+    /// already records four-way edges at cut rims as a problem that was
+    /// accepted rather than solved.
+    ///
+    /// So the assertion is against a BASELINE on the same fixture rather than
+    /// against zero. Against zero it would fail on the plane cut too, which
+    /// ships; against `is_printable` it would pass on a model with sixteen
+    /// non-manifold seams.
+    #[test]
+    fn a_shaped_cut_is_no_less_manifold_than_the_plane_that_covers_it() {
+        let mut worst_extra = 0i64;
+        for step in 0..6 {
+            let angle = step as f32 / 6.0 * std::f32::consts::TAU;
+            let (sin, cos) = angle.sin_cos();
+            // A prism whose axis is oblique to the lattice at every step, which
+            // is where a sloppy classification shows up.
+            let axis = Vec3::new(cos, 0.35, sin).normalize();
+
+            let mut planed = Volume::new(VOXEL);
+            planed.seed_sphere(Vec3::ZERO, 20.0);
+            planed.mark_everything_dirty();
+            planed.clip_convex(&[ClipPlane::new(axis * 8.0, axis).unwrap()]);
+            let (_, plane_report) = planed.export_mesh();
+
+            let mut shaped = Volume::new(VOXEL);
+            shaped.seed_sphere(Vec3::ZERO, 20.0);
+            shaped.mark_everything_dirty();
+            shaped.clip_convex(&prism(axis * 8.0, axis, 9.0, 16));
+            let (_, shaped_report) = shaped.export_mesh();
+
+            assert!(
+                shaped_report.is_printable(),
+                "a shaped cut at {angle:.2} rad is not printable: {}",
+                shaped_report.summary()
+            );
+            let extra =
+                shaped_report.non_manifold_edges as i64 - plane_report.non_manifold_edges as i64;
+            worst_extra = worst_extra.max(extra);
+        }
+        // Sixteen side planes meeting the surface make more rim than one plane
+        // does, so a small positive number is expected and zero would be a
+        // surprise. What this catches is the shape adding non-manifold edges
+        // out of proportion to the rim it draws -- an order of magnitude, not a
+        // handful.
+        assert!(
+            worst_extra < 64,
+            "a shaped cut added {worst_extra} non-manifold edges over the plane covering the \
+             same silhouette"
+        );
+    }
+
+    /// A regular prism, inward normals, as the app builds one from a hull.
+    fn prism(centre: Vec3, axis: Vec3, radius: f32, sides: usize) -> Vec<ClipPlane> {
+        let axis = axis.normalize();
+        let helper = if axis.x.abs() < 0.9 { Vec3::X } else { Vec3::Y };
+        let u = axis.cross(helper).normalize();
+        let v = axis.cross(u);
+        (0..sides)
+            .map(|side| {
+                let angle = side as f32 / sides as f32 * std::f32::consts::TAU;
+                let (sin, cos) = angle.sin_cos();
+                let outward = u * cos + v * sin;
+                ClipPlane::new(centre + outward * radius, -outward).expect("a unit normal")
+            })
+            .collect()
+    }
+
+    /// **The absolute cost assertion, and it is absolute on purpose.**
+    ///
+    /// The tempting form -- "a lasso dirties no more bricks than the plane that
+    /// covers it" -- gates nothing. A plane pushes every removed brick into the
+    /// touched set, which is half the body, against a small loop's handful of
+    /// wall bricks; it passes by three orders of magnitude and would keep
+    /// passing if a shaped cut promoted every brick it crossed twice over.
+    ///
+    /// So these are numbers, measured on this fixture, that a regression has to
+    /// move. They are generous -- the point is to catch something going badly
+    /// wrong, not to freeze the classification.
+    #[test]
+    fn a_shaped_cut_promotes_a_bounded_number_of_bricks() {
+        let mut volume = Volume::new(VOXEL);
+        volume.seed_sphere(Vec3::ZERO, 20.0);
+        volume.mark_everything_dirty();
+        volume.take_dirty(&mut Vec::new());
+
+        let counts = volume.clip_convex(&prism(Vec3::new(14.0, 0.0, 0.0), Vec3::X, 6.0, 16));
+
+        assert!(counts.changed > 0, "the cutter did nothing to measure");
+        assert!(
+            counts.crossed <= 48,
+            "a small loop promoted {} bricks to dense, which is more than the region it covers",
+            counts.crossed
+        );
+        assert!(
+            volume.dirty_count() <= 200,
+            "a small loop dirtied {} bricks",
+            volume.dirty_count()
+        );
+    }
+
+    /// **The mask must be reported as sparing exactly what the cut would have
+    /// taken -- including the bricks it would have taken WHOLE.**
+    ///
+    /// This is the regression test for a bug the per-brick plane pruning
+    /// introduced. A brick the cutter saturates classifies as `Removes`, and
+    /// `classify_active` says so by leaving the active plane set EMPTY. The
+    /// mask then downgrades it to `Crosses`, and the fully-protected arm asked
+    /// "would the cut have changed anything here?" using that empty set -- over
+    /// which the minimum is negative infinity, so the answer came back "no".
+    ///
+    /// Those bricks fell out of `bricks_spared_by_mask`: on this fixture 152
+    /// were reported where 216 were really spared, the 64 missing ones being
+    /// exactly those the cutter enclosed. A cut a mask had blocked entirely
+    /// could then report **"the cut missed the model"** -- the single most
+    /// misleading thing the status line can say, because it sends the user off
+    /// to redraw a gesture that was never the problem. Nothing else could see
+    /// it: the field really is untouched, the bricks really are all still
+    /// there, and no undo entry really is recorded. Only the count was wrong.
+    ///
+    /// **Asserted against the same cut run unmasked**, rather than against a
+    /// number written down here. "The mask spared what the cut would have
+    /// taken" is the property; a hard-coded 216 would pass just as well if the
+    /// fixture changed underneath it and would say nothing about why.
+    #[test]
+    fn a_mask_spares_exactly_what_the_cut_would_have_taken() {
+        // Big enough that bricks sit wholly INSIDE the cutter with room to
+        // spare, which is what makes them classify `Removes` rather than
+        // merely crossing. A cutter that only ever grazes bricks exercises the
+        // other arm and would pass either way.
+        let cutter = box_cutter(Vec3::splat(-40.0), Vec3::splat(40.0));
+
+        let mut unmasked = Volume::new(VOXEL);
+        unmasked.seed_sphere(Vec3::ZERO, 60.0);
+        unmasked.mark_everything_dirty();
+        let would_take = unmasked.clip_convex(&cutter).changed;
+        assert!(would_take > 0, "the fixture is not cut at all");
+
+        let mut masked = Volume::new(VOXEL);
+        masked.seed_sphere(Vec3::ZERO, 60.0);
+        masked.mark_everything_dirty();
+        // Mask All: an empty map read inverted protects every voxel there is.
+        masked.mask_mut().set_inverted(true);
+        let counts = masked.clip_convex(&cutter);
+
+        assert_eq!(counts.changed, 0, "a fully masked body was cut");
+        assert_eq!(
+            counts.spared_by_mask, would_take,
+            "the mask spared {} bricks but the same cut takes {would_take} unmasked, so the \
+             bricks it would have dropped whole are being reported as spared by nobody",
+            counts.spared_by_mask
+        );
+    }
+
+    /// A cutter the model is nowhere near costs the classification and nothing
+    /// else, and records no undo entry.
+    #[test]
+    fn a_cutter_that_misses_changes_nothing() {
+        let mut volume = Volume::new(VOXEL);
+        volume.seed_sphere(Vec3::ZERO, 20.0);
+        volume.mark_everything_dirty();
+        let before = volume.brick_coords().count();
+
+        let counts = volume.clip_convex(&box_cutter(Vec3::splat(500.0), Vec3::splat(540.0)));
+
+        assert_eq!(counts.changed, 0, "a cutter far outside the model changed bricks");
+        assert_eq!(counts.crossed, 0, "a cutter far outside the model promoted bricks");
+        assert_eq!(volume.brick_coords().count(), before);
+    }
+
+    /// **The multi-plane path writes what the definition says, to the bit.**
+    ///
+    /// This is the test that keeps two optimisations honest at once, and
+    /// without it neither is checkable. A brick crossed by one plane is written
+    /// by a fused voxel-major loop and a brick crossed by several by a
+    /// plane-major one over a scratch buffer; no input takes both, so a
+    /// disagreement between them is invisible. On top of that the plane set is
+    /// PRUNED per brick -- planes that saturate across a brick are dropped from
+    /// its minimum -- and the argument that this is exact rather than
+    /// approximate is exactly the kind that is convincing and occasionally
+    /// wrong.
+    ///
+    /// So the reference here is neither path: it is `min` over ALL the planes
+    /// at every voxel in a box, through `edit_voxels`, which is the definition
+    /// written out. Compared bit for bit, because the claim is bit-identity.
+    ///
+    /// Oblique planes at deliberately awkward angles, so no distance lands on a
+    /// lattice value and the rounding this is about actually happens.
+    #[test]
+    fn several_planes_write_the_minimum_of_their_distances_exactly() {
+        let planes = [
+            ClipPlane::new(Vec3::new(2.0, -1.0, 3.0), Vec3::new(1.0, 2.0, -0.5)).unwrap(),
+            ClipPlane::new(Vec3::new(-3.0, 4.0, 1.0), Vec3::new(-0.7, 1.0, 0.3)).unwrap(),
+            ClipPlane::new(Vec3::new(1.0, 1.0, -2.0), Vec3::new(0.2, -0.4, 1.0)).unwrap(),
+        ];
+
+        let mut cut = Volume::new(VOXEL);
+        cut.seed_sphere(Vec3::ZERO, 20.0);
+        cut.mark_everything_dirty();
+        assert!(cut.clip_convex(&planes).crossed > 0, "no brick took the multi-plane path");
+
+        let mut reference = Volume::new(VOXEL);
+        reference.seed_sphere(Vec3::ZERO, 20.0);
+        reference.mark_everything_dirty();
+        let voxel_size = reference.voxel_size();
+        let (lo, hi) = reference.voxel_bounds(Vec3::splat(-30.0), Vec3::splat(30.0));
+        reference.edit_voxels(lo, hi, |_, position, value| {
+            // The minimum in millimetres and the division afterwards, which is
+            // the order both real paths use. Dividing first would round each
+            // distance separately and this test would fail for a reason that
+            // has nothing to do with what it is checking.
+            let smallest =
+                planes.iter().map(|plane| plane.distance(position)).fold(f32::INFINITY, f32::min);
+            value.max(smallest / voxel_size).clamp(INSIDE, OUTSIDE)
+        });
+
+        let mut differing = 0usize;
+        let mut worst = None;
+        for z in lo.z..=hi.z {
+            for y in lo.y..=hi.y {
+                for x in lo.x..=hi.x {
+                    let cell = IVec3::new(x, y, z);
+                    let coord = BrickCoord::containing(cell);
+                    let local = cell - coord.origin();
+                    let read = |volume: &Volume| {
+                        volume.brick(coord).map_or(OUTSIDE, |brick| {
+                            brick.get(local.x as usize, local.y as usize, local.z as usize)
+                        })
+                    };
+                    let (theirs, ours) = (read(&reference), read(&cut));
+                    if theirs.to_bits() != ours.to_bits() {
+                        differing += 1;
+                        worst.get_or_insert((cell, theirs, ours));
+                    }
+                }
+            }
+        }
+        assert_eq!(
+            differing, 0,
+            "the convex cut is not the minimum of its planes: {differing} voxels differ, first \
+             at {worst:?}"
         );
     }
 }
@@ -1213,7 +2227,7 @@ mod through_a_mask {
         let outcome = doc.clip(ClipPlane::new(Vec3::ZERO, Vec3::Y).unwrap(), &visible);
 
         assert_eq!(outcome.bodies_crossed, 2);
-        assert_eq!(outcome.bodies_cut, 1, "the masked body was cut");
+        assert_eq!(outcome.bodies_cut.len(), 1, "the masked body was cut");
         assert!(outcome.bricks > 0, "the unmasked body was spared as well");
         assert!(outcome.bricks_spared_by_mask > 0, "the masked body reported nothing spared");
         assert_eq!(

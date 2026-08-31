@@ -71,12 +71,21 @@
 
 use std::collections::VecDeque;
 
+use rayon::prelude::*;
 use rustc_hash::FxHashMap;
 
 use crate::body::{Document, Node, NodeId, NodeMeta};
 use crate::brick::{Brick, BrickCoord, StoredBrick};
 use crate::mask::{MaskBrick, MaskField};
 use crate::volume::Volume;
+
+/// Bricks below which encoding a stroke's priors stays on one thread.
+///
+/// A dab touches a handful of bricks and encoding them is microseconds, where
+/// spinning up a fan-out for them costs more than it saves. Lower than
+/// `PARALLEL_MESH_THRESHOLD` because an encode is a much bigger unit of work
+/// than a mesh, so the crossover comes sooner.
+const PARALLEL_ENCODE_THRESHOLD: usize = 8;
 
 /// Default ceiling on the brick snapshots undo history holds.
 ///
@@ -164,10 +173,31 @@ impl StrokeEdit {
         }
         // Encoded here, at the one place a stroke's priors enter history, so
         // no caller has to remember to and no path can store a raw brick.
-        let encoded: PriorBricks = bricks
-            .into_iter()
-            .map(|(coord, brick)| (coord, brick.as_ref().map(StoredBrick::encode)))
-            .collect();
+        //
+        // **Across every core, because this is a third of what a cut costs.**
+        // Measured on the budget harness: a plane through the middle of the
+        // fixture spends 2.95 ms in `Volume::clip` and 3.7 ms encoding what it
+        // recorded -- 275 bricks of run-length encoding, a branch and a
+        // bit-compare per voxel over nine million voxels. It is not part of the
+        // cut and nobody had ever timed it separately from one.
+        //
+        // Every brick encodes independently: `StoredBrick::encode` reads one
+        // `&Brick` and returns, touching nothing shared. The map is drained
+        // into a `Vec` first because `FxHashMap`'s iterator is not a parallel
+        // one -- and collecting a Vec back out of `into_par_iter` PRESERVES
+        // ORDER, so the encoded list is exactly the list the serial form
+        // produced from the same map. Undo does not depend on that order, but
+        // silently changing it would be a change nobody asked for.
+        let raw: Vec<(BrickCoord, Option<Brick>)> = bricks.into_iter().collect();
+        let encoded: PriorBricks = if raw.len() < PARALLEL_ENCODE_THRESHOLD {
+            raw.into_iter()
+                .map(|(coord, brick)| (coord, brick.as_ref().map(StoredBrick::encode)))
+                .collect()
+        } else {
+            raw.into_par_iter()
+                .map(|(coord, brick)| (coord, brick.as_ref().map(StoredBrick::encode)))
+                .collect()
+        };
         Some(Self::from_parts(encoded, masks.into_iter().collect(), polarity))
     }
 

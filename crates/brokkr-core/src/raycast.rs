@@ -109,6 +109,125 @@ fn refine(field: &impl Fn(f32) -> f32, mut outside: f32, mut inside: f32) -> f32
     0.5 * (outside + inside)
 }
 
+/// A run of solid along a ray.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Span {
+    /// Distance along the ray where the solid begins.
+    pub enter: f32,
+    /// Distance along the ray where it ends.
+    pub exit: f32,
+}
+
+/// What a ray found: the first run of solid, and where the next one starts.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct SolidSpans {
+    /// The first complete run of solid the ray passed through.
+    ///
+    /// `None` when the ray met no surface, and also when it entered solid and
+    /// never came out within `max_distance` -- an unfinished span has no exit,
+    /// and a depth cap placed from a guessed one would cut where nothing was
+    /// measured.
+    pub first: Option<Span>,
+    /// Where the NEXT run of solid begins, if the ray reached one.
+    ///
+    /// This is the number a depth cap has to respect: it is the surface behind
+    /// the thing being cut off, and the wall that a cutter reaching too far
+    /// would thin from the front without anybody seeing it.
+    pub next_enter: Option<f32>,
+}
+
+/// March a ray and report the first solid run and the start of the one behind
+/// it.
+///
+/// `direction` must be unit length.
+///
+/// # Why this is not [`raycast`] called twice
+///
+/// Three differences, and each one is a bug if it is left out.
+///
+/// **The empty-brick skip only works outside.** [`empty_brick_span`] returns
+/// `None` for any brick that is not uniformly outside, so it accelerates the
+/// air in front of a body and the gap between two bodies, and does nothing at
+/// all for the leg from a surface to the far side of the same solid. Applying
+/// it while inside would be harmless but pointless; not noticing that it does
+/// nothing there is what makes the next point a surprise.
+///
+/// **The step rule has to flip sign inside.** [`raycast`] advances by
+/// `previous_d.max(min_step)`, and inside the solid `previous_d` is negative,
+/// so `max` picks the floor and the march crawls a quarter of a voxel at a
+/// time -- 512 steps buys 128 voxels of interior, which does not cross a model.
+/// Inside, the distance to the surface is `-d`, and stepping by that is what
+/// makes the exit reachable.
+///
+/// **A ray that starts inside contributes nothing.** [`raycast`] reports that
+/// as a hit at zero so the brush has somewhere to go. Here it would be a span
+/// with a fabricated `enter`, and a far cap placed from it sits at a depth
+/// measured from a surface the ray never crossed.
+pub fn first_solid_spans(
+    volume: &Volume,
+    origin: Vec3,
+    direction: Vec3,
+    max_distance: f32,
+) -> SolidSpans {
+    let voxel_size = volume.voxel_size();
+    let min_step = 0.25 * voxel_size;
+    let field = |t: f32| volume.sample_world(origin + direction * t) * voxel_size;
+
+    let mut previous_t = 0.0_f32;
+    let mut previous_d = field(0.0);
+    if previous_d <= 0.0 {
+        return SolidSpans::default();
+    }
+
+    let mut found = SolidSpans::default();
+    let mut enter: Option<f32> = None;
+    let mut inside = false;
+    let mut t = previous_d.max(min_step);
+
+    for _ in 0..MAX_STEPS {
+        if t > max_distance {
+            break;
+        }
+        if !inside && let Some(jump) = empty_brick_span(volume, origin + direction * t, direction) {
+            previous_t = t;
+            t += jump;
+            if t > max_distance {
+                break;
+            }
+        }
+        let d = field(t);
+        if !inside && d <= 0.0 {
+            let crossing = refine(&field, previous_t, t);
+            match enter {
+                None => enter = Some(crossing),
+                Some(_) => {
+                    // The second run: this is the surface behind, and it is all
+                    // the caller needs from it.
+                    found.next_enter = Some(crossing);
+                    break;
+                }
+            }
+            inside = true;
+        } else if inside && d > 0.0 {
+            // Arguments swapped: here `t` is the outside end of the bracket and
+            // `previous_t` the inside one. `refine` branches only on the sign
+            // it samples, so it needs no other change.
+            let crossing = refine(&field, t, previous_t);
+            if let Some(start) = enter
+                && found.first.is_none()
+            {
+                found.first = Some(Span { enter: start, exit: crossing });
+            }
+            inside = false;
+        }
+        previous_t = t;
+        previous_d = d;
+        t += if inside { (-previous_d).max(min_step) } else { previous_d.max(min_step) };
+    }
+
+    found
+}
+
 /// How far the ray may advance from `point` without any chance of stepping
 /// over a surface, when `point` sits in a brick that is empty everywhere.
 ///
@@ -298,5 +417,80 @@ mod tests {
                 hit.distance
             );
         }
+    }
+
+    /// Two balls in a row: the march must report the first as a complete span
+    /// and the second as the surface behind it.
+    ///
+    /// This is the measurement the depth cap is placed from, so getting the
+    /// second number wrong is what makes a cutter eat the wall behind a spur.
+    #[test]
+    fn a_ray_through_two_balls_reports_the_first_and_the_start_of_the_second() {
+        let mut volume = Volume::new(0.5);
+        volume.seed_sphere(Vec3::new(0.0, 0.0, 0.0), 10.0);
+        volume.seed_sphere(Vec3::new(0.0, 0.0, 40.0), 10.0);
+
+        let origin = Vec3::new(0.0, 0.0, -40.0);
+        let spans = first_solid_spans(&volume, origin, Vec3::Z, 200.0);
+
+        let first = spans.first.expect("the ray met the near ball");
+        // Enters at z = -10 and leaves at z = +10, measured from z = -40.
+        assert!((first.enter - 30.0).abs() < 1.0, "entered at {}", first.enter);
+        assert!((first.exit - 50.0).abs() < 1.0, "left at {}", first.exit);
+        let next = spans.next_enter.expect("the ray met the far ball");
+        // The far ball's near face is at z = 30.
+        assert!((next - 70.0).abs() < 1.0, "the next surface was reported at {next}");
+    }
+
+    /// One ball is one span and nothing behind it, which is what tells the
+    /// depth rule there is nothing to spare and the cut may go through.
+    #[test]
+    fn a_ray_through_one_ball_reports_no_surface_behind_it() {
+        let mut volume = Volume::new(0.5);
+        volume.seed_sphere(Vec3::ZERO, 10.0);
+
+        let spans = first_solid_spans(&volume, Vec3::new(0.0, 0.0, -40.0), Vec3::Z, 200.0);
+        assert!(spans.first.is_some(), "the ray missed the ball");
+        assert_eq!(spans.next_enter, None, "a lone ball reported something behind it");
+    }
+
+    /// A ray that misses reports nothing at all, rather than a span of zero
+    /// length that a cap could be placed from.
+    #[test]
+    fn a_ray_that_misses_reports_nothing() {
+        let mut volume = Volume::new(0.5);
+        volume.seed_sphere(Vec3::ZERO, 10.0);
+
+        let spans = first_solid_spans(&volume, Vec3::new(50.0, 0.0, -40.0), Vec3::Z, 200.0);
+        assert_eq!(spans, SolidSpans::default());
+    }
+
+    /// A ray that starts inside contributes nothing, deliberately: it has no
+    /// entry, and a cap placed from a fabricated one sits at a depth measured
+    /// from a surface the ray never crossed.
+    #[test]
+    fn a_ray_that_starts_inside_reports_no_span() {
+        let mut volume = Volume::new(0.5);
+        volume.seed_sphere(Vec3::ZERO, 10.0);
+
+        let spans = first_solid_spans(&volume, Vec3::ZERO, Vec3::Z, 200.0);
+        assert_eq!(spans.first, None, "a ray starting inside invented an entry");
+    }
+
+    /// **The interior leg has to step by the distance to the surface, not by
+    /// the floor.**
+    ///
+    /// Inside the solid the field is negative, so a step rule copied from
+    /// `raycast` picks `min_step` -- a quarter of a voxel -- and 512 steps buys
+    /// 128 voxels. This ball is 400 voxels across, so a march that crawls never
+    /// reaches the far side and reports no span at all.
+    #[test]
+    fn a_ray_crosses_a_body_wider_than_the_step_budget() {
+        let mut volume = Volume::new(0.5);
+        volume.seed_sphere(Vec3::ZERO, 100.0);
+
+        let spans = first_solid_spans(&volume, Vec3::new(0.0, 0.0, -200.0), Vec3::Z, 600.0);
+        let first = spans.first.expect("the march did not cross a 200 mm ball");
+        assert!((first.exit - first.enter - 200.0).abs() < 2.0, "span was {first:?}");
     }
 }

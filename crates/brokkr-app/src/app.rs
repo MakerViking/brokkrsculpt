@@ -19,6 +19,8 @@ use iced::{Subscription, Task};
 
 use crate::camera::OrbitCamera;
 use crate::cursor;
+use crate::cut;
+use crate::cut_preview;
 use crate::gizmo;
 use crate::message::{
     ConfirmChoice, ExportFormat, MaskGenerator, Message, PanelSection, PointerButton, PointerEvent,
@@ -228,6 +230,30 @@ const FRAME_HISTORY: usize = 60;
 /// and a small deliberate orbit opens a menu over the model. Four pixels and a
 /// quarter second are a starting point to tune by feel, which is why both are
 /// named.
+/// The narrowest a cut region may be, in voxels, before it is refused.
+///
+/// Two, because one is not enough: a region exactly one voxel across lands on a
+/// row of voxel centres or falls between two rows depending on where the
+/// lattice sits under it, so it removes material in some places and not others
+/// for reasons the user cannot see. Two guarantees at least one centre across
+/// the narrow direction wherever the region happens to fall.
+const MIN_CUT_WIDTH_VOXELS: f32 = 2.0;
+
+/// Bricks a cut may walk looking for loose pieces before it gives up.
+///
+/// **Sized from a time budget rather than from a memory one.**
+/// `Document::split_plan` measures 13 to 17 microseconds per brick -- 423
+/// bricks in 7.2 ms, 7,665 in 103 ms, close to linear -- so a brick ceiling IS
+/// a time ceiling once the slope is known. At 14 us a brick, 1,200 bricks is
+/// about one 16 ms frame, which is the right order for something appended to a
+/// status line.
+///
+/// The number this replaced was 24,000, chosen to sound like "a large model".
+/// At the measured slope that is roughly 320 milliseconds -- twenty frames --
+/// spent deciding whether to add five words to a sentence, on top of a cut that
+/// costs five.
+const MOST_BRICKS_TO_WALK: usize = 1_200;
+
 const CLICK_SLOP_PX: f32 = 4.0;
 const CLICK_MS: u128 = 250;
 
@@ -466,6 +492,19 @@ pub struct Brokkr {
     /// Stamp centres produced by the current pointer event. Reused so a stroke
     /// does not allocate.
     stamp_centres: Vec<Vec3>,
+    /// The whole path the pointer has taken during a live cut, in widget
+    /// pixels.
+    ///
+    /// **The whole path and not just its ends**, because the shape is inferred
+    /// from what was drawn and the ends of a lasso are the same two points as
+    /// the ends of a click.
+    ///
+    /// It lives here rather than in [`Drag`] because `Drag` is `Copy` and is
+    /// read by value at every pointer event; a `Vec` in it would be cloned
+    /// several times per motion, which is exactly the allocation a per-event
+    /// path most needs to avoid. Cleared at the press and drained at the
+    /// release, so it holds nothing between gestures.
+    cut_path: Vec<Vec2>,
     /// Bricks waiting to be remeshed, each tagged with the body it belongs to.
     ///
     /// One list across the whole document rather than one per body, because
@@ -1897,6 +1936,7 @@ impl Brokkr {
             move_grab: None,
             move_stroke: MoveStroke::new(),
             stamp_centres: Vec::new(),
+            cut_path: Vec::new(),
             dirty: Vec::new(),
             shown: Vec::new(),
             hidden_bodies: Vec::new(),
@@ -4516,8 +4556,81 @@ impl Brokkr {
             ),
             self.model_radius,
         );
+        self.add_cut_preview(&mut batch);
         self.shared.swap_overlay(&mut batch);
         self.overlay = batch;
+    }
+
+    /// Add the live cut's outline to the overlay, if a cut is being drawn.
+    ///
+    /// Appended after the ring rather than instead of it, because the batch is
+    /// shared -- and the ring is already gone by the time this runs, taken away
+    /// by `refresh_hover`'s `Tool::Cut` arm.
+    ///
+    /// The projection puts the shape on the plane through the camera's target,
+    /// facing the camera. That is where the model being looked at is, and it is
+    /// the one depth at which a screen-space region is honest about its size.
+    fn add_cut_preview(&self, batch: &mut brokkr_gpu::OverlayBatch) {
+        if self.tool != Tool::Cut || self.cut_path.is_empty() {
+            return;
+        }
+        let Some(gesture) = cut::read_stroke(&self.cut_path, CLICK_SLOP_PX) else {
+            return;
+        };
+        let eye = self.camera.eye();
+        let focus = self.camera.target;
+        let Some(facing) = (focus - eye).try_normalize() else {
+            return;
+        };
+        // **In FRONT of the model, not at its centre.** The preview is a
+        // projection of screen points along the view rays, so sliding it toward
+        // the camera changes its world size and not one pixel of where it
+        // appears -- it is screen-exact at every depth. What it does change is
+        // whether the depth test keeps it: drawn on the plane through the
+        // camera's target, the outline of a loop over the model sits INSIDE the
+        // model and is occluded by the very surface it is describing. The line
+        // cut hid this for a while, because its shaded band reaches three model
+        // radii out and the part beyond the silhouette has nothing in front of
+        // it -- so the band appeared over the background and vanished over the
+        // model, which reads as a rendering quirk rather than as the bug it is.
+        //
+        // Just clear of the bounding sphere, and never closer than twice the
+        // near plane, so it cannot be clipped away instead.
+        let depth =
+            ((focus - eye).length() - self.model_radius * 1.05).max(self.camera.near() * 2.0);
+        let plane_at = eye + facing * depth;
+        // Taken from the planes the cut is ACTUALLY about to use, so the shaded
+        // side and the removed side cannot disagree. `cutter_from_hull` is the
+        // one place the sign is settled, and asking it again here is cheaper
+        // than a second derivation that could be wrong on its own.
+        let doomed =
+            self.cutter_from_hull(&gesture.hull).and_then(|planes| match planes.as_slice() {
+                [only] => Some(only.normal),
+                _ => None,
+            });
+        cut_preview::build(
+            batch,
+            &gesture.hull,
+            gesture.shape,
+            self.model_radius,
+            doomed,
+            // A straight drag is infinite whatever shift says, so it is always
+            // the denser shading; a shaped cut is bounded unless shift asks
+            // otherwise.
+            self.shift || gesture.shape == cut::CutShape::Line,
+            |pixel| {
+                let (origin, ray) = self.ray_through(pixel);
+                // Where the ray crosses the plane through the target. The dot
+                // product cannot be zero for a ray inside the frustum, but a
+                // fallback costs nothing and a division by it would put a
+                // vertex at infinity.
+                let denominator = ray.dot(facing);
+                if denominator.abs() < 1.0e-6 {
+                    return origin + ray * depth;
+                }
+                origin + ray * ((plane_at - origin).dot(facing) / denominator)
+            },
+        );
     }
 
     /// Where the pointer meets the surface, and on which body, remembered for
@@ -4564,7 +4677,14 @@ impl Brokkr {
         // thing -- it grabs a handle, or it chooses a body. Drawing one would
         // be the same lie the live-stroke case below exists to stop, told about
         // a different gesture.
-        if self.tool == Tool::Transform {
+        //
+        // **The cut takes it away too, and for exactly the same reason.** With
+        // the cut armed a press does not carve, it draws a line -- and a ring
+        // saying "a press here would remove this much of that surface" is the
+        // same lie told about a different gesture. It is worse here than under
+        // the gizmo, because a cut IS destructive and the ring is what a user
+        // reads to decide whether it is safe to press.
+        if self.tool == Tool::Transform || self.tool == Tool::Cut {
             self.hover = None;
             self.hover_body = None;
             return;
@@ -4796,10 +4916,25 @@ impl Brokkr {
         match (self.tool, self.shift) {
             (Tool::Mask, true) => "MASK — BLUR".to_string(),
             (Tool::Mask, false) => "MASK".to_string(),
-            (Tool::Cut, _) => "PLANE CUT".to_string(),
+            // Shape-aware, through the same live substitution the mask's BLUR
+            // uses: the tool card has to say what the gesture in progress is
+            // going to do, and "PLANE CUT" over a lasso is a lie about which
+            // material is about to go. Before a drag starts there is no shape
+            // yet and it says what an unqualified cut is.
+            (Tool::Cut, _) => self.live_cut_shape().label().to_string(),
             (Tool::Transform, _) => "MOVE".to_string(),
             (Tool::Sculpt, _) => self.effective_brush().kind.label().to_uppercase(),
         }
+    }
+
+    /// How the path drawn so far would be read, for the label and the preview.
+    ///
+    /// [`cut::CutShape::Line`] before anything is drawn, which is both the safe
+    /// default and the true one: a cut that has not been dragged yet is the cut
+    /// this application has always had.
+    fn live_cut_shape(&self) -> cut::CutShape {
+        cut::read_stroke(&self.cut_path, CLICK_SLOP_PX)
+            .map_or(cut::CutShape::Line, |gesture| gesture.shape)
     }
 
     /// Put the live strength away and bring out the one the incoming tool or
@@ -5246,7 +5381,354 @@ impl Brokkr {
         direction * (magnitude * MAX_TILT)
     }
 
-    /// Turn the dragged line into a plane and cut with it.
+    /// The narrowest width of a screen-space hull, in voxels, at the depth the
+    /// camera is focused on.
+    ///
+    /// The narrowest and not the average: a long thin lens is wide in one
+    /// direction and vanishing in the other, and it is the vanishing one that
+    /// decides whether the cut lands on any voxel centres at all.
+    ///
+    /// Found by rotating-callipers over the hull's edges -- for a convex
+    /// polygon the minimum width is always across some edge, so the furthest
+    /// vertex from each edge in turn is the whole search. At most sixteen edges
+    /// by sixteen vertices, once per gesture.
+    fn hull_width_in_voxels(&self, hull: &[Vec2]) -> f32 {
+        let voxel_size = self.doc.voxel_size();
+        if hull.len() < 3 || voxel_size <= 0.0 {
+            return f32::INFINITY;
+        }
+        // Millimetres per pixel where the camera is looking, which is where the
+        // preview is drawn and where the user believes the shape is.
+        let target = self.camera.target;
+        let scale = {
+            let centre = self.viewport_size * 0.5;
+            let (_, straight) = self.ray_through(centre);
+            let (_, offset) = self.ray_through(centre + Vec2::X);
+            let depth = (target - self.camera.eye()).length();
+            (straight * depth).distance(offset * depth)
+        };
+
+        let mut narrowest = f32::INFINITY;
+        for index in 0..hull.len() {
+            let from = hull[index];
+            let to = hull[(index + 1) % hull.len()];
+            let Some(along) = (to - from).try_normalize() else {
+                continue;
+            };
+            // Perpendicular distance from the edge to the furthest vertex.
+            let across = hull
+                .iter()
+                .map(|point| ((*point - from).x * along.y - (*point - from).y * along.x).abs())
+                .fold(0.0, f32::max);
+            narrowest = narrowest.min(across);
+        }
+        narrowest * scale / voxel_size
+    }
+
+    /// A far cap for the cutter, so it stops behind what it is cutting off
+    /// instead of carrying on through the model.
+    ///
+    /// **This is the request, in one function.** "Something that makes it
+    /// easier to cut off things that are sticking out of the main body" is
+    /// unanswerable with an unbounded cutter: circling a spur on the near side
+    /// of a scan also takes whatever is behind it, and the only defence is a
+    /// hand-painted mask on the far side -- which is the workaround every
+    /// comparable tool ships and the one this is meant to remove.
+    ///
+    /// Returns `None` when there should be no cap, which is a real outcome
+    /// rather than a failure. Three ways to get it, and they are not the same:
+    ///
+    /// * A straight drag. One plane is an infinite half-space by definition;
+    ///   that is what the plane cut has always been and what
+    ///   `a_cut_passes_through_the_whole_model` asserts of it.
+    /// * Nothing was hit, so there is no depth to measure from.
+    /// * There is nothing behind worth sparing -- and `report` is set, so the
+    ///   status can say so rather than let the tool look clever.
+    ///
+    /// # Why the cap is clamped against the NEXT surface
+    ///
+    /// Placing it one band past the deepest exit is the obvious rule and it is
+    /// wrong. At a 0.25 mm voxel a band is 0.75 mm, so a wall half a millimetre
+    /// behind a spur is thinned from the front by a quarter of a millimetre
+    /// with a sharp step -- and `is_printable` returns true for the result,
+    /// because it counts holes and winding and has no thickness term at all.
+    /// So the cap is pulled back to stay a full band clear of whatever is
+    /// behind, and where there is not room for both it declines and says so. A
+    /// tool that quietly thins the wall behind is worse than one that admits it
+    /// cannot help.
+    fn depth_cap(
+        &self,
+        hull: &[Vec2],
+        report: &mut Option<&'static str>,
+    ) -> Option<(brokkr_core::ClipPlane, f32)> {
+        if hull.len() < 3 {
+            return None;
+        }
+        let eye = self.camera.eye();
+        let facing = (self.camera.target - eye).try_normalize()?;
+        let reach = self.camera.far();
+
+        // Points known to be inside a CONVEX hull: its centroid, and points on
+        // the way from the centroid to each vertex. Deliberately not a bounding
+        // box grid, which would put rays outside a hull that is not square, and
+        // deliberately not the centroid alone -- one ray down the middle is a
+        // sample of one, and on a long thin loop it can miss the spur entirely.
+        let centroid = hull.iter().copied().sum::<Vec2>() / hull.len() as f32;
+        let mut probes = vec![centroid];
+        for vertex in hull {
+            for fraction in [0.45_f32, 0.8] {
+                probes.push(centroid.lerp(*vertex, fraction));
+            }
+        }
+
+        let bodies = self.drawn_bodies();
+        let mut deepest_exit = f32::NEG_INFINITY;
+        let mut shallowest_enter = f32::INFINITY;
+        let mut nearest_behind = f32::INFINITY;
+        for pixel in probes {
+            let (origin, ray) = self.ray_through(pixel);
+            // Distances come back along each ray from its own origin on the
+            // near plane, so they are converted to DEPTH along the view
+            // direction before being compared between rays. Without this a ray
+            // at the edge of a wide hull reports a longer distance for the same
+            // depth and drags the cap backwards -- which is the same class of
+            // mistake as measuring the cutter's apex from the near plane.
+            let scale = ray.dot(facing);
+            if scale <= 0.0 {
+                continue;
+            }
+            let base = (origin - eye).dot(facing);
+            for body in &bodies {
+                let Some(volume) = self.doc.volume(*body) else {
+                    continue;
+                };
+                let spans = brokkr_core::first_solid_spans(volume, origin, ray, reach);
+                if let Some(span) = spans.first {
+                    deepest_exit = deepest_exit.max(base + span.exit * scale);
+                    shallowest_enter = shallowest_enter.min(base + span.enter * scale);
+                }
+                if let Some(next) = spans.next_enter {
+                    nearest_behind = nearest_behind.min(base + next * scale);
+                }
+            }
+        }
+
+        if deepest_exit == f32::NEG_INFINITY {
+            // Every ray missed. There is no depth here, and the existing "the
+            // cut missed the model" outcome is the one that applies.
+            return None;
+        }
+
+        let margin = brokkr_core::NARROW_BAND * self.doc.voxel_size();
+        let want = deepest_exit + margin;
+        if nearest_behind.is_finite() {
+            if nearest_behind - deepest_exit < 2.0 * margin {
+                *report = Some("nothing behind it to spare — the cut went through");
+                return None;
+            }
+            let limit = nearest_behind - margin;
+            let at = want.min(limit);
+            return brokkr_core::ClipPlane::new(eye + facing * at, -facing)
+                .map(|plane| (plane, at - shallowest_enter));
+        }
+        brokkr_core::ClipPlane::new(eye + facing * want, -facing)
+            .map(|plane| (plane, want - shallowest_enter))
+    }
+
+    /// How many loose pieces the cut left behind, as a phrase to append to the
+    /// status, or nothing.
+    ///
+    /// **A cut that severs a body leaves two shells inside one `Volume` with
+    /// nothing anywhere saying so.** The user gets a model that looks right,
+    /// exports as one object, and arrives at the slicer in two pieces -- which
+    /// is precisely the failure the research identified in the tools this one
+    /// is meant to beat.
+    ///
+    /// `Document::split_plan` is read-only, parallel and already tested, so
+    /// this is a report and not a second connectivity walk. It is specifically
+    /// NOT a brick-level walk: `split.rs` measures one finding a single
+    /// component on the reference dragon where the voxel walk finds 29, 47, 85
+    /// and 182 at four voxel sizes, and fusing parts of a real four-part model.
+    ///
+    /// # It is expensive, so it is bounded three ways
+    ///
+    /// `split_plan` is a per-voxel union-find and costs roughly 13 to 17
+    /// microseconds per brick -- more, on the bench fixture, than the entire
+    /// cut that preceded it. Left unbounded this one status-line suffix is the
+    /// most expensive thing on the commit path by a wide margin. So:
+    ///
+    /// 1. **Only bodies the cut actually changed.** They come from the outcome
+    ///    rather than from asking each body whether anything is dirty, which
+    ///    would be reading an answer off a set that merely has not been drained
+    ///    yet. Walking a body the cutter never reached costs full price and can
+    ///    only ever find what was already there before the gesture.
+    /// 2. **One budget across all of them**, not one each: eight small bodies
+    ///    are eight walks, and a per-body gate lets them through.
+    /// 3. **A budget sized in bricks from a time target.** See
+    ///    [`MOST_BRICKS_TO_WALK`].
+    ///
+    /// Going over budget stops and reports what was found so far rather than
+    /// reporting nothing: pieces already counted are true, and throwing them
+    /// away because a later body was large would hide a real severance behind
+    /// an unrelated body's size.
+    fn loose_pieces_note(&self, changed: &[NodeId]) -> String {
+        let mut pieces = 0usize;
+        let mut walked = 0usize;
+        for body in changed {
+            let Some(volume) = self.doc.volume(*body) else {
+                continue;
+            };
+            // `brick_count` and not `brick_coords().count()`: the second walks
+            // the map to answer a question the map already knows.
+            walked += volume.brick_count();
+            if walked > MOST_BRICKS_TO_WALK {
+                break;
+            }
+            let Some(plan) = self.doc.split_plan(*body) else {
+                continue;
+            };
+            // One part is the body itself and is not news.
+            pieces += plan.parts.len().saturating_sub(1);
+        }
+        match pieces {
+            0 => String::new(),
+            1 => " — 1 loose piece".to_string(),
+            many => format!(" — {many} loose pieces"),
+        }
+    }
+
+    /// The DRAWN bodies, by node id -- the same set the cut acts on.
+    fn drawn_bodies(&self) -> Vec<NodeId> {
+        let visible = self.drawn_nodes();
+        self.doc
+            .nodes()
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| visible.get(*index).copied().unwrap_or(false))
+            .map(|(_, node)| node.id)
+            .collect()
+    }
+
+    /// Build the cutter's planes from a screen-space hull.
+    ///
+    /// Each edge of the hull becomes a plane containing that edge and the view
+    /// direction, so the region removed is the PRISM the polygon sweeps out
+    /// going away from the viewer -- the same width front and back. `None` if
+    /// any edge is degenerate: all or nothing, because a polygon missing one
+    /// side is not a smaller region, it is an open wedge that carries on for
+    /// ever.
+    ///
+    /// The straight drag is the exception and keeps its plane through the eye:
+    /// a single half-space has no aperture, so there is nothing for a taper to
+    /// widen, and that construction is what ships and what the side-convention
+    /// test observes.
+    ///
+    /// # The eye is `camera.eye()`, and that is a bug fix
+    ///
+    /// [`OrbitCamera::ray`] returns the point where the ray crosses the NEAR
+    /// PLANE, not the eye -- and it must keep doing so, because every pick in
+    /// the application starts there and a test pins it. The cut used that point
+    /// as its apex, and for a single plane that is correct **by accident**: the
+    /// near point lies on the first ray, and the normal is perpendicular to
+    /// both rays, so the offset falls out of the dot product exactly.
+    ///
+    /// With several planes it stops cancelling. Plane `k`'s normal is not
+    /// perpendicular to the ray the near point came from, so plane `k` is
+    /// displaced by `(P0 - E) . n_k` -- a different amount for every side --
+    /// and the pyramid's apex opens into a small polyhedral gap. The bound is
+    /// `near()`, which is a hundredth of the camera distance and about 1.5 mm
+    /// on a framed 100 mm model, six voxels at 0.25 mm. In practice it is less,
+    /// because for a small hull all the rays are nearly parallel and the dot
+    /// product is a fraction of that; it grows with the model and with how wide
+    /// the gesture is.
+    ///
+    /// # The sign is measured, not assumed
+    ///
+    /// For a polygon the winding decides which side each plane removes, and
+    /// getting it backwards inverts the cutter: instead of removing the inside
+    /// of the loop it removes everything except a pyramid. Rather than reason
+    /// about the handedness of the camera basis, the y-flip in the pixel-to-NDC
+    /// step and the hull's winding all at once -- three chances to be wrong
+    /// with one symptom -- the normals are built to one convention and then
+    /// CHECKED against a point known to be inside the region. If the check
+    /// fails they are all flipped. A sign that is verified costs one dot
+    /// product per plane, once per gesture, and cannot be got wrong by a later
+    /// change to any of the three.
+    fn cutter_from_hull(&self, hull: &[Vec2]) -> Option<Vec<brokkr_core::ClipPlane>> {
+        let eye = self.camera.eye();
+
+        // Two points name one plane and no region: this is the straight drag,
+        // and it keeps its own construction so that the side convention a test
+        // observes is untouched.
+        if let [from, to] = hull {
+            let (_, first) = self.ray_through(*from);
+            let (_, second) = self.ray_through(*to);
+            return brokkr_core::ClipPlane::new(eye, second.cross(first)).map(|plane| vec![plane]);
+        }
+        if hull.len() < 3 {
+            return None;
+        }
+
+        // **A prism, not a pyramid**, and the difference is the loudest thing
+        // about this tool in use. Building each side plane through the EYE
+        // makes the removed region the view frustum's own wedge: it widens with
+        // distance in exactly the proportion the projection does. At the
+        // framing this application picks -- `camera.rs` puts the eye at
+        // `radius / sin(fov/2) * 1.15`, about 90 mm for a 30 mm ball -- the
+        // front face is 60 mm away and the back 120, so **the exit hole comes
+        // out twice the diameter of the entry hole**. Circling a lump takes a
+        // cone out of everything behind it.
+        //
+        // Building them along the VIEW DIRECTION instead makes the sides
+        // parallel, so the cutter is the same width all the way through: what a
+        // bandsaw does, and what a symmetric pair of cuts needs in order to
+        // come out symmetric.
+        //
+        // The trade is real and worth stating. A pyramid is screen-exact at
+        // every depth -- the region removed is precisely the screen area swept,
+        // whatever it passes through. A prism is exact only at the focus depth,
+        // which is where the preview is drawn; further away the region takes
+        // slightly less than the outline appeared to cover, and nearer slightly
+        // more. That is the better error to have: it is bounded by the model's
+        // own depth rather than growing with it, and it errs toward the
+        // recoverable direction on the far side.
+        //
+        // This is the orthographic-cut behaviour without an orthographic
+        // camera. The camera is untouched; only the cutter is parallel.
+        let facing = (self.camera.target - eye).try_normalize()?;
+        let corner = |pixel: Vec2| {
+            let (origin, ray) = self.ray_through(pixel);
+            let denominator = ray.dot(facing);
+            if denominator.abs() < 1.0e-6 {
+                return origin;
+            }
+            origin + ray * ((self.camera.target - origin).dot(facing) / denominator)
+        };
+
+        let mut planes = Vec::with_capacity(hull.len());
+        for index in 0..hull.len() {
+            let here = corner(hull[index]);
+            let next = corner(hull[(index + 1) % hull.len()]);
+            planes.push(brokkr_core::ClipPlane::new(here, (next - here).cross(facing))?);
+        }
+
+        // A point genuinely inside the prism: the centroid of a CONVEX polygon
+        // is inside it, so the point at the focus depth under the centroid is
+        // in the middle of the region.
+        let centroid = hull.iter().copied().sum::<Vec2>() / hull.len() as f32;
+        let inside = corner(centroid);
+        if planes.iter().any(|plane| plane.distance(inside) < 0.0) {
+            for plane in &mut planes {
+                plane.normal = -plane.normal;
+            }
+        }
+        debug_assert!(
+            planes.iter().all(|plane| plane.distance(inside) >= 0.0),
+            "the cutter excludes its own centre, so the hull is not convex"
+        );
+        Some(planes)
+    }
+
     ///
     /// **It cuts every body the user can SEE**, which is [`Document::clip`]'s
     /// whole job: solo narrows the set, a hidden body the line passes over is
@@ -5258,11 +5740,15 @@ impl Brokkr {
     /// below tells the two apart and names the body -- see there for why that
     /// matters more than the count does.
     ///
-    /// The plane is the one containing the eye and both ends of the line, so it
-    /// is exactly the surface the line sweeps out going away from the viewer --
-    /// which is what makes a screen-space drag mean something in three
-    /// dimensions, and why the cut passes through the whole model rather than
-    /// stopping at the first surface.
+    /// # The shape comes from the stroke
+    ///
+    /// [`cut::read_stroke`] decides whether the drag was a line, an open curve
+    /// or a closed loop, and hands back a convex polygon in screen pixels. Each
+    /// of its edges becomes a plane through the EYE, so the cutter is the
+    /// pyramid the polygon sweeps out going away from the viewer -- which is
+    /// what makes a screen-space gesture mean something in three dimensions.
+    /// A two-point polygon is the straight drag that has always shipped, and it
+    /// still produces exactly one plane and one cross product.
     ///
     /// **Which side goes is set by the drag direction**: the material to the
     /// LEFT of the arrow, as drawn on screen, is removed -- so a left to right
@@ -5273,63 +5759,150 @@ impl Brokkr {
     /// from reasoning about the cross product. The sign depends on the ray
     /// order, the handedness of the camera basis and whether the pixel-to-NDC
     /// step flips Y, and getting it backwards means the tool removes the half
-    /// the user meant to keep.
+    /// the user meant to keep. For a polygon the sign is not reasoned about at
+    /// all -- see [`Brokkr::cutter_from_hull`].
     fn finish_cut(&mut self, from: Vec2) {
-        let Some(to) = self.cursor else {
-            return;
-        };
-        // A click is not a cut. Without this, arming the tool and clicking once
-        // would take an arbitrary half of the model away. Ctrl only changes
-        // which field the half-space is written into, so the same slop applies
-        // and the word changes with it.
-        if from.distance(to) < CLICK_SLOP_PX {
-            let what = if self.control { "mask" } else { "cut" };
-            self.status = format!("{what} cancelled: drag a line across the model");
-            return;
+        // The path is taken whatever happens next, so no outcome below can
+        // leave it to leak into the next gesture.
+        let mut path = std::mem::take(&mut self.cut_path);
+        if let Some(to) = self.cursor {
+            // The release position, which no motion event may have delivered if
+            // the pointer stopped moving before the button came up.
+            if path.last().is_none_or(|last| *last != to) {
+                path.push(to);
+            }
+        }
+        // Older gestures reached here with only the press position recorded.
+        if path.is_empty() {
+            path.push(from);
         }
 
-        let (eye, first) = self.ray_through(from);
-        let (_, second) = self.ray_through(to);
-        // Both rays leave the same eye, so their cross product is normal to the
-        // plane through the two of them. The order is what decides the sign,
-        // and therefore which side is cut.
-        let Some(plane) = brokkr_core::ClipPlane::new(eye, second.cross(first)) else {
-            self.status = "cut cancelled: that line has no direction".to_string();
+        let Some(gesture) = cut::read_stroke(&path, CLICK_SLOP_PX) else {
+            // A click is not a cut. Without this, arming the tool and clicking
+            // once would take an arbitrary half of the model away. Ctrl only
+            // changes which field the region is written into, so the same slop
+            // applies and the word changes with it.
+            //
+            // It also catches a stroke that went somewhere and enclosed
+            // nothing -- out and straight back -- which is not a click and is
+            // just as much not a region. Hulling that into a sliver thinner
+            // than the lattice would remove material in some places and not
+            // others depending on where the voxels fell, while reporting
+            // success.
+            let what = if self.control { "mask" } else { "cut" };
+            self.status = format!("{what} cancelled: drag a shape across the model");
+            self.refresh_overlay();
             return;
         };
 
+        let Some(planes) = self.cutter_from_hull(&gesture.hull) else {
+            // All or nothing: dropping one side plane of a polygon does not
+            // make a smaller cutter, it opens the region into an unbounded
+            // wedge that carries on across the whole model.
+            self.status = "cut cancelled: that shape has no direction".to_string();
+            self.refresh_overlay();
+            return;
+        };
+
+        // **The width guard is in VOXELS and not in pixels, and that is the
+        // whole point of it.** A long thin loop clears any plausible area
+        // threshold in pixels while enclosing a lens a fraction of a voxel
+        // across, and whether any voxel centre falls inside such a lens depends
+        // on where the lattice happens to sit. The slot then appears in some
+        // places and not others, or nowhere at all -- after bricks were
+        // classified, promoted, written and counted, so the status line reports
+        // a successful cut over a model that did not visibly change.
+        //
+        // Measured at the focus depth, which is where the preview is drawn and
+        // therefore where the user believes the shape is.
+        if gesture.hull.len() >= 3 {
+            let across = self.hull_width_in_voxels(&gesture.hull);
+            if across < MIN_CUT_WIDTH_VOXELS {
+                self.status = "cut cancelled: that loop is thinner than the voxel grid".to_string();
+                self.refresh_overlay();
+                return;
+            }
+        }
+
+        // **Bounded by default, and shift is what asks for the old behaviour.**
+        // The default is the one that answers the request -- circle the spur
+        // and the spur goes -- and the unbounded cut is a modifier away rather
+        // than the other way round, because a cut that takes more than it was
+        // asked for is the complaint every surveyed tool has and a cut that
+        // takes less is one more drag.
+        //
+        // Read at the RELEASE, like ctrl, and previewed while it is held, so
+        // the verb is visible rather than inferred from a key state nobody can
+        // see. Silent mode flips at release are named in the research as the
+        // top pitfall of this whole family of tools.
+        let mut depth_note: Option<&'static str> = None;
+        let mut planes = planes;
+        let mut depth_mm = None;
+        if !self.shift
+            && let Some((cap, thickness)) = self.depth_cap(&gesture.hull, &mut depth_note)
+        {
+            depth_mm = Some(thickness);
+            planes.push(cap);
+        }
+
         // **Ctrl turns the cut into a selection**, which is increment 25c's
-        // "no new gesture": the same drag, the same plane, the same brick
+        // "no new gesture": the same drag, the same region, the same brick
         // classification, writing protection instead of removing material. It
         // is checked here at the RELEASE rather than at the press, because that
-        // is where the plane exists and because a user who realises mid-drag
+        // is where the region exists and because a user who realises mid-drag
         // that they meant to select can still say so.
+        //
+        // Only the straight drag routes here for now: the mask generator takes
+        // one half-space, and giving it a convex region is its own phase. A
+        // shaped ctrl-drag would otherwise silently mask a half-space nobody
+        // drew, which is worse than saying it is not built.
         if self.control {
-            self.mask_halfspace(plane);
+            self.mask_cutter(&planes, gesture.shape);
             // One shot per arming, exactly as the cut is: the assignment below
             // carries that property and this arm must not skip it.
             self.tool = Tool::Sculpt;
+            self.refresh_overlay();
             return;
         }
 
         // **The cut crosses every VISIBLE body**, which is what
-        // `Document::clip` is for: solo narrows the set, a hidden body the line
-        // passes over comes back bit-identical, and the whole gesture is ONE
-        // undo entry of N `Change::Bricks`. Direct manipulation acts on what is
-        // drawn.
+        // `Document::clip_convex` is for: solo narrows the set, a hidden body
+        // the gesture passes over comes back bit-identical, and the whole
+        // gesture is ONE undo entry of N `Change::Bricks`. Direct manipulation
+        // acts on what is drawn.
         let visible = self.drawn_nodes();
-        let outcome = self.doc.clip(plane, &visible);
+        let outcome = self.doc.clip_convex(&planes, &visible);
         if outcome.bricks > 0 {
             let before = self.history.stats();
             if let Some(entry) = outcome.entry {
                 self.history.push(entry);
             }
             self.unsaved = true;
-            self.status = if outcome.bodies_cut > 1 {
-                format!("cut {} bricks across {} bodies", outcome.bricks, outcome.bodies_cut)
-            } else {
-                format!("cut {} bricks", outcome.bricks)
+            let where_ = match gesture.shape {
+                cut::CutShape::Line => String::new(),
+                cut::CutShape::Curve => " inside the curve".to_string(),
+                cut::CutShape::Lasso => " inside the lasso".to_string(),
             };
+            // How deep it went, which is the whole difference between this and
+            // the cut that shipped before it. A shaped cut that says only how
+            // many bricks it took leaves the user to discover from the other
+            // side whether it stopped.
+            let how_deep = match (depth_mm, depth_note) {
+                (_, Some(note)) => format!(" — {note}"),
+                (Some(deep), None) => format!(", {deep:.0} mm deep"),
+                (None, None) if gesture.shape == cut::CutShape::Line => String::new(),
+                (None, None) => " — all the way through".to_string(),
+            };
+            let body_count = if outcome.bodies_cut.len() > 1 {
+                format!(" across {} bodies", outcome.bodies_cut.len())
+            } else {
+                String::new()
+            };
+            self.status = format!(
+                "cut {} bricks{where_}{body_count}{how_deep}{}",
+                outcome.bricks,
+                self.loose_pieces_note(&outcome.bodies_cut)
+            );
             // After the cut's own message on purpose: an eviction that took
             // a deleted body with it outranks a count of bricks.
             self.record_history(before);
@@ -7335,7 +7908,7 @@ impl Brokkr {
     /// a line the user draws across what they can see, and a mask drawn the same
     /// way has to mean the same thing. One compound entry of N
     /// `Change::WholeMask`, so one ctrl+Z takes the whole gesture back.
-    fn mask_halfspace(&mut self, plane: brokkr_core::ClipPlane) {
+    fn mask_cutter(&mut self, planes: &[brokkr_core::ClipPlane], shape: cut::CutShape) {
         let feather_mm = HALFSPACE_FEATHER_VOXELS * self.doc.voxel_size();
         let drawn = self.drawn_nodes();
         let bodies: Vec<NodeId> = self
@@ -7353,7 +7926,13 @@ impl Brokkr {
             let Some(volume) = self.doc.volume_mut(body) else {
                 continue;
             };
-            let mask = volume.generated_mask(MaskRecipe::Halfspace { plane, feather_mm });
+            // Straight to `cutter_mask` rather than through `MaskRecipe`, and
+            // that is deliberate. `MaskRecipe` derives `Copy` and travels
+            // inside `Message`, so a slice in it would need a lifetime, an
+            // `Arc` would cost the `Copy`, and a fixed array would put several
+            // hundred bytes into every message the application sends. The
+            // recipe stays the single-plane one it always was.
+            let mask = volume.cutter_mask(planes, feather_mm);
             if mask.is_free() {
                 // The plane missed this body entirely, so it keeps whatever it
                 // was carrying. Replacing it with an empty mask would throw a
@@ -7367,7 +7946,7 @@ impl Brokkr {
         }
 
         if changes.is_empty() {
-            self.status = "the mask line missed the model".to_string();
+            self.status = "the mask gesture missed the model".to_string();
             return;
         }
         let before = self.history.stats();
@@ -7375,10 +7954,21 @@ impl Brokkr {
         self.record_history(before);
         self.unsaved = true;
         self.remesh_dirty();
-        self.status = if touched > 1 {
-            format!("masked that half of {touched} bodies")
-        } else {
-            format!("masked that half of {}", self.active_body_name())
+        // Names what was protected, and then names the thing to do next.
+        // **Circling a lump and being told only that it is masked is half an
+        // answer**: the reason to select rather than cut is to lift the lump
+        // off as its own body, and a user who is not told that is available
+        // will reach for the panel and hunt for it.
+        let what = match shape {
+            cut::CutShape::Line => "that half",
+            cut::CutShape::Curve => "inside the curve",
+            cut::CutShape::Lasso => "inside the lasso",
+        };
+        let where_ =
+            if touched > 1 { format!("{touched} bodies") } else { self.active_body_name() };
+        self.status = match shape {
+            cut::CutShape::Line => format!("masked {what} of {where_}"),
+            _ => format!("masked {what} on {where_} — split it off from the BODIES panel"),
         };
     }
 
@@ -7908,7 +8498,14 @@ impl Brokkr {
                     PointerButton::Left => match self.tool {
                         // The mode was chosen deliberately and the next left
                         // drag is the line, not a stroke.
-                        Tool::Cut => DragKind::Cutting,
+                        Tool::Cut => {
+                            // The press is the first point of the path, and the
+                            // clear is what stops a cancelled gesture leaking
+                            // into the next one.
+                            self.cut_path.clear();
+                            self.cut_path.push(position);
+                            DragKind::Cutting
+                        }
                         // Deliberately does NOT pick: masking paints the ACTIVE
                         // body, and a press that silently moved the target
                         // mid-mask would paint protection onto a body the user
@@ -8094,13 +8691,26 @@ impl Brokkr {
                         self.camera.pan(delta, self.viewport_size.y);
                         self.publish_camera();
                     }
-                    // The cut line is only drawn while it is being dragged;
-                    // the model is not touched until the button comes up, so
-                    // the line can be adjusted freely. A press that chose a
-                    // body is over: dragging must not turn it into a stroke on
-                    // a body the user has only just arrived at.
-                    Some(DragKind::Cutting)
-                    | Some(DragKind::Sizing)
+                    // The cut accumulates its path here and redraws the
+                    // preview; the model is not touched until the button comes
+                    // up, so the shape can be adjusted freely and what is drawn
+                    // is what will go. A press that chose a body is over:
+                    // dragging must not turn it into a stroke on a body the
+                    // user has only just arrived at.
+                    Some(DragKind::Cutting) => {
+                        // Spaced rather than every event, so an identical
+                        // looking stroke reduces to the same shape whether it
+                        // was drawn quickly or slowly.
+                        if self
+                            .cut_path
+                            .last()
+                            .is_none_or(|last| last.distance(position) >= cut::CUT_PATH_SPACING_PX)
+                        {
+                            self.cut_path.push(position);
+                            self.refresh_overlay();
+                        }
+                    }
+                    Some(DragKind::Sizing)
                     | Some(DragKind::Selecting)
                     | Some(DragKind::Refused)
                     | None => {}
@@ -8722,6 +9332,18 @@ impl Brokkr {
                     return Task::none();
                 }
                 if self.tool == Tool::Cut {
+                    // A LIVE path is thrown away without disarming, exactly as
+                    // a live gizmo drag is above and for the same reason:
+                    // Escape mid-gesture means "not that shape", not "not any
+                    // cut". The tool stays armed so the next drag is still a
+                    // cut, which is what a user who mis-drew a lasso wants.
+                    if !self.cut_path.is_empty() {
+                        self.cut_path.clear();
+                        self.drag = None;
+                        self.refresh_overlay();
+                        self.status = "cancelled the cut".to_string();
+                        return Task::none();
+                    }
                     self.tool = Tool::Sculpt;
                 }
                 self.adding = false;
@@ -8778,7 +9400,13 @@ impl Brokkr {
                 self.swap_strength(|app| app.tool = tool);
                 self.status = match tool {
                     Tool::Cut => {
-                        "cut armed: drag a line across the model, the left of the arrow goes"
+                        // Names all three readings, because the shape is
+                        // inferred and a user who is not told a loop is
+                        // available will never draw one. The line is named
+                        // first: it is the default, and it is what the tool
+                        // did before it learned the other two.
+                        "cut armed: drag a line and the left of the arrow goes, or draw a \
+                         loop around what to remove"
                             .to_string()
                     }
                     Tool::Mask => "mask: drag to protect, ctrl or alt to unprotect, \
@@ -11343,6 +11971,521 @@ mod tests {
         assert_eq!(app.doc.active_volume().brick_coords().count(), before, "a click cut the model");
         assert!(!app.unsaved, "a click that cut nothing marked the document unsaved");
         assert!(app.status.contains("cancelled"), "reported: {}", app.status);
+    }
+
+    /// Add a sphere to whatever is already there.
+    ///
+    /// **Not `seed_sphere`, which OVERWRITES.** Seeding clears every brick the
+    /// sphere's box touches before writing, so seeding a small sphere onto a
+    /// large one carves a moat around it rather than adding a lump to it: the
+    /// fixture ends up as a ball with a pit, and a test that asserts "the spur
+    /// went" passes for the wrong reason. A union is `min` of the two distance
+    /// fields, which is what this does.
+    fn union_sphere(volume: &mut brokkr_core::Volume, centre: Vec3, radius: f32) {
+        let voxel_size = volume.voxel_size();
+        let band = brokkr_core::NARROW_BAND * voxel_size;
+        let (lo, hi) =
+            volume.voxel_bounds(centre - (radius + band * 2.0), centre + (radius + band * 2.0));
+        volume.edit_voxels(lo, hi, |_, position, value| {
+            let outside = (position.distance(centre) - radius) / voxel_size;
+            value.min(outside).clamp(brokkr_core::INSIDE, brokkr_core::OUTSIDE)
+        });
+    }
+
+    /// Drag a closed loop, from a list of viewport positions.
+    fn drag_loop(app: &mut Brokkr, points: &[Vector]) {
+        let first = *points.first().expect("a loop needs points");
+        press(app, first);
+        for point in points.iter().skip(1) {
+            app.on_pointer(PointerEvent::Moved { position: *point, size: SIZE });
+        }
+        app.on_pointer(PointerEvent::Moved { position: first, size: SIZE });
+        release(app);
+    }
+
+    /// A circle of viewport positions around the middle of the screen.
+    fn loop_around(radius: f32, steps: usize) -> Vec<Vector> {
+        let centre = centre_of_viewport();
+        (0..steps)
+            .map(|step| {
+                let angle = step as f32 / steps as f32 * std::f32::consts::TAU;
+                centre + Vector::new(angle.cos() * radius, angle.sin() * radius)
+            })
+            .collect()
+    }
+
+    /// **The region cut is the region drawn**, checked in world space rather
+    /// than by looking at the screen.
+    ///
+    /// This is the test whose absence let the apex bug survive a design review.
+    /// The cut used the ray's NEAR-PLANE point as the pyramid's apex instead of
+    /// the eye; with one plane that cancels exactly, and with several it
+    /// displaces every side by a different amount. It was invisible to any test
+    /// comparing the preview against the drawing, because the preview projects
+    /// the same screen points and is therefore screen-exact either way.
+    ///
+    /// So this projects the RESULT back: every point that lost material must
+    /// fall inside the drawn polygon, and points well outside it must be
+    /// untouched. A displaced apex fails the second half.
+    #[test]
+    fn the_region_cut_matches_the_region_drawn() {
+        let mut app = app();
+        app.camera.yaw = 0.0;
+        app.camera.pitch = 0.0;
+        app.publish_camera();
+        update(&mut app, Message::ToolChanged(Tool::Cut));
+
+        let radius = SIZE.y * 0.15;
+        drag_loop(&mut app, &loop_around(radius, 24));
+        assert!(app.unsaved, "the lasso did not cut: {}", app.status);
+
+        // Probe a ring of world points at the depth the camera focuses on,
+        // spanning well inside the loop and well outside it.
+        let centre = centre_of_viewport();
+        let volume = app.doc.active_volume();
+        let mut inside_survived = 0;
+        let mut outside_removed = 0;
+        for step in 0..48 {
+            let angle = step as f32 / 48.0 * std::f32::consts::TAU;
+            for (scale, expect_gone) in [(0.45_f32, true), (2.2_f32, false)] {
+                let pixel = centre + Vector::new(angle.cos(), angle.sin()) * (radius * scale);
+                // Where that pixel meets the sphere's front face, before the
+                // cut: the model is a ball of known radius at the origin.
+                let (origin, ray) = app.ray_through(Vec2::new(pixel.x, pixel.y));
+                let Some(hit) = ray_meets_ball(origin, ray, MODEL_RADIUS_MM) else {
+                    continue;
+                };
+                // A little inside the surface, so a grazing sample does not
+                // decide the outcome.
+                let probe = hit + ray * 0.5;
+                let gone = volume.sample_world(probe) > 0.0;
+                if expect_gone && !gone {
+                    inside_survived += 1;
+                }
+                if !expect_gone && gone {
+                    outside_removed += 1;
+                }
+            }
+        }
+        assert_eq!(inside_survived, 0, "material survived well inside the drawn loop");
+        assert_eq!(outside_removed, 0, "material was removed well outside the drawn loop");
+    }
+
+    /// Where a ray first meets a ball at the origin, if it does.
+    fn ray_meets_ball(origin: Vec3, ray: Vec3, radius: f32) -> Option<Vec3> {
+        let b = origin.dot(ray);
+        let c = origin.length_squared() - radius * radius;
+        let discriminant = b * b - c;
+        if discriminant < 0.0 {
+            return None;
+        }
+        let t = -b - discriminant.sqrt();
+        (t > 0.0).then(|| origin + ray * t)
+    }
+
+    /// **The preview must be drawn in FRONT of the model it describes.**
+    ///
+    /// This is the one that `cargo test` could not see and a screenshot could.
+    /// The outline was first projected onto the plane through the camera's
+    /// target -- which is the middle of the model -- so the polygon sat INSIDE
+    /// the sphere and the depth test threw it away. Every headless assertion
+    /// passed: the geometry was built, the vertex counts were right, the shape
+    /// was correct, and the screen showed nothing at all.
+    ///
+    /// The straight-line cut hid it for a while, because its band reaches three
+    /// model radii out and the part past the silhouette has nothing in front of
+    /// it. So the band appeared over the background and vanished over the
+    /// model, which reads as a rendering quirk rather than as a preview drawn
+    /// in the wrong place.
+    ///
+    /// Depth is what is asserted, not pixels, because depth is the thing that
+    /// was wrong and it is checkable without a compositor.
+    #[test]
+    fn the_live_preview_is_drawn_in_front_of_the_model() {
+        let mut app = app();
+        app.camera.yaw = 0.0;
+        app.camera.pitch = 0.0;
+        app.publish_camera();
+        update(&mut app, Message::ToolChanged(Tool::Cut));
+
+        let points = loop_around(SIZE.y * 0.15, 12);
+        press(&mut app, points[0]);
+        for point in points.iter().skip(1) {
+            app.on_pointer(PointerEvent::Moved { position: *point, size: SIZE });
+        }
+        app.on_pointer(PointerEvent::Moved { position: points[0], size: SIZE });
+
+        assert!(!app.overlay.lines.is_empty(), "the live lasso drew no outline");
+
+        // The nearest the model can be to the eye: the camera looks at the
+        // origin and the body is a ball of MODEL_RADIUS_MM about it.
+        let eye = app.camera.eye();
+        let nearest_surface = eye.length() - MODEL_RADIUS_MM;
+        for vertex in app.overlay.lines.iter().chain(&app.overlay.surfaces) {
+            let away = Vec3::from_array(vertex.position).distance(eye);
+            assert!(
+                away < nearest_surface,
+                "a preview vertex sits {away} from the eye, behind the model's near face at \
+                 {nearest_surface} -- the depth test will hide it"
+            );
+        }
+    }
+
+    /// **The depth cap spares the wall behind the spur.**
+    ///
+    /// The fixture is the one the design argues about: a lump sticking out with
+    /// another surface close behind it, close enough that placing the cap one
+    /// band past the lump's back face would eat into the wall. Circling the
+    /// lump must take the lump and leave the wall EXACTLY as it was.
+    ///
+    /// `assert_same_field` rather than a thickness measurement, because a
+    /// thickness measurement is what `is_printable` does not have: it counts
+    /// holes and winding, so a wall thinned from the front with a clean step is
+    /// still "printable" and no other assertion in this repo would notice.
+    #[test]
+    fn a_lasso_over_a_spur_leaves_the_wall_behind_it_alone() {
+        let mut app = app();
+        app.camera.yaw = 0.0;
+        app.camera.pitch = 0.0;
+        app.publish_camera();
+
+        // Rebuilt as a spur in front of a wall, in camera-relative terms so the
+        // fixture does not depend on which way yaw zero points.
+        let eye = app.camera.eye();
+        let toward_camera = (eye - app.camera.target).normalize();
+        {
+            let volume = app.doc.active_volume_mut();
+            *volume = brokkr_core::Volume::new(volume.voxel_size());
+            // The wall: a big ball centred behind the origin, so its near face
+            // sits a little way behind the spur.
+            volume.seed_sphere(-toward_camera * 34.0, 30.0);
+            // The spur: small, in front, straddling the wall's near face so it
+            // is attached rather than floating. UNIONED, because seeding it
+            // would clear the wall's bricks around it and leave a moat.
+            union_sphere(volume, toward_camera * 6.0, 7.0);
+            volume.mark_everything_dirty();
+        }
+        app.rebuild_everything();
+
+        let before = app.doc.active_volume().duplicated(glam::IVec3::ZERO);
+
+        update(&mut app, Message::ToolChanged(Tool::Cut));
+        drag_loop(&mut app, &loop_around(SIZE.y * 0.06, 20));
+        assert!(app.unsaved, "the lasso did not cut: {}", app.status);
+
+        // The wall's far side, well behind anything the spur occupies: it must
+        // read exactly as it did.
+        let deep = -toward_camera * 50.0;
+        let after = app.doc.active_volume().sample_world(deep);
+        assert_eq!(
+            before.sample_world(deep),
+            after,
+            "the cut reached through to the back of the wall"
+        );
+        // And the spur itself is gone.
+        let spur = toward_camera * 10.0;
+        assert!(
+            app.doc.active_volume().sample_world(spur) > 0.0,
+            "the spur survived the lasso that circled it"
+        );
+    }
+
+    /// Shift asks for the old behaviour, and it must actually get it: the same
+    /// loop with shift held goes all the way through.
+    #[test]
+    fn shift_makes_the_same_lasso_cut_through() {
+        let mut app = app();
+        app.camera.yaw = 0.0;
+        app.camera.pitch = 0.0;
+        app.publish_camera();
+        let eye = app.camera.eye();
+        let toward_camera = (eye - app.camera.target).normalize();
+        {
+            let volume = app.doc.active_volume_mut();
+            *volume = brokkr_core::Volume::new(volume.voxel_size());
+            volume.seed_sphere(-toward_camera * 34.0, 30.0);
+            union_sphere(volume, toward_camera * 6.0, 7.0);
+            volume.mark_everything_dirty();
+        }
+        app.rebuild_everything();
+
+        app.shift = true;
+        update(&mut app, Message::ToolChanged(Tool::Cut));
+        drag_loop(&mut app, &loop_around(SIZE.y * 0.06, 20));
+
+        let deep = -toward_camera * 50.0;
+        assert!(
+            app.doc.active_volume().sample_world(deep) > 0.0,
+            "shift did not cut through: {}",
+            app.status
+        );
+    }
+
+    /// **The hole is the same size where it goes in and where it comes out.**
+    ///
+    /// The cutter is built along the view direction rather than from the eye,
+    /// so its sides are parallel. Built from the eye instead -- which is the
+    /// obvious construction and the one this shipped with first -- the removed
+    /// region is the view frustum's own wedge and widens exactly as the
+    /// projection does. At the framing this application picks that is not
+    /// subtle: the eye sits about 90 mm from a 30 mm ball, so the front face is
+    /// 60 mm away and the back 120, and **the exit hole comes out twice the
+    /// diameter of the entry hole**.
+    ///
+    /// Measured rather than reasoned about, because the factor depends on the
+    /// framing rule, the field of view and the model's size all at once, and a
+    /// test that recomputed those would be asserting its own arithmetic.
+    #[test]
+    fn a_cut_through_leaves_the_same_hole_at_both_ends() {
+        let mut app = app();
+        app.camera.yaw = 0.0;
+        app.camera.pitch = 0.0;
+        app.publish_camera();
+
+        let eye = app.camera.eye();
+        let facing = (app.camera.target - eye).normalize();
+        // Any direction across the view, to scan outward along.
+        let across = facing.cross(Vec3::Y).normalize_or(Vec3::X);
+
+        update(&mut app, Message::ToolChanged(Tool::Cut));
+        // Shift, so the cut goes all the way through and there are two ends to
+        // compare. With the depth cap on there is only one.
+        app.shift = true;
+        drag_loop(&mut app, &loop_around(SIZE.y * 0.10, 24));
+        assert!(app.unsaved, "the lasso did not cut: {}", app.status);
+
+        // How far the hole reaches from the axis, on a slab a little inside
+        // each face so a grazing sample cannot decide it.
+        let reach_at = |depth: f32| {
+            let volume = app.doc.active_volume();
+            let mut last_gone = 0.0_f32;
+            let mut radius = 0.0_f32;
+            while radius < 28.0 {
+                let probe = facing * depth + across * radius;
+                if volume.sample_world(probe) > 0.0 {
+                    last_gone = radius;
+                } else {
+                    break;
+                }
+                radius += 0.25;
+            }
+            last_gone
+        };
+
+        let front = reach_at(-25.0);
+        let back = reach_at(25.0);
+        assert!(front > 1.0, "no hole at the front face: {front}");
+        assert!(back > 1.0, "no hole at the back face: {back}");
+        assert!(
+            (back - front).abs() < front * 0.15,
+            "the hole flares through the model: {front:.2} mm going in, {back:.2} mm coming \
+             out -- the cutter is a pyramid from the eye rather than a prism"
+        );
+    }
+
+    /// **Ctrl with a loop selects instead of cutting, and the selection becomes
+    /// a body.**
+    ///
+    /// This is the whole "circle the lump and it becomes a layer" route, end to
+    /// end through the application: the same drag, the same hull, the same
+    /// classification, writing protection instead of removing material -- and
+    /// then the shipped masked split lifting it off.
+    ///
+    /// The field must come through the mask step bit-identical. Ctrl and no
+    /// ctrl differ in which map they write, and a ctrl gesture that moved one
+    /// voxel of geometry would be a destructive operation wearing a
+    /// selection's clothes.
+    #[test]
+    fn a_ctrl_lasso_selects_a_region_and_it_can_be_split_off() {
+        let mut app = app();
+        app.camera.yaw = 0.0;
+        app.camera.pitch = 0.0;
+        app.publish_camera();
+
+        let before = app.doc.active_volume().duplicated(glam::IVec3::ZERO);
+        let bodies_before = app.doc.nodes().len();
+
+        update(&mut app, Message::ToolChanged(Tool::Cut));
+        app.control = true;
+        drag_loop(&mut app, &loop_around(SIZE.y * 0.12, 20));
+        app.control = false;
+
+        assert!(
+            !app.doc.active_volume().mask().is_free(),
+            "a ctrl lasso protected nothing: {}",
+            app.status
+        );
+        // Compared by sampling rather than through the core's own helper,
+        // which is behind a test-only module this crate cannot reach.
+        for probe in [
+            Vec3::new(0.0, 0.0, MODEL_RADIUS_MM - 2.0),
+            Vec3::new(8.0, 4.0, MODEL_RADIUS_MM - 6.0),
+            Vec3::ZERO,
+            Vec3::new(-12.0, 0.0, 0.0),
+        ] {
+            assert_eq!(
+                before.sample_world(probe),
+                app.doc.active_volume().sample_world(probe),
+                "a ctrl lasso moved the field at {probe:?}"
+            );
+        }
+        assert!(app.status.contains("lasso"), "the status does not name the shape: {}", app.status);
+
+        // And the selection lifts off as its own row.
+        update(&mut app, Message::BodySplitMasked);
+        assert!(
+            app.doc.nodes().len() > bodies_before,
+            "the masked split produced no new body: {}",
+            app.status
+        );
+    }
+
+    /// **A cut that severs a body says so.**
+    ///
+    /// Two shells inside one `Volume` look right on screen, export as one
+    /// object and arrive at the slicer in two pieces. Nothing before this said
+    /// a word about it.
+    #[test]
+    fn a_cut_that_severs_a_body_reports_the_loose_piece() {
+        let mut app = app();
+        app.camera.yaw = 0.0;
+        app.camera.pitch = 0.0;
+        app.publish_camera();
+
+        // A dumbbell: two balls joined by a thin neck, arranged across the view
+        // so a straight drag can part them.
+        let eye = app.camera.eye();
+        let facing = (app.camera.target - eye).normalize();
+        let across = facing.cross(Vec3::Y).normalize_or(Vec3::X);
+        {
+            let volume = app.doc.active_volume_mut();
+            *volume = brokkr_core::Volume::new(volume.voxel_size());
+            volume.seed_sphere(across * -14.0, 10.0);
+            union_sphere(volume, across * 14.0, 10.0);
+            // The neck, as a chain of overlapping spheres: there is no capsule
+            // primitive, and a union of them is the same solid.
+            for step in 0..=56 {
+                let t = step as f32 / 56.0;
+                union_sphere(volume, across * (-14.0 + t * 28.0), 2.5);
+            }
+            volume.mark_everything_dirty();
+        }
+        app.rebuild_everything();
+        assert_eq!(
+            app.doc.split_plan(app.doc.active()).map(|plan| plan.parts.len()),
+            Some(1),
+            "the fixture is already in pieces before the cut"
+        );
+
+        // Cut the neck: a lasso around the middle, deep enough to part it.
+        update(&mut app, Message::ToolChanged(Tool::Cut));
+        app.shift = true;
+        drag_loop(&mut app, &loop_around(SIZE.y * 0.035, 16));
+        app.shift = false;
+
+        assert!(
+            app.status.contains("loose piece"),
+            "a severed body was not reported: {}",
+            app.status
+        );
+    }
+
+    /// A lasso disarms the tool exactly as a line does. The one-shot property
+    /// belongs to the gesture, not to the shape of it.
+    #[test]
+    fn a_lasso_disarms_the_cut_like_a_line_does() {
+        let mut app = app();
+        update(&mut app, Message::ToolChanged(Tool::Cut));
+        drag_loop(&mut app, &loop_around(SIZE.y * 0.15, 20));
+        assert_ne!(app.tool, Tool::Cut, "the cut stayed armed after a lasso");
+    }
+
+    /// The status names the shape, because "cut 812 bricks" over a lasso and
+    /// over a plane describe very different things happening to the model.
+    #[test]
+    fn the_status_says_which_shape_cut() {
+        let mut app = app();
+        app.camera.yaw = 0.0;
+        app.camera.pitch = 0.0;
+        app.publish_camera();
+
+        update(&mut app, Message::ToolChanged(Tool::Cut));
+        drag_loop(&mut app, &loop_around(SIZE.y * 0.15, 24));
+        assert!(app.status.contains("lasso"), "a lasso reported: {}", app.status);
+
+        update(&mut app, Message::ToolChanged(Tool::Cut));
+        press(&mut app, Vector::new(SIZE.x * 0.1, SIZE.y * 0.3));
+        app.on_pointer(PointerEvent::Moved {
+            position: Vector::new(SIZE.x * 0.9, SIZE.y * 0.3),
+            size: SIZE,
+        });
+        release(&mut app);
+        assert!(!app.status.contains("lasso"), "a straight drag reported: {}", app.status);
+    }
+
+    /// A loop thinner than the lattice is refused with its own sentence rather
+    /// than reporting a successful cut over a model that did not change.
+    #[test]
+    fn a_loop_thinner_than_the_voxel_grid_is_refused() {
+        let mut app = app();
+        update(&mut app, Message::ToolChanged(Tool::Cut));
+        let before = app.doc.active_volume().brick_coords().count();
+
+        // Long, and about a pixel wide: out along the middle of the viewport
+        // and back a hair below.
+        let middle = SIZE.y * 0.5;
+        let mut path = vec![Vector::new(SIZE.x * 0.2, middle)];
+        for step in 1..=20 {
+            path.push(Vector::new(SIZE.x * (0.2 + 0.03 * step as f32), middle));
+        }
+        for step in (0..=20).rev() {
+            path.push(Vector::new(SIZE.x * (0.2 + 0.03 * step as f32), middle + 0.4));
+        }
+        drag_loop(&mut app, &path);
+
+        assert_eq!(
+            app.doc.active_volume().brick_coords().count(),
+            before,
+            "a sliver loop changed the model"
+        );
+        assert!(app.status.contains("cancelled"), "reported: {}", app.status);
+    }
+
+    /// Escape mid-drag throws the shape away and leaves the tool armed, which
+    /// is the treatment a live gizmo drag already gets.
+    #[test]
+    fn escape_mid_path_leaves_the_cut_armed() {
+        let mut app = app();
+        update(&mut app, Message::ToolChanged(Tool::Cut));
+        press(&mut app, Vector::new(SIZE.x * 0.2, SIZE.y * 0.5));
+        app.on_pointer(PointerEvent::Moved {
+            position: Vector::new(SIZE.x * 0.5, SIZE.y * 0.4),
+            size: SIZE,
+        });
+        assert!(!app.cut_path.is_empty(), "the path did not accumulate");
+
+        update(&mut app, Message::MenuClosed);
+
+        assert_eq!(app.tool, Tool::Cut, "escape mid-path disarmed the tool");
+        assert!(app.cut_path.is_empty(), "escape left the path behind");
+        assert!(!app.unsaved, "escape mid-path still cut");
+    }
+
+    /// The tool card has to say what the gesture in progress will do. "PLANE
+    /// CUT" over a lasso is a lie about which material is about to go.
+    #[test]
+    fn the_live_label_follows_the_shape_being_drawn() {
+        let mut app = app();
+        update(&mut app, Message::ToolChanged(Tool::Cut));
+        assert_eq!(app.live_tool_label(), "PLANE CUT", "an unstarted cut is not a plane cut");
+
+        let points = loop_around(SIZE.y * 0.15, 20);
+        press(&mut app, points[0]);
+        for point in points.iter().skip(1) {
+            app.on_pointer(PointerEvent::Moved { position: *point, size: SIZE });
+        }
+        app.on_pointer(PointerEvent::Moved { position: points[0], size: SIZE });
+        assert_eq!(app.live_tool_label(), "LASSO CUT", "a live loop still says plane cut");
     }
 
     #[test]

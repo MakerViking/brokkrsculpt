@@ -31,6 +31,8 @@ mod breadcrumbs;
 mod camera;
 mod crash;
 mod cursor;
+mod cut;
+mod cut_preview;
 mod gizmo;
 mod icon;
 // `/dev/input` and the evdev crate are Linux only, and so is everything that
