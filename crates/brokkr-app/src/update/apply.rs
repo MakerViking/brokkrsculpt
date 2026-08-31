@@ -390,20 +390,27 @@ fn is_in_app_bundle(path: &Path) -> bool {
 ///
 /// Two questions, and the second is the one people forget.
 fn directory_is_safe(directory: &Path) -> Result<(), Refusal> {
-    let metadata = std::fs::metadata(directory).map_err(|why| {
-        Refusal::CannotReplace(format!("could not read {} ({why})", directory.display()))
-    })?;
-    if metadata.permissions().readonly() {
-        return Err(Refusal::CannotReplace(format!(
-            "{} is not writable -- this looks like a system install, so update it the way you \
-             installed it",
-            directory.display()
-        )));
-    }
+    // **`Permissions::readonly()` is NOT asked about a directory**, and that is
+    // not fussiness. On Windows it reports `FILE_ATTRIBUTE_READONLY`, which the
+    // shell sets to mark a folder as customised and which Microsoft documents as
+    // "not honored on directories" -- so it is true for a great many perfectly
+    // writable folders. A Windows tester's `C:\Users\<name>\Downloads` was
+    // refused by it on 2026-08-31 with "this looks like a system install", after
+    // the download had already succeeded. The probe below is the ground truth on
+    // every platform: it answers by writing, which is the thing actually being
+    // asked, and it also covers ACLs, read-only mounts and a full filesystem
+    // that no attribute reports.
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
         use std::os::unix::fs::PermissionsExt;
+        // Fetched here rather than at the top: the ownership rules below are the
+        // only thing that needs it, and on Windows the probe answers everything
+        // -- including a directory that is not there, which `File::create` in it
+        // reports perfectly well.
+        let metadata = std::fs::metadata(directory).map_err(|why| {
+            Refusal::CannotReplace(format!("could not read {} ({why})", directory.display()))
+        })?;
         let mode = metadata.permissions().mode();
         // **Group- or world-writable is refused even though we could write.**
         // A bare writability test passes on a loose `/opt` or a shared
@@ -449,8 +456,12 @@ fn directory_is_safe(directory: &Path) -> Result<(), Refusal> {
             let _ = std::fs::remove_file(&probe);
             Ok(())
         }
+        // The actionable message lives here now, because this is the check that
+        // can actually tell. A user whose install directory really is read-only
+        // needs to hear what to do instead, not an errno.
         Err(why) => Err(Refusal::CannotReplace(format!(
-            "cannot write into {} ({why})",
+            "{} is not writable ({why}) -- if this is a system-wide install, update it the way \
+             you installed it",
             directory.display()
         ))),
     }
@@ -1780,6 +1791,33 @@ mod tests {
         )));
         assert!(!is_translocated(Path::new("/Applications/BrokkrSculpt.app/Contents/MacOS/x")));
         assert!(!is_translocated(Path::new("/usr/bin/brokkrsculpt")));
+    }
+
+    /// **A directory is judged by writing to it, never by an attribute.**
+    ///
+    /// `Permissions::readonly()` on Windows reports FILE_ATTRIBUTE_READONLY,
+    /// which the shell sets on customised folders and which Microsoft documents
+    /// as not honored on directories -- so it is true for many writable ones. A
+    /// tester's Downloads folder was refused by it, with a message telling them
+    /// it looked like a system install. Nothing here could reproduce that: on
+    /// Linux the attribute tracks the write bits and behaves.
+    #[test]
+    fn a_writable_directory_is_accepted_whatever_its_attributes_say() {
+        let dir = scratch("writable");
+        assert_eq!(directory_is_safe(&dir), Ok(()), "a plain writable directory must pass");
+
+        // And one that genuinely cannot be written is still refused, with
+        // something a user can act on rather than an errno alone.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).expect("chmod");
+            let refusal = directory_is_safe(&dir).expect_err("read-only must still refuse");
+            let said = refusal.to_string();
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+            assert!(said.contains("not writable"), "got {said}");
+            assert!(said.contains("installed it"), "it must say what to do instead: {said}");
+        }
     }
 
     /// The bundle test runs on every platform, which is the point of making it
