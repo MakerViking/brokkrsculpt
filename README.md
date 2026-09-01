@@ -42,11 +42,24 @@ and printing mostly cannot happen here.
 - **One click into OrcaSlicer**
 
 It is free, open source, and **honestly not finished**. It is being built in the
-open by one person. There is no installer yet — see [Get it](#get-it).
+open by one person.
+
+<p align="center">
+  <strong><a href="https://github.com/MakerViking/brokkrsculpt/releases/tag/beta">⬇ Download the open beta</a></strong><br>
+  <a href="https://github.com/MakerViking/brokkrsculpt/releases/download/beta/BrokkrSculpt-Linux-x86_64.tar.gz">Linux</a> ·
+  <a href="https://github.com/MakerViking/brokkrsculpt/releases/download/beta/BrokkrSculpt-Windows-x86_64.zip">Windows</a> ·
+  <a href="https://github.com/MakerViking/brokkrsculpt/releases/download/beta/BrokkrSculpt-macOS-arm64.zip">macOS</a><br>
+  <sub>Free, no account. Nothing is signed yet, so Windows and macOS will both
+  warn you about it: <a href="#get-it">Get it</a> says exactly what to do.
+  <a href="#what-works-on-which-platform">What works on which platform</a> says
+  where each of the three builds actually stands.</sub>
+</p>
 
 > Named for Brokkr, the dwarven smith of Norse myth. Sibling to
 > [SindriCAD](https://tinkeratlas.com/sindricad) — Brokkr and Sindri forged
 > Mjolnir together. SindriCAD does parametric CAD; BrokkrSculpt does clay.
+> There is a [product page](https://tinkeratlas.com/brokkrsculpt) too, if you
+> would rather see the pictures first.
 
 <p align="center">
   <img alt="Brokkr the dwarven smith, carving a dragon's head from a block of stone" src="docs/images/brokkr-dwarf.png" width="330">
@@ -275,7 +288,7 @@ with the material it displaces instead of leaving it behind in the air.
 ## Status
 
 Milestones M0 through M3 of [docs/BUILD-SPEC.md](docs/BUILD-SPEC.md) are
-complete, and a good deal beyond them. **1316 tests pass**, clippy is at zero
+complete, and a good deal beyond them. **1411 tests pass**, clippy is at zero
 warnings, and three performance gates fail the build if a budget is blown.
 
 **Not there yet:** procedural primitives, painting filament slots by hand, and
