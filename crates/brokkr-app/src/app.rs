@@ -1494,10 +1494,10 @@ impl MaskCard {
 
     /// Whether the percentage on this card is about the ACTIVE body.
     ///
-    /// What the `[invert]` and `[clear]` buttons are gated on, and they need
-    /// gating: both act on the active body, and a card that is up purely
-    /// because something is masked OFF screen would otherwise offer to clear a
-    /// mask the user cannot see -- on a body that has none.
+    /// What the `[invert]`, `[clear]` and `[split off]` buttons are gated on,
+    /// and they need gating: all three act on the active body, and a card that
+    /// is up purely because something is masked OFF screen would otherwise
+    /// offer to clear a mask the user cannot see -- on a body that has none.
     pub(crate) fn names_the_active_body(&self) -> bool {
         self.revision != NO_MASK_HERE
     }
@@ -2271,6 +2271,17 @@ impl Brokkr {
             return Task::none();
         };
         let Some(offer) = self.offer.clone() else {
+            // **Reachable, and it used to return in silence.** Turning update
+            // checking off clears `self.offer` but leaves `downloaded_update`
+            // alone, and the Help entry that starts an install is gated on the
+            // download alone -- so a user who downloads, unticks Check for
+            // updates, then presses Install lands exactly here. With the clear
+            // above and nothing said, the card would go blank and the press
+            // would look like a dead button.
+            self.update_says(
+                crate::update::journal::Step::Install,
+                "the update was withdrawn -- switch checking back on and look again".to_string(),
+            );
             return Task::none();
         };
         let Some(target) = self.exe.clone() else {
@@ -6244,8 +6255,8 @@ impl Brokkr {
         // has no console, so before the journal existed a refused install left
         // no trace anywhere once the window was shut. A user cannot be asked to
         // go and find a file; Help > Report a bug is the button they already
-        // press. Empty on a machine that has never updated, which costs a
-        // heading and says something true.
+        // press. A machine that has never updated has no history and gets no
+        // heading, rather than a heading over nothing.
         let history = crate::update::journal::for_report();
         if !history.trim().is_empty() {
             let _ = writeln!(out, "update history:\n{}", history.trim_end());
@@ -7988,7 +7999,24 @@ impl Brokkr {
     /// assigns `self.status` directly for an update outcome is a bug of the
     /// shape this exists to prevent.
     fn update_says(&mut self, step: crate::update::journal::Step, why: String) {
-        crate::update::journal::failed(step, self.offer.as_ref().map(|offer| offer.build), &why);
+        let build = self.offer.as_ref().map(|offer| offer.build);
+        self.update_says_of(step, build, why);
+    }
+
+    /// [`Brokkr::update_says`] about a stated build.
+    ///
+    /// The revert path needs this: the build it is about comes from
+    /// `crash_revert` -- the build being rolled back FROM -- and not from
+    /// `self.offer`, which is whatever an update check last advertised and is
+    /// an unrelated number. Recording the offer there put a failed revert and
+    /// the successful revert beside it under two different builds.
+    fn update_says_of(
+        &mut self,
+        step: crate::update::journal::Step,
+        build: Option<u64>,
+        why: String,
+    ) {
+        crate::update::journal::failed(step, build, &why);
         self.update_shows(why);
     }
 
@@ -9227,8 +9255,9 @@ impl Brokkr {
                     .and_then(|path| std::fs::read_to_string(path).ok())
                     .and_then(|text| crate::update::previous_sha256_from(&text));
                 let Some(digest) = recorded else {
-                    self.update_says(
+                    self.update_says_of(
                         crate::update::journal::Step::Revert,
+                        Some(build),
                         "there is no verified copy to go back to".to_string(),
                     );
                     return Task::none();
@@ -9247,9 +9276,11 @@ impl Brokkr {
                             "went back from build {build} — restart BrokkrSculpt to use it"
                         );
                     }
-                    Err(why) => {
-                        self.update_says(crate::update::journal::Step::Revert, why.to_string())
-                    }
+                    Err(why) => self.update_says_of(
+                        crate::update::journal::Step::Revert,
+                        Some(build),
+                        why.to_string(),
+                    ),
                 }
             }
             Message::UpdateInstalled(id, outcome) => {
@@ -11296,8 +11327,12 @@ mod tests {
         update(&mut app, Message::PrimitiveAdded(brokkr_core::PrimitiveKind::Cube));
         let cube = app.doc.active();
         app.solo = Some(cube);
-        // Clear whatever is pending, so the assertion below is about this call.
+        // Clear whatever is pending, so the assertions below are about THIS
+        // call and not about the primitive that was just added -- adding a body
+        // dirties bricks too, and a counter left carrying its value made the
+        // dirty assertion below pass with the remesh removed.
         app.shared.take_pool_reset_for_tests();
+        app.perf.dirty_bricks = 0;
 
         update(&mut app, Message::ViewRebuilt);
 
@@ -11310,6 +11345,16 @@ mod tests {
         assert!(
             app.shared.take_pool_reset_for_tests(),
             "the pool was never asked to reset, so nothing was recovered"
+        );
+        // **The reset is only sound paired with marking everything dirty** --
+        // `request_pool_reset`'s own doc says the model otherwise leaves the
+        // GPU and does not come back. That is a different mutation from the
+        // solo one above and it needs its own assertion: dropping the two
+        // statements after the reset would leave the solo check green and the
+        // screen empty.
+        assert!(
+            app.perf.dirty_bricks > 0,
+            "the pool was emptied and nothing was re-offered, so the model has left the screen"
         );
         assert!(
             app.status.contains("rebuilt the view"),
@@ -11349,7 +11394,19 @@ mod tests {
     #[test]
     fn an_update_refusal_reaches_the_card_that_covers_the_status_line() {
         let mut app = app();
-        app.update_shows("starting the new build failed (os error 5)".to_string());
+
+        // Through a real message, not by calling the setter: what this pins is
+        // that the DISPATCH ARM routes to the writer. Calling `update_shows`
+        // here would exercise a two-line setter against itself and stay green
+        // if every arm went back to assigning `self.status` directly, which is
+        // exactly the defect being fixed.
+        update(
+            &mut app,
+            Message::UpdateInstalled(
+                iced::window::Id::unique(),
+                Err("starting the new build failed (os error 5)".to_string()),
+            ),
+        );
 
         assert_eq!(
             app.update_failure.as_deref(),
@@ -11358,23 +11415,81 @@ mod tests {
              install button is on"
         );
         assert_eq!(app.status, "starting the new build failed (os error 5)");
+        assert!(!app.installing_update, "the install was left marked in flight");
+    }
+
+    /// Every refusal in the install path reaches the card, not just the first.
+    ///
+    /// **One test per arm, because each is a separate `let ... else` and the
+    /// silent one was found by review rather than by this suite.** Removing
+    /// any single `update_says` leaves the others green, so a per-arm
+    /// assertion is the only shape that catches it. The middle arm is the one
+    /// that returned in silence: unticking Check for updates clears `offer`
+    /// while leaving `downloaded_update`, and the Help entry is gated on the
+    /// download alone.
+    #[test]
+    fn every_refusal_in_the_install_path_reaches_the_card() {
+        // No payload downloaded, reached through the message arm the Help
+        // entry and the card's button both raise.
+        {
+            let mut nothing = app();
+            update(&mut nothing, Message::UpdateInstallRequested(iced::window::Id::unique()));
+            assert_eq!(
+                nothing.update_failure.as_deref(),
+                Some("download the update first"),
+                "the guard in the message arm said nothing on the card"
+            );
+        }
+
+        // And the same state reaching the install path itself, which has its
+        // own sentence and its own arm.
+        {
+            let mut nothing = app();
+            let _ = nothing.install_and_restart(iced::window::Id::unique());
+            assert_eq!(
+                nothing.update_failure.as_deref(),
+                Some("there is no downloaded update to install"),
+                "a press with nothing downloaded said nothing on the card"
+            );
+        }
+
+        // A payload, but the offer behind it has been withdrawn.
+        {
+            let mut withdrawn = app();
+            withdrawn.downloaded_update = Some(std::path::PathBuf::from("/tmp/does-not-matter"));
+            withdrawn.offer = None;
+            let _ = withdrawn.install_and_restart(iced::window::Id::unique());
+            assert_eq!(
+                withdrawn.update_failure.as_deref(),
+                Some("the update was withdrawn -- switch checking back on and look again"),
+                "the withdrawn-offer arm returned in silence and blanked the card"
+            );
+        }
     }
 
     /// A fresh attempt clears the last one's refusal, so the card cannot go on
     /// showing a reason that has been superseded.
+    ///
+    /// **The refusal has to be one this attempt cannot itself produce**, or the
+    /// assertion is satisfied by the next statement rather than by the clear.
+    /// The first draft used a string the very next `let ... else` overwrote, so
+    /// it passed with the clear deleted.
     #[test]
     fn starting_another_install_clears_the_previous_refusal() {
         let mut app = app();
-        app.update_shows("it refused".to_string());
-        assert!(app.update_failure.is_some());
+        app.update_shows("a reason from last time".to_string());
 
-        // No downloaded payload and no resolved executable, so this refuses --
-        // but it must clear first, or the card would show the old reason
-        // beside the new one.
+        // Reaches the first refusal, which writes its OWN string. If the clear
+        // were removed the old reason would still be gone -- so instead: park
+        // the app where every arm is silent, and check the field is empty.
+        app.downloaded_update = Some(std::path::PathBuf::from("/tmp/does-not-matter"));
+        app.offer = None;
+        app.installing_update = false;
+        app.update_failure = Some("a reason from last time".to_string());
         let _ = app.install_and_restart(iced::window::Id::unique());
         assert_ne!(
             app.update_failure.as_deref(),
-            Some("it refused"),
+            Some("a reason from last time"),
             "the previous attempt's reason survived a new attempt"
         );
     }

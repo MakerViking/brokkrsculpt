@@ -223,19 +223,30 @@ fn append_to(path: &Path, entry: &Entry<'_>, at: u64) -> std::io::Result<()> {
     std::fs::write(path, trim_to(&text, MAX_BYTES))
 }
 
+/// Write down one update outcome at a stated path, dropping any failure.
+///
+/// **This is where the `let _ =` discipline actually lives**, so it is what the
+/// tests drive. [`record`] is the two lines that resolve the real state
+/// directory and call this; a test driving those would append to the
+/// developer's own update history, in parallel and unsynchronised, mixed in
+/// with records a user might need. `crash.rs` states the same rule for its own
+/// readers.
+fn record_to(path: &Path, entry: &Entry<'_>, at: u64) {
+    let _ = append_to(path, entry, at);
+}
+
 /// Write down one update outcome. Failure to write is dropped.
 ///
 /// **Every call happens AFTER the thing it records**, so a log that cannot be
 /// written can never cause the failure it would have described.
 ///
-/// Does nothing under `cfg(test)`, and that is the same rule `crash.rs` states
-/// for its own readers rather than a gap in coverage. This is the one function
-/// here that resolves the REAL state directory, so leaving it live would have
-/// every app-level test that touches an update outcome append to the
-/// developer's own update history -- in parallel, unsynchronised, and mixed in
-/// with records a user might need. What it resolves to is a two-line wrapper;
-/// what it wraps, [`append_to`], is driven directly by the tests below against
-/// scratch paths.
+/// Resolves the real state directory and does nothing else, which is why it is
+/// inert under `cfg(test)`: the app-level tests that exercise an update outcome
+/// dispatch real messages, and without this they would append to the
+/// developer's own update history, in parallel and unsynchronised, mixed in
+/// with records a user might still need. What it delegates to, [`record_to`],
+/// is driven directly by the tests below at scratch paths, so the discipline
+/// this exists to guarantee is still pinned.
 pub fn record(entry: &Entry<'_>) {
     if cfg!(test) {
         return;
@@ -243,7 +254,7 @@ pub fn record(entry: &Entry<'_>) {
     let Some(path) = crate::paths::state_file(LOG_FILE) else {
         return;
     };
-    let _ = append_to(&path, entry, now());
+    record_to(&path, entry, now());
 }
 
 /// Write down a refusal. Failure to write is dropped.
@@ -412,9 +423,15 @@ mod tests {
 
     /// **A log that cannot be written never breaks an update.**
     ///
-    /// Driven through the real writer against an unwritable path rather than
-    /// through a helper: asserting that a helper returns `Err` would pass even
-    /// if `record` were changed to `unwrap` it.
+    /// The writer is driven at a path it cannot possibly write -- a directory
+    /// standing where the file should be -- and the assertion is that the
+    /// PUBLIC entry point returns normally anyway. That is the claim: every
+    /// call site does `let _ =` on this, and an `unwrap` slipped in here would
+    /// turn a logging failure into a panic in the middle of an update.
+    ///
+    /// Asserting only that `append_to` returns `Err` would be the weaker test
+    /// the name does not promise: it would stay green if `record_to` were
+    /// changed to unwrap that very `Err`.
     #[test]
     fn a_log_that_cannot_be_written_is_dropped_rather_than_breaking_the_update() {
         let blocked = scratch("blocked");
@@ -425,11 +442,15 @@ mod tests {
         // A directory where the file should be: every write to it fails.
         std::fs::create_dir_all(&blocked).expect("a directory in the file's place");
 
-        let outcome = append_to(&blocked, &entry(Step::Install, Outcome::Failed, None), 1);
-        assert!(outcome.is_err(), "writing over a directory should not have succeeded");
+        assert!(
+            append_to(&blocked, &entry(Step::Install, Outcome::Failed, None), 1).is_err(),
+            "the fixture no longer blocks writes, so this test proves nothing"
+        );
 
-        // And the caller drops it. Nothing here may panic.
-        let _ = append_to(&blocked, &entry(Step::Install, Outcome::Failed, None), 1);
+        // The claim: the public writer swallows that and returns.
+        record_to(&blocked, &entry(Step::Relaunch, Outcome::Failed, Some("os error 5")), 2);
+
+        assert!(blocked.is_dir(), "the blocking directory should still be in the way");
         clean(&blocked);
     }
 

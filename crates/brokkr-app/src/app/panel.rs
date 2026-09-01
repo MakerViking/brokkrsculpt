@@ -824,19 +824,17 @@ impl Brokkr {
         // report a failure, and that place was behind this card. That is why
         // the Windows relaunch error has never been read by anyone.
         //
-        // Above the foot row rather than inside it: the row is already five
-        // items wide and a wrapped sentence in it would push the Close button
-        // off a narrow window.
-        let update: Element<'_, Message> = match &self.update_failure {
-            Some(why) => {
-                column![text(why.as_str()).size(theme::CAPTION_SIZE).color(theme::ERROR), update,]
-                    .spacing(theme::S1)
-                    .align_x(Alignment::Center)
-                    .into()
-            }
-            None => update,
-        };
-
+        // **Above the foot row and not inside it**, which is a layout decision
+        // and not a preference. The row already holds two checkboxes, the
+        // update button and Close, and iced lays a row out in index order,
+        // giving each shrink-sized child the width still unspent and then
+        // subtracting what it took (`iced_core`'s `layout::flex::resolve`). A
+        // wrapped sentence placed before Close therefore reports the width of
+        // its widest line and leaves Close with nothing -- and Close is the
+        // button the refusal itself tells the user to press.
+        //
+        // The first draft of this wrapped the update BUTTON instead, which put
+        // the sentence inside the row while this comment claimed it had not.
         let foot = row![
             checkbox(self.welcome_on_startup)
                 .label("Show this screen on startup")
@@ -866,6 +864,26 @@ impl Brokkr {
         ]
         .align_y(Alignment::Center)
         .spacing(theme::S3);
+
+        // **The refusal goes above that row, full width**, and not only in the
+        // status line: this card is drawn over a full-window scrim and returns
+        // before every other card in `view`, so the status line beneath it
+        // cannot be read while the card is up. An install started from the
+        // button in the row above therefore had exactly one place to report a
+        // failure, and that place was behind this card. That is why the Windows
+        // relaunch error has never been read by anyone.
+        let foot: Element<'_, Message> = match &self.update_failure {
+            Some(why) => column![
+                text(why.as_str())
+                    .size(theme::CAPTION_SIZE)
+                    .color(theme::ERROR)
+                    .width(Length::Fill),
+                foot,
+            ]
+            .spacing(theme::S2)
+            .into(),
+            None => foot.into(),
+        };
 
         // **The keys stay.** They are the one thing a first-time user cannot get
         // anywhere else -- there is no manual -- and they are cheap here: a
@@ -1275,7 +1293,7 @@ impl Brokkr {
                 "MESH POOL FULL: {} bricks missing from the view\n{remedy}",
                 pool.overflowed
             );
-            let mut card = column![
+            let card = column![
                 text(warning).size(theme::TEXT_SIZE_SMALL).font(theme::MONO).color(theme::ERROR)
             ]
             .spacing(theme::S2);
@@ -1288,18 +1306,34 @@ impl Brokkr {
             // refuses exactly the same bricks again, so there the sentence
             // above is the whole answer and a button would be a trap.
             //
-            // A `Button` captures its own presses (see `mask_card`), so this
-            // needs no `opaque` around the card and does not change what a
-            // press on the rest of the banner already does.
-            if fragmented {
-                card = card.push(
-                    button(text("Rebuild view").size(theme::CAPTION_SIZE))
-                        .padding(theme::S1)
-                        .style(theme::tool_button)
-                        .on_press(Message::ViewRebuilt),
-                );
-            }
-            stacked = stacked.push(container(card).padding(theme::S3).style(theme::overlay_card));
+            // **`opaque`, but only in the state that has a button.** The
+            // button captures its own bounds; the card's PADDING does not, and
+            // a press that lands a few pixels off a button the banner is
+            // inviting you to hit would fall straight through to the shader and
+            // carve a divot out of the model behind it. That is this project's
+            // own recorded gotcha, and it is why `mask_card` is wrapped.
+            //
+            // Only when fragmented, so the warning-without-a-button keeps
+            // exactly the fall-through behaviour it has today: making a region
+            // of the viewport unsculptable is a real cost, and it is worth
+            // paying only where there is something to click.
+            let card: Element<'_, Message> = if fragmented {
+                opaque(
+                    container(
+                        card.push(
+                            button(text("Rebuild view").size(theme::CAPTION_SIZE))
+                                .padding(theme::S1)
+                                .style(theme::tool_button)
+                                .on_press(Message::ViewRebuilt),
+                        ),
+                    )
+                    .padding(theme::S3)
+                    .style(theme::overlay_card),
+                )
+            } else {
+                container(card).padding(theme::S3).style(theme::overlay_card).into()
+            };
+            stacked = stacked.push(card);
         }
 
         if let Some(card) = &self.mask_card {
