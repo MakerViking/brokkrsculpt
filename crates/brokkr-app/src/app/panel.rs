@@ -816,6 +816,27 @@ impl Brokkr {
             None => space::horizontal().into(),
         };
 
+        // **The refusal goes here, next to the button that produced it**, and
+        // not only in the status line: this card is drawn over a full-window
+        // scrim and returns before every other card in `view`, so the status
+        // line beneath it cannot be read while the card is up. An install
+        // started from the button above therefore had exactly one place to
+        // report a failure, and that place was behind this card. That is why
+        // the Windows relaunch error has never been read by anyone.
+        //
+        // Above the foot row rather than inside it: the row is already five
+        // items wide and a wrapped sentence in it would push the Close button
+        // off a narrow window.
+        let update: Element<'_, Message> = match &self.update_failure {
+            Some(why) => {
+                column![text(why.as_str()).size(theme::CAPTION_SIZE).color(theme::ERROR), update,]
+                    .spacing(theme::S1)
+                    .align_x(Alignment::Center)
+                    .into()
+            }
+            None => update,
+        };
+
         let foot = row![
             checkbox(self.welcome_on_startup)
                 .label("Show this screen on startup")

@@ -745,6 +745,104 @@ fn swap_windows(
     Ok(())
 }
 
+/// How long to keep trying to start the freshly installed build.
+///
+/// **Deliberately short.** The hypothesis this exists for is a transient
+/// antivirus hold on a file renamed a moment ago, which clears in well under a
+/// second; two seconds crosses that with room to spare. Longer was considered
+/// and refused twice over. A user is watching a window that says "installing"
+/// and a ten-second stall is the "froze solid with nothing said" symptom that
+/// has already produced one wrong bug report here. And the apply lock is
+/// released before the spawn, so every second of retrying is a second in which
+/// a user who has given up can start the new build by hand -- and then ours
+/// succeeds too, leaving two windows.
+pub const RELAUNCH_BUDGET: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// A relaunch that never worked, and how hard it was tried.
+///
+/// `tries` is not decoration and not logging for its own sake: it is the
+/// evidence that settles what nobody yet knows. A refusal reported as
+/// "after 1 try" is a permanent block -- Smart App Control, a policy, a broken
+/// file -- and one reported as "after 6 tries" is the transient hold this
+/// module assumes. The count is what tells them apart, from a user who has no
+/// console and cannot be asked to run anything.
+///
+/// The `io::Error` is kept whole rather than stringified here, so
+/// `raw_os_error()` survives for a caller that wants to name a specific
+/// Windows code later.
+pub struct Refused {
+    pub error: std::io::Error,
+    pub tries: u32,
+}
+
+/// Whether a refusal to start the new build can only get worse by waiting.
+///
+/// Only `NotFound`. The swap reported success against this exact path moments
+/// ago -- on Windows by hashing the file back, on Unix because `rename` from
+/// `install_unix` returned `Ok` -- so "there is nothing there" means something
+/// removed it between then and now, which is quarantine or a second instance.
+/// Waiting cannot bring it back and would turn a clear answer into a stall.
+///
+/// **Everything else is retried, including `PermissionDenied`, and that is the
+/// weakest link in this design.** `PermissionDenied` is what a scanner holding
+/// the file looks like, and it is also what Smart App Control declining to
+/// execute the binary at all looks like -- which this module names twice as the
+/// one Windows failure nothing here can catch. Under that second reading the
+/// retry buys nothing but two seconds. That is the price of finding out, and it
+/// is why the attempt count is reported.
+fn launch_is_hopeless(kind: std::io::ErrorKind) -> bool {
+    matches!(kind, std::io::ErrorKind::NotFound)
+}
+
+/// Start the build that was just installed, retrying a transient refusal.
+///
+/// **This is a fix for an unconfirmed hypothesis and it does not prove
+/// itself.** The recorded evidence is that the same code failed for a tester on
+/// one build and worked on the next with nothing between them touching the
+/// spawn or the relaunch -- which is the signature of a race, not of a repair.
+/// A race that works once is not evidence of a fix, so what makes this worth
+/// shipping is not the retry but the count it reports beside a failure.
+///
+/// Nothing re-waits for antivirus after the new file lands at the target path.
+/// The module waits for it BEFORE the swap, and the file the scanner is
+/// interested in is the one that appeared after it.
+pub fn relaunch(path: &Path) -> Result<std::process::Child, Refused> {
+    relaunch_within(RELAUNCH_BUDGET, path)
+}
+
+/// [`relaunch`] against a stated budget.
+///
+/// **The budget is a parameter for the only reason that matters: it is what
+/// lets the retry be tested at all.** With `RELAUNCH_BUDGET` hard-coded the
+/// only test that could pin "a refused launch is actually waited out" would
+/// cost two seconds of wall clock on three CI platforms, so it would not be
+/// written -- and a retry nothing exercises is a retry that quietly stops
+/// happening.
+pub fn relaunch_within(
+    budget: std::time::Duration,
+    path: &Path,
+) -> Result<std::process::Child, Refused> {
+    let deadline = std::time::Instant::now() + budget;
+    let mut wait = std::time::Duration::from_millis(20);
+    let mut tries = 0u32;
+    loop {
+        tries += 1;
+        match std::process::Command::new(path).spawn() {
+            Ok(child) => return Ok(child),
+            Err(error) => {
+                if launch_is_hopeless(error.kind()) || std::time::Instant::now() >= deadline {
+                    return Err(Refused { error, tries });
+                }
+                std::thread::sleep(wait);
+                // Capped lower than `retry`'s 400 ms: the whole budget here is
+                // two seconds, so a 400 ms step would spend a fifth of it
+                // asleep after a single failure.
+                wait = (wait * 2).min(std::time::Duration::from_millis(200));
+            }
+        }
+    }
+}
+
 /// Retry a filesystem operation until it works or the budget runs out.
 #[cfg(any(windows, test))]
 fn retry<T>(
@@ -1756,6 +1854,86 @@ mod tests {
         });
         assert!(outcome.is_err());
         assert!(started.elapsed() < std::time::Duration::from_secs(3), "it must bound itself");
+    }
+
+    /// **A launch that keeps being refused is actually waited out.**
+    ///
+    /// This is the test the retry exists for, and it is the reason
+    /// `relaunch_within` takes a budget at all: against the shipped two-second
+    /// one it would cost two seconds on three CI platforms and would therefore
+    /// never have been written.
+    ///
+    /// A file with no execute bit refuses with `PermissionDenied`, which is the
+    /// kind the antivirus hypothesis predicts and the kind
+    /// `launch_is_hopeless` deliberately keeps retrying. Asserting the COUNT
+    /// rather than the elapsed time is what makes it fail if the retry is
+    /// removed: a single-shot spawn reports one try and takes no measurable
+    /// time either way.
+    #[cfg(unix)]
+    #[test]
+    fn a_launch_that_keeps_being_refused_is_retried_until_the_budget_is_spent() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = scratch("relaunch-refused");
+        let file = dir.join("not-executable");
+        std::fs::write(&file, b"not a program").expect("writable");
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o644))
+            .expect("permissions");
+
+        let Err(refused) = relaunch_within(std::time::Duration::from_millis(150), &file) else {
+            panic!("a file with no execute bit was somehow spawned");
+        };
+
+        assert_eq!(
+            refused.error.kind(),
+            std::io::ErrorKind::PermissionDenied,
+            "the fixture no longer produces the error kind this is about: {}",
+            refused.error
+        );
+        assert!(
+            refused.tries > 1,
+            "the launch was not retried at all -- it gave up after {} try",
+            refused.tries
+        );
+    }
+
+    /// A launch refused because there is nothing there gives up at once.
+    ///
+    /// The swap reported success against this exact path moments before, so
+    /// `NotFound` means something removed it and waiting cannot bring it back.
+    /// Retrying would turn a clear answer into a stall in front of a user.
+    #[test]
+    fn a_launch_with_nothing_at_the_path_gives_up_without_waiting() {
+        let dir = scratch("relaunch-missing");
+        let missing = dir.join("was-never-there");
+
+        let started = std::time::Instant::now();
+        let Err(refused) = relaunch_within(std::time::Duration::from_secs(30), &missing) else {
+            panic!("a path with no file was somehow spawned");
+        };
+
+        assert_eq!(refused.tries, 1, "a hopeless launch was retried {} times", refused.tries);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(1),
+            "it waited out a budget it should have skipped entirely"
+        );
+    }
+
+    /// The shipped budget stays short enough not to read as a freeze.
+    ///
+    /// Not a round-number check: the recorded failure mode is a window that
+    /// says "installing" and does nothing for a long time, which has already
+    /// produced one wrong bug report here. Five seconds is where that starts.
+    #[test]
+    fn the_wait_for_a_relaunch_is_too_short_to_read_as_a_frozen_window() {
+        assert!(
+            RELAUNCH_BUDGET <= std::time::Duration::from_secs(5),
+            "a {RELAUNCH_BUDGET:?} stall in front of a user is the symptom, not the fix"
+        );
+        assert!(
+            RELAUNCH_BUDGET >= std::time::Duration::from_secs(1),
+            "too short to cross the transient hold this exists for"
+        );
     }
 
     /// Self-replacement ships ON; the escape hatch is opt-out and off by

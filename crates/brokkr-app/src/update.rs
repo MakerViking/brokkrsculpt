@@ -51,6 +51,9 @@ use std::fmt;
 
 /// Putting a verified file in place, on all three platforms. See the module.
 pub mod apply;
+/// What each update attempt did, written where a user with no console can read
+/// it. See the module.
+pub mod journal;
 
 /// The keys that may sign a manifest, each with the epoch it *is* -- never the
 /// epoch of its position in this slice.

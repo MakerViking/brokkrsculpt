@@ -89,6 +89,23 @@ real hardware.
 
 ### Fixed
 
+- **Selecting with the cut tool now tells you where the button actually is.**
+  Ctrl and a cut gesture protects what you circled instead of removing it, and
+  the message afterwards sent you to the BODIES panel, which has no such
+  button. The mask card in the corner now carries a **split off** verb beside
+  invert and clear, and the message names it. The same message also named
+  whichever body happened to be selected rather than the one you had just
+  masked.
+- **A failed update now says why, somewhere you can read it.** The install
+  button on the welcome screen reported its outcome into the status line
+  behind that screen, so a refused install left nothing on screen at all.
+  Refusals appear on the welcome screen itself, and every update outcome is
+  written to `update-log.txt` beside the crash report and included in
+  Help > Report a bug — on Windows there is no console, so until now a failed
+  update left no trace anywhere once the window was closed.
+- **A newly installed build that will not start is retried** for a couple of
+  seconds before giving up, and the message says how many attempts it took.
+  Windows antivirus can hold a file it has just seen appear.
 - **A mask no longer hangs in the air waiting to catch moving material.**
   Dragging an unmasked part of a model towards a masked one made the moving
   part arrive masked, and stretched it on the way in. Protection now travels

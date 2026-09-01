@@ -419,6 +419,26 @@ pub struct Brokkr {
     /// waiting for antivirus to let go of the staged file, so a second press
     /// during that window would start a second swap.
     installing_update: bool,
+    /// The last update FAILURE, shown ON the welcome card rather than only in
+    /// the status line.
+    ///
+    /// **The status line is not always readable, and the install button is on
+    /// the screen that hides it.** `welcome_card` draws over a full-window
+    /// scrim and returns before every other card, so an install started from
+    /// the welcome screen reports its outcome into a line covered by the very
+    /// card the button is on. That is why the Windows spawn failure has been
+    /// reported more than once and its error text has never been read.
+    ///
+    /// Failures only, and that is the whole scope. A successful install closes
+    /// the window, and a successful download changes the button's own label, so
+    /// neither has an outcome anyone needs to go looking for. Only a refusal
+    /// leaves the user on the same screen with nothing to read.
+    ///
+    /// Not a general notification system and deliberately not a new layer: the
+    /// other install entry point is Help > Install the update and restart,
+    /// where `self.welcome` is false and the status line is fully visible. The
+    /// hole is exactly one screen wide and this fills exactly that hole.
+    update_failure: Option<String>,
     /// Where a verified payload landed, once one has. Only this is installable.
     downloaded_update: Option<std::path::PathBuf>,
     /// The executable to replace, resolved ONCE at startup.
@@ -1943,6 +1963,7 @@ impl Brokkr {
             update_settings: crate::update::Settings::default(),
             downloading_update: false,
             installing_update: false,
+            update_failure: None,
             downloaded_update: None,
             exe: None,
             update_pending_marker: None,
@@ -2231,20 +2252,34 @@ impl Brokkr {
     /// Everything before the rename is non-destructive, so a refusal here leaves
     /// the install exactly as it was.
     fn install_and_restart(&mut self, id: iced::window::Id) -> Task<Message> {
+        // **First, above everything, including the clear below.** A second
+        // press while a swap is running must change nothing at all: clearing
+        // the note first and then returning would wipe "Installing build N…"
+        // off the card and leave a running install saying nothing, which is the
+        // "clicked install, nothing happened" report this whole path exists to
+        // stop producing.
+        if self.installing_update {
+            return Task::none();
+        }
+        // A new attempt, so last attempt's refusal stops being the answer.
+        self.update_failure = None;
         let Some(staged) = self.downloaded_update.clone() else {
-            self.status = "there is no downloaded update to install".to_string();
+            self.update_says(
+                crate::update::journal::Step::Install,
+                "there is no downloaded update to install".to_string(),
+            );
             return Task::none();
         };
         let Some(offer) = self.offer.clone() else {
             return Task::none();
         };
         let Some(target) = self.exe.clone() else {
-            self.status = "this copy cannot update itself".to_string();
+            self.update_says(
+                crate::update::journal::Step::Install,
+                "this copy cannot update itself".to_string(),
+            );
             return Task::none();
         };
-        if self.installing_update {
-            return Task::none();
-        }
         self.installing_update = true;
         // Said before the work starts, because the work can take a minute and a
         // button that does nothing visible is indistinguishable from a broken
@@ -2256,16 +2291,33 @@ impl Brokkr {
         let resume = self.project_path.clone();
         Task::perform(
             async move {
+                use crate::update::journal::{self, Step};
+                // Every refusal below is written down where it is raised, and
+                // not back in the message arm: only here is it known whether
+                // the swap or the relaunch after it was the thing that refused,
+                // and that distinction is the point of `Step::Relaunch`.
+                let build = Some(offer.build);
+                let refused_at = |step: Step, why: String| {
+                    journal::failed(step, build, &why);
+                    why
+                };
                 // Never waited on: another copy mid-apply means this one says so
                 // rather than blocking behind someone else's 33 MB.
-                let lock = crate::update::apply::Lock::take().map_err(|why| why.to_string())?;
+                let lock = crate::update::apply::Lock::take()
+                    .map_err(|why| refused_at(Step::Install, why.to_string()))?;
                 crate::update::apply::gates(&target, running_build, running_commit)
-                    .map_err(|why| why.to_string())?;
+                    .map_err(|why| refused_at(Step::Install, why.to_string()))?;
                 // What we are reverting TO, recorded before anything moves.
-                let previous =
-                    crate::update::apply::sha256_of(&target.path).map_err(|why| why.to_string())?;
+                let previous = crate::update::apply::sha256_of(&target.path)
+                    .map_err(|why| refused_at(Step::Install, why.to_string()))?;
                 crate::update::apply::install(&target, &staged, &previous)
-                    .map_err(|why| why.to_string())?;
+                    .map_err(|why| refused_at(Step::Install, why.to_string()))?;
+                // **The swap is done, so the record goes down before anything
+                // that follows can fail.** What follows moves the floor and
+                // spawns a process, and a log that said only "relaunch failed"
+                // would leave a maintainer unable to tell whether the new build
+                // is at the target path -- which is the first thing they need.
+                journal::ok(Step::Install, build);
                 // **The floor rises here and nowhere else.** Only a completed
                 // apply may move it, so merely being shown a manifest cannot.
                 // After the swap rather than before: a floor raised for an update
@@ -2293,12 +2345,25 @@ impl Brokkr {
                 // who clicked restart and got a closed window with nothing
                 // coming back has no terminal and no way to tell whether their
                 // install survived.
-                std::process::Command::new(&target.path).spawn().map_err(|why| {
-                    format!(
-                        "build {} is installed, but starting it failed ({why}) -- this window is \
-                         still the old build; close it and start BrokkrSculpt again",
-                        offer.build
-                    )
+                //
+                // Retried, because nothing re-waits for antivirus after the new
+                // file lands at the target path. The attempt count rides along
+                // in the message and in the log: it is what tells a permanent
+                // block apart from the transient hold this assumes, and until
+                // one of those two is confirmed the count is worth more than
+                // the retry is.
+                crate::update::apply::relaunch(&target.path).map_err(|refused| {
+                    let tries = if refused.tries == 1 {
+                        "one try".to_string()
+                    } else {
+                        format!("{} tries", refused.tries)
+                    };
+                    let why = format!(
+                        "build {} is installed, but starting it failed after {tries} ({}) -- this \
+                         window is still the old build; close it and start BrokkrSculpt again",
+                        offer.build, refused.error
+                    );
+                    refused_at(Step::Relaunch, why)
                 })?;
                 Ok(offer.build)
             },
@@ -6129,6 +6194,17 @@ impl Brokkr {
                 .map_or_else(|| "none (not a release build)".to_string(), |n| n.to_string())
         );
         let _ = writeln!(out, "updates: {}", crate::update::outcome_line());
+        // **The update history, verbatim, and this is the route by which a
+        // failed update reaches a maintainer at all.** A Windows release build
+        // has no console, so before the journal existed a refused install left
+        // no trace anywhere once the window was shut. A user cannot be asked to
+        // go and find a file; Help > Report a bug is the button they already
+        // press. Empty on a machine that has never updated, which costs a
+        // heading and says something true.
+        let history = crate::update::journal::for_report();
+        if !history.trim().is_empty() {
+            let _ = writeln!(out, "update history:\n{}", history.trim_end());
+        }
         // **The OS line, and it is not the same question on each platform.**
         // `XDG_SESSION_TYPE` and `XDG_CURRENT_DESKTOP` answer "Wayland or X11,
         // and which compositor", which is the first thing to know about a
@@ -7855,6 +7931,33 @@ impl Brokkr {
         self.body_name(self.doc.active())
     }
 
+    /// Report an update refusal to BOTH places a user might be looking, and
+    /// write it down where it survives the window closing.
+    ///
+    /// **One writer, so a new update outcome cannot reach one surface and miss
+    /// the others.** The status line is the general one and is enough whenever
+    /// the welcome screen is down; `update_failure` is what the welcome card
+    /// draws, because that card covers the status line and carries an install
+    /// button of its own; the journal is what is still there tomorrow, and the
+    /// only thing a Windows release build leaves behind at all. Anything that
+    /// assigns `self.status` directly for an update outcome is a bug of the
+    /// shape this exists to prevent.
+    fn update_says(&mut self, step: crate::update::journal::Step, why: String) {
+        crate::update::journal::failed(step, self.offer.as_ref().map(|offer| offer.build), &why);
+        self.update_shows(why);
+    }
+
+    /// Show an update outcome that has ALREADY been written down.
+    ///
+    /// Separate from [`Brokkr::update_says`] because the failures raised inside
+    /// the install task record themselves: only there is it known whether the
+    /// swap or the relaunch after it was the thing that refused, and a record
+    /// written back here would have to guess from the wording.
+    fn update_shows(&mut self, why: String) {
+        self.update_failure = Some(why.clone());
+        self.status = why;
+    }
+
     // ------------------------------------------------- the generated masks
 
     /// The recipe a generator button means, with the sliders as they stand.
@@ -9050,18 +9153,23 @@ impl Brokkr {
             }
             Message::UpdateDownloaded(answer) => {
                 self.downloading_update = false;
-                self.status = match answer {
+                match answer {
                     // **Where it is, not just that it worked.** A user handed a
                     // verified file and not told where it landed has been given
                     // nothing they can act on, and there is no terminal here to
                     // go looking with.
                     Ok(path) => {
-                        let where_it_is = format!("verified and saved to {}", path.display());
+                        self.status = format!("verified and saved to {}", path.display());
                         self.downloaded_update = Some(path);
-                        where_it_is
+                        // A download that worked answers the previous refusal.
+                        self.update_failure = None;
+                        crate::update::journal::ok(
+                            crate::update::journal::Step::Download,
+                            self.offer.as_ref().map(|o| o.build),
+                        );
                     }
-                    Err(why) => why,
-                };
+                    Err(why) => self.update_says(crate::update::journal::Step::Download, why),
+                }
             }
             Message::UpdateRevertRequested => {
                 let Some(build) = self.crash_revert.take() else {
@@ -9074,7 +9182,10 @@ impl Brokkr {
                     .and_then(|path| std::fs::read_to_string(path).ok())
                     .and_then(|text| crate::update::previous_sha256_from(&text));
                 let Some(digest) = recorded else {
-                    self.status = "there is no verified copy to go back to".to_string();
+                    self.update_says(
+                        crate::update::journal::Step::Revert,
+                        "there is no verified copy to go back to".to_string(),
+                    );
                     return Task::none();
                 };
                 match crate::update::apply::revert(&target, &digest) {
@@ -9083,18 +9194,30 @@ impl Brokkr {
                         // becoming a loop with a network fetch per cycle.
                         self.update_settings.skip_build = Some(build);
                         crate::update::store(&self.update_settings);
+                        crate::update::journal::ok(
+                            crate::update::journal::Step::Revert,
+                            Some(build),
+                        );
                         self.status = format!(
                             "went back from build {build} — restart BrokkrSculpt to use it"
                         );
                     }
-                    Err(why) => self.status = why.to_string(),
+                    Err(why) => {
+                        self.update_says(crate::update::journal::Step::Revert, why.to_string())
+                    }
                 }
             }
             Message::UpdateInstalled(id, outcome) => {
                 self.installing_update = false;
                 match outcome {
                     Ok(_) => return iced::window::close(id),
-                    Err(why) => self.status = why,
+                    // The install refused, and this is the one that has never
+                    // been read: on Windows the swap completes and the relaunch
+                    // is what fails, so the user is left looking at the old
+                    // build with the reason behind the welcome card. Already
+                    // written to the journal by the task that raised it, which
+                    // is the only place that knows which step refused.
+                    Err(why) => self.update_shows(why),
                 }
             }
             Message::UpdateInstallPressed => {
@@ -9103,7 +9226,13 @@ impl Brokkr {
             }
             Message::UpdateInstallRequested(id) => {
                 if self.downloaded_update.is_none() {
-                    self.status = "download the update first".to_string();
+                    // Through the one writer like every other update outcome:
+                    // this is reachable from the welcome card's own button, so
+                    // the status line alone would put it behind the card.
+                    self.update_says(
+                        crate::update::journal::Step::Install,
+                        "download the update first".to_string(),
+                    );
                     return Task::none();
                 }
                 return self.guard(PendingAction::Restart(id));
@@ -11103,6 +11232,72 @@ mod tests {
         );
         assert!(app.crash_revert.is_none(), "and nothing may offer a revert before that");
         assert!(!app.crashed_last_session, "a scratch-dir construction has no crash report");
+    }
+
+    /// **An update refusal reaches the welcome card, not only the status line.**
+    ///
+    /// The install button lives on the welcome card, and that card draws over a
+    /// full-window scrim and returns before every other card in `view` -- so
+    /// the status line it reported into was behind the very screen the button
+    /// is on. That is why the Windows relaunch failure has been reported more
+    /// than once and its text never read. `update_failure` is the field the
+    /// card draws; if a refusal does not reach it, the refusal is invisible
+    /// again on exactly the screen that caused it.
+    #[test]
+    fn an_update_refusal_reaches_the_card_that_covers_the_status_line() {
+        let mut app = app();
+        app.update_shows("starting the new build failed (os error 5)".to_string());
+
+        assert_eq!(
+            app.update_failure.as_deref(),
+            Some("starting the new build failed (os error 5)"),
+            "the welcome card has nothing to draw, so the reason is invisible on the screen the \
+             install button is on"
+        );
+        assert_eq!(app.status, "starting the new build failed (os error 5)");
+    }
+
+    /// A fresh attempt clears the last one's refusal, so the card cannot go on
+    /// showing a reason that has been superseded.
+    #[test]
+    fn starting_another_install_clears_the_previous_refusal() {
+        let mut app = app();
+        app.update_shows("it refused".to_string());
+        assert!(app.update_failure.is_some());
+
+        // No downloaded payload and no resolved executable, so this refuses --
+        // but it must clear first, or the card would show the old reason
+        // beside the new one.
+        let _ = app.install_and_restart(iced::window::Id::unique());
+        assert_ne!(
+            app.update_failure.as_deref(),
+            Some("it refused"),
+            "the previous attempt's reason survived a new attempt"
+        );
+    }
+
+    /// **A second press while a swap is running changes nothing at all.**
+    ///
+    /// The guard has to come above the clear, not below it: clearing the note
+    /// and then returning would wipe "installing build N…" off the card and
+    /// leave a running install saying nothing on screen -- which is the
+    /// "clicked install, nothing happened" report this path exists to stop
+    /// producing.
+    #[test]
+    fn a_second_install_press_during_a_swap_does_not_wipe_what_the_card_is_saying() {
+        let mut app = app();
+        app.installing_update = true;
+        app.update_failure = Some("installing build 1042…".to_string());
+        app.status = "installing build 1042…".to_string();
+
+        let _ = app.install_and_restart(iced::window::Id::unique());
+
+        assert_eq!(
+            app.update_failure.as_deref(),
+            Some("installing build 1042…"),
+            "a second press blanked the card while the install was still running"
+        );
+        assert_eq!(app.status, "installing build 1042…");
     }
 
     #[test]
