@@ -515,6 +515,14 @@ pub enum Message {
     /// Show or hide the stats readout over the viewport. Collapsed it is one
     /// icon in the corner; open it is seven lines of numbers.
     StatsToggled,
+    /// Hand every brick back to the mesh pool and mesh them again, from the
+    /// button on the overflow banner.
+    ///
+    /// **User-pressed and never automatic**, which was the open question and is
+    /// now the answer: it is a synchronous whole-document remesh, and spending
+    /// seconds of one uninvited mid-gesture is a worse surprise than the banner
+    /// it would silence. See [`crate::app::Brokkr::rebuild_view`].
+    ViewRebuilt,
     /// Choose what a left drag does. Pressing the live tool goes back to
     /// [`crate::app::Tool::Sculpt`], so this covers arming AND disarming and
     /// the cut costs no second variant.

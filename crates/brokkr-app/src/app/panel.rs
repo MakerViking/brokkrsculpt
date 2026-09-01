@@ -1267,7 +1267,7 @@ impl Brokkr {
             // of the view gets it back.
             let fragmented = pool.vertices_watermark > (pool.vertices as u64).saturating_mul(5) / 4;
             let remedy = if fragmented {
-                "the pool is fragmented by editing, not full -- reopen the file to recover it"
+                "the pool is fragmented by editing, not full"
             } else {
                 "delete a body or resample coarser -- hiding one frees nothing"
             };
@@ -1275,16 +1275,31 @@ impl Brokkr {
                 "MESH POOL FULL: {} bricks missing from the view\n{remedy}",
                 pool.overflowed
             );
-            stacked = stacked.push(
-                container(
-                    text(warning)
-                        .size(theme::TEXT_SIZE_SMALL)
-                        .font(theme::MONO)
-                        .color(theme::ERROR),
-                )
-                .padding(theme::S3)
-                .style(theme::overlay_card),
-            );
+            let mut card = column![
+                text(warning).size(theme::TEXT_SIZE_SMALL).font(theme::MONO).color(theme::ERROR)
+            ]
+            .spacing(theme::S2);
+            // **The remedy is a button, and only in the state it answers.**
+            // This used to say "reopen the file to recover it", which is advice
+            // to close a document with unsaved work in order to fix a display
+            // problem -- and the fix is three statements the application can do
+            // in place. Offered only when the pool is FRAGMENTED: on a pool
+            // that is genuinely full a rebuild is a multi-second freeze that
+            // refuses exactly the same bricks again, so there the sentence
+            // above is the whole answer and a button would be a trap.
+            //
+            // A `Button` captures its own presses (see `mask_card`), so this
+            // needs no `opaque` around the card and does not change what a
+            // press on the rest of the banner already does.
+            if fragmented {
+                card = card.push(
+                    button(text("Rebuild view").size(theme::CAPTION_SIZE))
+                        .padding(theme::S1)
+                        .style(theme::tool_button)
+                        .on_press(Message::ViewRebuilt),
+                );
+            }
+            stacked = stacked.push(container(card).padding(theme::S3).style(theme::overlay_card));
         }
 
         if let Some(card) = &self.mask_card {

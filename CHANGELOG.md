@@ -106,6 +106,14 @@ real hardware.
 - **A newly installed build that will not start is retried** for a couple of
   seconds before giving up, and the message says how many attempts it took.
   Windows antivirus can hold a file it has just seen appear.
+- **The "mesh pool full" warning now has a button instead of bad advice.**
+  After a lot of cutting the pool can be fragmented rather than actually
+  full — there is room, it is just stranded. The warning used to tell you to
+  reopen the file, which meant closing a sculpt to fix a display problem.
+  It now offers **Rebuild view**, which packs the pool in place. It is a
+  button and not something a cut decides for you: it is a full remesh, and
+  a few seconds of one arriving uninvited mid-stroke is worse than the
+  warning it silences.
 - **A mask no longer hangs in the air waiting to catch moving material.**
   Dragging an unmasked part of a model towards a masked one made the moving
   part arrive masked, and stretched it on the way in. Protection now travels

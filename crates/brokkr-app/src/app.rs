@@ -3238,6 +3238,51 @@ impl Brokkr {
         self.refresh_model_radius();
     }
 
+    /// Hand every brick back to the mesh pool and mesh them again.
+    ///
+    /// **The remedy for a FRAGMENTED pool, and it is deliberately something
+    /// the user presses rather than something a cut decides.** The allocator
+    /// never splits or merges blocks, and a cut only ever shrinks the meshes it
+    /// touches, so each one orphans a block and takes a fresh one off the bump
+    /// pointer: thirty trims measured 1.45x watermark over live, with `live`
+    /// FALLING 11% while the bump pointer ROSE 16%. The space is there; it is
+    /// stranded, and only re-offering every brick from an empty allocator
+    /// recovers it.
+    ///
+    /// # Why a cut does not do this by itself
+    ///
+    /// It was the open question and the answer is no. This is a synchronous,
+    /// unbudgeted remesh of the whole document inside `update` -- the same
+    /// shape of work `MOST_BRICKS_TO_WALK` refuses to spend 320 ms on merely to
+    /// put five more words in a status line. Spending seconds of it, uninvited,
+    /// in the middle of a sculpting gesture, is a worse surprise than the
+    /// banner it would silence. A user who is told what is wrong and given the
+    /// button can choose the moment; a threshold cannot.
+    ///
+    /// # What it does NOT do
+    ///
+    /// **It does not give memory back to the system.** `MeshPool::reset` empties
+    /// the allocators over the buffers it already holds and never drops a
+    /// `BufferPair`, so a pool that has grown to N pairs keeps them for the life
+    /// of the process. What this recovers is allocatable space inside those
+    /// buffers, which is what the overflow is actually about. Any wording that
+    /// reads as freeing VRAM would be a lie.
+    ///
+    /// Solo is NOT cleared, and that is the one thing separating this from
+    /// [`Brokkr::rebuild_everything`]. That function clears it because its four
+    /// callers replace the whole document and renumber its rows, so a kept solo
+    /// id would name a different body. Nothing here changes which rows exist.
+    ///
+    /// It is not free beyond the remesh: `remesh_dirty` marks every dirtied
+    /// body's thumbnail stale, and `mark_everything_dirty` dirties all of them,
+    /// so the pictures redraw at one body per idle frame afterwards.
+    fn rebuild_view(&mut self) {
+        self.shared.request_pool_reset();
+        self.doc.mark_everything_dirty();
+        self.remesh_dirty();
+        self.status = "rebuilt the view — the pool is packed again".to_string();
+    }
+
     fn remesh_dirty(&mut self) {
         self.doc.take_dirty(&mut self.dirty);
         self.perf.dirty_bricks = self.dirty.len();
@@ -9865,6 +9910,7 @@ impl Brokkr {
                 *open = !*open;
             }
             Message::StatsToggled => self.stats_open = !self.stats_open,
+            Message::ViewRebuilt => self.rebuild_view(),
             // Both the panel button and File > New come here, so the two
             // cannot drift apart. Both discard the document, so both ask.
             Message::ResetSphere | Message::NewSculpt => {
@@ -11232,6 +11278,63 @@ mod tests {
         );
         assert!(app.crash_revert.is_none(), "and nothing may offer a revert before that");
         assert!(!app.crashed_last_session, "a scratch-dir construction has no crash report");
+    }
+
+    /// **Rebuilding the view keeps solo, where rebuilding everything drops it.**
+    ///
+    /// That single difference is the whole reason these are two functions, so
+    /// it is the only assertion here that discriminates -- and saying so
+    /// matters, because the obvious companions do not. Asserting the pool reset
+    /// was requested passes under either function, and so does asserting that
+    /// the bricks were dirtied: both do those two things identically. A test
+    /// built out of those would be green with `Message::ViewRebuilt` wired
+    /// straight to `rebuild_everything`, which would silently throw away a
+    /// user's solo mode every time they pressed a button about the mesh pool.
+    #[test]
+    fn rebuilding_the_view_packs_the_pool_without_dropping_solo() {
+        let mut app = app();
+        update(&mut app, Message::PrimitiveAdded(brokkr_core::PrimitiveKind::Cube));
+        let cube = app.doc.active();
+        app.solo = Some(cube);
+        // Clear whatever is pending, so the assertion below is about this call.
+        app.shared.take_pool_reset_for_tests();
+
+        update(&mut app, Message::ViewRebuilt);
+
+        assert_eq!(
+            app.solo,
+            Some(cube),
+            "a rebuild of the VIEW dropped solo -- that is `rebuild_everything`'s behaviour, and \
+             it is right there only because a document swap renumbers the rows"
+        );
+        assert!(
+            app.shared.take_pool_reset_for_tests(),
+            "the pool was never asked to reset, so nothing was recovered"
+        );
+        assert!(
+            app.status.contains("rebuilt the view"),
+            "the button reported nothing: {}",
+            app.status
+        );
+    }
+
+    /// The remedy must not claim to give memory back.
+    ///
+    /// `MeshPool::reset` empties the allocators over the buffers it already
+    /// holds and never drops a `BufferPair`, so nothing is returned to the
+    /// system. A sentence that read as freeing VRAM would be false in the one
+    /// place a user is deciding whether they have a memory problem.
+    #[test]
+    fn the_rebuild_does_not_claim_to_have_freed_memory() {
+        let mut app = app();
+        update(&mut app, Message::ViewRebuilt);
+        for lie in ["MB", "memory", "VRAM", "freed"] {
+            assert!(
+                !app.status.contains(lie),
+                "the status implies memory came back, and it did not: {}",
+                app.status
+            );
+        }
     }
 
     /// **An update refusal reaches the welcome card, not only the status line.**
