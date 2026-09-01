@@ -14,9 +14,25 @@
 # Windows target wants `lib.exe`, so the matrix IS the toolchain.
 name: Release
 
+# **Documentation does not mint a build.** Every push to `main` used to publish,
+# so a README fix offered every installed copy an update that changed nothing
+# they could see. Five of those went out on 2026-09-01 alone, and one of them
+# handed a tester a moving target while he was mid-way through reproducing an
+# updater defect.
+#
+# `paths-ignore` skips the run entirely rather than producing a skipped one, so
+# `run_number` does not advance and the build ordinals stay gapless. A push
+# touching code AND documentation still releases: the filter only skips when
+# EVERY changed file matches, which is the behaviour we want. A release with no
+# code change at all is still one `workflow_dispatch` away.
 on:
   push:
     branches: [main]
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+      - 'LICENSE'
+      - '.gitignore'
   workflow_dispatch:
 
 # **Two pushes to `main` in quick succession would otherwise race.** Both jobs
