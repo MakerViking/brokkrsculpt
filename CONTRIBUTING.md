@@ -37,10 +37,20 @@ Add one to any new file.
 
 You need a Linux machine with a Vulkan-capable GPU, and a Rust toolchain at
 least as new as the `rust-version` in the workspace manifest. See the
-**Building** section of [`README.md`](README.md) to get started, and
-[`handoff.md`](handoff.md) for the state of the world — what is verified, what
-is only tested, and which approaches were tried and rejected. It is long on
-purpose and it is the fastest way in.
+**Building** section of [`README.md`](README.md) to get started.
+
+Then [`docs/`](docs/), which is where the reasoning lives. These are long on
+purpose: they record what was tried and rejected as well as what shipped, which
+is usually the faster way in than the code.
+
+- [`BUILD-SPEC.md`](docs/BUILD-SPEC.md): what the application is meant to be,
+  and the performance budgets it is held to.
+- [`DRIVING-THE-APP.md`](docs/DRIVING-THE-APP.md): launching, driving and
+  screenshotting the running application, and the traps in doing so.
+- [`CUT-TOOL-PLAN.md`](docs/CUT-TOOL-PLAN.md): the cut tool's design, and a
+  worked example of the detail a plan here gets before any code does.
+- [`AUTOUPDATE-PLAN.md`](docs/AUTOUPDATE-PLAN.md): the updater, its trust model,
+  and what could not be deferred.
 
 Before opening a PR:
 

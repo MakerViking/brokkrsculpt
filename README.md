@@ -583,10 +583,12 @@ To look at what the offscreen tests rendered:
 env BROKKR_DUMP_FRAMES=/tmp cargo test -p brokkr-gpu --test offscreen
 ```
 
-[`handoff.md`](handoff.md) is the long version: what is verified against
-hardware versus only against tests, every gotcha that cost real time, and the
-optimisations that were implemented, measured and reverted. It is unusually
-frank for a file in a public repository, and that is on purpose.
+[`docs/`](docs/) is the long version: the build spec and the budgets it holds
+the sculpt loop to, how to drive the running application when a test cannot
+reach what you changed, and the design behind the cut tool and the updater.
+They record what was tried and rejected alongside what shipped, including
+optimisations that were implemented, measured and then reverted, which is
+usually a faster way in than the code.
 
 ## Layout
 
