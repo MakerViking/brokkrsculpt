@@ -1315,7 +1315,7 @@ impl Brokkr {
     /// # It MUST be `opaque`, and "a `stack!` child captures" is not true
     ///
     /// Capture only happens where a child actually captures. `Button` does, so
-    /// the two verb buttons below are safe; everything else on this card is a
+    /// the three verb buttons below are safe; everything else on this card is a
     /// `container` and a `text`, and neither captures anything.
     /// `Stack::update` levitates the cursor for the layers below only when the
     /// upper child's `mouse_interaction` is non-`None`
@@ -1326,14 +1326,31 @@ impl Brokkr {
     /// `opaque` captures presses only, only inside its bounds, which is legal
     /// under the rule the viewport is written to; see [`modal_layer`].
     ///
-    /// # The two reflex verbs, and why only when the card names this body
+    /// # The three reflex verbs, and why only when the card names this body
     ///
-    /// Invert and Clear are here so that the two things a user reaches for
-    /// mid-sculpt are one click away without a chord or a menu. They act on the
-    /// ACTIVE body, so they are shown only when the percentage above them is
+    /// Invert, Clear and Split off are here so that the things a user reaches
+    /// for mid-sculpt are one click away without a chord or a menu. They act on
+    /// the ACTIVE body, so they are shown only when the percentage above them is
     /// about the active body: a card that is up purely because something is
     /// masked OFF screen would otherwise offer to clear a mask that is not
     /// there. See [`MaskCard::names_the_active_body`].
+    ///
+    /// **Split off is here because this card is the only mask surface that
+    /// survives the tool being disarmed.** `mask_block`'s own copy of it is
+    /// behind `self.tool == Tool::Mask` AND an open tool menu, and a ctrl cut
+    /// drag lands in `Tool::Sculpt` (`finish_cut`), so that gate is shut before
+    /// the status line naming the verb can even be read. It was named as being
+    /// in the BODIES panel, which has no such button -- the Split icon there is
+    /// `Message::BodySplit`, a different operation -- and a beta user hunted for
+    /// it within an hour of the repository going public.
+    ///
+    /// It is NOT gated any more tightly than its two siblings, and that is
+    /// deliberate rather than an omission: `split_the_mask_off` answers every
+    /// bad case with a status line saying why -- no mask, a mask covering the
+    /// whole body, a body off screen, a mask that does not divide it -- so an
+    /// enabled button can refuse but can never quietly do the wrong thing.
+    /// Gating it on `Document::split_masked_guard` instead would put a walk of
+    /// the document on the `view()` path, which the section below forbids.
     ///
     /// # Nothing here computes or formats
     ///
@@ -1360,9 +1377,15 @@ impl Brokkr {
                     .style(theme::tool_button)
                     .on_press(message)
             };
+            // Split off last, because it changes the document's shape where the
+            // other two only change the mask sitting on it.
             body = body.push(
-                row![verb("invert", Message::MaskInverted), verb("clear", Message::MaskCleared),]
-                    .spacing(theme::S2),
+                row![
+                    verb("invert", Message::MaskInverted),
+                    verb("clear", Message::MaskCleared),
+                    verb("split off", Message::BodySplitMasked),
+                ]
+                .spacing(theme::S2),
             );
         }
         opaque(container(body).padding(theme::S3).style(theme::overlay_card))
@@ -1822,6 +1845,14 @@ impl Brokkr {
             // Here rather than in the bodies panel's verb row, which is icons:
             // this is a mask operation, it reads with the verbs it belongs to,
             // and it costs no new icon and no new icon test.
+            //
+            // **This is not the copy a status line may name.** It is behind
+            // `self.tool == Tool::Mask` above AND an open tool menu, and a ctrl
+            // cut drag disarms to `Tool::Sculpt`, so both gates are shut by the
+            // time its status is read. The reachable surface after any masking
+            // gesture is the mask card's `split off` -- see `mask_card`. Two
+            // labels for one message is deliberate: this one sits among full
+            // sentences, the card's among lower-case verbs.
             verb("Split off the mask", Message::BodySplitMasked),
         ]
         .spacing(theme::S1);
@@ -2244,7 +2275,7 @@ impl Brokkr {
                 // makes it free, and a gesture with no control on screen is a
                 // gesture nobody finds.
                 text(
-                    "drag: sculpt\nctrl or alt drag: invert\nshift drag: smooth\nright drag: orbit\nshift right drag: pan\nwheel: zoom\n1-7: brush\nm: mask\nctrl + cut drag: mask that half\nhold h: show the mask\nx y z: mirror\n[ ]: radius\nctrl z, ctrl shift z: undo, redo"
+                    "drag: sculpt\nctrl or alt drag: invert\nshift drag: smooth\nright drag: orbit\nshift right drag: pan\nwheel: zoom\n1-7: brush\nm: mask\nctrl + cut drag or loop: mask it\nhold h: show the mask\nx y z: mirror\n[ ]: radius\nctrl z, ctrl shift z: undo, redo"
                 )
                 .size(theme::CAPTION_SIZE)
                 .color(theme::TEXT_MUTE),

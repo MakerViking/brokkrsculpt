@@ -1378,6 +1378,42 @@ pub(crate) struct MaskCard {
 /// free has had at least one and can never be mistaken for this.
 const NO_MASK_HERE: u64 = 0;
 
+/// What to press next, for the mask cutter's status line.
+///
+/// Lifted out of the `format!` it was written in so that it can be asserted
+/// without an application. That is not hypothetical: the sentence this replaces
+/// sent users to the BODIES panel, whose verb row is five icons and whose Split
+/// fires [`Message::BodySplit`] -- the connected-component split, a different
+/// operation -- and nothing in the suite could see it, because the sentence
+/// only ever existed inside a gesture handler. A beta user found it in an hour.
+///
+/// Two things it must never say.
+///
+/// It must not point at the mask card's verb row unless that row will be
+/// showing. The row is gated on [`MaskCard::names_the_active_body`], so asking
+/// whether THIS gesture masked the ACTIVE body answers that without keeping a
+/// second copy of the gate: if it did, `refresh_mask_card` runs on the
+/// every-message tail before `view` and cannot leave the card without verbs.
+/// It is also the stronger question -- the card's own gate is satisfied by a
+/// mask left over from an earlier gesture, and advice resting on that would
+/// point at a button that splits along a mask this stroke never drew.
+///
+/// And it must not read as an offer to lift them all off at once:
+/// `split_the_mask_off` takes `doc.active()` and nothing else, so N masked
+/// bodies are N presses with a click in between.
+///
+/// The `false` arms still say BODIES, and this time it is true: BODIES is where
+/// a body is CHOSEN. The verb is named on the card either way. Say so here, or
+/// the next reader will helpfully "fix" it back.
+fn split_advice(touched_active: bool, touched: usize) -> &'static str {
+    match (touched_active, touched) {
+        (true, 1) => "split off on the mask card",
+        (true, _) => "split off on the mask card, one body at a time",
+        (false, 1) => "click it in BODIES, then split off on the mask card",
+        (false, _) => "click one of them in BODIES, then split off on the mask card",
+    }
+}
+
 impl MaskCard {
     /// `+2 masked, hidden`, or empty when none are.
     fn hidden_count_line(count: usize) -> String {
@@ -5852,10 +5888,13 @@ impl Brokkr {
         // is where the region exists and because a user who realises mid-drag
         // that they meant to select can still say so.
         //
-        // Only the straight drag routes here for now: the mask generator takes
-        // one half-space, and giving it a convex region is its own phase. A
-        // shaped ctrl-drag would otherwise silently mask a half-space nobody
-        // drew, which is worse than saying it is not built.
+        // EVERY shape routes here, not just the straight drag. `planes` is
+        // whatever `cutter_from_hull` built -- the whole convex region and its
+        // depth cap -- and `mask_cutter` reads the shape only to choose a word
+        // for the status line. (This paragraph said the opposite for as long as
+        // the shaped cut has existed, which is how its status line came to
+        // describe a lasso and name a button that only a half-space user could
+        // ever have found.)
         if self.control {
             self.mask_cutter(&planes, gesture.shape);
             // One shot per arming, exactly as the cut is: the assignment below
@@ -7750,7 +7789,7 @@ impl Brokkr {
         };
         let verb = grab.filter.done();
         let body = grab.body;
-        let name = self.doc.node(body).map_or("this body", |node| node.name.as_str()).to_string();
+        let name = self.body_name(body);
         self.commit_whole_mask(body, grab.snapshot);
         self.status = format!("{verb} the mask on {name}");
     }
@@ -7801,9 +7840,19 @@ impl Brokkr {
         Some(format!("could not {} the mask on {}: {why}", filter.verb(), self.active_body_name()))
     }
 
+    /// One body's name, for a status line.
+    ///
+    /// Separate from [`Brokkr::active_body_name`] because a status line about a
+    /// gesture that crossed several bodies has to be able to name the one it
+    /// actually touched. Naming the active body regardless is how the mask
+    /// cutter came to report a body the lasso never went near.
+    fn body_name(&self, body: NodeId) -> String {
+        self.doc.node(body).map_or("this body", |node| node.name.as_str()).to_string()
+    }
+
     /// The active body's name, for a status line.
     fn active_body_name(&self) -> String {
-        self.doc.node(self.doc.active()).map_or("this body", |node| node.name.as_str()).to_string()
+        self.body_name(self.doc.active())
     }
 
     // ------------------------------------------------- the generated masks
@@ -7920,8 +7969,16 @@ impl Brokkr {
             .map(|(_, node)| node.id)
             .collect();
 
+        let active = self.doc.active();
         let mut changes = Vec::new();
         let mut touched = 0usize;
+        // Two facts the old status line confused, and the confusion was the
+        // whole of its second defect. This loop walks every DRAWN body, while
+        // `split_the_mask_off` takes `doc.active()` and nothing else -- so "the
+        // body this sentence is about" and "the body the split would take" are
+        // not the same body. It named the second while describing the first.
+        let mut only: Option<NodeId> = None;
+        let mut touched_active = false;
         for body in bodies {
             let Some(volume) = self.doc.volume_mut(body) else {
                 continue;
@@ -7943,6 +8000,11 @@ impl Brokkr {
             changes.push(Change::WholeMask { body, mask: Box::new(previous) });
             self.thumbs.geometry_changed(body);
             touched += 1;
+            // `then_some` rather than a first-write guard: this clears itself
+            // on the second body, so `only` is safe to read anywhere rather
+            // than only under a `touched == 1` arm somewhere further down.
+            only = (touched == 1).then_some(body);
+            touched_active |= body == active;
         }
 
         if changes.is_empty() {
@@ -7959,16 +8021,25 @@ impl Brokkr {
         // answer**: the reason to select rather than cut is to lift the lump
         // off as its own body, and a user who is not told that is available
         // will reach for the panel and hunt for it.
+        //
+        // Which is exactly what happened. This used to say "split it off from
+        // the BODIES panel", and the BODIES panel has no such button -- its
+        // verb row is five icons and its Split fires `Message::BodySplit`, the
+        // connected-component split, a different operation. See `split_advice`.
         let what = match shape {
             cut::CutShape::Line => "that half",
             cut::CutShape::Curve => "inside the curve",
             cut::CutShape::Lasso => "inside the lasso",
         };
-        let where_ =
-            if touched > 1 { format!("{touched} bodies") } else { self.active_body_name() };
+        let where_ = match only {
+            Some(body) => self.body_name(body),
+            None => format!("{touched} bodies"),
+        };
         self.status = match shape {
             cut::CutShape::Line => format!("masked {what} of {where_}"),
-            _ => format!("masked {what} on {where_} — split it off from the BODIES panel"),
+            _ => {
+                format!("masked {what} on {where_} — {}", split_advice(touched_active, touched))
+            }
         };
     }
 
@@ -12398,6 +12469,168 @@ mod tests {
         update(&mut app, Message::ToolChanged(Tool::Cut));
         drag_loop(&mut app, &loop_around(SIZE.y * 0.15, 20));
         assert_ne!(app.tool, Tool::Cut, "the cut stayed armed after a lasso");
+    }
+
+    /// Arm the cut, hold ctrl, and draw a loop: the mask-instead-of-cut gesture.
+    ///
+    /// The release goes through `update` rather than `on_pointer`, because the
+    /// every-message tail is what refreshes the mask card -- and a status line
+    /// that names the card's verb row is only honest if that row is up by the
+    /// time anyone reads it.
+    fn ctrl_lasso(app: &mut Brokkr, radius: f32) {
+        update(app, Message::ToolChanged(Tool::Cut));
+        app.control = true;
+        let points = loop_around(radius, 24);
+        let first = *points.first().expect("a loop needs points");
+        press(app, first);
+        for point in points.iter().skip(1) {
+            app.on_pointer(PointerEvent::Moved { position: *point, size: SIZE });
+        }
+        app.on_pointer(PointerEvent::Moved { position: first, size: SIZE });
+        update(app, Message::Pointer(PointerEvent::Released { button: PointerButton::Left }));
+        app.control = false;
+    }
+
+    /// **The status must not send anyone to a panel with no such button.**
+    ///
+    /// It used to say "split it off from the BODIES panel". The BODIES verb row
+    /// is five icons and its Split fires [`Message::BodySplit`], a different
+    /// operation, so a user who followed the sentence either found nothing or
+    /// found the wrong thing. A beta user hit it within an hour of the
+    /// repository going public.
+    #[test]
+    fn the_ctrl_lasso_status_names_a_surface_that_is_actually_on_screen() {
+        let mut app = app();
+        app.camera.yaw = 0.0;
+        app.camera.pitch = 0.0;
+        app.publish_camera();
+
+        ctrl_lasso(&mut app, SIZE.y * 0.15);
+
+        assert!(!app.doc.active_volume().mask().is_free(), "the ctrl lasso masked nothing");
+        assert!(
+            !app.status.contains("BODIES"),
+            "the status still sends the user to a panel that has no such button: {}",
+            app.status
+        );
+        assert!(
+            app.status.contains("mask card"),
+            "the status does not name the surface the verb is on: {}",
+            app.status
+        );
+        assert!(
+            app.mask_card.as_ref().is_some_and(MaskCard::names_the_active_body),
+            "the status named the mask card's verb row and the card will not be showing one: {}",
+            app.status
+        );
+    }
+
+    /// **The advised operation must actually run from the state the gesture
+    /// leaves**, which is the half of the claim a test can carry.
+    ///
+    /// Dispatching [`Message::BodySplitMasked`] with no `ToolChanged` in
+    /// between is what pressing the card's `split off` does, so this pins that
+    /// the advice is not merely well-worded but possible: the tool is disarmed,
+    /// the active body carries a partial mask, and `split_the_mask_off` accepts
+    /// it rather than refusing. Before this round the same dispatch would still
+    /// have worked -- the defect was that nothing on screen could send it.
+    ///
+    /// **What this does NOT pin:** that the button exists in the widget tree.
+    /// iced offers no introspection, so no test in this suite can see a button.
+    /// That half is verified by driving the running application; see
+    /// `docs/DRIVING-THE-APP.md`.
+    #[test]
+    fn a_ctrl_lasso_leaves_the_split_it_advises_ready_to_run() {
+        let mut app = app();
+        app.camera.yaw = 0.0;
+        app.camera.pitch = 0.0;
+        app.publish_camera();
+        let before = app.doc.body_count();
+
+        ctrl_lasso(&mut app, SIZE.y * 0.15);
+        assert!(app.status.contains("split off"), "the status did not advise a split");
+
+        update(&mut app, Message::BodySplitMasked);
+
+        assert!(
+            app.status.starts_with("split "),
+            "the split the status advised refused instead: {}",
+            app.status
+        );
+        assert_eq!(
+            app.doc.body_count(),
+            before + 1,
+            "the advised split did not leave two bodies where there was one"
+        );
+    }
+
+    /// The advice points at the card only when the card will carry the verb,
+    /// and never reads as an offer to lift several bodies off at once.
+    #[test]
+    fn the_split_advice_points_at_the_card_only_when_the_card_will_carry_the_verb() {
+        // The active body was masked, so the card's verb row is up.
+        assert!(split_advice(true, 1).starts_with("split off on the mask card"));
+        assert!(!split_advice(true, 1).contains("BODIES"));
+        assert!(!split_advice(true, 1).contains("one body at a time"));
+
+        // Several bodies masked: one press splits one of them.
+        assert!(split_advice(true, 3).contains("one body at a time"));
+
+        // The active body was missed, so BODIES is where a body gets chosen
+        // first -- and the singular case must read as singular.
+        assert!(split_advice(false, 1).contains("click it in BODIES"));
+        assert!(split_advice(false, 3).contains("click one of them in BODIES"));
+        for touched in [1, 3] {
+            assert!(
+                split_advice(false, touched).contains("mask card"),
+                "the verb is still on the card even when a body must be chosen first"
+            );
+        }
+    }
+
+    /// **The sentence names the body it masked, not whichever body was active.**
+    ///
+    /// The loop walks every DRAWN body while `split_the_mask_off` takes
+    /// `doc.active()`, and the old line read the second while describing the
+    /// first: mask a body that is not active and it confidently named a body
+    /// the gesture never went near. Hiding the active one is the cheap way to
+    /// make it undrawn -- placing two bodies so a centred loop reaches one and
+    /// misses the other is the fiddly way, and buys nothing extra.
+    #[test]
+    fn a_ctrl_lasso_names_the_body_it_masked_rather_than_the_one_that_was_active() {
+        let mut app = app();
+        app.camera.yaw = 0.0;
+        app.camera.pitch = 0.0;
+        app.publish_camera();
+
+        let sphere = app.doc.active();
+        let sphere_name = app.body_name(sphere);
+
+        // A second body, which becomes active, and is then taken off screen so
+        // the gesture cannot reach it. Hiding the active body moves the active
+        // row to the first visible one -- deliberate, and documented in
+        // `toggle_visibility` -- so it has to be selected back afterwards. That
+        // reselection is the whole fixture: it is the only way to reach the
+        // state where the active body is not the body a gesture can touch.
+        update(&mut app, Message::PrimitiveAdded(brokkr_core::PrimitiveKind::Cube));
+        let cube = app.doc.active();
+        assert_ne!(cube, sphere, "the primitive did not become the active body");
+        update(&mut app, Message::BodyVisibilityToggled(cube));
+        update(&mut app, Message::BodySelected(cube));
+        assert_eq!(app.doc.active(), cube, "the hidden body could not be made active again");
+
+        ctrl_lasso(&mut app, SIZE.y * 0.15);
+
+        assert!(
+            app.status.contains(&sphere_name),
+            "the status did not name the body the lasso actually masked: {}",
+            app.status
+        );
+        assert!(
+            app.status.contains("click it in BODIES"),
+            "the status offered a card verb for a body that was not masked: {}",
+            app.status
+        );
     }
 
     /// The status names the shape, because "cut 812 bricks" over a lasso and
