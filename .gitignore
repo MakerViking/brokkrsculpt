@@ -9,3 +9,6 @@ handoff.md
 # Working plan — kept locally, never shipped. It names an unprotected public
 # write endpoint, which a public repository is the wrong place for.
 plan.md
+
+# Editor and tooling directories, kept local.
+.claude/

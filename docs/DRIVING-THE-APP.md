@@ -1,15 +1,17 @@
----
-name: drive-the-app
-description: Launch, drive and screenshot the running BrokkrSculpt window on this KDE Wayland session. Use when asked to run or start the app, to verify an interaction end to end, to reproduce a reported bug, or to check that a gizmo handle, camera gesture or panel control is actually live — anything the test suite cannot see because 3D and widget hit-testing both need a compositor.
----
-
 # Driving BrokkrSculpt
 
-Two `#[ignore]`-free facts to start from: **this project has shipped a
-green-but-dead interaction twice**, and no test in the suite can catch a third,
-because both 3D handle picking and widget picking need a compositor. That is
-what this skill is for. It is not a substitute for `cargo test`; it is the only
-way to answer "does the handle actually grab".
+How to launch, drive and screenshot the running application, so that an
+interaction can be verified end to end rather than only in the test suite.
+
+Two facts to start from: **this project has shipped a green-but-dead
+interaction twice**, and no test in the suite can catch a third, because both
+3D handle picking and widget picking need a compositor. That is what this is
+for. It is not a substitute for `cargo test`; it is the only way to answer
+"does the handle actually grab".
+
+Written against a KDE Wayland session, which is what the tooling below assumes.
+The traps section is the part worth reading before you script anything: every
+one of them has produced a confident wrong conclusion here.
 
 ## The three tools
 
@@ -91,12 +93,12 @@ travel; one jump reads as neither. `drag` emits 24 steps by default.
 
 **`shot.sh` may refuse, and that is it working.** It checks focus before *and*
 after the grab and compares the image's aspect ratio to the window's, then
-deletes anything it cannot prove is ours — because it once captured a media
-player and a private browsing session straight into an agent's context. Never
-work around it with `spectacle -f`.
+deletes anything it cannot prove is ours, because it once captured a media
+player and a private browsing session instead of the application. Never work
+around it with `spectacle -f`.
 
-**Do not kill the app to rebuild without asking.** The title bar shows `*` for
-unsaved work. The autosave in `$XDG_STATE_HOME/brokkrsculpt/autosave.brokkr` is
+**Check for unsaved work before killing the app to rebuild.** The title bar
+shows `*` for unsaved work. The autosave in `$XDG_STATE_HOME/brokkrsculpt/autosave.brokkr` is
 only written every two minutes, and File > Recover is the way back.
 
 ## Reading the status line is most of the value
@@ -113,9 +115,33 @@ than the picture. Real examples, each of which confirmed a whole code path:
 If a gesture produced no status change at all, the press probably missed the
 handle. Screenshot before assuming the feature is broken.
 
+## Screenshotting a gesture MID-drag
+
+`drive.py` releases the button when the script ENDS, because closing the uinput
+device is a release as far as the compositor is concerned. So a drag always
+commits, and a screenshot taken afterwards shows the result rather than the
+gesture. To catch the middle of one, run the script in the background with a
+long trailing `sleep` and take the shot during it:
+
+```bash
+(scripts/drive.py /tmp/drag.txt >/dev/null 2>&1 &)
+sleep 4
+./scripts/shot.sh /tmp/mid.png
+```
+
+This is the only way to see a live preview at all. Without it the cut tool's
+preview looks like it does not exist, because every screenshot shows the
+committed cut.
+
+**A one-shot tool disarms after it fires.** The cut is armed with `c` and is
+back to Sculpt after one drag, so a second drag in the same script is a sculpt
+stroke on the model. That is easy to misread as the tool misbehaving. Re-arm
+between gestures.
+
 ## What has been driven this way, and worked
 
 Arming the gizmo; dragging an axis arrow; dragging a per-axis scale box;
 abandoning a live drag with a second button; scrolling while holding a handle;
-orbiting; adding a primitive from the BODIES panel; and `ctrl+z`. Six of those
-are behaviours no test in the suite can reach.
+orbiting; adding a primitive from the BODIES panel; `ctrl+z`; and the whole cut
+tool, including its live preview, the depth-bounded lasso and the ctrl-drag
+selection. Most of those are behaviours no test in the suite can reach.

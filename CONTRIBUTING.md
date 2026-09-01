@@ -56,6 +56,14 @@ Before opening a PR:
 CI runs a stricter toolchain than a typical local one, and has caught lints
 that did not exist locally. Local green does not guarantee CI green.
 
+**If you changed anything you can see or click, drive it.** Handle picking and
+widget hit-testing both need a compositor, so no test in the suite can tell you
+whether a gizmo handle actually grabs or a preview actually draws. This project
+has shipped a green-but-dead interaction twice.
+[`docs/DRIVING-THE-APP.md`](docs/DRIVING-THE-APP.md) is how to launch, drive
+and screenshot the running application, and the traps section is worth reading
+before you script anything.
+
 ## Things that will get a PR sent back
 
 These are not style preferences. Each one cost real debugging time, and each is
