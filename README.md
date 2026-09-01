@@ -603,6 +603,19 @@ They record what was tried and rejected alongside what shipped, including
 optimisations that were implemented, measured and then reverted, which is
 usually a faster way in than the code.
 
+## AI assistance
+
+I build this with AI assistance. Code, tests, docs.
+
+I direct it and review what comes out. Every change passes the same gates
+whatever wrote it: `cargo fmt`, `cargo clippy` with `-D warnings`, the full
+test suite, and a performance benchmark that exits non-zero when a budget is
+blown. No exceptions.
+
+The reasoning lives in the repo rather than in my head. Commit messages record
+what was tried and rejected, and [`docs/`](docs/) carries the design documents.
+Judge it on that.
+
 ## Layout
 
 ```
