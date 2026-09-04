@@ -703,10 +703,23 @@ impl MeshPool {
             "one mask byte per vertex, or the tail of this brick reads the previous tenant's \
              attributes"
         );
+        debug_assert!(
+            mesh.colour.is_empty() || mesh.colour.len() == mesh.vertices.len(),
+            "colour must be one byte per vertex or absent entirely"
+        );
         // Widened into the kept buffer before anything else is borrowed, so
         // that the three writes below can share `&self`. See `staging`.
         self.staging.clear();
-        self.staging.extend(mesh.mask.iter().map(|byte| [*byte, 0, 0, 0]));
+        // Byte 0 the mask, byte 1 the painted slot -- the layout `ATTRIBUTE_BYTES`
+        // reserved. Zipped rather than a second pass: `upload` runs inside
+        // `prepare` on the frame path, and `staging` is a kept buffer precisely
+        // so this allocates nothing.
+        self.staging.extend(
+            mesh.mask
+                .iter()
+                .zip(mesh.colour.iter().chain(std::iter::repeat(&0)))
+                .map(|(mask, slot)| [*mask, *slot, 0, 0]),
+        );
 
         let pair = &self.buffers[slot.vertices.buffer as usize];
         queue.write_buffer(
@@ -1324,6 +1337,7 @@ mod tests {
             indices: (0..indices as u32).map(|index| index % vertices.max(1) as u32).collect(),
             cells: Vec::new(),
             mask: vec![0; vertices],
+            colour: vec![0; vertices],
         }
     }
 

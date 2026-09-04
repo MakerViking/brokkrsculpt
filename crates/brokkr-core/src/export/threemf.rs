@@ -828,6 +828,53 @@ mod tests {
         assert_eq!(painted, mesh.triangles.len(), "some assigned triangles came out unpainted");
     }
 
+    /// A painted body, through the real writer, to real `paint_color` codes.
+    ///
+    /// End to end and deliberately not through a hand-built `ExportMesh`: the
+    /// writer has been able to emit paint since the day it shipped, and what
+    /// was missing was anything upstream that filled `slots`. A test that
+    /// supplies its own slots would still have passed on the day no user could
+    /// get one.
+    #[test]
+    fn a_painted_volume_exports_triangles_on_the_right_filaments() {
+        let mut volume = crate::Volume::new(0.5);
+        volume.seed_sphere(glam::Vec3::ZERO, 6.0);
+        volume.mark_everything_dirty();
+
+        // Paint the upper half by cell, over a box that comfortably contains
+        // the sphere. Written straight into the field rather than through a
+        // brush: this test is about the writer, and a cell that carries no
+        // vertex simply contributes nothing.
+        let reach = (6.0 / 0.5) as i32 + 2;
+        for x in -reach..=reach {
+            for y in 1..=reach {
+                for z in -reach..=reach {
+                    volume.colour_mut().write(glam::IVec3::new(x, y, z), 2);
+                }
+            }
+        }
+        volume.mark_everything_dirty();
+
+        let (mesh, report) = volume.export_mesh();
+        assert!(report.is_printable());
+        assert!(!mesh.slots.is_empty(), "the export carried no slots");
+
+        let mut bytes = Vec::new();
+        write(&mesh, &mut bytes).expect("write failed");
+        let xml = String::from_utf8_lossy(&bytes).into_owned();
+
+        // Slot 2's code, and no other slot's, on some triangles but not all.
+        let painted = xml.matches("paint_color=\"8\"").count();
+        let bare = xml.matches("<triangle ").count() - xml.matches("paint_color=").count();
+        assert!(painted > 0, "no triangle came out on filament 2");
+        assert!(bare > 0, "every triangle came out painted");
+        assert_eq!(
+            xml.matches("paint_color=").count(),
+            painted,
+            "a filament nobody painted reached the file"
+        );
+    }
+
     /// A filament's material is not this application's text -- it comes off the
     /// printer -- and it lands in a JSON document a slicer parses.
     #[test]

@@ -2121,7 +2121,17 @@ impl Brokkr {
         // knows it is there, and the File menu is not somewhere you look
         // unprompted.
         if app.has_autosave() {
-            app.status = "an autosave from a previous session is in File > Recover".to_string();
+            // Checked BEFORE the offer, so nobody is invited to recover a file
+            // this build cannot open -- and, far more importantly, before the
+            // 120-second autosave timer gets a chance to overwrite it.
+            app.status = match app.preserve_unreadable_autosave() {
+                Some(aside) => format!(
+                    "an autosave from a previous session could not be read by this build — \
+                     it has been kept as {}",
+                    aside.display()
+                ),
+                None => "an autosave from a previous session is in File > Recover".to_string(),
+            };
         }
         // **And a crash outranks it**, because it is the rarer message and the
         // one with something to do about it. Taken rather than read, so it is
@@ -6661,6 +6671,60 @@ impl Brokkr {
     /// Whether there is a crash net to offer.
     pub(crate) fn has_autosave(&self) -> bool {
         self.autosave_file.as_ref().is_some_and(|path| path.is_file())
+    }
+
+    /// Move an autosave this build cannot read out of the way, so the next one
+    /// cannot destroy it.
+    ///
+    /// **The updater supports downgrade, and that is what makes this
+    /// necessary.** Publishing a manifest naming an older build is how a bad
+    /// release is walked back, and `apply.rs` states outright that the build
+    /// reading a file can be older than the build that wrote it. Compose that
+    /// with the autosave: a newer build writes a crash net in a field encoding
+    /// the older one refuses, the user is told an autosave is waiting, File >
+    /// Recover fails with a version message, they shrug and start sculpting --
+    /// and 120 seconds later the older build overwrites the only copy of their
+    /// work with an empty sphere. Nothing in the write path notices that the
+    /// file it is about to replace is one it could not read.
+    ///
+    /// Probed with [`read_outline`], which reads a header and a node table
+    /// rather than a document, so the check costs a few hundred bytes on a file
+    /// that may be a gigabyte. Any error moves it aside, not only a version
+    /// one: a truncated or corrupt crash net is equally worth keeping, since
+    /// it is the only copy of something and this application cannot say what a
+    /// later build or a hex editor will make of it.
+    ///
+    /// Named by the first free number rather than by a timestamp, so a test can
+    /// assert the name it lands on.
+    fn preserve_unreadable_autosave(&mut self) -> Option<std::path::PathBuf> {
+        let path = self.autosave_file.clone()?;
+        let file = std::fs::File::open(&path).ok()?;
+        let mut reader = std::io::BufReader::new(file);
+        if brokkr_core::project::read_outline(&mut reader).is_ok() {
+            return None;
+        }
+        drop(reader);
+
+        // A bounded search: a directory already holding this many refused crash
+        // nets is a bigger problem than the naming, and spinning here would be
+        // worse than giving up.
+        for attempt in 1..100 {
+            let aside = path.with_file_name(format!("autosave-unreadable-{attempt}.brokkr"));
+            if aside.exists() {
+                continue;
+            }
+            return match std::fs::rename(&path, &aside) {
+                Ok(()) => {
+                    log::warn!("kept an unreadable autosave as {}", aside.display());
+                    Some(aside)
+                }
+                Err(error) => {
+                    log::error!("could not move {} aside: {error}", path.display());
+                    None
+                }
+            };
+        }
+        None
     }
 
     /// Load the crash net, and deliberately do not adopt its path.
@@ -11922,6 +11986,76 @@ mod tests {
         app.open_project(&gone);
         assert!(app.status.contains("could not"), "reported: {}", app.status);
         assert!(app.recent.is_empty(), "a file that cannot be opened stayed in the list");
+
+        std::fs::remove_dir_all(&directory).ok();
+    }
+
+    /// A crash net this build cannot read is kept, not overwritten.
+    ///
+    /// **This is a data-loss guard, and the loss is silent.** The updater
+    /// supports downgrade, so an older build can meet a newer build's autosave;
+    /// it refuses to open it, says so, and then the 120-second timer replaces
+    /// the only copy of the user's work with whatever is on screen.
+    ///
+    /// The unreadable file is manufactured by bumping the FIELD version in the
+    /// header of a real autosave, which is exactly the shape a downgrade
+    /// produces -- rather than by writing rubbish, which would prove only that
+    /// rubbish is refused.
+    #[test]
+    fn an_autosave_this_build_cannot_read_is_kept_rather_than_overwritten() {
+        let directory = scratch("autosave-unreadable");
+        let path = directory.join("autosave.brokkr");
+
+        // A genuine autosave first, so the bytes are real in every other way.
+        let mut app = app_with_unsaved_work();
+        app.autosave_file = Some(path.clone());
+        app.write_autosave();
+        let good = std::fs::read(&path).expect("the autosave should be there");
+
+        // Bytes 10..12 are the field version. One past what this build can READ
+        // is a file from a newer build -- and that is NOT one past what it just
+        // wrote: an unpainted, unmasked document deliberately stamps the OLDEST
+        // encoding that can carry it, which is the whole backward-compatibility
+        // mechanism. So the boundary is found rather than assumed, which also
+        // stops this test rotting at the next field bump.
+        let mut from_the_future = good.clone();
+        let mut version = u16::from_le_bytes([good[10], good[11]]);
+        loop {
+            version += 1;
+            assert!(version < 64, "no field version in range was refused");
+            from_the_future[10..12].copy_from_slice(&version.to_le_bytes());
+            if brokkr_core::project::read_outline(&mut from_the_future.as_slice()).is_err() {
+                break;
+            }
+        }
+        std::fs::write(&path, &from_the_future).expect("write failed");
+
+        let mut older = Brokkr::with_tablet(crate::tablet::Tablet::inert());
+        older.autosave_file = Some(path.clone());
+        let aside = older.preserve_unreadable_autosave().expect("it should have been kept");
+
+        assert!(
+            !path.exists(),
+            "the unreadable autosave was left where the timer would clobber it"
+        );
+        assert!(aside.exists(), "it was moved somewhere that does not exist");
+        assert_eq!(
+            std::fs::read(&aside).expect("read failed"),
+            from_the_future,
+            "the kept file is not the bytes that were there"
+        );
+        assert_eq!(aside.file_name().unwrap(), "autosave-unreadable-1.brokkr");
+
+        // A second one does not overwrite the first.
+        std::fs::write(&path, &from_the_future).expect("write failed");
+        let second = older.preserve_unreadable_autosave().expect("the second should be kept too");
+        assert_eq!(second.file_name().unwrap(), "autosave-unreadable-2.brokkr");
+        assert!(aside.exists(), "the second refusal destroyed the first one");
+
+        // And a file this build CAN read is left exactly where it is.
+        std::fs::write(&path, &good).expect("write failed");
+        assert_eq!(older.preserve_unreadable_autosave(), None, "a good autosave was moved aside");
+        assert!(path.exists(), "a readable autosave was taken away from File > Recover");
 
         std::fs::remove_dir_all(&directory).ok();
     }

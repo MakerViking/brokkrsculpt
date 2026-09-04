@@ -11,6 +11,7 @@ use crate::brick::{
     APRON_VOXELS, BRICK_DIM, BRICK_VOXELS, Brick, BrickCoord, INSIDE, NARROW_BAND, OUTSIDE,
     StoredBrick, apron_index, brick_index,
 };
+use crate::colour::ColourField;
 use crate::mask::{MaskBrick, MaskEdit, MaskField, MaskSlab, PROTECTED, UNMASKED};
 use crate::mesh::{BrickMesh, MeshScratch, mesh_apron};
 use crate::region::FieldRegion;
@@ -44,7 +45,18 @@ pub struct VolumeStats {
     pub mask_dense_bricks: usize,
     /// Bytes of mask data, excluding the map that indexes it.
     pub mask_bytes: usize,
-    /// Bytes of voxel data, mask data, and the maps that index them.
+    /// Colour bricks, of which [`VolumeStats::colour_dense_bricks`] carry an
+    /// array.
+    ///
+    /// Counted apart from the field's bricks for the same reason the mask's
+    /// are: the two censuses do not cover the same coordinates.
+    pub colour_bricks: usize,
+    /// Colour bricks holding a full byte array, at 32,768 bytes each.
+    pub colour_dense_bricks: usize,
+    /// Bytes of painted-slot data, excluding the map that indexes it.
+    pub colour_bytes: usize,
+    /// Bytes of voxel data, mask data, colour data, and the maps that index
+    /// them.
     pub resident_bytes: usize,
 }
 
@@ -440,6 +452,10 @@ pub struct Volume {
     /// The mask's polarity when the current stroke opened, once something in
     /// the stroke has changed it. See [`crate::undo::StrokeEdit`].
     mask_polarity: Option<bool>,
+    /// The painted filament slot per voxel. Beside the mask and inside the
+    /// volume for exactly the reasons [`crate::colour`] gives, which are the
+    /// mask's three plus the undo arithmetic that decided it.
+    colour: ColourField,
     scratch: EditScratch,
 }
 
@@ -459,6 +475,7 @@ impl Volume {
             recorder: None,
             mask_recorder: None,
             mask_polarity: None,
+            colour: ColourField::default(),
             scratch: EditScratch::default(),
         }
     }
@@ -491,6 +508,17 @@ impl Volume {
     #[inline]
     pub fn mask_mut(&mut self) -> &mut MaskField {
         &mut self.mask
+    }
+
+    /// The painted slots of this body.
+    #[inline]
+    pub fn colour(&self) -> &ColourField {
+        &self.colour
+    }
+
+    #[inline]
+    pub fn colour_mut(&mut self) -> &mut ColourField {
+        &mut self.colour
     }
 
     /// Swap a whole mask onto this body and hand back the one that was there.
@@ -829,10 +857,19 @@ impl Volume {
         }
         mesh_apron(&scratch.apron, coord, self.voxel_size, &mut scratch.surface_nets, out);
         self.mask.bytes_at_cells(coord, &out.cells, &mut out.mask);
+        // The same walk for the painted slot. An unpainted body takes the
+        // empty-map fast path inside and pays a `resize` of zeros, which is
+        // what keeps this free for someone who never paints.
+        self.colour.slots_at_cells(coord, &out.cells, &mut out.colour);
         debug_assert_eq!(
             out.mask.len(),
             out.vertices.len(),
             "one mask byte per vertex, or the pool writes a short attribute slice"
+        );
+        debug_assert_eq!(
+            out.colour.len(),
+            out.vertices.len(),
+            "one colour byte per vertex, or the pool writes a short attribute slice"
         );
     }
 }
@@ -1943,6 +1980,10 @@ impl Volume {
         // a generated mask writes a value at every surface voxel -- leaving it
         // out under-reports by up to 25% at the moment the document is largest.
         self.mask.add_to_stats(&mut stats);
+        // And the colour, on the same basis and for the same reason. Missing
+        // this is how the growth guard, the debug overlay and every bug report
+        // come to under-report a painted document by up to 25%.
+        self.colour.add_to_stats(&mut stats);
         stats
     }
 

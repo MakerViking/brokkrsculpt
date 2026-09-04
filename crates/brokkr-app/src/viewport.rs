@@ -1304,6 +1304,7 @@ mod apply_tests {
             indices: (0..64).collect(),
             cells: Vec::new(),
             mask: vec![0; 64],
+            colour: vec![0; 64],
         }
     }
 
@@ -1343,6 +1344,7 @@ mod apply_tests {
             indices: vec![0, 1, 2, 0, 2, 3],
             cells: Vec::new(),
             mask: vec![0; 4],
+            colour: vec![0; 4],
         }
     }
 

@@ -352,6 +352,7 @@ impl Volume {
         let total_vertices: usize = meshes.iter().map(|brick| brick.vertices.len()).sum();
         welded.reserve(total_vertices);
         mesh.positions.reserve(total_vertices);
+        mesh.slots.reserve(total_vertices);
         normal_sums.reserve(total_vertices);
         mesh.triangles.reserve(meshes.iter().map(BrickMesh::triangle_count).sum());
 
@@ -359,11 +360,18 @@ impl Volume {
         for brick in &meshes {
             remap.clear();
             remap.reserve(brick.vertices.len());
-            for (vertex, cell) in brick.vertices.iter().zip(brick.cells.iter()) {
+            for (at, (vertex, cell)) in brick.vertices.iter().zip(brick.cells.iter()).enumerate() {
                 let position = Vec3::from_array(vertex.position);
                 let normal = Vec3::from_array(vertex.normal);
+                // The painted slot rides the weld rather than being zipped on
+                // afterwards, because welding CHANGES the vertex count: a seam
+                // vertex two bricks both emitted becomes one, so a parallel
+                // array built from the brick meshes would run out of step with
+                // `positions` at the first seam.
+                let slot = brick.colour.get(at).copied().unwrap_or(0);
                 let index = *welded.entry(*cell).or_insert_with(|| {
                     mesh.positions.push(position);
+                    mesh.slots.push(slot);
                     normal_sums.push(Vec3::ZERO);
                     (mesh.positions.len() - 1) as u32
                 });
@@ -388,6 +396,15 @@ impl Volume {
 
         mesh.normals =
             normal_sums.into_iter().map(|sum| sum.try_normalize().unwrap_or(Vec3::Y)).collect();
+
+        // An unpainted body carries NO slots at all rather than a run of zeros.
+        // `ExportMesh::slots` documents empty as "the whole mesh is
+        // unassigned", the 3MF writer emits a bare `<triangle>` for slot 0
+        // either way, and this is what keeps every existing export byte for
+        // byte what it was.
+        if mesh.slots.iter().all(|slot| *slot == 0) {
+            mesh.slots.clear();
+        }
 
         let mut report = mesh.validate();
         report.collapsed_triangles = collapsed;
@@ -644,6 +661,94 @@ pub(crate) mod golden {
 mod tests {
     use super::*;
     use crate::{Brush, BrushDirection, BrushKind, BrushScratch, Stamp};
+
+    /// Painting voxels puts filament slots on the triangles that come out.
+    ///
+    /// **The link the writer waited for.** `paint_color` shipped complete and
+    /// unreferenced: `export_mesh` never filled `slots`, so no file a user
+    /// received could carry a slot however they painted. This is the end of
+    /// that chain, checked on the mesh rather than through the 3MF writer so a
+    /// failure says which half broke.
+    #[test]
+    fn painted_voxels_reach_the_exported_mesh() {
+        let mut volume = sphere(0.5, 8.0);
+        volume.mark_everything_dirty();
+
+        // Paint every surface voxel on one side. Working from the mesh's own
+        // cells rather than from a guessed coordinate, because a voxel that
+        // carries no vertex has nothing to colour and the test would then be
+        // asserting about the empty set.
+        let (before, _) = volume.export_mesh();
+        assert!(before.slots.is_empty(), "an unpainted body carried slots");
+
+        let cells: Vec<glam::IVec3> = {
+            let mut coords: Vec<_> = volume.brick_coords().collect();
+            expand_by_one(&mut coords);
+            let mut meshes = vec![BrickMesh::default(); coords.len()];
+            volume.mesh_bricks(&coords, &mut meshes);
+            meshes.iter().flat_map(|brick| brick.cells.iter().copied()).collect()
+        };
+        assert!(!cells.is_empty(), "the fixture meshed to nothing");
+
+        let painted: Vec<glam::IVec3> = cells.iter().copied().filter(|cell| cell.x > 0).collect();
+        assert!(!painted.is_empty(), "no vertex fell on the painted side");
+        for cell in &painted {
+            volume.colour_mut().write(*cell, 3);
+        }
+        volume.mark_everything_dirty();
+
+        let (after, report) = volume.export_mesh();
+        assert!(report.is_printable(), "painting broke the mesh");
+        assert_eq!(after.positions.len(), before.positions.len(), "painting changed the geometry");
+        assert_eq!(after.slots.len(), after.positions.len(), "one slot per welded vertex");
+
+        let on_three = after.slots.iter().filter(|slot| **slot == 3).count();
+        let unpainted = after.slots.iter().filter(|slot| **slot == 0).count();
+        assert!(on_three > 0, "nothing came out on filament 3");
+        assert!(unpainted > 0, "the whole model came out painted");
+        assert_eq!(on_three + unpainted, after.slots.len(), "a slot nobody painted appeared");
+
+        // The slot really follows the geometry. Checked with a margin either
+        // side of the boundary rather than at it: a vertex is interpolated
+        // WITHIN its cell, so one in cell x = 0 can sit at position x = 0.25 --
+        // position and cell are not the same test where they meet, and only
+        // away from the seam does the painted set have a geometric edge.
+        //
+        // This is what a parallel array zipped on after the weld would fail: a
+        // seam vertex two bricks both emit is welded into one, so the arrays
+        // run out of step from the first seam onward and every slot after it
+        // lands on the wrong vertex.
+        let margin = 1.0;
+        let mut checked = 0;
+        for (position, slot) in after.positions.iter().zip(after.slots.iter()) {
+            if position.x > margin {
+                assert_eq!(*slot, 3, "an unpainted vertex well inside the painted side");
+                checked += 1;
+            } else if position.x < -margin {
+                assert_eq!(*slot, 0, "a painted vertex well outside the painted side");
+                checked += 1;
+            }
+        }
+        assert!(checked > 0, "the margin excluded every vertex, so nothing was checked");
+    }
+
+    /// Painting a body and then painting it back leaves the export exactly as
+    /// it was, bytes included.
+    #[test]
+    fn a_body_painted_back_to_nothing_exports_as_unpainted() {
+        let mut volume = sphere(0.5, 6.0);
+        volume.mark_everything_dirty();
+        let (before, _) = volume.export_mesh();
+
+        volume.colour_mut().write(glam::IVec3::new(0, 0, 0), 2);
+        volume.colour_mut().write(glam::IVec3::new(0, 0, 0), 0);
+        volume.colour_mut().collapse();
+        volume.mark_everything_dirty();
+
+        let (after, _) = volume.export_mesh();
+        assert!(after.slots.is_empty(), "a body painted back to nothing still carried slots");
+        assert_eq!(after.positions, before.positions);
+    }
 
     fn sphere(voxel_size: f32, radius: f32) -> Volume {
         let mut volume = Volume::new(voxel_size);

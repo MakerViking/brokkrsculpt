@@ -67,6 +67,20 @@ pub struct BrickMesh {
     /// buffer of its own, so a short one would leave the tail of a brick
     /// reading whatever the previous tenant of that slice left behind.
     pub mask: Vec<u8>,
+    /// The painted filament slot at each vertex's own lattice cell, one per
+    /// vertex.
+    ///
+    /// Sampled by CELL for the same reason the mask is: two bricks that both
+    /// emit a vertex at a shared seam derive that cell from the same world
+    /// coordinate, so they read the same voxel and agree bit for bit. A slot is
+    /// an INDEX, so a seam that disagreed would not shade slightly differently
+    /// -- it would print in another filament.
+    ///
+    /// **Always the same length as `vertices`**, including for an unpainted
+    /// body, where it is a run of zeros, for the reason `mask` gives: the pool
+    /// writes it into a shared buffer and a short run leaves the tail of a
+    /// brick reading whatever the previous tenant left there.
+    pub colour: Vec<u8>,
 }
 
 impl BrickMesh {
@@ -77,6 +91,7 @@ impl BrickMesh {
         self.indices.clear();
         self.cells.clear();
         self.mask.clear();
+        self.colour.clear();
     }
 
     #[inline]
