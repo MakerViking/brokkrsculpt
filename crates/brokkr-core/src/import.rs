@@ -272,10 +272,35 @@ mod round_trip_tests {
             let back = read_path(&path).unwrap_or_else(|error| panic!("{name}: {error}"));
             let (back_low, back_high) = tallest(&back);
 
+            // The rotation guarantee, which is what this test exists for, and
+            // which no translation can hide: the shape comes back the same size
+            // on the same axes. A swapped pair of axes changes this extent.
+            let extent = high - low;
+            let back_extent = back_high - back_low;
             assert!(
-                (back_low - low).length() < 1.0e-3 && (back_high - high).length() < 1.0e-3,
-                "{name} came back at {back_low:?}..{back_high:?} instead of {low:?}..{high:?} -- \
+                (back_extent - extent).length() < 1.0e-3,
+                "{name} came back {back_extent:?} instead of {extent:?} -- \
                  the export and import rotations do not cancel"
+            );
+
+            // A 3MF is a PRINT file and carries a build transform that sits the
+            // model on the bed, so it deliberately comes back resting at y = 0
+            // rather than where it was sculpted. Print z is sculpt y (see
+            // `to_print_space`), so the drop lands on that axis and that axis
+            // only. STL and OBJ carry no transform and must not move at all.
+            let expected_low = if name.ends_with(".3mf") {
+                assert!(
+                    back_low.y.abs() < 1.0e-3,
+                    "{name} came back at y = {} instead of sitting on the bed",
+                    back_low.y
+                );
+                Vec3::new(low.x, 0.0, low.z)
+            } else {
+                low
+            };
+            assert!(
+                (back_low - expected_low).length() < 1.0e-3,
+                "{name} came back at {back_low:?} instead of {expected_low:?}"
             );
         }
 

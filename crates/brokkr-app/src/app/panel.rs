@@ -2333,6 +2333,7 @@ impl Brokkr {
                 text("HISTORY").size(theme::CAPTION_SIZE).color(theme::TEXT_MUTE),
                 history,
                 self.section(PanelSection::Detail, || self.detail_panel()),
+                self.section(PanelSection::Filament, || self.filament_panel()),
                 self.section(PanelSection::Export, || self.export_panel()),
                 button(text("Reset sphere").size(theme::TEXT_SIZE_SMALL))
                     .style(theme::tool_button)
@@ -3517,6 +3518,52 @@ impl Brokkr {
             // show beside it is what the current resolution MEANS at that size.
             // Without this the field reads as a detail control, which it is not.
             text(&self.detail_advice).size(theme::TEXT_SIZE_SMALL).color(theme::TEXT_DIM),
+        ]
+        .spacing(theme::S2)
+        .into()
+    }
+
+    /// The filament loaded in each slot, and a way to ask the printer.
+    ///
+    /// **This is what the sculpt's slot numbers MEAN**, which is why it sits
+    /// directly above EXPORT: it is read at the moment somebody sends a model
+    /// to a printer, not while they sculpt.
+    ///
+    /// Read-only for now. A slot is edited by hand in `filaments.conf` or taken
+    /// from the machine with the button; there is no colour picker here because
+    /// the answer that matters is what is physically loaded, and the printer
+    /// knows that better than a mouse does.
+    fn filament_panel(&self) -> Element<'_, Message> {
+        let rows = self.palette.slots.iter().enumerate().fold(
+            column![].spacing(theme::S1),
+            |assembled, (index, slot)| {
+                assembled.push(
+                    row![
+                        // A fixed square rather than a Fill: this sits inside a
+                        // column that is already sized by the panel, and a Fill
+                        // swatch would take the whole row and push the label off.
+                        container(text(""))
+                            .width(14)
+                            .height(14)
+                            .style(theme::swatch(slot.swatch())),
+                        text(format!("{}. {}", index + 1, slot.name))
+                            .size(theme::TEXT_SIZE_SMALL)
+                            .color(theme::TEXT),
+                        text(slot.material.clone())
+                            .size(theme::CAPTION_SIZE)
+                            .color(theme::TEXT_MUTE),
+                    ]
+                    .spacing(theme::S2)
+                    .align_y(iced::Alignment::Center),
+                )
+            },
+        );
+
+        column![
+            rows,
+            button(text("Sync filaments from printer").size(theme::TEXT_SIZE_SMALL))
+                .style(theme::tool_button)
+                .on_press(Message::PaletteSyncRequested),
         ]
         .spacing(theme::S2)
         .into()

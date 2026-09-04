@@ -37,6 +37,63 @@ real hardware.
 
 ### Added
 
+- **Your own filaments in the exported 3MF.** A new **FILAMENT** section in the
+  properties panel shows what is loaded in each of the printer's slots, and
+  **Sync filaments from printer** reads it straight off a Snapmaker U1 over the
+  network — colour, material and vendor per tool head. Exporting a 3MF now
+  declares those filaments, so the file opens in OrcaSlicer showing what is
+  actually in your machine instead of four built-in colours nobody chose.
+
+  A slot with nothing loaded is left alone rather than blanked, and the status
+  line says which ones were skipped. The palette is kept in `filaments.conf`
+  beside your printer settings and can be edited by hand.
+
+  This is the groundwork for painting a sculpt in filament slots, which is the
+  next piece and is not here yet: every triangle still prints on slot 1.
+
+### Fixed
+
+- **Vendor forks and every packaging format are found, not just OrcaSlicer.**
+  Snapmaker ships its own OrcaSlicer fork, BambuStudio is the same lineage again,
+  and any of them can arrive as a native package, an AppImage, a flatpak or a
+  snap. Rather than a list of names times a list of install locations — a table
+  that is wrong the day somebody forks again — a preset directory is now
+  recognised by its shape, and the slicer's config file is read by its own name
+  instead of always `OrcaSlicer.conf`. Where several are installed, the one you
+  used most recently wins.
+
+  If yours still is not found, put `datadir = /path/to/it` in `slicer.conf`
+  beside your other settings and it is used before anything is probed.
+
+- **Opening an exported 3MF no longer changes your printer in OrcaSlicer.** The
+  file named no machine, so Orca invented a printer, a process and four filaments
+  all called `(yourfile.3mf)` — and wrote that invented printer into its own
+  settings, so the machine you had selected was displaced by opening a model. An
+  export now names the presets your slicer already has.
+
+  **Your printer's address and credentials are deliberately left out of the
+  file.** A machine preset holds `print_host`, `printhost_apikey` and
+  `printhost_password`; an exported model is something you hand to other people,
+  so those keys are stripped on the way in. Binding matches on the preset name,
+  which is not a secret.
+
+  If your presets cannot be read, the export still works and the status line says
+  so rather than leaving you to find out in the slicer.
+
+- **An exported 3MF now sits on the bed instead of half under it.** A 3MF opened
+  as a *project* is placed exactly where the file says, unlike an STL, which the
+  slicer drops onto the bed for you — and the file said the origin, so the model
+  arrived on the plate's front-left corner with half of it below the bed. It now
+  carries a transform that rests it on the bed and, when your OrcaSlicer machine
+  preset can be read, centres it on your actual plate. Only 3MF was affected;
+  STL and OBJ never carried a transform and are unchanged.
+
+- **"Check printer" reads the config file it tells you to write.** It looked for
+  `printer` while every other setting in the application is a `.conf` file, so a
+  perfectly good `printer.conf` was ignored and the application reported no
+  printer at all. Both names are read now, and a missing file names the `.conf`
+  one.
+
 - **Sign in to TinkerAtlas, optionally.** It exists for one reason: an
   anonymous bug report cannot be answered. Signed out, a report carries no
   account and no credential; signed in, it goes under your name — and the line

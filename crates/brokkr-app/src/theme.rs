@@ -227,6 +227,25 @@ pub fn panel(_theme: &iced::Theme) -> iced::widget::container::Style {
     }
 }
 
+/// A filament swatch: a block of one slot's colour.
+///
+/// **The first style here that takes a colour**, and so the first that returns
+/// a closure rather than a `fn`. Every other style in this module is a plain
+/// function pointer because the palette is fixed at compile time; a filament's
+/// colour is not, so the value has to be captured. `iced` takes any
+/// `Fn(&Theme) -> Style` for a container, so this costs nothing but the move.
+///
+/// It carries a border in the panel's own line colour rather than none, because
+/// a white filament against the panel would otherwise have no edge at all and
+/// read as a hole rather than as a swatch.
+pub fn swatch(colour: Color) -> impl Fn(&iced::Theme) -> iced::widget::container::Style {
+    move |_theme: &iced::Theme| iced::widget::container::Style {
+        background: Some(colour.into()),
+        border: iced::Border { color: LINE, width: 1.0, radius: RADIUS_SM.into() },
+        ..Default::default()
+    }
+}
+
 /// The viewport well, deeper than the surrounding chrome.
 pub fn viewport_well(_theme: &iced::Theme) -> iced::widget::container::Style {
     iced::widget::container::Style {

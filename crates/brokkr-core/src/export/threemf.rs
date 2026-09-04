@@ -15,12 +15,15 @@
 //! there is nothing here to keep up with.
 //!
 //! What this writer produces is a deliberately degenerate subset of the format:
-//! stored entries only, one namespace, always millimetres, and no transforms --
-//! a body's position IS its brick occupancy, so there is nothing for a
-//! transform to say. [`crate::import::threemf`] reads it back in the tests,
-//! which is what stops this module being checked only against its own
-//! assumptions -- but that reader is not tested against this writer alone,
-//! precisely because agreeing with it would prove nothing about a real file.
+//! stored entries only, one namespace, always millimetres, and exactly one kind
+//! of transform -- a translation that sits the document on the bed. A body's
+//! position relative to its siblings IS its brick occupancy, so a transform has
+//! nothing to say about that; what it does say is where the whole document sits
+//! on the plate, which the sculpt's own origin cannot know. See [`Placement`].
+//! [`crate::import::threemf`] reads it back in the tests, which is what stops
+//! this module being checked only against its own assumptions -- but that
+//! reader is not tested against this writer alone, precisely because agreeing
+//! with it would prove nothing about a real file.
 //!
 //! # Colour is not in the specification's terms
 //!
@@ -80,10 +83,60 @@ const CORE_NAMESPACE: &str = "http://schemas.microsoft.com/3dmanufacturing/core/
 const PAINT_CODE: [&str; 16] =
     ["4", "8", "0C", "1C", "2C", "3C", "4C", "5C", "6C", "7C", "8C", "9C", "AC", "BC", "CC", "DC"];
 
+/// How many filament slots a package can name.
+///
+/// **A ceiling, not a preference.** Above 16 the two lineages disagree about
+/// the escape nibble, so slot 17 would mean one thing to OrcaSlicer and another
+/// to PrusaSlicer -- the table stopping here is a constraint rather than a
+/// coincidence. Exported so a caller building a palette clamps to the same
+/// number this writer can encode, instead of keeping a second copy of it.
+pub const MAX_SLOTS: usize = PAINT_CODE.len();
+
 /// The code for a 1-based filament slot, or `None` when the slot is unassigned
 /// or out of range.
 fn paint_code(slot: u8) -> Option<&'static str> {
     if slot == 0 { None } else { PAINT_CODE.get(slot as usize - 1).copied() }
+}
+
+/// Where the model sits on the printer's plate.
+///
+/// **A 3MF opened as a PROJECT is placed exactly where the file says**, unlike
+/// an STL, which every slicer drops onto the bed for you. Writing no transform
+/// therefore put the model at the plate's front-left corner with half of it
+/// *below* the bed -- the sculpt is centred on its own origin, so it straddled
+/// z = 0. Observed in OrcaSlicer 2.4.0-alpha on 2026-09-02, which placed it
+/// there and then reported "objects are laid over the boundary of plate". STL
+/// and OBJ never showed this, which is why it survived to a public build.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Placement {
+    /// The middle of the printable area, in bed coordinates.
+    ///
+    /// `None` centres nothing and only sits the model on the bed, which is
+    /// what an installation we cannot read a plate size out of gets. That is
+    /// still strictly better than the corner, and it never invents a bed.
+    pub plate_centre: Option<(f32, f32)>,
+}
+
+/// Everything about a package that is not its geometry.
+///
+/// One struct rather than a growing parameter list, so the module keeps a
+/// single extension point instead of a combination of entry points that does
+/// not exist.
+#[derive(Debug, Default)]
+pub struct Project<'a> {
+    /// The filament slots the package declares.
+    pub filaments: Filaments,
+    /// Where the result sits on the plate.
+    pub placement: Placement,
+    /// A complete `Metadata/project_settings.config` body, for a caller that
+    /// can read the slicer's own presets and knows more than this module does.
+    ///
+    /// **`None` writes the minimal three keys, which is not enough for
+    /// OrcaSlicer to bind a printer.** Given only colours, it invents a
+    /// project-custom machine, process and filament named after the file and
+    /// writes that name into its own config -- displacing whatever printer the
+    /// user had selected. Reported against a real export on 2026-09-02.
+    pub settings: Option<&'a str>,
 }
 
 /// The filament slots a package declares, so a slicer opening it shows the
@@ -127,7 +180,7 @@ impl Default for Filaments {
 /// filament, or deleted independently. Indices stay per object -- 3MF numbers
 /// vertices within an object, unlike OBJ -- so there is no running offset here
 /// and adding one would be the bug.
-fn model_xml(bodies: &[(&str, &ExportMesh)]) -> String {
+fn model_xml(bodies: &[(&str, &ExportMesh)], placement: &Placement) -> String {
     let capacity: usize =
         bodies.iter().map(|(_, mesh)| mesh.positions.len() * 48 + mesh.triangles.len() * 40).sum();
     let mut xml = String::with_capacity(capacity);
@@ -176,13 +229,59 @@ fn model_xml(bodies: &[(&str, &ExportMesh)]) -> String {
     }
     xml.push_str(" </resources>\n");
 
+    // One transform for the whole document, computed from the union of every
+    // body: placing each body against its own bounds would pile them all on the
+    // same spot and destroy the arrangement the user built.
+    let shift = offset_for(bodies, placement);
     xml.push_str(" <build>\n");
     for index in 0..bodies.len() {
-        xml.push_str(&format!("  <item objectid=\"{}\"/>\n", index + 1));
+        let id = index + 1;
+        match shift {
+            Some((x, y, z)) => xml.push_str(&format!(
+                "  <item objectid=\"{id}\" transform=\"1 0 0 0 1 0 0 0 1 {x} {y} {z}\"/>\n"
+            )),
+            None => xml.push_str(&format!("  <item objectid=\"{id}\"/>\n")),
+        }
     }
     xml.push_str(" </build>\n");
     xml.push_str("</model>\n");
     xml
+}
+
+/// The translation that sits a document on the bed, and centres it when the
+/// plate size is known.
+///
+/// Returns `None` when there is nothing to move -- an empty document, or a
+/// document already exactly where it should be -- so a file that needs no
+/// transform does not carry one.
+///
+/// **The bounds are taken in print space**, after [`to_print_space`], because
+/// that is the space the vertices are written in and the axis that must end up
+/// on the bed is the printer's z, not the sculpt's y.
+fn offset_for(bodies: &[(&str, &ExportMesh)], placement: &Placement) -> Option<(f32, f32, f32)> {
+    let mut low = [f32::INFINITY; 3];
+    let mut high = [f32::NEG_INFINITY; 3];
+    for (_, mesh) in bodies {
+        for position in &mesh.positions {
+            let position = to_print_space(*position);
+            for (axis, value) in [position.x, position.y, position.z].into_iter().enumerate() {
+                low[axis] = low[axis].min(value);
+                high[axis] = high[axis].max(value);
+            }
+        }
+    }
+    if !low[2].is_finite() {
+        return None; // No geometry at all; nothing to place.
+    }
+
+    // Always sit it on the bed. A model half below z = 0 is never what anyone
+    // meant, and this needs no knowledge of the printer.
+    let z = -low[2];
+    let (x, y) = match placement.plate_centre {
+        Some((cx, cy)) => (cx - (low[0] + high[0]) / 2.0, cy - (low[1] + high[1]) / 2.0),
+        None => (0.0, 0.0),
+    };
+    if x == 0.0 && y == 0.0 && z == 0.0 { None } else { Some((x, y, z)) }
 }
 
 const CONTENT_TYPES: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
@@ -250,6 +349,35 @@ fn escape(text: &str) -> String {
     out
 }
 
+/// The two characters JSON cannot carry raw in a string, plus the control
+/// codes.
+///
+/// **A filament's material and colour are not this application's text.** They
+/// come off the printer over the network, through the palette, and land here.
+/// A material containing a quote would close the string and make the settings
+/// part unparseable -- the same shape as [`escape`] for XML, and for the same
+/// reason: this writer emits a document somebody else's parser trusts.
+///
+/// There is no JSON library in this crate and this is the only place that needs
+/// one, which is why it is nine lines rather than a dependency.
+fn json_escape(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for character in text.chars() {
+        match character {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            control if control.is_control() => {
+                out.push_str(&format!("\\u{:04x}", control as u32));
+            }
+            other => out.push(other),
+        }
+    }
+    out
+}
+
 /// The slot colours, so the slicer shows what the sculpt was painted with.
 ///
 /// A real one of these is a 437-key versioned preset blob, and coupling to all
@@ -261,9 +389,32 @@ fn escape(text: &str) -> String {
 /// measures.** If the slicer refuses a partial file, drop this part entirely
 /// and keep [`model_settings_xml`]; the slot assignment still lands and only
 /// the colours come from the user's own setup instead of ours.
+///
+/// # This part crashes OrcaSlicer's command line, and only its command line
+///
+/// Measured 2026-09-02 against OrcaSlicer 2.4.0-alpha, by A/B on the
+/// `export-cube.3mf` golden: `--info` core dumps with this part present and
+/// succeeds with it removed. Narrowed to **the `filament_colour` key alone** --
+/// deleting just that key while keeping `filament_type` is enough to fix it,
+/// and reducing it to a single entry still crashes, so it is the key's presence
+/// rather than how many slots it names. Stripping every `paint_color` attribute
+/// changes nothing, so the paint is not involved. A plain STL never crashes.
+/// The last line logged before the dump is `project filament colors size N`,
+/// which is consistent with the length of this array setting the project
+/// filament count and then being read against zero loaded filament presets.
+///
+/// This is broader than the tracked upstream bug (which needs paint *and* two
+/// or more `--load-filaments`): it needs no paint and no flags at all.
+///
+/// **The GUI is unaffected** -- the coloured export was opened by hand in
+/// OrcaSlicer on 2026-08-20 and shows its slots correctly -- which is why this
+/// stayed invisible. It only bites a caller that shells out to the CLI, so a
+/// future headless-slice path must omit `filament_colour` here and pass the
+/// colours as `--load-filaments` presets instead.
 fn project_settings_json(filaments: &Filaments) -> String {
     let list = |values: &[String]| {
-        let quoted: Vec<String> = values.iter().map(|v| format!("\"{v}\"")).collect();
+        let quoted: Vec<String> =
+            values.iter().map(|value| format!("\"{}\"", json_escape(value))).collect();
         quoted.join(", ")
     };
     let mut materials = filaments.materials.clone();
@@ -295,19 +446,37 @@ pub fn write_all(bodies: &[(&str, &ExportMesh)], out: &mut impl Write) -> io::Re
 }
 
 /// Write a document's bodies as one 3MF package, declaring `filaments` as the
-/// slot setup.
+/// slot setup and sitting them on the bed.
 ///
 /// The extension point of this module: every other entry point here is a
 /// wrapper over it, so a caller with both several bodies and a filament setup
 /// to declare has one call rather than a combination that does not exist.
+///
+/// Placement defaults to "on the bed, centred on nothing" -- see [`Placement`]
+/// for why sitting on the bed is unconditional and centring is not.
 pub fn write_with_all(
     bodies: &[(&str, &ExportMesh)],
     filaments: &Filaments,
     out: &mut impl Write,
 ) -> io::Result<()> {
-    let model = model_xml(bodies);
-    let model_settings = model_settings_xml(bodies, filaments);
-    let project_settings = project_settings_json(filaments);
+    write_project(bodies, &Project { filaments: filaments.clone(), ..Project::default() }, out)
+}
+
+/// Write a document's bodies as one 3MF package.
+///
+/// The extension point of this module: every other entry point here is a
+/// wrapper over it.
+pub fn write_project(
+    bodies: &[(&str, &ExportMesh)],
+    project: &Project<'_>,
+    out: &mut impl Write,
+) -> io::Result<()> {
+    let model = model_xml(bodies, &project.placement);
+    let model_settings = model_settings_xml(bodies, &project.filaments);
+    let project_settings = match project.settings {
+        Some(body) => body.to_string(),
+        None => project_settings_json(&project.filaments),
+    };
     let mut zip = ZipWriter::new();
     // Order matters to some readers: the content types part has to come first.
     zip.add("[Content_Types].xml", CONTENT_TYPES.as_bytes());
@@ -466,17 +635,17 @@ mod tests {
     #[test]
     fn the_model_xml_declares_millimetres_and_references_its_object() {
         // The whole reason to prefer 3MF: the units are not a guess.
-        let xml = model_xml(&solo(&exported()));
+        let xml = model_xml(&solo(&exported()), &Placement::default());
         assert!(xml.contains("unit=\"millimeter\""), "{xml:.400}");
         assert!(xml.contains(CORE_NAMESPACE));
         assert!(xml.contains("<object id=\"1\""));
-        assert!(xml.contains("<item objectid=\"1\"/>"), "the build has to reference the object");
+        assert!(xml.contains("<item objectid=\"1\""), "the build has to reference the object");
     }
 
     #[test]
     fn every_vertex_and_triangle_reaches_the_xml() {
         let mesh = exported();
-        let xml = model_xml(&solo(&mesh));
+        let xml = model_xml(&solo(&mesh), &Placement::default());
         assert_eq!(xml.matches("<vertex ").count(), mesh.positions.len());
         assert_eq!(xml.matches("<triangle ").count(), mesh.triangles.len());
     }
@@ -486,7 +655,7 @@ mod tests {
         // The file is Z-up while the sculpt is Y-up. 3MF is the archival copy,
         // so getting this wrong here is the version that outlives the others.
         let mesh = exported();
-        let xml = model_xml(&solo(&mesh));
+        let xml = model_xml(&solo(&mesh), &Placement::default());
 
         let written: Vec<Vec3> = xml
             .lines()
@@ -520,7 +689,7 @@ mod tests {
         // 3MF counts from zero, unlike OBJ. Getting that backwards would shift
         // every face by one.
         let mesh = exported();
-        let xml = model_xml(&solo(&mesh));
+        let xml = model_xml(&solo(&mesh), &Placement::default());
         let first = xml.lines().find(|line| line.contains("<triangle ")).expect("has a triangle");
         let [a, b, c] = mesh.triangles[0];
         assert!(first.contains(&format!("v1=\"{a}\"")), "{first}");
@@ -622,7 +791,7 @@ mod tests {
         mesh.slots[b as usize] = 4;
         mesh.slots[c as usize] = 4;
 
-        let xml = model_xml(&solo(&mesh));
+        let xml = model_xml(&solo(&mesh), &Placement::default());
         let line = xml
             .lines()
             .find(|line| line.contains(&format!("v1=\"{a}\" v2=\"{b}\" v3=\"{c}\"")))
@@ -634,12 +803,16 @@ mod tests {
     fn an_unassigned_mesh_writes_exactly_what_it_used_to() {
         // The property that keeps every existing export byte-identical: a mesh
         // nobody painted must not gain a single attribute.
-        let xml = model_xml(&solo(&exported()));
+        let xml = model_xml(&solo(&exported()), &Placement::default());
         assert!(!xml.contains("paint_color"), "an unpainted mesh grew colour attributes");
 
         // And an all-zero slots vector is the same thing as an empty one.
         let zeroed = with_slots(|_| 0);
-        assert_eq!(model_xml(&solo(&zeroed)), xml, "zeros are not the same as unassigned");
+        assert_eq!(
+            model_xml(&solo(&zeroed), &Placement::default()),
+            xml,
+            "zeros are not the same as unassigned"
+        );
     }
 
     #[test]
@@ -650,9 +823,44 @@ mod tests {
         // so omission is an optimisation nothing in the target relies on. Until
         // a round trip proves the slicer reads "absent" as "base", write it.
         let mesh = with_slots(|index| (index % 4 + 1) as u8);
-        let xml = model_xml(&solo(&mesh));
+        let xml = model_xml(&solo(&mesh), &Placement::default());
         let painted = xml.matches("paint_color=").count();
         assert_eq!(painted, mesh.triangles.len(), "some assigned triangles came out unpainted");
+    }
+
+    /// A filament's material is not this application's text -- it comes off the
+    /// printer -- and it lands in a JSON document a slicer parses.
+    #[test]
+    fn printer_text_cannot_break_the_settings_json() {
+        let filaments = Filaments {
+            colours: vec!["#FFFFFF".into(), "#000000".into()],
+            materials: vec![r#"PLA "Pro""#.into(), "back\\slash\nnewline".into()],
+            base: 1,
+        };
+        let json = project_settings_json(&filaments);
+
+        // The quotes are escaped rather than closing the string early, so the
+        // part still has exactly the six quote-delimited values it should.
+        assert!(json.contains(r#"PLA \"Pro\""#), "{json}");
+        assert!(json.contains(r"back\\slash"), "{json}");
+        assert!(json.contains(r"newline"), "{json}");
+        assert!(!json.contains('\n') || json.lines().count() == 5, "a raw newline split the JSON");
+
+        // And the structure survives: five lines, opening and closing braces.
+        assert!(json.starts_with("{\n"), "{json}");
+        assert!(json.trim_end().ends_with('}'), "{json}");
+    }
+
+    #[test]
+    fn the_json_escape_covers_what_json_cannot_carry() {
+        assert_eq!(json_escape("plain"), "plain");
+        assert_eq!(json_escape(r#"a"b"#), r#"a\"b"#);
+        assert_eq!(json_escape(r"a\b"), r"a\\b");
+        assert_eq!(json_escape("a\nb"), r"a\nb");
+        assert_eq!(json_escape("a\tb"), r"a\tb");
+        assert_eq!(json_escape("a\u{7}b"), r"a\u0007b");
+        // Ordinary non-ASCII is fine as-is; JSON is UTF-8.
+        assert_eq!(json_escape("Pölymaker"), "Pölymaker");
     }
 
     #[test]
@@ -756,13 +964,22 @@ mod tests {
     #[test]
     fn each_body_is_its_own_object_and_its_own_build_item() {
         let mesh = exported();
-        let xml = model_xml(&[("Left", &mesh), ("Right", &mesh)]);
+        let xml = model_xml(&[("Left", &mesh), ("Right", &mesh)], &Placement::default());
 
         assert_eq!(xml.matches("<object id=").count(), 2);
         assert!(xml.contains("<object id=\"1\" type=\"model\">"), "{xml:.400}");
         assert!(xml.contains("<object id=\"2\" type=\"model\">"));
-        assert!(xml.contains("<item objectid=\"1\"/>"));
-        assert!(xml.contains("<item objectid=\"2\"/>"));
+        assert!(xml.contains("<item objectid=\"1\""));
+        assert!(xml.contains("<item objectid=\"2\""));
+        // Both bodies take the SAME transform. Placing each against its own
+        // bounds would stack them on one spot and destroy the arrangement.
+        let transforms: Vec<&str> = xml.lines().filter(|line| line.contains("<item ")).collect();
+        assert_eq!(transforms.len(), 2);
+        assert_eq!(
+            transforms[0].replace("objectid=\"1\"", ""),
+            transforms[1].replace("objectid=\"2\"", ""),
+            "the two bodies were placed independently"
+        );
         assert_eq!(xml.matches("<vertex ").count(), mesh.positions.len() * 2);
         assert_eq!(xml.matches("<triangle ").count(), mesh.triangles.len() * 2);
 

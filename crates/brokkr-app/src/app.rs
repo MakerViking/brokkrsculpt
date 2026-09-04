@@ -698,6 +698,14 @@ pub struct Brokkr {
     /// file. Every other setting in this application is loaded once into state
     /// the same way -- see `recent` above and `spacemouse.config`.
     welcome_on_startup: bool,
+    /// The filament loaded in each of the printer's slots. See
+    /// [`crate::palette`] for why this is machine state rather than part of the
+    /// document: a sculpt stores a slot NUMBER, and which filament that is
+    /// belongs to the machine in front of you.
+    ///
+    /// Loaded once into state for the same reason `welcome_on_startup` is --
+    /// the panel draws it every frame and must not open a file to do so.
+    palette: crate::palette::Palette,
     /// The TinkerAtlas articles that screen shows. See [`crate::articles`] for
     /// why this is fetched only while the screen is actually up.
     feed: crate::articles::Feed,
@@ -1795,6 +1803,10 @@ impl Brokkr {
         // what the tests build through, and a test that picked up whoever is
         // signed in on the machine running it would pass or fail on that.
         app.account = crate::account::load();
+        // And the palette, for exactly that reason again -- a suite that read
+        // the developer's own `filaments.conf` would assert against whatever
+        // happens to be loaded in their printer.
+        app.palette = crate::palette::Palette::load();
         // The screen is up, so its articles are wanted. The only other place
         // that raises it, `Message::WelcomeOpened`, asks for them too.
         let mut boot =
@@ -2032,6 +2044,7 @@ impl Brokkr {
             gizmo_baked: None,
             welcome: false,
             welcome_on_startup: true,
+            palette: crate::palette::Palette::default(),
             feed: crate::articles::Feed::default(),
             account: None,
             signing_in: false,
@@ -6955,15 +6968,31 @@ impl Brokkr {
         let parts: Vec<(&str, &brokkr_core::ExportMesh)> =
             bodies.iter().map(|(meta, mesh, _)| (meta.name.as_str(), mesh)).collect();
 
+        let filaments = self.palette.as_filaments();
+        // Read once, here, rather than inside the writer: both of these walk the
+        // user's OrcaSlicer presets off disk, which is not something an export
+        // writer should be doing per body.
+        let placement =
+            brokkr_core::export::threemf::Placement { plate_centre: crate::slicer::plate_centre() };
+        let settings = crate::slicer::project_settings_body(&self.palette);
         let write = || -> std::io::Result<()> {
             let file = std::fs::File::create(path)?;
             let mut file = std::io::BufWriter::new(file);
             match format {
                 ExportFormat::Stl => brokkr_core::export::stl::write_all(&parts, &mut file)?,
                 ExportFormat::Obj => brokkr_core::export::obj::write_all(&parts, &mut file)?,
-                ExportFormat::ThreeMf => {
-                    brokkr_core::export::threemf::write_all(&parts, &mut file)?
-                }
+                // The 3MF carries the user's own filament slots, sits on their
+                // bed, and names the presets their slicer already has -- none of
+                // which the geometry knows anything about.
+                ExportFormat::ThreeMf => brokkr_core::export::threemf::write_project(
+                    &parts,
+                    &brokkr_core::export::threemf::Project {
+                        filaments: filaments.clone(),
+                        placement,
+                        settings: settings.as_deref(),
+                    },
+                    &mut file,
+                )?,
             }
             std::io::Write::flush(&mut file)
         };
@@ -6975,15 +7004,26 @@ impl Brokkr {
                 // arrive in a slicer as one part. Said here rather than
                 // discovered after slicing.
                 let fused = matches!(format, ExportFormat::Stl) && parts.len() > 1;
+                // No silent fallback. Without the user's presets the file still
+                // opens, but OrcaSlicer invents a machine named after it and
+                // displaces whatever printer they had selected -- which looks
+                // like the application broke their slicer rather than like a
+                // setting that could not be read.
+                let unbound = matches!(format, ExportFormat::ThreeMf) && settings.is_none();
                 self.status = format!(
                     "exported {} of {} bodies; {omitted} hidden{} -- {summary} to {} \
-                     ({:.1} MB, {:.0} ms)",
+                     ({:.1} MB, {:.0} ms){}",
                     parts.len(),
                     self.doc.body_count(),
                     if fused { " (STL fuses them into one part)" } else { "" },
                     path.display(),
                     bytes as f64 / (1024.0 * 1024.0),
-                    started.elapsed().as_secs_f64() * 1000.0
+                    started.elapsed().as_secs_f64() * 1000.0,
+                    if unbound {
+                        " — no printer named: pick your machine in OrcaSlicer, then export again"
+                    } else {
+                        ""
+                    }
                 );
                 log::info!("{}", self.status);
             }
@@ -9414,12 +9454,12 @@ impl Brokkr {
             Message::PrinterChecked => {
                 self.top_menu = None;
                 let Some(printer) =
-                    crate::printer::configured(crate::paths::config_file("printer").as_deref())
+                    crate::printer::configured(crate::printer::config_path().as_deref())
                 else {
                     // Says where to write it rather than only that it is
                     // missing: a setting with no interface needs its file named
                     // or it may as well not exist.
-                    self.status = match crate::paths::config_file("printer") {
+                    self.status = match crate::printer::config_path() {
                         Some(path) => format!(
                             "no printer set — put `host = 192.0.2.46` in {}",
                             path.display()
@@ -9440,6 +9480,58 @@ impl Brokkr {
             Message::PrinterAnswered(answer) => {
                 self.status = match answer {
                     Ok(summary) => summary,
+                    Err(why) => format!("could not reach the printer: {why}"),
+                };
+            }
+            Message::PaletteSyncRequested => {
+                self.top_menu = None;
+                let Some(printer) =
+                    crate::printer::configured(crate::printer::config_path().as_deref())
+                else {
+                    // Same wording as `PrinterChecked`, and for the same
+                    // reason: a setting with no interface needs its file named.
+                    self.status = match crate::printer::config_path() {
+                        Some(path) => format!(
+                            "no printer set — put `host = 192.0.2.46` in {}",
+                            path.display()
+                        ),
+                        None => "could not work out where the printer config lives".to_string(),
+                    };
+                    return Task::none();
+                };
+                self.status = format!("asking {} what is loaded…", printer.host);
+                return Task::perform(
+                    async move { crate::printer::filaments(&printer.host, printer.port) },
+                    Message::PaletteSynced,
+                );
+            }
+            Message::PaletteSynced(answer) => {
+                self.status = match answer {
+                    Ok(Some(reported)) => {
+                        let skipped = self.palette.sync_from_printer(&reported);
+                        let loaded = reported.len() - skipped.len();
+                        let plural = |count: usize| if count == 1 { "" } else { "s" };
+                        // Saved here rather than on quit: this is the only
+                        // moment the palette is known to match the machine, and
+                        // a crash between here and quitting would lose the one
+                        // thing the user pressed a button to get.
+                        let mut said = match self.palette.save() {
+                            Ok(()) => format!("synced {loaded} filament{}", plural(loaded)),
+                            Err(why) => format!("synced, but not saved: {why}"),
+                        };
+                        // Never a silent partial sync: an empty head is left
+                        // alone deliberately, and the user should hear which.
+                        if !skipped.is_empty() {
+                            let list: Vec<String> = skipped.iter().map(usize::to_string).collect();
+                            said.push_str(&format!(
+                                " — slot{} {} empty, left alone",
+                                plural(skipped.len()),
+                                list.join(", ")
+                            ));
+                        }
+                        said
+                    }
+                    Ok(None) => "that printer does not report which filament is loaded".to_string(),
                     Err(why) => format!("could not reach the printer: {why}"),
                 };
             }
@@ -15502,6 +15594,124 @@ mod export_tests {
         std::fs::remove_dir_all(&directory).ok();
     }
 
+    /// The user's own filament slots reach the exported package.
+    ///
+    /// **This is the whole of what increment 1 is for.** The `paint_color`
+    /// writer and its `Filaments` shipped complete and unreferenced: nothing
+    /// outside `export/threemf.rs` mentioned either, so every 3MF a user ever
+    /// received declared the four built-in colours regardless of what was in
+    /// their machine. The assertion is a substring rather than a parsed zip
+    /// because the writer stores its entries uncompressed, so the settings part
+    /// is literally in the file -- and reaching for a zip reader to check one
+    /// string would be the more fragile of the two.
+    #[test]
+    fn the_users_own_filaments_reach_the_exported_package() {
+        let directory = scratch("export-palette");
+        let path = directory.join("painted.3mf");
+        let mut app = app();
+        app.palette.slots[0].colour = "#123456".to_string();
+        app.palette.slots[1].material = "PETG".to_string();
+
+        app.export(ExportFormat::ThreeMf, &path);
+        let written =
+            String::from_utf8_lossy(&std::fs::read(&path).expect("the file should be there"))
+                .into_owned();
+
+        assert!(
+            written.contains("\"#123456\""),
+            "the export declared the built-in colours instead of the user's"
+        );
+        assert!(written.contains("\"PETG\""), "the material did not travel");
+
+        std::fs::remove_dir_all(&directory).ok();
+    }
+
+    /// A user who never touches the palette gets exactly the file they got
+    /// before, byte for byte.
+    ///
+    /// The default palette is DERIVED from `Filaments::default()` rather than
+    /// restating it, and this is what holds that true: if the two ever drift,
+    /// every existing export silently changes and this fails.
+    #[test]
+    fn an_untouched_palette_exports_the_same_bytes_as_before() {
+        let directory = scratch("export-palette-default");
+        let path = directory.join("plain.3mf");
+        let mut app = app();
+
+        app.export(ExportFormat::ThreeMf, &path);
+        let written =
+            String::from_utf8_lossy(&std::fs::read(&path).expect("the file should be there"))
+                .into_owned();
+
+        // The default palette must still be the writer's own defaults. Asserted
+        // on the settings part rather than on the whole file's bytes, because
+        // the placement transform is read from the developer's own OrcaSlicer
+        // presets -- a byte comparison here would pass or fail depending on
+        // which printer the machine running the suite happens to have selected.
+        for colour in brokkr_core::export::threemf::Filaments::default().colours {
+            assert!(
+                written.contains(&format!("\"{colour}\"")),
+                "the default palette and the writer's own defaults have drifted apart: \
+                 {colour} is missing"
+            );
+        }
+
+        std::fs::remove_dir_all(&directory).ok();
+    }
+
+    /// The exported model sits ON the bed, not half under it.
+    ///
+    /// A 3MF opened as a project is placed exactly where the file says, and
+    /// with no transform that was the plate's front-left corner with half the
+    /// sculpt below z = 0 -- reported from OrcaSlicer against a real export on
+    /// 2026-09-02. The centring half needs the user's plate size and is absent
+    /// on a machine with no OrcaSlicer; the drop onto the bed is unconditional
+    /// and is what this pins.
+    #[test]
+    fn an_exported_model_sits_on_the_bed_rather_than_half_under_it() {
+        let directory = scratch("export-on-bed");
+        let path = directory.join("placed.3mf");
+        let mut app = app();
+
+        app.export(ExportFormat::ThreeMf, &path);
+        let written =
+            String::from_utf8_lossy(&std::fs::read(&path).expect("the file should be there"))
+                .into_owned();
+
+        let item = written
+            .lines()
+            .find(|line| line.contains("<item "))
+            .expect("the build has to reference the object")
+            .to_string();
+        let transform = item
+            .split_once("transform=\"")
+            .map(|(_, rest)| rest.split('"').next().unwrap_or_default().to_string())
+            .expect("a default sphere straddles z = 0, so it must carry a transform");
+        let numbers: Vec<f32> =
+            transform.split_whitespace().filter_map(|word| word.parse().ok()).collect();
+        assert_eq!(numbers.len(), 12, "a 3MF item transform is 12 numbers: {transform}");
+
+        // The lowest point of the sphere, in print space, plus the lift the
+        // transform applies, has to land on the bed.
+        let lifted = numbers[11];
+        let mut lowest = f32::INFINITY;
+        for line in written.lines().filter(|line| line.contains("<vertex ")) {
+            if let Some((_, rest)) = line.split_once("z=\"")
+                && let Ok(z) = rest.split('"').next().unwrap_or_default().parse::<f32>()
+            {
+                lowest = lowest.min(z);
+            }
+        }
+        assert!(lowest.is_finite(), "no vertices in the exported file");
+        assert!(
+            (lowest + lifted).abs() < 1.0e-3,
+            "the model's lowest point lands at {} instead of on the bed",
+            lowest + lifted
+        );
+
+        std::fs::remove_dir_all(&directory).ok();
+    }
+
     /// Several bodies in one STL are named as fused, because the format has
     /// nowhere to put an object boundary and a slicer will load them as one
     /// part. Better said here than discovered after slicing.
@@ -18179,17 +18389,30 @@ mod body_panel_tests {
         }
     }
 
-    /// The sixth section is FIRST and open, and DETAIL is what paid for it.
+    /// BODIES is FIRST and open; DETAIL and FILAMENT start closed.
+    ///
+    /// The count is pinned so that adding a section is a deliberate act: the
+    /// budget is a 1080 high window with every heading reachable without a
+    /// scroll, and a section added without thinking about that budget is how
+    /// the one below it goes under the fold.
     #[test]
-    fn the_bodies_section_is_first_and_open_and_detail_now_starts_closed() {
+    fn the_bodies_section_is_first_and_open_and_the_long_ones_start_closed() {
         assert_eq!(PanelSection::ALL[0], PanelSection::Bodies);
-        assert_eq!(PanelSection::ALL.len(), 6);
+        assert_eq!(PanelSection::ALL.len(), 7);
         assert!(PanelSection::Bodies.open_by_default());
         assert!(!PanelSection::Detail.open_by_default());
+        assert!(!PanelSection::Filament.open_by_default());
+        // FILAMENT sits directly above EXPORT: it says what the sculpt's slot
+        // numbers mean, and it is read when somebody exports.
+        let position = |which: PanelSection| {
+            PanelSection::ALL.iter().position(|section| *section == which).expect("in ALL")
+        };
+        assert_eq!(position(PanelSection::Filament) + 1, position(PanelSection::Export));
 
         let app = app();
         assert!(app.expanded[PanelSection::Bodies as usize], "BODIES did not start open");
         assert!(!app.expanded[PanelSection::Detail as usize], "DETAIL did not start closed");
+        assert!(!app.expanded[PanelSection::Filament as usize], "FILAMENT did not start closed");
     }
 
     // --- folders -------------------------------------------------------------
