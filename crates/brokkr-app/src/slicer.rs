@@ -1105,7 +1105,14 @@ mod tests {
         assert!(linux.contains(&PathBuf::from("/home/someone/.config")));
 
         // An XDG override is honoured, and a relative one is refused rather
-        // than joined onto something.
+        // than joined onto something. Not on a Windows host: `is_absolute`
+        // there wants a drive letter, so `/somewhere/else` is refused as
+        // relative and the honoured half fails for a reason that has nothing
+        // to do with the code, which never runs XDG logic on Windows. The
+        // Linux job is the one that checks it.
+        if cfg!(target_os = "windows") {
+            return;
+        }
         let xdg = |key: &str| (key == "XDG_CONFIG_HOME").then(|| PathBuf::from("/somewhere/else"));
         assert!(
             config_roots("linux", Some(&home()), &xdg).contains(&PathBuf::from("/somewhere/else"))
