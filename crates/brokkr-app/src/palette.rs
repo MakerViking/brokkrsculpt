@@ -125,6 +125,20 @@ fn normalise_colour(text: &str) -> Option<String> {
 }
 
 impl Palette {
+    /// The slots as the sculpt shader wants them: linear RGB by slot number.
+    ///
+    /// Index 0 is unpainted and never read. Every slot this machine does not
+    /// have -- past the end of the list, or past what the shader can hold --
+    /// is left at [`brokkr_gpu::UNKNOWN_FILAMENT`], so a sculpt painted for a
+    /// machine with more heads shows where rather than showing clay.
+    pub fn shader_palette(&self) -> [[f32; 4]; brokkr_gpu::PALETTE_SLOTS] {
+        let mut palette = [brokkr_gpu::UNKNOWN_FILAMENT; brokkr_gpu::PALETTE_SLOTS];
+        for (index, slot) in self.slots.iter().enumerate().take(brokkr_gpu::PALETTE_SLOTS - 1) {
+            palette[index + 1] = slot.swatch().into_linear();
+        }
+        palette
+    }
+
     /// The palette on this machine, or the defaults when there is no file.
     pub fn load() -> Self {
         Self::load_from(crate::paths::config_file(FILE).as_deref())
@@ -191,7 +205,17 @@ impl Palette {
     }
 
     /// Write the palette to this machine's config file.
+    ///
+    /// **Inert under `cfg(test)`, deliberately**, the way the update journal's
+    /// `record` is: an application test that sends `PaletteSynced` reaches
+    /// this through the real `update`, and on 2026-09-05 one did and replaced
+    /// the U1's synced `filaments.conf` on the developer's machine with the
+    /// test's fixture. A test wanting the file goes through
+    /// [`Palette::to_config`] and a path of its own.
     pub fn save(&self) -> Result<(), String> {
+        if cfg!(test) {
+            return Ok(());
+        }
         let Some(path) = crate::paths::config_file(FILE) else {
             return Err("no config directory to write to".to_string());
         };
@@ -312,6 +336,29 @@ fn parse_rgb(text: &str) -> Option<iced::Color> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_shader_palette_is_linear_by_slot_number_and_unknown_past_the_end() {
+        let mut palette = Palette::default();
+        palette.slots[0].colour = "#FF0000".to_string();
+        let shader = palette.shader_palette();
+        assert_eq!(shader[0], brokkr_gpu::UNKNOWN_FILAMENT, "slot 0 is unpainted, never a colour");
+        assert_eq!(shader[1], [1.0, 0.0, 0.0, 1.0], "slot 1 should be the first filament");
+        // Linear, not sRGB: mid grey encodes as #808080 and lands near 0.216.
+        palette.slots[1].colour = "#808080".to_string();
+        let grey = palette.shader_palette()[2][0];
+        assert!(
+            (grey - 0.216).abs() < 0.01,
+            "slot colours must reach the shader linear, got {grey}"
+        );
+        // Past the machine's slots is the unknown-filament colour, not clay.
+        assert_eq!(shader[palette.slots.len() + 1], brokkr_gpu::UNKNOWN_FILAMENT);
+        // And a palette longer than the shader can hold does not panic.
+        while palette.slots.len() < brokkr_gpu::PALETTE_SLOTS + 4 {
+            palette.slots.push(palette.slots[0].clone());
+        }
+        let _ = palette.shader_palette();
+    }
 
     #[test]
     fn the_default_palette_is_the_writers_own_slots() {

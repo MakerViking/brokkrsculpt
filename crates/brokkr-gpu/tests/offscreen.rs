@@ -20,8 +20,8 @@ use brokkr_core::{
     NARROW_BAND, OUTSIDE, Pattern, PatternKind, Stamp, Volume,
 };
 use brokkr_gpu::{
-    Frustum, NodeId, OverlayBatch, PixelRect, SculptRenderer, SlotKey, THE_ONLY_BODY,
-    THUMBNAIL_BACKGROUND, THUMBNAIL_SIZE, Uniforms, background_texel,
+    Frustum, NodeId, OverlayBatch, PALETTE_SLOTS, PixelRect, SculptRenderer, SlotKey,
+    THE_ONLY_BODY, THUMBNAIL_BACKGROUND, THUMBNAIL_SIZE, Uniforms, background_texel,
 };
 use glam::{IVec3, Vec3};
 
@@ -425,8 +425,174 @@ fn uniforms(distance: f32) -> Uniforms {
         srgb_target: 1,
         mask_inverted: 0,
         mask_tint: 1.0,
-        padding: [0; 1],
+        paint_shown: 1,
+        palette: red_palette(),
     }
+}
+
+/// Slot 1 is a pure red, which the clay's warm grey never reaches; every
+/// other slot is the default's unknown-filament magenta.
+fn red_palette() -> [[f32; 4]; PALETTE_SLOTS] {
+    let mut palette = Uniforms::default().palette;
+    palette[1] = [1.0, 0.0, 0.0, 1.0];
+    palette
+}
+
+/// How warm a pixel is: red minus blue, in sRGB levels. The paint test's
+/// twin of `chroma`, pointing the other way.
+fn warmth(pixels: &[u8]) -> Vec<i32> {
+    pixels
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|pixel| i32::from(pixel[0]) - i32::from(pixel[2]))
+        .collect()
+}
+
+/// Paint every in-band voxel of the model slot 1, or only the half of it at x
+/// below zero. The half is the one turned AWAY from the camera, exactly as
+/// `protect` arranges, so the boundary is on screen.
+fn paint(volume: &mut Volume, half: bool) {
+    let reach = (MODEL_RADIUS / VOXEL_SIZE) as i32 + 4;
+    let high = IVec3::new(if half { 0 } else { reach }, reach, reach);
+    volume.edit_colour(IVec3::splat(-reach), high, |_, _, _, _| 1);
+}
+
+/// The thumbnail pass draws paint through the palette the VIEWPORT was last
+/// given, and draws it whether or not the viewport is showing paint: paint is
+/// what a body is, the toggle is how the viewport shows it. Nothing else
+/// exercises `SculptRenderer::palette`, the relay between the two passes.
+#[test]
+fn a_thumbnail_shows_the_paint_in_the_viewports_palette_whatever_the_toggle_says() {
+    const CELL: u32 = 2;
+    const BODY: NodeId = NodeId(1);
+    let Some(harness) = Harness::in_format(TARGET_FORMAT) else {
+        eprintln!("no usable wgpu adapter, skipping the thumbnail paint test");
+        return;
+    };
+    let distance = MODEL_RADIUS * 3.0;
+    let mut renderer = SculptRenderer::new(&harness.device, &harness.queue, TARGET_FORMAT);
+    renderer.resize(&harness.device, WIDTH, HEIGHT);
+
+    let mut sphere = Volume::new(VOXEL_SIZE);
+    sphere.seed_sphere(Vec3::ZERO, MODEL_RADIUS);
+    let bounds = sphere.world_bounds().expect("a seeded sphere has bricks");
+    upload_body(&mut renderer, &harness.device, &harness.queue, &mut sphere, BODY);
+    renderer.write_uniforms(&harness.queue, &uniforms(distance));
+    renderer.render_thumbnail(&harness.device, &harness.queue, CELL, BODY, bounds);
+    let bare = harness.cell(&renderer, CELL);
+    let bare_warmest = warmth(&bare).into_iter().max().expect("a cell has texels");
+
+    paint(&mut sphere, false);
+    upload_dirty_as(&mut renderer, &harness.device, &harness.queue, &mut sphere, BODY);
+    // The viewport has paint HIDDEN; the thumbnail must show it regardless,
+    // in the red the viewport's palette names for slot 1.
+    renderer.write_uniforms(&harness.queue, &Uniforms { paint_shown: 0, ..uniforms(distance) });
+    renderer.render_thumbnail(&harness.device, &harness.queue, CELL, BODY, bounds);
+    let painted = harness.cell(&renderer, CELL);
+    let red = warmth(&painted).into_iter().filter(|w| *w > bare_warmest).count();
+    let total = (THUMBNAIL_SIZE * THUMBNAIL_SIZE) as usize;
+    assert!(
+        red * 8 > total,
+        "only {red} of {total} thumbnail texels are warmer than the bare cell's warmest \
+         ({bare_warmest}); the thumbnail pass is not drawing the paint"
+    );
+
+    // And through the palette, not a colour of its own: hand the viewport a
+    // palette with slot 1 blue and the same cell turns cool.
+    let mut blue = uniforms(distance);
+    blue.palette[1] = [0.0, 0.0, 1.0, 1.0];
+    renderer.write_uniforms(&harness.queue, &blue);
+    renderer.render_thumbnail(&harness.device, &harness.queue, CELL, BODY, bounds);
+    let recoloured = harness.cell(&renderer, CELL);
+    let cool = chroma(&recoloured).into_iter().filter(|c| *c > 40).count();
+    assert!(cool * 8 > total, "the thumbnail did not follow the viewport's palette ({cool} cool)");
+}
+
+/// A painted body is drawn in its filament's colour where it is painted, keeps
+/// its shape, and is bare clay where it is not.
+///
+/// The mask tint test's shape, measured the other way round the colour wheel:
+/// slot 1 is pure red, the clay's warm grey never gets past a rim of +28
+/// levels of red over blue, so "warmer than anything the bare body reaches"
+/// is the claim. The unpainted half must not change by a byte, which is the
+/// GPU-side leak this exists to catch -- a `@location` slip, an interpolated
+/// slot, a stride mistake in the attribute buffer -- none of which the core
+/// tests can see.
+#[test]
+fn a_painted_body_is_drawn_in_its_filament_where_it_is_painted_and_nowhere_else() {
+    let Some(harness) = Harness::new() else {
+        eprintln!("no usable wgpu adapter, skipping the paint render test");
+        return;
+    };
+
+    let distance = MODEL_RADIUS * 3.0;
+    let mut renderer = SculptRenderer::new(&harness.device, &harness.queue, TARGET_FORMAT);
+    renderer.resize(&harness.device, WIDTH, HEIGHT);
+    renderer.write_uniforms(&harness.queue, &uniforms(distance));
+
+    let mut volume = Volume::new(VOXEL_SIZE);
+    volume.seed_sphere(Vec3::ZERO, MODEL_RADIUS);
+    upload_all(&mut renderer, &harness.device, &harness.queue, &mut volume);
+    let bare = harness.frame(&renderer);
+    dump("paint-none", &bare);
+
+    paint(&mut volume, true);
+    let remeshed = upload_dirty(&mut renderer, &harness.device, &harness.queue, &mut volume);
+    assert!(remeshed > 0, "painting marked no brick for remesh");
+    let painted = harness.frame(&renderer);
+    dump("paint-half", &painted);
+
+    let before = mask(&bare);
+    let after = mask(&painted);
+    let moved = before.iter().zip(&after).filter(|(one, other)| one != other).count();
+    assert_eq!(moved, 0, "{moved} pixels changed shape, so the paint reached the geometry");
+
+    let clay_warmest = warmth(&bare)
+        .iter()
+        .zip(&before)
+        .filter_map(|(value, drawn)| drawn.then_some(*value))
+        .max()
+        .expect("the fixture drew nothing");
+    let painted_warmth = warmth(&painted);
+    let red = painted_warmth
+        .iter()
+        .zip(&after)
+        .filter(|(value, drawn)| **drawn && **value > clay_warmest)
+        .count();
+    let drawn = after.iter().filter(|drawn| **drawn).count();
+    assert!(
+        red * 5 > drawn,
+        "only {red} of {drawn} drawn pixels are warmer than the warmest the bare body reaches \
+         ({clay_warmest}), so the paint is not visible"
+    );
+
+    // The half that was not painted is the bare frame, byte for byte, and the
+    // painted half is not: bounded both ways over the drawn pixels, for the
+    // reason the mask test spells out.
+    let unchanged = bare
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .zip(painted.as_chunks::<4>().0)
+        .zip(&after)
+        .filter(|((one, other), drawn)| **drawn && one == other)
+        .count();
+    assert!(
+        unchanged * 10 > drawn * 5 && unchanged * 10 < drawn * 9,
+        "{unchanged} of {drawn} drawn pixels are unchanged; the paint should cover roughly \
+         a quarter to a half of the visible body and leave the rest exactly alone"
+    );
+
+    // The toggle, and nothing but the toggle: one uniform write, no upload.
+    let slots = renderer.stats();
+    renderer.write_uniforms(&harness.queue, &Uniforms { paint_shown: 0, ..uniforms(distance) });
+    let hidden = harness.frame(&renderer);
+    assert_eq!(
+        hidden, bare,
+        "with paint hidden a painted body must be pixel-identical to a bare one"
+    );
+    assert_eq!(renderer.stats().bricks, slots.bricks, "the toggle moved pool slots");
 }
 
 #[test]
@@ -620,13 +786,16 @@ fn every_brush_leaves_a_visible_mark() {
             let at = front + Vec3::new(0.0, step as f32 * 3.0, 0.0);
             let normal = volume.gradient_world(at);
             for _ in 0..4 {
-                brush.apply(
-                    &mut volume,
-                    // The drag that move follows. Every other brush ignores it
-                    // unless it is running a comb pattern, and none is here.
-                    &Stamp::new(at, normal, BrushDirection::Add).with_tangent(Vec3::Y),
-                    &mut brush_scratch,
-                );
+                // The drag that move follows. Every other brush ignores it
+                // unless it is running a comb pattern, and none is here.
+                let stamp = Stamp::new(at, normal, BrushDirection::Add).with_tangent(Vec3::Y);
+                // Paint has no field path; its mark is the slot, drawn through
+                // the palette `uniforms` sets up. See `BrushKind::Paint`.
+                if kind == BrushKind::Paint {
+                    brush.apply_paint(&mut volume, &stamp, 1, &mut brush_scratch);
+                } else {
+                    brush.apply(&mut volume, &stamp, &mut brush_scratch);
+                }
             }
         }
 

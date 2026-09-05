@@ -124,6 +124,26 @@ mod tests {
         assert!(lit > shadowed, "upper left {lit} should outshine lower right {shadowed}");
     }
 
+    /// The shader divides a painted pixel's shading by this number, written
+    /// there as a literal because WGSL cannot read a Rust constant. If BASE
+    /// moves, this fails and names the other copy.
+    #[test]
+    fn the_base_luma_the_shader_divides_by_is_the_clays() {
+        let luma = BASE.dot(Vec3::new(0.2126, 0.7152, 0.0722));
+        // Read out of the shader source rather than retyped here, so either
+        // copy moving fails this; a literal in the test caught only one side.
+        let shader = include_str!("shaders/sculpt.wgsl");
+        let declared: f32 = shader
+            .lines()
+            .find_map(|line| line.trim().strip_prefix("const MATCAP_BASE_LUMA: f32 = "))
+            .and_then(|rest| rest.trim_end_matches(';').trim().parse().ok())
+            .expect("sculpt.wgsl declares `const MATCAP_BASE_LUMA: f32 = <n>;`");
+        assert!(
+            (luma - declared).abs() < 0.0015,
+            "BASE's luminance is {luma:.4} and sculpt.wgsl says {declared}; make them agree"
+        );
+    }
+
     #[test]
     fn srgb_encoding_hits_the_known_end_points() {
         assert_eq!(encode_srgb(0.0), 0);

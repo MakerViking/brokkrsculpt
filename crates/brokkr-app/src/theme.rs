@@ -165,7 +165,7 @@ pub const ICON_CHROME: f32 = 14.0;
 /// The tool strip, above the tool's name.
 ///
 /// Eighteen rather than the twenty-four the grid is drawn on, because the strip
-/// has a vertical budget: seven brushes, three mirror toggles, the cut and the
+/// has a vertical budget: eight brushes, three mirror toggles, the cut and the
 /// mask have to fit a 768-high window without scrolling. A properties panel
 /// taller than its window has already happened here once and put every
 /// SpaceMouse binding out of reach. Adding the mask as the eleventh button was

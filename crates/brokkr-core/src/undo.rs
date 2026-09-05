@@ -76,6 +76,7 @@ use rustc_hash::FxHashMap;
 
 use crate::body::{Document, Node, NodeId, NodeMeta};
 use crate::brick::{Brick, BrickCoord, StoredBrick};
+use crate::colour::ColourBrick;
 use crate::mask::{MaskBrick, MaskField};
 use crate::volume::Volume;
 
@@ -125,10 +126,10 @@ pub const DEFAULT_RECLAIM_BUDGET: usize = 1024 * 1024 * 1024;
 /// restore just as faithfully as any content: leaving an empty brick behind
 /// would leave its triangles on screen.
 ///
-/// # Three lists, not one, and the mask's is usually the empty one
+/// # Four lists, not one, and the mask's is usually the empty one
 ///
-/// A gesture can change the field, the mask, or the mask's polarity, and one
-/// entry has to put back whatever it changed. They are kept apart rather than
+/// A gesture can change the field, the mask, the paint, or the mask's
+/// polarity, and one entry has to put back whatever it changed. They are kept apart rather than
 /// folded into a single "brick" list because they cost two orders of magnitude
 /// differently: a field brick is 131,104 B against a mask brick's 32,800, and
 /// **a sculpt stroke through a mask records ZERO mask bytes** -- the mask is
@@ -140,10 +141,19 @@ pub const DEFAULT_RECLAIM_BUDGET: usize = 1024 * 1024 * 1024;
 /// `None` means the gesture did not touch it. One bool rather than a rewritten
 /// map is the whole reason Mask All and Invert are O(1) in undo as well as in
 /// time and memory.
+///
+/// `colours` is the fourth list, and it is kept apart for the same reason the
+/// mask's is: a paint stroke touches no field brick and a field stroke touches
+/// no colour brick, so each records only its own kind and pays only its own
+/// weight -- which is the arithmetic [`crate::colour`] made its storage
+/// decision on. The two exceptions record both halves honestly: a Move
+/// carries the paint with the material, and a merge takes the incoming body's
+/// paint.
 #[derive(Debug, Default)]
 pub struct StrokeEdit {
     bricks: PriorBricks,
     masks: PriorMasks,
+    colours: PriorColours,
     polarity: Option<bool>,
     bytes: usize,
 }
@@ -162,13 +172,17 @@ type PriorBricks = Vec<(BrickCoord, Option<StoredBrick>)>;
 /// not.
 type PriorMasks = Vec<(BrickCoord, Option<MaskBrick>)>;
 
+/// And for colour bricks, on the same terms.
+type PriorColours = Vec<(BrickCoord, Option<ColourBrick>)>;
+
 impl StrokeEdit {
     pub(crate) fn from_recording(
         bricks: FxHashMap<BrickCoord, Option<Brick>>,
         masks: FxHashMap<BrickCoord, Option<MaskBrick>>,
+        colours: FxHashMap<BrickCoord, Option<ColourBrick>>,
         polarity: Option<bool>,
     ) -> Option<Self> {
-        if bricks.is_empty() && masks.is_empty() && polarity.is_none() {
+        if bricks.is_empty() && masks.is_empty() && colours.is_empty() && polarity.is_none() {
             return None;
         }
         // Encoded here, at the one place a stroke's priors enter history, so
@@ -198,7 +212,12 @@ impl StrokeEdit {
                 .map(|(coord, brick)| (coord, brick.as_ref().map(StoredBrick::encode)))
                 .collect()
         };
-        Some(Self::from_parts(encoded, masks.into_iter().collect(), polarity))
+        Some(Self::from_parts(
+            encoded,
+            masks.into_iter().collect(),
+            colours.into_iter().collect(),
+            polarity,
+        ))
     }
 
     /// An entry that puts back field bricks and nothing else.
@@ -209,21 +228,23 @@ impl StrokeEdit {
     /// is exactly the shape a future caller should not reach for.
     #[cfg(test)]
     pub(crate) fn from_bricks(bricks: PriorBricks) -> Self {
-        Self::from_parts(bricks, Vec::new(), None)
+        Self::from_parts(bricks, Vec::new(), Vec::new(), None)
     }
 
     pub(crate) fn from_parts(
         bricks: PriorBricks,
         masks: PriorMasks,
+        colours: PriorColours,
         polarity: Option<bool>,
     ) -> Self {
         let bytes = bricks.iter().map(|(_, brick)| prior_bytes(brick.as_ref())).sum::<usize>()
-            + masks.iter().map(|(_, brick)| mask_prior_bytes(brick.as_ref())).sum::<usize>();
-        Self { bricks, masks, polarity, bytes }
+            + masks.iter().map(|(_, brick)| mask_prior_bytes(brick.as_ref())).sum::<usize>()
+            + colours.iter().map(|(_, brick)| colour_prior_bytes(brick.as_ref())).sum::<usize>();
+        Self { bricks, masks, colours, polarity, bytes }
     }
 
-    pub(crate) fn into_parts(self) -> (PriorBricks, PriorMasks, Option<bool>) {
-        (self.bricks, self.masks, self.polarity)
+    pub(crate) fn into_parts(self) -> (PriorBricks, PriorMasks, PriorColours, Option<bool>) {
+        (self.bricks, self.masks, self.colours, self.polarity)
     }
 
     /// Bricks this entry restores.
@@ -238,9 +259,18 @@ impl StrokeEdit {
         self.masks.len()
     }
 
+    /// Colour bricks this entry restores.
+    #[inline]
+    pub fn colour_len(&self) -> usize {
+        self.colours.len()
+    }
+
     #[inline]
     pub fn is_empty(&self) -> bool {
-        self.bricks.is_empty() && self.masks.is_empty() && self.polarity.is_none()
+        self.bricks.is_empty()
+            && self.masks.is_empty()
+            && self.colours.is_empty()
+            && self.polarity.is_none()
     }
 
     /// Memory this entry holds, which is what the budget counts.
@@ -281,6 +311,18 @@ pub(crate) fn prior_bytes(prior: Option<&StoredBrick>) -> usize {
 #[inline]
 pub(crate) fn mask_prior_bytes(prior: Option<&MaskBrick>) -> usize {
     size_of::<(BrickCoord, Option<MaskBrick>)>() + prior.map_or(0, MaskBrick::heap_bytes)
+}
+
+/// What one colour brick's prior contents cost the stroke budget.
+///
+/// The same 32,800 B a dense mask brick costs, and pinned to the same figure
+/// by `a_colour_entry_weighs_what_a_mask_entry_does`: the two types are the
+/// same shape, and the undo arithmetic in [`crate::colour`] -- 8,192 paint
+/// snapshots against the budget where colour-in-brick would give 1,365 --
+/// depends on this being the mask's number and not the field's.
+#[inline]
+pub(crate) fn colour_prior_bytes(prior: Option<&ColourBrick>) -> usize {
+    size_of::<(BrickCoord, Option<ColourBrick>)>() + prior.map_or(0, ColourBrick::heap_bytes)
 }
 
 /// What removing one node costs the reclaim allowance.
@@ -1726,6 +1768,13 @@ mod tests {
         assert_eq!(size_of::<(BrickCoord, Option<StoredBrick>)>(), 40);
         assert_eq!(prior_bytes(Some(&StoredBrick::encode(&field))), 40 + 6);
         assert_eq!(predicted_prior_bytes(Some(&field)), 40 + 6);
+    }
+
+    #[test]
+    fn a_colour_entry_weighs_what_a_mask_entry_does() {
+        assert_eq!(colour_prior_bytes(Some(&ColourBrick::dense_filled(3))), 32_800);
+        assert_eq!(colour_prior_bytes(Some(&ColourBrick::Uniform(3))), 32);
+        assert_eq!(colour_prior_bytes(None), 32);
     }
 
     /// **The encoding is lossless, bit for bit, or undo silently corrupts.**

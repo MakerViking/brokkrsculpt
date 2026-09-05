@@ -13,6 +13,7 @@
 
 use std::time::{Duration, Instant};
 
+use brokkr_core::colour::ColourField;
 use brokkr_core::{
     BRICK_DIM, BrickCoord, BrickMesh, Brush, BrushDirection, BrushKind, BrushScratch, ClipCounts,
     ClipPlane, Document, Entry, FalloffCurve, History, INSIDE, MaskField, MeshScratch, NARROW_BAND,
@@ -65,6 +66,19 @@ const PATTERN_EDIT_BUDGET: Duration = Duration::from_micros(6_000);
 /// the 8 ms remesh budget it is worth knowing, which is the point of leaving
 /// the number where it is.
 const MASKED_EDIT_BUDGET: Duration = Duration::from_micros(5_000);
+/// Edit budget for a stroke over a body that carries paint.
+///
+/// **The unrelaxed 4 ms, on purpose.** A field stroke never reads the colour
+/// -- the field edit does not consult it where it does consult the mask -- so
+/// unlike the masked row there is no per-voxel byte to allow for, and a
+/// painted body must edit in exactly the time an unpainted one does. (Move is
+/// the exception: it carries the paint with the material in a pass of its own,
+/// and the per-brush table below measures it painted.) What paint adds is one more
+/// stored byte per VERTEX at mesh time, taken through a slab resolved once per
+/// brick, which the unchanged remesh budget gates in the same row. A regression
+/// from one slab lookup per brick to one per voxel would show up there, and
+/// this row is what makes the gate measure a painted stroke at all.
+const PAINTED_EDIT_BUDGET: Duration = EDIT_BUDGET;
 /// Edit budget at the largest radius on the tool strip.
 ///
 /// The 4 ms edit budget is not met at a 20 mm radius and, on this
@@ -101,6 +115,14 @@ const REMESH_BUDGET: Duration = Duration::from_micros(8_000);
 /// The budget rows use the ceiling rather than a typical stroke: a gate set at
 /// the average passes while the worst case a user can actually draw does not.
 const MAX_CUT_PLANES: usize = 16;
+
+/// What the body carries under a stroke row, beyond its field.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Carrying {
+    Nothing,
+    Mask,
+    Paint,
+}
 
 /// Voxels across the model, which is the M0 target size.
 const EFFECTIVE_RESOLUTION: f32 = 256.0;
@@ -248,6 +270,40 @@ fn paint_a_mask(volume: &mut Volume, centre: Vec3, radius: f32) {
     );
 }
 
+/// Paint the whole shell in alternating slots, so every colour brick under the
+/// stroke is dense and the mesher's per-vertex slot read cannot hoist.
+fn paint_the_body(volume: &mut Volume, centre: Vec3, radius: f32) {
+    let reach = Vec3::splat(radius + BRICK_DIM as f32 * volume.voxel_size());
+    let (lo, hi) = volume.voxel_bounds(centre - reach, centre + reach);
+    volume.edit_colour(lo, hi, |cell, _, _, _| 1 + ((cell.x + cell.y + cell.z) & 1) as u8);
+    // `edit_colour` dirties its whole box, unlike the mask writer above, and
+    // a first event that remeshed those thousand bricks would be the row's
+    // maximum and nothing a stroke did.
+    let mut settled = Vec::new();
+    volume.take_dirty(&mut settled);
+
+    let stats = volume.stats();
+    println!(
+        "  painted: {} colour bricks, {} of them dense, {:.1} MB of colour",
+        stats.colour_bricks,
+        stats.colour_dense_bricks,
+        stats.colour_bytes as f64 / (1024.0 * 1024.0)
+    );
+}
+
+/// One stamp of `brush`, whichever entry point its kind takes.
+///
+/// Paint has no field path -- `Brush::apply` with it is inert, see the
+/// variant -- so the per-brush tables would print a zero for it and gate
+/// nothing. Slot 1 is arbitrary; every slot costs the same.
+fn stamp_once(brush: &Brush, volume: &mut Volume, stamp: &Stamp, scratch: &mut BrushScratch) {
+    if brush.kind == BrushKind::Paint {
+        brush.apply_paint(volume, stamp, 1, scratch);
+    } else {
+        brush.apply(volume, stamp, scratch);
+    }
+}
+
 fn main() {
     let voxel_size = 1.0_f32;
     let centre = Vec3::splat(EFFECTIVE_RESOLUTION * voxel_size * 0.5);
@@ -332,14 +388,20 @@ fn main() {
     // Slow and fast drags over the same path. The fast one is the case the
     // per event budget really has to survive: fewer pointer samples means more
     // interpolated stamps per event.
-    for (label, events, pattern, masked, edit_budget) in [
-        ("slow drag", STEPS, PatternKind::None, false, EDIT_BUDGET),
-        ("fast drag", STEPS / 5, PatternKind::None, false, EDIT_BUDGET),
+    for (label, events, pattern, carrying, edit_budget) in [
+        ("slow drag", STEPS, PatternKind::None, Carrying::Nothing, EDIT_BUDGET),
+        ("fast drag", STEPS / 5, PatternKind::None, Carrying::Nothing, EDIT_BUDGET),
         // Hair measured as the worst of the six in the per pattern table
         // below. A pattern multiplies into the hottest loop in the project, so
         // the case that has to hold is the fast drag with one switched on --
         // not a single stamp in isolation.
-        ("fast drag, hair pattern", STEPS / 5, PatternKind::Hair, false, PATTERN_EDIT_BUDGET),
+        (
+            "fast drag, hair pattern",
+            STEPS / 5,
+            PatternKind::Hair,
+            Carrying::Nothing,
+            PATTERN_EDIT_BUDGET,
+        ),
         // LAST, and the mask it paints is torn off again at the bottom of this
         // loop -- see the comment there, which is the load-bearing half. A mask
         // is a second multiply into the same loop the pattern is, so the case
@@ -348,10 +410,15 @@ fn main() {
         // would stay green through a regression from one slab lookup per brick
         // to one per voxel, which is three and a half million map probes on a
         // large stamp.
-        ("fast drag, masked", STEPS / 5, PatternKind::None, true, MASKED_EDIT_BUDGET),
+        ("fast drag, masked", STEPS / 5, PatternKind::None, Carrying::Mask, MASKED_EDIT_BUDGET),
+        // The same again over a painted shell, torn off at the bottom for the
+        // same reason. See `PAINTED_EDIT_BUDGET` for what this row gates.
+        ("fast drag, painted", STEPS / 5, PatternKind::None, Carrying::Paint, PAINTED_EDIT_BUDGET),
     ] {
-        if masked {
-            paint_a_mask(volume, centre, radius);
+        match carrying {
+            Carrying::Nothing => {}
+            Carrying::Mask => paint_a_mask(volume, centre, radius),
+            Carrying::Paint => paint_the_body(volume, centre, radius),
         }
         let brush =
             Brush { pattern: Pattern { kind: pattern, scale_mm: 2.0, depth: 1.0 }, ..brush };
@@ -430,9 +497,9 @@ fn main() {
         // Every block in this file after the loop shares this one body -- the
         // undo timing, the per brush table and the per pattern table all reach
         // it through `doc.active_volume_mut()` -- and nothing puts a mask back
-        // the way `end_stroke` puts bricks back, because the mask is
-        // deliberately not part of an undo entry (see `mask`'s module
-        // documentation). A mask left here would therefore be on the body for
+        // the way `end_stroke` puts bricks back, because the mask was painted
+        // outside any stroke and a sculpt stroke over it records no mask
+        // brick. A mask left here would therefore be on the body for
         // the rest of `main`, with two consequences and neither of them
         // announced in the printed output. Both tables below would measure
         // masked strokes -- an extra `u8` per voxel plus a slab resolve per
@@ -443,8 +510,10 @@ fn main() {
         // on any body carrying a mask, so that row would warp half as far as it
         // did in every previous run and stop being comparable across commits
         // without ever failing.
-        if masked {
-            *volume.mask_mut() = MaskField::default();
+        match carrying {
+            Carrying::Nothing => {}
+            Carrying::Mask => *volume.mask_mut() = MaskField::default(),
+            Carrying::Paint => *volume.colour_mut() = ColourField::default(),
         }
     }
 
@@ -488,7 +557,8 @@ fn main() {
             let at = centre + Vec3::new(angle.cos(), 0.0, angle.sin()) * radius;
             let normal = volume.gradient_world(at);
             let started = Instant::now();
-            each.apply(
+            stamp_once(
+                &each,
                 volume,
                 // The way round the circle the stamps walk, which is the drag
                 // move needs before it will do any work. Costs the others
@@ -560,7 +630,8 @@ fn main() {
                 let at = centre + Vec3::new(angle.cos(), 0.0, angle.sin()) * radius;
                 let normal = fresh.gradient_world(at);
                 let started = Instant::now();
-                each.apply(
+                stamp_once(
+                    &each,
                     &mut fresh,
                     &Stamp::new(at, normal, BrushDirection::Add).with_tangent(Vec3::new(
                         -angle.sin(),

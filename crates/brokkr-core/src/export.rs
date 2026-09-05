@@ -340,10 +340,11 @@ impl Volume {
         let mut meshes = vec![BrickMesh::default(); coords.len()];
         self.mesh_bricks(&coords, &mut meshes);
 
-        // Welded on the lattice cell each vertex came from, which is an exact
-        // integer identity. See BrickMesh::cells for why welding on positions
-        // instead leaves holes.
-        let mut welded: FxHashMap<glam::IVec3, u32> = FxHashMap::default();
+        // Welded on the lattice cell each vertex came from -- the PAIR of
+        // cells, for the midpoints a paint boundary adds -- which is an exact
+        // integer identity. See BrickMesh::cells and BrickMesh::partners for
+        // why welding on positions instead leaves holes.
+        let mut welded: FxHashMap<(glam::IVec3, glam::IVec3), u32> = FxHashMap::default();
         let mut mesh = ExportMesh::default();
         let mut normal_sums: Vec<Vec3> = Vec::new();
         let mut collapsed = 0;
@@ -360,7 +361,8 @@ impl Volume {
         for brick in &meshes {
             remap.clear();
             remap.reserve(brick.vertices.len());
-            for (at, (vertex, cell)) in brick.vertices.iter().zip(brick.cells.iter()).enumerate() {
+            for (at, vertex) in brick.vertices.iter().enumerate() {
+                let key = brick.weld_key(at);
                 let position = Vec3::from_array(vertex.position);
                 let normal = Vec3::from_array(vertex.normal);
                 // The painted slot rides the weld rather than being zipped on
@@ -369,7 +371,7 @@ impl Volume {
                 // array built from the brick meshes would run out of step with
                 // `positions` at the first seam.
                 let slot = brick.colour.get(at).copied().unwrap_or(0);
-                let index = *welded.entry(*cell).or_insert_with(|| {
+                let index = *welded.entry(key).or_insert_with(|| {
                     mesh.positions.push(position);
                     mesh.slots.push(slot);
                     normal_sums.push(Vec3::ZERO);
@@ -662,6 +664,43 @@ mod tests {
     use super::*;
     use crate::{Brush, BrushDirection, BrushKind, BrushScratch, Stamp};
 
+    /// The paint boundary cuts triangles at mesh time, and both bricks either
+    /// side of a seam must cut the same edge the same way or the export has a
+    /// T-junction and is no longer closed. Two boundaries: one ON a brick
+    /// seam plane, where every mixed edge is a seam edge, and one off it.
+    #[test]
+    fn a_painted_body_exports_watertight_with_its_boundary_on_and_off_a_seam() {
+        for (boundary, what) in [(0, "on the seam"), (5, "off the seam")] {
+            let mut volume = Volume::new(0.5);
+            volume.seed_sphere(Vec3::ZERO, 20.0);
+            let (bare, _) = volume.export_mesh();
+            let reach = glam::IVec3::splat(48);
+            volume.edit_colour(
+                -reach,
+                reach,
+                |cell, _, _, _| if cell.x < boundary { 2 } else { 3 },
+            );
+            volume.mark_everything_dirty();
+
+            let (painted, report) = volume.export_mesh();
+            assert!(
+                report.is_printable(),
+                "{what}: the painted export is not closed: {}",
+                report.summary()
+            );
+            assert!(
+                painted.triangles.len() > bare.triangles.len(),
+                "{what}: no triangle was cut along the boundary"
+            );
+            // Every triangle's slot is its first vertex's, and both slots print.
+            let mut seen = [false; 4];
+            for [a, _, _] in &painted.triangles {
+                seen[painted.slots[*a as usize] as usize] = true;
+            }
+            assert!(seen[2] && seen[3], "{what}: a side of the boundary is missing from the file");
+        }
+    }
+
     /// Painting voxels puts filament slots on the triangles that come out.
     ///
     /// **The link the writer waited for.** `paint_color` shipped complete and
@@ -699,7 +738,18 @@ mod tests {
 
         let (after, report) = volume.export_mesh();
         assert!(report.is_printable(), "painting broke the mesh");
-        assert_eq!(after.positions.len(), before.positions.len(), "painting changed the geometry");
+        // Painting ADDS vertices -- the boundary is cut at edge midpoints, see
+        // `split_paint_boundaries` -- and moves none: every vertex the bare
+        // export had is still there, bit for bit.
+        assert!(after.positions.len() >= before.positions.len(), "painting lost geometry");
+        let kept: std::collections::HashSet<[u32; 3]> =
+            after.positions.iter().map(|p| p.to_array().map(f32::to_bits)).collect();
+        let missing = before
+            .positions
+            .iter()
+            .filter(|p| !kept.contains(&p.to_array().map(f32::to_bits)))
+            .count();
+        assert_eq!(missing, 0, "painting moved or dropped {missing} vertices");
         assert_eq!(after.slots.len(), after.positions.len(), "one slot per welded vertex");
 
         let on_three = after.slots.iter().filter(|slot| **slot == 3).count();

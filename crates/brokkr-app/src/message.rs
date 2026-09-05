@@ -695,6 +695,15 @@ pub enum Message {
     /// key repeats while it is held, and a toggle would strobe.
     MaskPeekStarted,
     MaskPeekEnded,
+    /// Which filament slot the paint brush writes, 1-based. Clamped to the
+    /// palette on arrival.
+    PaintSlotChanged(u8),
+    /// Draw painted slots in their filament colours, or as bare clay.
+    ///
+    /// View state on the mask toggle's terms: it changes no slot, dirties no
+    /// brick and does not dirty the document. See
+    /// [`brokkr_gpu::Uniforms::paint_shown`].
+    ShowPaintToggled,
     /// Put the camera back on the active body, keeping the angles.
     ///
     /// The recovery half of a free camera. A camera that can go anywhere can

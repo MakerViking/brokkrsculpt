@@ -110,6 +110,18 @@ const PINCH_PULL_VOXELS: f32 = 0.85;
 /// box that is written are the same one. See [`MoveStroke`].
 const MOVE_DRAG_MARGIN: f32 = 0.75;
 
+/// The pattern weight at or above which a paint stamp writes its slot.
+///
+/// See [`Brush::apply_paint`]. Half, because a pattern's weight is a smooth
+/// `0..=1` and a categorical write needs one line through it; the pattern's
+/// own `depth` slider moves where that line falls on the surface.
+const PAINT_STENCIL: f32 = 0.5;
+
+/// The resolved protection at or above which a paint stamp leaves a voxel
+/// alone: half, the same line [`PAINT_STENCIL`] draws for the pattern and the
+/// masked split draws for a side.
+const PAINT_PROTECTED: u8 = PROTECTED / 2 + 1;
+
 /// How far the drag has to change before a Move gesture redoes its warp, in
 /// voxels.
 ///
@@ -303,10 +315,35 @@ pub enum BrushKind {
     /// direction comes from where the cursor meets the model. Pulling a form
     /// out toward the camera is draw's job, not this one's.
     Move,
+    /// Write a filament slot into the voxels under the stamp, and nothing
+    /// into the field.
+    ///
+    /// **A brush and not a tool, unlike the mask**, and the difference is what
+    /// the user switches between. A mask is a mode with a standing card, three
+    /// operations and a polarity; paint is one more thing a stroke can do,
+    /// chosen between carving strokes as often as Clay is chosen between Draw
+    /// strokes, which is what the digit keys are for. Every sculpting tool
+    /// files it the same way.
+    ///
+    /// **It has no strength and no falloff, because a slot has no half.** A
+    /// mask byte blends toward its target and feathers at the rim; a slot
+    /// index is categorical -- there is no voxel "40% filament 3" -- so a stamp
+    /// paints its whole disc to one slot, with a hard edge exactly at the
+    /// radius the cursor ring draws. The pattern still applies, as a stencil:
+    /// scales or cracks in a second filament are a real thing to want.
+    ///
+    /// The slot to paint is the CALLER's, passed to [`Brush::apply_paint`] the
+    /// way the mask's operation is passed to [`Brush::apply_mask`], and for
+    /// the same reason: it is state of the interface, not of the brush.
+    /// [`Brush::apply`] with this kind therefore does nothing at all -- it is
+    /// the field path, and there is no field work in a paint stroke.
+    Paint,
 }
 
 impl BrushKind {
-    pub const ALL: [BrushKind; 7] = [
+    /// Appended and never reordered: the digits index this, so `1` to `7` have
+    /// meant the same seven brushes since Move landed and must go on doing so.
+    pub const ALL: [BrushKind; 8] = [
         BrushKind::Draw,
         BrushKind::Clay,
         BrushKind::Smooth,
@@ -314,6 +351,7 @@ impl BrushKind {
         BrushKind::Pinch,
         BrushKind::Flatten,
         BrushKind::Move,
+        BrushKind::Paint,
     ];
 
     pub fn label(self) -> &'static str {
@@ -325,6 +363,7 @@ impl BrushKind {
             BrushKind::Pinch => "Pinch",
             BrushKind::Flatten => "Flatten",
             BrushKind::Move => "Move",
+            BrushKind::Paint => "Paint",
         }
     }
 
@@ -338,6 +377,9 @@ impl BrushKind {
         match self {
             // Follows the cursor essentially one to one.
             BrushKind::Move => 1.0,
+            // Not read at all -- see the variant -- so the value that cannot
+            // mislead a slider is the one that means "whole".
+            BrushKind::Paint => 1.0,
             // Smoothing at full strength erases detail in one pass.
             BrushKind::Smooth => 0.4,
             _ => 0.15,
@@ -353,6 +395,9 @@ impl BrushKind {
     /// Holding the invert key with any of the three selected does nothing,
     /// which is worth saying in the interface rather than leaving the user to
     /// wonder.
+    ///
+    /// Paint is directional: its opposite is the eraser, which writes
+    /// [`crate::colour::UNPAINTED`].
     pub fn is_directional(self) -> bool {
         !matches!(self, BrushKind::Smooth | BrushKind::Flatten | BrushKind::Move)
     }
@@ -882,6 +927,97 @@ impl Brush {
         });
     }
 
+    /// Paint a filament slot under one stamp, plus its mirrors when symmetry
+    /// is on.
+    ///
+    /// Mirrored for the reason [`Brush::apply_mask_symmetric`] gives: the
+    /// mirror toggles stay lit while this brush is live, so a paint that
+    /// ignored them would be the interface saying one thing and the tool doing
+    /// another.
+    pub fn apply_paint_symmetric(
+        &self,
+        volume: &mut Volume,
+        stamp: &Stamp,
+        slot: u8,
+        symmetry: Symmetry,
+        centre: Vec3,
+        scratch: &mut BrushScratch,
+    ) {
+        self.apply_paint(volume, stamp, slot, scratch);
+        if symmetry.is_off() {
+            return;
+        }
+        let mut twins = [*stamp; Symmetry::MAX_MIRRORS];
+        let count = symmetry.mirrors(stamp, centre, &mut twins);
+        for twin in &twins[..count] {
+            self.apply_paint(volume, twin, slot, scratch);
+        }
+    }
+
+    /// Write `slot` into every paintable voxel within the radius of one stamp.
+    ///
+    /// Reads the radius, the pattern and nothing else of the brush -- see
+    /// [`BrushKind::Paint`] for why strength, falloff and pressure have no
+    /// meaning for a categorical value -- and `slot` from the caller, which
+    /// passes [`crate::colour::UNPAINTED`] to erase.
+    ///
+    /// **The pattern is a stencil at half weight**, not a factor. A factor has
+    /// nothing to multiply here; what a pattern can do to a slot is decide
+    /// whether the voxel gets it, and the halfway line is where a
+    /// smoothly-varying weight in `0..=1` reads as "on" by the same rule the
+    /// mask's `0.30` floor draws for "there is a mask here".
+    ///
+    /// Which voxels are paintable at all is the volume's decision -- see
+    /// [`Volume::edit_colour`] -- so a stamp whose disc reaches into the solid
+    /// interior paints the shell under it and opens no brick beneath. A voxel
+    /// at least half protected by the mask is left alone; see
+    /// [`PAINT_PROTECTED`].
+    pub fn apply_paint(
+        &self,
+        volume: &mut Volume,
+        stamp: &Stamp,
+        slot: u8,
+        scratch: &mut BrushScratch,
+    ) {
+        if self.radius <= 0.0 {
+            return;
+        }
+        // Nothing is read from the region, and nothing is written to it. The
+        // parameter is kept so the four `apply_*` entry points share a shape.
+        let _ = scratch;
+
+        let voxel_size = volume.voxel_size();
+        let extent = Vec3::splat(self.radius);
+        let (lo, hi) = volume.voxel_bounds(stamp.centre - extent, stamp.centre + extent);
+
+        let pattern = if self.pattern.is_off() {
+            Prepared::OFF
+        } else {
+            self.pattern.prepare(voxel_size, stamp.normal, stamp.tangent)
+        };
+
+        let centre = stamp.centre;
+        let radius_squared = self.radius * self.radius;
+
+        volume.edit_colour(lo, hi, |_, position, held, protection| {
+            if (position - centre).length_squared() >= radius_squared {
+                return held;
+            }
+            // The mask protects against paint as it protects against every
+            // other stroke, on the same half line the pattern stencil and the
+            // masked split draw: a voxel at least half protected keeps what it
+            // has. The status line already tells the user a press here is
+            // protected, and the tool has to agree with it.
+            if protection >= PAINT_PROTECTED {
+                return held;
+            }
+            if pattern.weight(position) < PAINT_STENCIL {
+                return held;
+            }
+            slot
+        });
+    }
+
     /// Apply one stamp, plus its mirrors when symmetry is on.
     ///
     /// `centre` is the point the enabled mirror planes pass through. See
@@ -988,7 +1124,12 @@ impl Brush {
         match self.kind {
             BrushKind::Draw | BrushKind::Pinch | BrushKind::Smooth => true,
             // Move never reaches this path at all; it has its own locked copy.
-            BrushKind::Clay | BrushKind::Flatten | BrushKind::Inflate | BrushKind::Move => false,
+            // Paint never reaches it either; it has no field work.
+            BrushKind::Clay
+            | BrushKind::Flatten
+            | BrushKind::Inflate
+            | BrushKind::Move
+            | BrushKind::Paint => false,
         }
     }
 
@@ -1000,7 +1141,8 @@ impl Brush {
             | BrushKind::Clay
             | BrushKind::Smooth
             | BrushKind::Inflate
-            | BrushKind::Flatten => 0.0,
+            | BrushKind::Flatten
+            | BrushKind::Paint => 0.0,
         };
         voxels * voxel_size
     }
@@ -1040,6 +1182,9 @@ impl Brush {
             // The mean of six equal values is that value, so the blend has
             // nothing to blend toward.
             BrushKind::Smooth => true,
+            // Writes nothing to the field anywhere, so it leaves every constant
+            // alone. Never asked: `stamp` returns before the planner runs.
+            BrushKind::Paint => true,
             // Adding a constant offset lands back on the clamp it started at,
             // but only in the direction the clamp is already holding: inflating
             // outward cannot make solid interior any more solid, and carving
@@ -1093,6 +1238,11 @@ impl Brush {
             // Symmetry is OFF here, so there is nothing for a centre to be the
             // centre OF; `ZERO` is the value that cannot be wrong.
             self.drag_once(volume, stamp, Symmetry::OFF, Vec3::ZERO, scratch, skipping);
+            return;
+        }
+        // Paint has no field work, and the slot it would need is the caller's
+        // to pass to `apply_paint`. See the variant for why this is not a bug.
+        if self.kind == BrushKind::Paint {
             return;
         }
 
@@ -1346,6 +1496,12 @@ impl Brush {
                         value
                     }
 
+                    BrushKind::Paint => {
+                        // Unreachable: `stamp` returns before any of this, because
+                        // paint writes no field value. See `apply_paint`.
+                        value
+                    }
+
                     // The same shape as `Flatten` above, and the same reason.
                     BrushKind::Clay => {
                         let plane = (position - plane_point).dot(stroke_normal) / voxel_size;
@@ -1588,6 +1744,11 @@ struct Locked {
     /// False when the body carries no mask at all, so the second pass and the
     /// per voxel multiply are both skipped entirely.
     masked: bool,
+    /// The paint over the same box, snapshotted with the field, on the terms
+    /// the mask is: read from the lock so dragging out and back returns it.
+    colour: FieldRegion,
+    /// False when the body carries no paint, so the third pass is skipped.
+    painted: bool,
 }
 
 /// A Move gesture, holding the field as it stood when the button went down.
@@ -1776,6 +1937,10 @@ impl MoveStroke {
             locked.masked = !volume.mask().is_free();
             if locked.masked {
                 volume.snapshot_mask(read_lo, read_hi, &mut locked.mask);
+            }
+            locked.painted = !volume.colour().is_empty();
+            if locked.painted {
+                volume.snapshot_colour(read_lo, read_hi, &mut locked.colour);
             }
         }
     }
@@ -2004,6 +2169,35 @@ impl MoveStroke {
                         }
                     }
                 }
+            }
+
+            // **The paint travels with the material too**, by the same
+            // displacement and the same `free`, from the same lock. Nearest
+            // neighbour where the mask samples, because a slot has nothing
+            // between two values. Through `edit_colour` rather than a bare
+            // write, so only the surface the warp just produced is painted
+            // and the stroke's recorder sees the bricks it changed.
+            if locked.painted {
+                let locked_colour = &locked.colour;
+                // The live protection handed over is ignored in favour of the
+                // locked one, for the reason the mask pass reads its lock.
+                volume.edit_colour(anchor.lo, anchor.hi, |voxel, position, held, _| {
+                    let free = if masked {
+                        1.0 - (locked_mask.get(voxel) / PROTECTED as f32).clamp(0.0, 1.0)
+                    } else {
+                        1.0
+                    };
+                    if free <= 0.0 {
+                        return held;
+                    }
+                    let Some(displacement) =
+                        move_displacement(anchors, drag, position, inverse_radius, falloff, cap)
+                    else {
+                        return held;
+                    };
+                    let from = (position - displacement * free) / voxel_size;
+                    locked_colour.get(from.round().as_ivec3()) as u8
+                });
             }
         }
     }
@@ -2807,10 +3001,14 @@ mod skipping_tests {
     use crate::brick::{BRICK_DIM, BRICK_VOXELS, Brick, BrickCoord, INSIDE, OUTSIDE, brick_index};
     use crate::testing::assert_same_field;
 
-    /// Every brush, both ways round the stroke, which is the grid the claims in
-    /// [`Brush::leaves_constant_alone`] are made over.
+    /// Every FIELD brush, both ways round the stroke, which is the grid the
+    /// claims in [`Brush::leaves_constant_alone`] are made over.
+    ///
+    /// Paint is left out because it has no field path to make claims about:
+    /// `apply` with it returns before the planner runs, and `paint_tests`
+    /// proves that it moves nothing rather than this module assuming it.
     fn every_brush() -> impl Iterator<Item = (BrushKind, BrushDirection)> {
-        BrushKind::ALL.into_iter().flat_map(|kind| {
+        BrushKind::ALL.into_iter().filter(|kind| *kind != BrushKind::Paint).flat_map(|kind| {
             [BrushDirection::Add, BrushDirection::Subtract].map(move |d| (kind, d))
         })
     }
@@ -4357,6 +4555,143 @@ mod move_tests {
         );
     }
 
+    /// Paint travels with the material under a Move, as the mask does. The
+    /// voxels checked are the ones that were UNPAINTED before the drag and sit
+    /// at the surface after it, which only moved material can account for.
+    ///
+    /// At the surface and not merely in band: the field is resampled
+    /// trilinearly and the paint nearest neighbour, so at the band's outer rim
+    /// a value can land a hair inside `OUTSIDE` from a source cell that was
+    /// exactly on it and carried nothing. No mesh vertex reads a cell there --
+    /// surface nets puts vertices in the cells the zero crossing passes
+    /// through -- so it is not a claim this test makes.
+    #[test]
+    fn paint_travels_with_the_material_under_a_move() {
+        use crate::colour::ColourField;
+
+        let brush = Brush { kind: BrushKind::Move, radius: 9.0, strength: 0.8, ..Brush::default() };
+        let at = Vec3::new(24.0, 0.0, 0.0);
+        let mut volume = sphere_with_a_bump();
+        let lo = IVec3::new(12, -12, -12);
+        let hi = IVec3::new(40, 12, 12);
+        // Only the cells nearest the surface, NOT the whole band. The band is
+        // three voxels deep and the drag moves the surface about that far, so
+        // a band painted throughout would have the arrival cells painted
+        // before the gesture and the test would pass with the pass deleted --
+        // which it did, once.
+        let paint_depth = 1.5;
+        let near: Vec<IVec3> = (lo.x..=hi.x)
+            .flat_map(|x| {
+                (lo.y..=hi.y).flat_map(move |y| (lo.z..=hi.z).map(move |z| IVec3::new(x, y, z)))
+            })
+            .filter(|cell| volume.sample_voxel(*cell).abs() < paint_depth)
+            .collect();
+        volume.edit_colour(lo, hi, |cell, _, held, _| if near.contains(&cell) { 2 } else { held });
+        assert!(ColourField::paintable(volume.sample_voxel(at.as_ivec3())), "fixture");
+        // Cells that were NOT painted before, because they were deeper than
+        // the paint reached.
+        let unpainted_before: Vec<IVec3> = (lo.x..=hi.x)
+            .flat_map(|x| {
+                (lo.y..=hi.y).flat_map(move |y| (lo.z..=hi.z).map(move |z| IVec3::new(x, y, z)))
+            })
+            .filter(|cell| volume.sample_voxel(*cell).abs() >= paint_depth)
+            .collect();
+
+        let mut stroke = MoveStroke::new();
+        stroke.begin(&volume, &brush, at, Symmetry::OFF, Vec3::ZERO);
+        stroke.drag_to(&mut volume, at + Vec3::X * 8.0, 1.0);
+        stroke.end();
+
+        let mut arrived = 0;
+        for x in lo.x..=hi.x {
+            for y in -3..=3 {
+                for z in -3..=3 {
+                    let cell = IVec3::new(x, y, z);
+                    if volume.sample_voxel(cell).abs() >= 0.5 || !unpainted_before.contains(&cell) {
+                        continue;
+                    }
+                    arrived += 1;
+                    assert_eq!(
+                        volume.colour().at(cell),
+                        2,
+                        "material arrived at {cell:?} without the paint it carried"
+                    );
+                }
+            }
+        }
+        assert!(arrived > 0, "the drag moved no surface cell, so this proves nothing");
+    }
+
+    /// Under a mask the paint moves as far as the material does and no
+    /// further: a fully protected patch keeps its slot in place, and a Move
+    /// that ignored the mask on the colour pass would drag paint out from
+    /// under material that did not move.
+    #[test]
+    fn paint_under_protection_stays_put_under_a_move() {
+        let brush = Brush { kind: BrushKind::Move, radius: 9.0, strength: 0.8, ..Brush::default() };
+        let at = Vec3::new(24.0, 0.0, 0.0);
+        let mut volume = sphere_with_a_bump();
+        let lo = IVec3::new(12, -12, -12);
+        let hi = IVec3::new(40, 12, 12);
+        // Two slots side by side across the drag, so a shift is visible.
+        volume.edit_colour(lo, hi, |cell, _, _, _| if cell.x < 25 { 2 } else { 4 });
+        volume.edit_mask(lo, hi, |_, _, _| PROTECTED);
+        let before: Vec<(IVec3, u8)> = (lo.x..=hi.x)
+            .flat_map(|x| (-3..=3).flat_map(move |y| (-3..=3).map(move |z| IVec3::new(x, y, z))))
+            .map(|cell| (cell, volume.colour().at(cell)))
+            .collect();
+
+        let mut stroke = MoveStroke::new();
+        stroke.begin(&volume, &brush, at, Symmetry::OFF, Vec3::ZERO);
+        stroke.drag_to(&mut volume, at + Vec3::X * 8.0, 1.0);
+        stroke.end();
+
+        for (cell, slot) in before {
+            assert_eq!(volume.colour().at(cell), slot, "protected paint moved at {cell:?}");
+        }
+    }
+
+    /// One Move gesture on a painted body is one undo entry that carries the
+    /// colour bricks, and applying it puts every slot back. The colour pass is
+    /// the one Move pass that records at all -- the mask pass writes bare --
+    /// so this is where a future bare write would be caught.
+    #[test]
+    fn undoing_a_move_puts_the_paint_back() {
+        let brush = Brush { kind: BrushKind::Move, radius: 9.0, strength: 0.8, ..Brush::default() };
+        let at = Vec3::new(24.0, 0.0, 0.0);
+        let mut volume = sphere_with_a_bump();
+        let lo = IVec3::new(12, -12, -12);
+        let hi = IVec3::new(40, 12, 12);
+        volume.edit_colour(lo, hi, |cell, _, _, _| 1 + ((cell.x + cell.y + cell.z) & 1) as u8);
+        let before: Vec<(IVec3, u8)> = (lo.x..=hi.x)
+            .flat_map(|x| {
+                (lo.y..=hi.y).flat_map(move |y| (lo.z..=hi.z).map(move |z| IVec3::new(x, y, z)))
+            })
+            .map(|cell| (cell, volume.colour().at(cell)))
+            .collect();
+
+        volume.begin_stroke();
+        let mut stroke = MoveStroke::new();
+        stroke.begin(&volume, &brush, at, Symmetry::OFF, Vec3::ZERO);
+        stroke.drag_to(&mut volume, at + Vec3::X * 8.0, 1.0);
+        stroke.end();
+        let edit = volume.end_stroke().expect("a drag recorded nothing");
+        assert!(edit.colour_len() > 0, "the gesture recorded no colour brick");
+        assert!(
+            before.iter().any(|(cell, slot)| volume.colour().at(*cell) != *slot),
+            "nothing moved"
+        );
+
+        volume.apply_edit(edit);
+        for (cell, slot) in before {
+            assert_eq!(
+                volume.colour().at(cell),
+                slot,
+                "undo did not put the paint back at {cell:?}"
+            );
+        }
+    }
+
     /// A masked gesture ends where the drag ended, however many pointer events
     /// it took to get there.
     ///
@@ -4658,6 +4993,216 @@ mod tilt_tests {
 /// Its own module, matching the shape of `move_tests` and `skipping_tests`
 /// above -- these all run against a masked fixture, and the assertions are
 /// about a different map from the one every test in `tests` is about.
+#[cfg(test)]
+mod paint_tests {
+    use super::*;
+    use crate::colour::UNPAINTED;
+    use crate::testing::assert_same_field;
+
+    fn sphere() -> Volume {
+        let mut volume = Volume::new(1.0);
+        volume.seed_sphere(Vec3::ZERO, 24.0);
+        volume
+    }
+
+    /// A point on the surface of the seeded sphere, and its outward normal.
+    fn surface(volume: &Volume) -> (Vec3, Vec3) {
+        let point = Vec3::new(24.0, 0.0, 0.0);
+        (point, volume.gradient_world(point))
+    }
+
+    fn brush() -> Brush {
+        Brush { kind: BrushKind::Paint, radius: 6.0, ..Brush::default() }
+    }
+
+    /// Every lattice cell within `reach` of `centre` whose field is in band --
+    /// the voxels a stamp there could paint.
+    fn shell_cells(volume: &Volume, centre: Vec3, reach: f32) -> Vec<(IVec3, f32)> {
+        let (lo, hi) =
+            volume.voxel_bounds(centre - Vec3::splat(reach), centre + Vec3::splat(reach));
+        let mut cells = Vec::new();
+        for z in lo.z..=hi.z {
+            for y in lo.y..=hi.y {
+                for x in lo.x..=hi.x {
+                    let cell = IVec3::new(x, y, z);
+                    if crate::colour::ColourField::paintable(volume.sample_voxel(cell)) {
+                        let distance = volume.voxel_position(cell).distance(centre);
+                        cells.push((cell, distance));
+                    }
+                }
+            }
+        }
+        cells
+    }
+
+    /// The whole disc, to one slot, with a hard edge at the radius: inside it
+    /// every in-band voxel carries the slot and outside it none does.
+    #[test]
+    fn a_paint_stamp_fills_its_disc_and_stops_at_the_radius() {
+        let mut volume = sphere();
+        let (point, normal) = surface(&volume);
+        let brush = brush();
+        brush.apply_paint(
+            &mut volume,
+            &Stamp::new(point, normal, BrushDirection::Add),
+            3,
+            &mut BrushScratch::new(),
+        );
+
+        let cells = shell_cells(&volume, point, brush.radius * 2.0);
+        assert!(!cells.is_empty(), "the fixture found no shell to paint");
+        for (cell, distance) in cells {
+            let slot = volume.colour().at(cell);
+            if distance < brush.radius - 0.01 {
+                assert_eq!(slot, 3, "{cell} at {distance:.2} inside the radius was not painted");
+            } else if distance > brush.radius + 0.01 {
+                assert_eq!(
+                    slot, UNPAINTED,
+                    "{cell} at {distance:.2} outside the radius was painted"
+                );
+            }
+        }
+    }
+
+    /// The one property this brush rests on at this layer, in both directions:
+    /// painting moves not one field value, and the field path moves not one
+    /// slot.
+    #[test]
+    fn paint_changes_the_colour_and_not_the_field_and_apply_changes_neither() {
+        let mut painted = sphere();
+        let untouched = sphere();
+        let (point, normal) = surface(&painted);
+        let stamp = Stamp::new(point, normal, BrushDirection::Add).with_tangent(Vec3::Y);
+        let mut scratch = BrushScratch::new();
+
+        brush().apply_paint(&mut painted, &stamp, 2, &mut scratch);
+        assert_same_field(&painted, &untouched, "a paint stamp moved the field");
+        assert!(!painted.colour().is_empty(), "the stamp painted nothing");
+
+        // And the field entry point, handed the paint brush, is inert on both.
+        let mut through_apply = sphere();
+        for _ in 0..5 {
+            brush().apply(&mut through_apply, &stamp, &mut scratch);
+        }
+        assert_same_field(&through_apply, &untouched, "`apply` with Paint moved the field");
+        assert!(through_apply.colour().is_empty(), "`apply` with Paint painted something");
+    }
+
+    #[test]
+    fn painting_slot_zero_erases_exactly_what_the_disc_covers() {
+        let mut volume = sphere();
+        let (point, normal) = surface(&volume);
+        let stamp = Stamp::new(point, normal, BrushDirection::Add);
+        let mut scratch = BrushScratch::new();
+        let wide = Brush { radius: 10.0, ..brush() };
+        let narrow = Brush { radius: 4.0, ..brush() };
+        wide.apply_paint(&mut volume, &stamp, 5, &mut scratch);
+        narrow.apply_paint(&mut volume, &stamp, UNPAINTED, &mut scratch);
+
+        for (cell, distance) in shell_cells(&volume, point, wide.radius * 2.0) {
+            let slot = volume.colour().at(cell);
+            if distance < narrow.radius - 0.01 {
+                assert_eq!(slot, UNPAINTED, "{cell} under the eraser kept its paint");
+            } else if distance > narrow.radius + 0.01 && distance < wide.radius - 0.01 {
+                assert_eq!(slot, 5, "{cell} outside the eraser lost its paint");
+            }
+        }
+    }
+
+    #[test]
+    fn a_mirrored_paint_stamp_paints_the_twin() {
+        let mut volume = sphere();
+        let (point, normal) = surface(&volume);
+        let stamp = Stamp::new(point, normal, BrushDirection::Add);
+        brush().apply_paint_symmetric(
+            &mut volume,
+            &stamp,
+            4,
+            Symmetry::X,
+            Vec3::ZERO,
+            &mut BrushScratch::new(),
+        );
+        let at = |point: Vec3| volume.colour().at(volume.voxel_bounds(point, point).0);
+        assert_eq!(at(point), 4, "the stamp itself was not painted");
+        assert_eq!(at(Vec3::new(-24.0, 0.0, 0.0)), 4, "the mirror was not painted");
+        assert_eq!(at(Vec3::new(0.0, 24.0, 0.0)), UNPAINTED, "an unmirrored point was painted");
+    }
+
+    /// A protected voxel is not painted and an unprotected one beside it is,
+    /// whichever way the polarity points -- the status line says a press on
+    /// protection is protected, and this is the tool keeping that promise.
+    #[test]
+    fn a_paint_stamp_leaves_protected_voxels_alone() {
+        for inverted in [false, true] {
+            let mut volume = sphere();
+            let (point, normal) = surface(&volume);
+            let protected = IVec3::new(24, 0, 0);
+            let free = IVec3::new(24, 2, 0);
+            // `write` takes RESOLVED protection whichever way the polarity
+            // points, so the fixture writes the same two values both times.
+            volume.mask_mut().set_inverted(inverted);
+            volume.mask_mut().write(protected, PROTECTED);
+            volume.mask_mut().write(free, UNMASKED);
+            assert_eq!(volume.mask().at(protected), PROTECTED, "fixture");
+            assert_eq!(volume.mask().at(free), UNMASKED, "fixture");
+
+            brush().apply_paint(
+                &mut volume,
+                &Stamp::new(point, normal, BrushDirection::Add),
+                3,
+                &mut BrushScratch::new(),
+            );
+            assert_eq!(
+                volume.colour().at(protected),
+                UNPAINTED,
+                "inverted={inverted}: painted through the mask"
+            );
+            assert_eq!(
+                volume.colour().at(free),
+                3,
+                "inverted={inverted}: the free voxel was not painted"
+            );
+        }
+    }
+
+    /// The doc comment promises half; a threshold that drifted to 0.1 or 0.9
+    /// would still pass `a_pattern_stencils_the_paint`.
+    #[test]
+    fn the_stencil_and_the_protection_lines_are_at_half() {
+        assert_eq!(PAINT_STENCIL, 0.5);
+        assert_eq!(PAINT_PROTECTED, 128, "half of 255, rounded up, so 127 is still painted");
+    }
+
+    /// The pattern is a stencil: some of the disc is painted and some is not,
+    /// where an unpatterned stamp paints all of it.
+    #[test]
+    fn a_pattern_stencils_the_paint() {
+        let mut plain = sphere();
+        let mut patterned = sphere();
+        let (point, normal) = surface(&plain);
+        let stamp = Stamp::new(point, normal, BrushDirection::Add).with_tangent(Vec3::Y);
+        let mut scratch = BrushScratch::new();
+        let brush = Brush { radius: 10.0, ..brush() };
+        brush.apply_paint(&mut plain, &stamp, 1, &mut scratch);
+        let with_pattern = Brush {
+            pattern: Pattern {
+                kind: crate::pattern::PatternKind::Scales,
+                scale_mm: 3.0,
+                depth: 1.0,
+            },
+            ..brush
+        };
+        with_pattern.apply_paint(&mut patterned, &stamp, 1, &mut scratch);
+
+        let cells = shell_cells(&plain, point, brush.radius);
+        let all = cells.iter().filter(|(cell, _)| plain.colour().at(*cell) == 1).count();
+        let some = cells.iter().filter(|(cell, _)| patterned.colour().at(*cell) == 1).count();
+        assert!(all > 0);
+        assert!(some > 0, "the pattern stencilled everything out");
+        assert!(some < all, "the pattern stencilled nothing out ({some} of {all})");
+    }
+}
+
 #[cfg(test)]
 mod mask_tests {
     use super::*;

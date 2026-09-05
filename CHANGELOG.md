@@ -48,8 +48,24 @@ real hardware.
   line says which ones were skipped. The palette is kept in `filaments.conf`
   beside your printer settings and can be edited by hand.
 
-  This is the groundwork for painting a sculpt in filament slots, which is the
-  next piece and is not here yet: every triangle still prints on slot 1.
+- **Paint, in filament slots.** Brush **8** paints the surface under the
+  stroke with one of your printer's slots — pick which on the swatch row that
+  replaces the strength slider while the brush is live — and **ctrl** or
+  **alt** drag erases. What you paint is a slot NUMBER, never a colour: the
+  viewport shows it in whatever that slot's filament is today, the FILAMENT
+  panel's **show paint** hides it without changing anything, and the exported
+  3MF assigns each painted triangle to that slot, so OrcaSlicer opens it ready
+  to print in those filaments. Paint is saved with the model, undone a stroke
+  at a time, mirrored with the mirror planes, and stencilled by the surface
+  patterns. It has no strength or falloff, because a slot has no half.
+
+  Paint travels with the material: through the transform gizmo, a turn, a
+  resample, a merge, a split, a duplicate and under the Move brush. A cut
+  face is unpainted, because it is new surface; paint it if you want it in
+  another filament. The edge of a painted region is cut through the
+  triangles it crosses rather than stepping a whole triangle at a time, in
+  the viewport and in the exported file alike, so a curve painted across a
+  form comes out as a curve.
 
 ### Fixed
 

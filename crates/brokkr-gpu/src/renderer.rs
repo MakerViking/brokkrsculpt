@@ -30,17 +30,19 @@ pub const OVERLAY_DEPTH_FORMAT: wgpu::TextureFormat = DEPTH_FORMAT;
 /// The layout has to match the `Uniforms` struct in `sculpt.wgsl` byte for
 /// byte. Uniform address space rounds a struct up to its largest member
 /// alignment, which the two matrices set to 16, and it aligns a `vec3` to 16
-/// as well. That is why the tail is four scalars on both sides rather than a
-/// vector: a `vec3<u32>` there would make the shader struct 160 bytes against
-/// this type's 144, and wgpu rejects the mismatch only at draw time.
+/// as well. That is why the four scalars after the matrices are four scalars
+/// on both sides rather than a vector: a `vec3<u32>` there would misalign the
+/// palette that follows, and wgpu rejects the mismatch only at draw time. The
+/// palette is an array of `vec4`, 16 bytes a stride, so it adds no padding
+/// of its own; `size_of` is asserted below.
 ///
-/// **The tail is four NAMED scalars and not a `[u32; 3]` padding array**, and
-/// the naming is what makes the mask flags reachable. `mask_tint` is a float
-/// while the array was `u32`, so parking it in the array would have meant a
-/// bit-cast on both sides; worse, four construction sites hardcoded
-/// `padding: [0; 3]`, so a flag put there would have been silently zero at
-/// every one of them until all four were found. Splitting the array made that
-/// a compile error instead.
+/// **The scalars are NAMED and not a padding array**, and the naming is what
+/// makes the flags reachable. `mask_tint` is a float while the array was
+/// `u32`, so parking it in the array would have meant a bit-cast on both
+/// sides; worse, four construction sites hardcoded `padding: [0; 3]`, so a
+/// flag put there would have been silently zero at every one of them until
+/// all four were found. Splitting the array made that a compile error, and
+/// so did spending the last spare word on `paint_shown`.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Pod, Zeroable)]
 pub struct Uniforms {
@@ -82,12 +84,41 @@ pub struct Uniforms {
     /// the application's standing mask card is unconditional -- so "a mask is
     /// active and nothing on screen says so" is still unreachable.
     pub mask_tint: f32,
-    pub padding: [u32; 1],
+    /// Non zero when painted slots are drawn in their filament colours.
+    ///
+    /// A VIEW toggle on the same terms as [`Uniforms::mask_tint`]: nothing
+    /// downstream of this word can change what a stroke writes, and zero draws
+    /// every body as bare clay whatever it carries. The thumbnail pass draws
+    /// with it ON regardless of the viewport's toggle, because paint is what a
+    /// body IS where the mask is how it is being shown.
+    pub paint_shown: u32,
+    /// Linear RGB per filament slot, indexed by the stored slot byte.
+    ///
+    /// Slot 0 is never read -- unpainted is the clay. Every entry the
+    /// application has no filament for is filled with [`UNKNOWN_FILAMENT`], a
+    /// colour no filament is, so "painted with a slot this machine does not
+    /// have" is visible rather than silently the clay; a slot past the end of
+    /// this array clamps to its last entry, which is that colour unless the
+    /// machine really has fifteen heads. `vec4` and not `vec3` for the 16
+    /// byte array stride uniform address space imposes; the fourth component
+    /// is spare.
+    pub palette: [[f32; 4]; PALETTE_SLOTS],
 }
 
+/// Filament slots the shader can name, counting the unpainted zero.
+///
+/// Sixteen is what an AMS-class multi-material setup tops out at and four
+/// times what the U1 has. A slot byte can hold 255, and one past this reads as
+/// "unknown filament" rather than wrapping -- see [`Uniforms::palette`].
+pub const PALETTE_SLOTS: usize = 16;
+
+/// The colour of a slot no filament is loaded in: a magenta no palette here
+/// produces, so it reads as a warning rather than as a choice.
+pub const UNKNOWN_FILAMENT: [f32; 4] = [1.0, 0.0, 1.0, 1.0];
+
 const _: () = assert!(
-    size_of::<Uniforms>() == 144,
-    "Uniforms must stay 144 bytes to match the WGSL struct in sculpt.wgsl"
+    size_of::<Uniforms>() == 144 + 16 * PALETTE_SLOTS,
+    "Uniforms must stay in step with the WGSL struct in sculpt.wgsl"
 );
 
 impl Default for Uniforms {
@@ -102,7 +133,10 @@ impl Default for Uniforms {
             // design is arranged around is a masked surface reading as a broken
             // brush, and a defaulted-to-zero tint is exactly that.
             mask_tint: 1.0,
-            padding: [0; 1],
+            // Shown, for the same reason the tint is: a painted body that
+            // reads as bare clay is the failure, not the other way round.
+            paint_shown: 1,
+            palette: [UNKNOWN_FILAMENT; PALETTE_SLOTS],
         }
     }
 }
@@ -189,6 +223,9 @@ pub struct SculptRenderer {
     /// in the application.
     format: wgpu::TextureFormat,
     srgb_target: bool,
+    /// The palette the viewport was last given, for the thumbnail pass, which
+    /// writes its own camera and has no other way to learn the colours.
+    palette: [[f32; 4]; PALETTE_SLOTS],
 }
 
 impl SculptRenderer {
@@ -420,6 +457,7 @@ impl SculptRenderer {
             ),
             format: target_format,
             srgb_target: target_format.is_srgb(),
+            palette: Uniforms::default().palette,
         }
     }
 
@@ -525,7 +563,8 @@ impl SculptRenderer {
     /// value, here and nowhere else, so the two can never disagree about the
     /// camera. See [`SculptRenderer::opposite_uniform_buffer`] for why it is a
     /// second buffer and not an offset.
-    pub fn write_uniforms(&self, queue: &wgpu::Queue, uniforms: &Uniforms) {
+    pub fn write_uniforms(&mut self, queue: &wgpu::Queue, uniforms: &Uniforms) {
+        self.palette = uniforms.palette;
         queue.write_buffer(&self.uniform_buffer, 0, bytemuck::bytes_of(uniforms));
         let opposite =
             Uniforms { mask_inverted: u32::from(uniforms.mask_inverted == 0), ..*uniforms };
@@ -611,7 +650,7 @@ impl SculptRenderer {
             return;
         }
 
-        self.thumbnails.write_uniforms(queue, bounds, self.srgb_target);
+        self.thumbnails.write_uniforms(queue, bounds, self.srgb_target, &self.palette);
 
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("brokkr thumbnail"),
@@ -864,4 +903,25 @@ pub struct PixelRect {
     pub y: u32,
     pub width: u32,
     pub height: u32,
+}
+
+#[cfg(test)]
+mod tests {
+    /// The WGSL cannot read `PALETTE_SLOTS`, so its array length and its
+    /// clamp are literals; this reads them back out of the source so a change
+    /// on either side fails here rather than at the first slot past the end.
+    #[test]
+    fn the_shader_palette_is_sized_to_palette_slots() {
+        let shader = include_str!("shaders/sculpt.wgsl");
+        assert!(
+            shader.contains(&format!("palette: array<vec4<f32>, {}>,", super::PALETTE_SLOTS)),
+            "sculpt.wgsl's palette array is not {} long",
+            super::PALETTE_SLOTS
+        );
+        assert!(
+            shader.contains(&format!("min(in.slot, {}u)", super::PALETTE_SLOTS - 1)),
+            "sculpt.wgsl clamps the slot to something other than {}",
+            super::PALETTE_SLOTS - 1
+        );
+    }
 }

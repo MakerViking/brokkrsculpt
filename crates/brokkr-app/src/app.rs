@@ -841,6 +841,18 @@ pub struct Brokkr {
     /// tint it replaces. Revisit on the first report of a stroke that "did
     /// nothing" while the tint was off.
     show_mask: bool,
+    /// Which filament slot the paint brush writes, 1-based.
+    ///
+    /// The brush's own state lives on the application and not on
+    /// [`Brush`], the way the mask's operation does: it is what the interface
+    /// has chosen, threaded into every stamp by [`Brokkr::paint_to`].
+    paint_slot: u8,
+    /// Whether painted slots are drawn in their filament colours.
+    ///
+    /// View state: see [`brokkr_gpu::Uniforms::paint_shown`]. Nothing about it
+    /// changes what a stroke writes, and a document saved with it off carries
+    /// every slot it was painted with.
+    show_paint: bool,
     /// How strong the tint is when it is shown at all, 0..1.
     ///
     /// The shader has its own floor under this (`0.30 + 0.70 * m`), which is
@@ -2083,6 +2095,8 @@ impl Brokkr {
             // switch in the panel covers the heavy import.
             thumbnails: true,
             show_mask: true,
+            paint_slot: 1,
+            show_paint: true,
             mask_tint: DEFAULT_MASK_TINT,
             mask_peek: false,
             mask_filter: MaskFilter::Blur,
@@ -5414,12 +5428,73 @@ impl Brokkr {
         self.remesh_dirty();
     }
 
+    /// Paint the chosen filament slot along the stroke path up to the point
+    /// under the cursor.
+    ///
+    /// `mask_to`'s twin, and the same shape for the same reasons: the same
+    /// stroke walker at the same spacing, the same lazy recorder, and the
+    /// active body only. The inverted direction is the eraser, which writes
+    /// [`brokkr_core::colour::UNPAINTED`]; there is no third operation.
+    fn paint_to(&mut self, pixel: Vec2, direction: BrushDirection, start: bool) {
+        let Some(point) = self.surface_under(pixel) else {
+            return;
+        };
+        self.arm_recorder();
+
+        let started = Instant::now();
+        self.stamp_centres.clear();
+        if start {
+            self.stroke.begin(point, &mut self.stamp_centres);
+        } else {
+            let spacing = self.brush.spacing(self.doc.voxel_size());
+            self.stroke.advance(point, spacing, &mut self.stamp_centres);
+        }
+
+        let slot = match direction {
+            BrushDirection::Add => self.paint_slot,
+            BrushDirection::Subtract => brokkr_core::colour::UNPAINTED,
+        };
+        let brush = self.brush;
+        let lean = self.pen_lean();
+        let tangent = self.stroke.direction().unwrap_or(Vec3::ZERO);
+        // Pressure is sampled so the readout stays honest; the brush does not
+        // read it, because a slot has no half. See `BrushKind::Paint`.
+        let pressure = self.tablet.stamp_pressure(self.pressure_enabled, self.pressure_curve);
+
+        for index in 0..self.stamp_centres.len() {
+            let centre = self.stamp_centres[index];
+            let normal = lean_normal(self.doc.active_volume().gradient_world(centre), lean);
+            let stamp =
+                Stamp::new(centre, normal, direction).with_pressure(pressure).with_tangent(tangent);
+            brush.apply_paint_symmetric(
+                self.doc.active_volume_mut(),
+                &stamp,
+                slot,
+                self.symmetry,
+                MIRROR_CENTRE,
+                &mut self.brush_scratch,
+            );
+        }
+
+        self.perf.stamps = self.stamp_centres.len();
+        self.perf.pressure = pressure;
+        self.perf.edit_ms = started.elapsed().as_secs_f32() * 1000.0;
+        self.remesh_dirty();
+    }
+
     fn sculpt_to(&mut self, pixel: Vec2, direction: BrushDirection, start: bool) {
         // Move is handled before anything else, because it wants the pointer
         // rather than the surface under the pointer, and it must keep working
         // once the cursor has been dragged off the model.
         if self.effective_brush().kind == BrushKind::Move {
             self.move_to(pixel, start);
+            return;
+        }
+        // Paint has no field path either. `effective_brush` so that shift
+        // still smooths with the paint brush selected, as it does with every
+        // other.
+        if self.effective_brush().kind == BrushKind::Paint {
+            self.paint_to(pixel, direction, start);
             return;
         }
 
@@ -5502,8 +5577,23 @@ impl Brokkr {
     /// then has to notice a key being released while the window is unfocused,
     /// and the tool strip does not flicker between two highlights during a
     /// stroke. The selection is never touched, so there is nothing to restore.
+    ///
+    /// **Shift over the paint brush smooths at Smooth's OWN remembered
+    /// strength**, not the paint brush's. Paint's strength is a fixed 1.0 the
+    /// panel hides -- a slot has no half -- and carrying it into Smooth meant
+    /// shift-drag smoothed at 2.5x Smooth's default and above the slider's
+    /// ceiling, with no control on screen to say so. Every other brush keeps
+    /// its own strength under shift, as before.
     fn effective_brush(&self) -> Brush {
-        if self.shift { Brush { kind: BrushKind::Smooth, ..self.brush } } else { self.brush }
+        if !self.shift {
+            return self.brush;
+        }
+        let strength = if self.brush.kind == BrushKind::Paint {
+            self.strengths[Self::strength_slot(BrushKind::Smooth)]
+        } else {
+            self.brush.strength
+        };
+        Brush { kind: BrushKind::Smooth, strength, ..self.brush }
     }
 
     /// Direction for a new stroke, honouring the invert modifier, the eraser
@@ -7756,6 +7846,12 @@ impl Brokkr {
             inverted,
             tint: if shown { self.mask_tint } else { 0.0 },
         });
+        // Published beside the mask's view for the same reason and at the same
+        // cost: a fixed array and no allocation, on the frame path.
+        self.shared.set_paint_view(crate::viewport::PaintView {
+            shown: self.show_paint,
+            palette: self.palette.shader_palette(),
+        });
     }
 
     /// Rebuild the standing mask card, cheaply enough to do it every message.
@@ -9574,6 +9670,11 @@ impl Brokkr {
                     Ok(Some(reported)) => {
                         let skipped = self.palette.sync_from_printer(&reported);
                         let loaded = reported.len() - skipped.len();
+                        // The pictures in the body list are drawn through the
+                        // palette and refresh on brick changes only, so a
+                        // painted body's thumbnail would keep the old colours
+                        // while the viewport showed the new ones.
+                        self.thumbs.stale_everything();
                         let plural = |count: usize| if count == 1 { "" } else { "s" };
                         // Saved here rather than on quit: this is the only
                         // moment the palette is known to match the machine, and
@@ -9961,6 +10062,16 @@ impl Brokkr {
             Message::CameraFramedOnActive => self.frame_active(),
             Message::MaskPeekStarted => self.mask_peek = true,
             Message::MaskPeekEnded => self.mask_peek = false,
+            // Clamped rather than trusted, for the reason the radius is: a
+            // message can arrive from anything, and a slot past the machine's
+            // heads would paint a filament that does not exist. The palette
+            // only grows in a session -- `sync_from_printer` never removes a
+            // slot -- so a chosen slot cannot be orphaned after the fact.
+            Message::PaintSlotChanged(slot) => {
+                let last = self.palette.slots.len().clamp(1, usize::from(u8::MAX)) as u8;
+                self.paint_slot = slot.clamp(1, last);
+            }
+            Message::ShowPaintToggled => self.show_paint = !self.show_paint,
             // And the verbs, which DO change protection and all of which are
             // undoable in one entry apiece.
             Message::MaskCleared => self.clear_mask(),
@@ -20846,6 +20957,214 @@ mod mask_tool_tests {
             "a press onto protected material reported: {}",
             app.status
         );
+    }
+}
+
+/// The paint brush through the application: the digit, the drag, the eraser,
+/// the undo, and what the shader is told.
+#[cfg(test)]
+mod paint_brush_tests {
+    use super::*;
+    use iced::Vector;
+
+    const SIZE: Vector = Vector { x: 800.0, y: 600.0 };
+
+    fn update(app: &mut Brokkr, message: Message) {
+        drop(app.update(message));
+    }
+
+    fn app() -> Brokkr {
+        let mut app = Brokkr::with_tablet(crate::tablet::Tablet::inert());
+        update(&mut app, Message::BrushKindChanged(BrushKind::Paint));
+        app
+    }
+
+    fn centre_of_viewport() -> Vector {
+        Vector::new(SIZE.x / 2.0, SIZE.y / 2.0)
+    }
+
+    fn press(app: &mut Brokkr, at: Vector) {
+        update(
+            app,
+            Message::Pointer(PointerEvent::Pressed {
+                button: PointerButton::Left,
+                position: at,
+                size: SIZE,
+            }),
+        );
+    }
+
+    fn drag_to(app: &mut Brokkr, at: Vector) {
+        update(app, Message::Pointer(PointerEvent::Moved { position: at, size: SIZE }));
+    }
+
+    fn release(app: &mut Brokkr) {
+        update(app, Message::Pointer(PointerEvent::Released { button: PointerButton::Left }));
+    }
+
+    /// A short drag across the middle of the model.
+    fn paint_drag(app: &mut Brokkr) {
+        let centre = centre_of_viewport();
+        press(app, centre);
+        drag_to(app, Vector::new(centre.x + 20.0, centre.y));
+        drag_to(app, Vector::new(centre.x + 40.0, centre.y));
+        release(app);
+    }
+
+    /// How many painted colour bricks the active body carries.
+    fn painted_bricks(app: &Brokkr) -> usize {
+        app.doc.active_volume().stats().colour_bricks
+    }
+
+    #[test]
+    fn a_paint_drag_paints_the_active_body_with_the_chosen_slot_and_is_undoable() {
+        let mut app = app();
+        update(&mut app, Message::PaintSlotChanged(3));
+        assert_eq!(painted_bricks(&app), 0);
+        let field_before = app.doc.active_volume().stats().dense_bricks;
+
+        paint_drag(&mut app);
+        assert!(painted_bricks(&app) > 0, "the drag painted nothing");
+        assert!(app.unsaved, "a paint stroke did not mark the document unsaved");
+        assert_eq!(
+            app.doc.active_volume().stats().dense_bricks,
+            field_before,
+            "a paint stroke changed the field's own allocation"
+        );
+        // The slot that was chosen, and not slot 1, somewhere on the body.
+        let volume = app.doc.active_volume();
+        let painted = volume.brick_coords().any(|coord| {
+            let origin = coord.origin();
+            (0..32 * 32 * 32).any(|index| {
+                let cell = origin + glam::IVec3::new(index % 32, (index / 32) % 32, index / 1024);
+                volume.colour().at(cell) == 3
+            })
+        });
+        assert!(painted, "no voxel carries slot 3");
+
+        assert!(app.history.can_undo(), "a paint stroke pushed no history entry");
+        update(&mut app, Message::Undo);
+        assert_eq!(painted_bricks(&app), 0, "undo left the paint on the body");
+        update(&mut app, Message::Redo);
+        assert!(painted_bricks(&app) > 0, "redo did not put the paint back");
+    }
+
+    #[test]
+    fn ctrl_drag_erases_the_paint() {
+        let mut app = app();
+        paint_drag(&mut app);
+        assert!(painted_bricks(&app) > 0, "the fixture painted nothing");
+
+        app.control = true;
+        for _ in 0..3 {
+            paint_drag(&mut app);
+        }
+        assert_eq!(painted_bricks(&app), 0, "the eraser left painted bricks behind");
+    }
+
+    #[test]
+    fn a_paint_drag_moves_no_field_value() {
+        let mut app = app();
+        let before: Vec<f32> = {
+            let volume = app.doc.active_volume();
+            let mut coords: Vec<_> = volume.brick_coords().collect();
+            coords.sort_by_key(|coord| (coord.0.z, coord.0.y, coord.0.x));
+            coords
+                .iter()
+                .flat_map(|coord| {
+                    let origin = coord.origin();
+                    (0..32).map(move |i| volume.sample_voxel(origin + glam::IVec3::new(i, i, i)))
+                })
+                .collect()
+        };
+        paint_drag(&mut app);
+        let after: Vec<f32> = {
+            let volume = app.doc.active_volume();
+            let mut coords: Vec<_> = volume.brick_coords().collect();
+            coords.sort_by_key(|coord| (coord.0.z, coord.0.y, coord.0.x));
+            coords
+                .iter()
+                .flat_map(|coord| {
+                    let origin = coord.origin();
+                    (0..32).map(move |i| volume.sample_voxel(origin + glam::IVec3::new(i, i, i)))
+                })
+                .collect()
+        };
+        assert_eq!(before.len(), after.len(), "a paint stroke added or removed field bricks");
+        assert!(
+            before.iter().zip(&after).all(|(a, b)| a.to_bits() == b.to_bits()),
+            "a paint stroke moved the field"
+        );
+    }
+
+    /// Shift over the paint brush smooths at Smooth's own strength, within
+    /// the slider's ceiling. Paint's 1.0 is not a sculpting strength.
+    #[test]
+    fn shift_over_the_paint_brush_smooths_at_smooths_own_strength() {
+        let mut app = app();
+        assert_eq!(app.brush.strength, 1.0, "the fixture expects paint's fixed 1.0");
+        app.shift = true;
+        let effective = app.effective_brush();
+        assert_eq!(effective.kind, BrushKind::Smooth);
+        assert!(effective.strength <= MAX_STRENGTH, "shift-smooth ran at {}", effective.strength);
+        assert_eq!(effective.strength, BrushKind::Smooth.default_strength());
+    }
+
+    /// A palette change recolours the viewport through the uniforms every
+    /// message; the thumbnails are drawn on brick changes, so they have to be
+    /// told.
+    #[test]
+    fn syncing_the_palette_marks_every_thumbnail_stale() {
+        let mut app = app();
+        paint_drag(&mut app);
+        app.thumbs.settle_now();
+        while let Some(body) = app.thumbs.next_stale() {
+            app.thumbs.requested(body);
+        }
+        assert_eq!(app.thumbs.stale_count(), 0, "the fixture should start with nothing stale");
+
+        let reported = vec![crate::printer::Filament {
+            vendor: "Different".to_string(),
+            material: "PLA".to_string(),
+            sub_type: String::new(),
+            colour: "#123456".to_string(),
+            present: true,
+        }];
+        update(&mut app, Message::PaletteSynced(Ok(Some(reported))));
+        assert!(app.thumbs.stale_count() > 0, "a palette change left the thumbnails as they were");
+    }
+
+    #[test]
+    fn the_slot_is_clamped_to_the_palette() {
+        let mut app = app();
+        let last = app.palette.slots.len() as u8;
+        update(&mut app, Message::PaintSlotChanged(0));
+        assert_eq!(app.paint_slot, 1, "slot 0 is unpainted and cannot be chosen");
+        update(&mut app, Message::PaintSlotChanged(200));
+        assert_eq!(app.paint_slot, last, "a slot past the palette was accepted");
+    }
+
+    /// The toggle reaches the shader and touches nothing else: no brick dirty,
+    /// no document change, no slot moved.
+    #[test]
+    fn the_show_paint_toggle_reaches_the_renderer_and_dirties_nothing() {
+        let mut app = app();
+        paint_drag(&mut app);
+        let bricks = painted_bricks(&app);
+        app.unsaved = false;
+        let mut dirty = Vec::new();
+        app.doc.active_volume_mut().take_dirty(&mut dirty);
+
+        assert!(app.shared.paint_view().shown, "paint should start shown");
+        update(&mut app, Message::ShowPaintToggled);
+        assert!(!app.shared.paint_view().shown, "the toggle did not reach the shared frame");
+        assert!(!app.unsaved, "a view toggle dirtied the document");
+        assert_eq!(app.doc.active_volume().dirty_count(), 0, "a view toggle dirtied bricks");
+        assert_eq!(painted_bricks(&app), bricks, "a view toggle changed the paint");
+
+        // And the palette the shader sees is the machine's, slot by slot.
+        let palette = app.shared.paint_view().palette;
+        assert_eq!(palette[1], app.palette.slots[0].swatch().into_linear());
     }
 }
 

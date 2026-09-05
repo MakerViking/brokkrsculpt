@@ -110,6 +110,7 @@ impl Volume {
         // protection over empty space is real, and a mask brick with no brick
         // under it would be left behind by a walk of `brick_coords`.
         *rotated.mask_mut() = self.mask().rotated(rotation);
+        *rotated.colour_mut() = self.colour().rotated(rotation);
         rotated.mark_everything_dirty();
         rotated
     }
@@ -120,7 +121,7 @@ mod tests {
     use super::*;
     use crate::brick::INSIDE;
     use crate::orientation::Facing;
-    use glam::Vec3;
+    use glam::{IVec3, Vec3};
 
     fn sphere(voxel_size: f32) -> Volume {
         let mut volume = Volume::new(voxel_size);
@@ -150,12 +151,47 @@ mod tests {
             .collect()
     }
 
+    /// Paint the whole shell in alternating slots by cell parity, so every
+    /// colour brick under the surface is dense and carries detail a transform
+    /// could scramble.
+    fn paint(volume: &mut Volume) {
+        let reach = IVec3::splat(60);
+        volume
+            .edit_colour(-reach, reach, |cell, _, _, _| 1 + ((cell.x + cell.y + cell.z) & 1) as u8);
+        assert!(!volume.colour().is_empty(), "the fixture painted nothing");
+    }
+
+    /// Every stored slot, in the order [`field`] uses, so the two can be
+    /// compared side by side. **Not `field`'s twin by accident**: a rotation
+    /// that carried the distances and dropped the colour passed every test in
+    /// this module until this existed.
+    fn colour(volume: &Volume) -> Vec<(BrickCoord, Vec<u8>)> {
+        let mut coords: Vec<BrickCoord> = volume.brick_coords().collect();
+        coords.sort_unstable();
+        coords
+            .into_iter()
+            .map(|coord| {
+                let origin = coord.origin();
+                let mut slots = Vec::with_capacity(BRICK_DIM * BRICK_DIM * BRICK_DIM);
+                for z in 0..BRICK_DIM as i32 {
+                    for y in 0..BRICK_DIM as i32 {
+                        for x in 0..BRICK_DIM as i32 {
+                            slots.push(volume.colour().at(origin + IVec3::new(x, y, z)));
+                        }
+                    }
+                }
+                (coord, slots)
+            })
+            .collect()
+    }
+
     #[test]
     fn four_quarter_turns_of_a_sculpt_are_bit_identical() {
         // The claim the whole module rests on, and the reason a rotation is not
         // a resample. Not "close to": the same bits, because no value was ever
-        // recomputed.
-        let source = sphere(0.5);
+        // recomputed. Painted, so the claim covers the colour too.
+        let mut source = sphere(0.5);
+        paint(&mut source);
         let quarter = AxisRotation::taking(Facing::Up, Facing::Front);
 
         let mut turned = source.rotated(quarter);
@@ -164,6 +200,7 @@ mod tests {
         }
 
         assert_eq!(field(&turned), field(&source), "four quarter turns did not come home");
+        assert_eq!(colour(&turned), colour(&source), "the paint did not come home");
     }
 
     #[test]
@@ -171,7 +208,8 @@ mod tests {
         // Stated separately from the four-turn case because this is the one the
         // user reaches for: the recovery path for a wrong click is to turn it
         // back, and it has to return the sculpt rather than something like it.
-        let source = sphere(0.5);
+        let mut source = sphere(0.5);
+        paint(&mut source);
         for from in Facing::ALL {
             for to in Facing::ALL {
                 let there = AxisRotation::taking(from, to);
@@ -182,8 +220,36 @@ mod tests {
                     field(&source),
                     "{from:?} -> {to:?} and back did not return the field"
                 );
+                assert_eq!(
+                    colour(&round_trip),
+                    colour(&source),
+                    "{from:?} -> {to:?} and back did not return the paint"
+                );
             }
         }
+    }
+
+    #[test]
+    fn a_turn_carries_the_paint_to_the_same_world_voxel() {
+        use crate::colour::UNPAINTED;
+
+        let mut volume = sphere(0.5);
+        let rotation = AxisRotation::taking(Facing::Up, Facing::Front);
+        let on_the_body = IVec3::new(3, 40, 7);
+        assert!(
+            crate::colour::ColourField::paintable(volume.sample_voxel(on_the_body)),
+            "the fixture cell must be on the shell"
+        );
+        volume.colour_mut().write(on_the_body, 3);
+
+        let turned = volume.rotated(rotation);
+
+        assert_eq!(turned.colour().at(rotation.apply_voxel(on_the_body)), 3);
+        assert_eq!(
+            turned.colour().at(on_the_body),
+            UNPAINTED,
+            "the paint did not turn with the body"
+        );
     }
 
     #[test]
