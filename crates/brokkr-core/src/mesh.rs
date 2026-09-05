@@ -23,7 +23,14 @@ const _: () = assert!(
      If BRICK_DIM changes, change ApronShape to match."
 );
 
-/// One mesh vertex. Normals are unit length.
+/// One mesh vertex.
+///
+/// Normals are unit length from surface nets. A midpoint vertex added by
+/// [`split_paint_boundaries`] carries the MEAN of its two ends' normals,
+/// which is shorter than one, so that linear interpolation across the cut
+/// pieces reproduces the uncut triangle's interpolated normal at every point
+/// and the body shades identically whether or not it is painted. Every
+/// consumer normalises: the shader per fragment, the export after summing.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Pod, Zeroable)]
 pub struct Vertex {
@@ -305,9 +312,11 @@ fn midpoint(
     *midpoints.entry(key).or_insert_with(|| {
         let (vp, vq) = (out.vertices[p], out.vertices[q]);
         let position = (Vec3::from_array(vp.position) + Vec3::from_array(vq.position)) * 0.5;
-        let normal = (Vec3::from_array(vp.normal) + Vec3::from_array(vq.normal))
-            .try_normalize()
-            .unwrap_or(Vec3::from_array(vp.normal));
+        // The MEAN, not the normalised mean: see `Vertex`. Renormalising here
+        // made the pieces interpolate a slightly different normal from the
+        // uncut triangle, and on one GPU that was a visible level of shading
+        // with paint hidden where the body has to draw as bare clay.
+        let normal = (Vec3::from_array(vp.normal) + Vec3::from_array(vq.normal)) * 0.5;
         out.vertices.push(Vertex { position: position.to_array(), normal: normal.to_array() });
         out.cells.push(key.0);
         out.partners.push(key.1);

@@ -585,12 +585,27 @@ fn a_painted_body_is_drawn_in_its_filament_where_it_is_painted_and_nowhere_else(
     );
 
     // The toggle, and nothing but the toggle: one uniform write, no upload.
+    //
+    // Within rounding rather than pixel-identical, unlike the mask's toggle
+    // test: painting CUTS the boundary triangles, so the same surface is
+    // rasterised as different triangles whose barycentric interpolation
+    // differs in the last float bits, and an 8-bit channel near a rounding
+    // boundary can move by one. The shape has to be identical, and no channel
+    // may move by more than a couple of levels; a Windows adapter caught a
+    // real level of shading here that the Linux one rounded away.
     let slots = renderer.stats();
     renderer.write_uniforms(&harness.queue, &Uniforms { paint_shown: 0, ..uniforms(distance) });
     let hidden = harness.frame(&renderer);
-    assert_eq!(
-        hidden, bare,
-        "with paint hidden a painted body must be pixel-identical to a bare one"
+    assert_eq!(mask(&hidden), mask(&bare), "hiding the paint changed the silhouette");
+    let worst = hidden
+        .iter()
+        .zip(&bare)
+        .map(|(one, other)| (i32::from(*one) - i32::from(*other)).abs())
+        .max()
+        .unwrap_or(0);
+    assert!(
+        worst <= 2,
+        "with paint hidden a painted body must draw as bare clay; a channel moved by {worst}"
     );
     assert_eq!(renderer.stats().bricks, slots.bricks, "the toggle moved pool slots");
 }
