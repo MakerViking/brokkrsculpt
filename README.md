@@ -31,7 +31,7 @@ treats it as the point of the exercise: it works in **solid material** rather
 than on a hollow surface, so the things that usually go wrong between sculpting
 and printing mostly cannot happen here.
 
-- **Seven brushes** — draw, clay, smooth, inflate, pinch, flatten and move
+- **Eight brushes** — draw, clay, smooth, inflate, pinch, flatten, move and paint, which writes a filament slot for multi-colour printing
 - **Symmetry** across any combination of the three axes
 - **Surface patterns** — scales, weave, cracks, hair and noise
 - **A plane cut** that leaves a closed, printable face

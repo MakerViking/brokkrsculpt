@@ -19,11 +19,30 @@ struct Uniforms {
     // changes what a stroke does. Zero is the `show mask` toggle switched off,
     // and it draws the body exactly as an unmasked one.
     mask_tint: f32,
-    // Separate scalars, not a vec3<u32>. A vec3 aligns to 16 bytes in uniform
-    // address space, which would push the struct to 160 bytes while the
-    // matching Rust type is 144, and wgpu rejects the bind group at draw time.
-    _pad0: u32,
+    // Non zero when painted slots are drawn in their filament colours. A VIEW
+    // toggle like the tint: zero draws every body as bare clay.
+    paint_shown: u32,
+    // Linear RGB per filament slot, indexed by the stored slot byte. Slot 0 is
+    // never read. Sixteen entries of 16 bytes, which keeps the struct's size a
+    // multiple of 16 without a padding word; the Rust type asserts the total,
+    // and `renderer::tests::the_shader_palette_is_sized_to_palette_slots`
+    // reads this literal and the clamp below out of the source, because a
+    // Rust-side change to PALETTE_SLOTS would otherwise pass validation with
+    // the shader indexing past what it was given.
+    palette: array<vec4<f32>, 16>,
 }
+
+// Luminance of the matcap's BASE clay colour in linear light, which is what a
+// painted pixel divides its shading by: `luma / MATCAP_BASE_LUMA` recovers the
+// lighting term the matcap multiplied into the clay, near enough, and the
+// filament colour is then lit the way the clay was. One fact in two places;
+// `matcap::tests::the_base_luma_the_shader_divides_by_is_the_clays` pins it.
+const MATCAP_BASE_LUMA: f32 = 0.384;
+// Filament colours are drawn a little under their full value. The lit side of
+// the matcap runs to about 1.4x BASE's luminance, so a white filament still
+// clips at the specular peak -- as white plastic does -- while the rest of the
+// lit quarter keeps its gradient rather than flattening to one value.
+const PAINT_EXPOSURE: f32 = 0.8;
 
 @group(0) @binding(0) var<uniform> uniforms: Uniforms;
 @group(0) @binding(1) var matcap_texture: texture_2d<f32>;
@@ -33,9 +52,17 @@ struct VertexOutput {
     @builtin(position) clip_position: vec4<f32>,
     @location(0) view_normal: vec3<f32>,
     // The STORED protection at this vertex's own lattice cell, 0..1. Byte 0 of
-    // the pool's attribute buffer; bytes 1 and 2 are reserved for the filament
-    // slots and are deliberately not read here.
+    // the pool's attribute buffer.
     @location(1) mask: f32,
+    // The painted filament slot at that cell, byte 1 of the attribute buffer.
+    // FLAT, never interpolated: a slot is categorical, and a triangle whose
+    // three corners disagree prints in ONE filament. Interpolating would draw
+    // a blend of two that no printer can make. On Vulkan, Metal and DX12 the
+    // flat value is the FIRST vertex's, which is the rule the 3MF export uses
+    // for the same triangle, so what is drawn is what will be printed; wgpu's
+    // GL backend takes the LAST vertex, so on that one backend a boundary
+    // triangle can draw in the other filament. One triangle wide, at most.
+    @location(2) @interpolate(flat) slot: u32,
 }
 
 @vertex
@@ -50,6 +77,8 @@ fn vertex_main(
     // correctly without an inverse transpose.
     out.view_normal = (uniforms.view * vec4<f32>(normal, 0.0)).xyz;
     out.mask = attributes.r;
+    // `Unorm8x4` hands the byte back as `n / 255`; the round undoes it exactly.
+    out.slot = u32(round(attributes.g * 255.0));
     return out;
 }
 
@@ -68,6 +97,19 @@ fn fragment_main(in: VertexOutput, @builtin(front_facing) front_facing: bool) ->
     // axis is flipped because texture row 0 is the top of the sphere.
     let uv = vec2<f32>(normal.x * 0.5 + 0.5, 0.5 - normal.y * 0.5);
     var colour = textureSample(matcap_texture, matcap_sampler, uv).rgb;
+
+    // The paint, BEFORE the mask so protection still reads on a painted
+    // surface: the clay's albedo is swapped for the filament's and the matcap's
+    // lighting kept. A slot past the palette clamps to the last entry, which
+    // the application fills with a colour no filament is.
+    if (uniforms.paint_shown != 0u && in.slot != 0u) {
+        let filament = uniforms.palette[min(in.slot, 15u)].rgb;
+        let luma = dot(colour, vec3<f32>(0.2126, 0.7152, 0.0722));
+        // Not clamped at 1: the lighting term is allowed to exceed the clay's
+        // own, or every painted pixel on the key-lit side collapses to one
+        // flat value and the form under the paint is gone.
+        colour = filament * (luma / MATCAP_BASE_LUMA) * PAINT_EXPOSURE;
+    }
 
     // The mask, as a CHROMA shift toward a cool blue the matcap cannot produce,
     // with luminance barely touched so the form stays readable underneath.

@@ -46,7 +46,7 @@
 use brokkr_core::MAX_BODIES;
 use glam::{Mat4, Vec3};
 
-use crate::renderer::Uniforms;
+use crate::renderer::{PALETTE_SLOTS, Uniforms};
 
 /// The side of one cell, in physical pixels.
 ///
@@ -462,6 +462,7 @@ impl ThumbnailAtlas {
         queue: &wgpu::Queue,
         bounds: (Vec3, Vec3),
         srgb_target: bool,
+        palette: &[[f32; 4]; PALETTE_SLOTS],
     ) {
         let (view_projection, view) = framing(bounds);
         let uniforms = Uniforms {
@@ -470,7 +471,10 @@ impl ThumbnailAtlas {
             srgb_target: u32::from(srgb_target),
             mask_inverted: 0,
             mask_tint: 0.0,
-            padding: [0; 1],
+            // Paint is document state where the mask is view state, so the
+            // list shows it whatever the viewport's toggle says.
+            paint_shown: 1,
+            palette: *palette,
         };
         queue.write_buffer(&self.uniform_buffer, 0, bytemuck::bytes_of(&uniforms));
     }

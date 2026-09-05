@@ -172,16 +172,18 @@ pub enum PanelSection {
     Pen,
     SpaceMouse,
     Detail,
+    Filament,
     Export,
 }
 
 impl PanelSection {
-    pub const ALL: [PanelSection; 6] = [
+    pub const ALL: [PanelSection; 7] = [
         PanelSection::Bodies,
         PanelSection::Pattern,
         PanelSection::Pen,
         PanelSection::SpaceMouse,
         PanelSection::Detail,
+        PanelSection::Filament,
         PanelSection::Export,
     ];
 
@@ -192,6 +194,7 @@ impl PanelSection {
             PanelSection::Pen => "PEN",
             PanelSection::SpaceMouse => "SPACEMOUSE",
             PanelSection::Detail => "DETAIL",
+            PanelSection::Filament => "FILAMENT",
             PanelSection::Export => "EXPORT",
         }
     }
@@ -204,8 +207,19 @@ impl PanelSection {
     /// heading reachable, and the handoff already reports DETAIL's advice line
     /// clipped below the fold at that height -- so it was the block already
     /// costing more than it showed.
+    ///
+    /// FILAMENT is the seventh, and starts closed for the same reason: it is
+    /// four rows plus a button, it sits directly above EXPORT which must stay
+    /// reachable, and it is read at the moment somebody exports rather than
+    /// while they sculpt.
     pub fn open_by_default(self) -> bool {
-        !matches!(self, PanelSection::Pen | PanelSection::SpaceMouse | PanelSection::Detail)
+        !matches!(
+            self,
+            PanelSection::Pen
+                | PanelSection::SpaceMouse
+                | PanelSection::Detail
+                | PanelSection::Filament
+        )
     }
 }
 
@@ -262,6 +276,11 @@ pub enum Message {
     PrinterChecked,
     /// What it said.
     PrinterAnswered(Result<String, String>),
+    /// Ask the printer which filament is loaded, and take it into the palette.
+    PaletteSyncRequested,
+    /// What it said. `Ok(None)` is a printer that does not report filament,
+    /// which is a different thing from one that could not be reached.
+    PaletteSynced(Result<Option<Vec<crate::printer::Filament>>, String>),
 
     /// Open the bug report dialog.
     BugReportOpened,
@@ -676,6 +695,15 @@ pub enum Message {
     /// key repeats while it is held, and a toggle would strobe.
     MaskPeekStarted,
     MaskPeekEnded,
+    /// Which filament slot the paint brush writes, 1-based. Clamped to the
+    /// palette on arrival.
+    PaintSlotChanged(u8),
+    /// Draw painted slots in their filament colours, or as bare clay.
+    ///
+    /// View state on the mask toggle's terms: it changes no slot, dirties no
+    /// brick and does not dirty the document. See
+    /// [`brokkr_gpu::Uniforms::paint_shown`].
+    ShowPaintToggled,
     /// Put the camera back on the active body, keeping the angles.
     ///
     /// The recovery half of a free camera. A camera that can go anywhere can

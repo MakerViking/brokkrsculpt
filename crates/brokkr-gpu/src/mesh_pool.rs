@@ -38,13 +38,13 @@ pub const INDEX_CAPACITY: u64 = 66_000_000;
 
 /// Bytes of per-vertex attributes, in the pool's THIRD buffer.
 ///
-/// **Four, and it is one byte of mask plus three that are not spent yet.**
-/// `Unorm8x4` is the narrowest format that fits: a vertex buffer's
+/// **Four: one byte of mask, one of painted filament slot, two not spent
+/// yet.** `Unorm8x4` is the narrowest format that fits: a vertex buffer's
 /// `array_stride` must be a multiple of 4 and wgpu rejects anything else at
 /// pipeline creation, so a one-byte attribute would cost the same four bytes
-/// with nothing to show for it. Byte 0 is the mask, byte 1 is reserved for the
-/// painted filament slot and byte 2 for the imported one, byte 3 spare -- which
-/// is why colour, when it lands, costs the pool no capacity at all.
+/// with nothing to show for it. Byte 0 is the mask, byte 1 the painted slot,
+/// byte 2 reserved for an imported slot, byte 3 spare -- which is why paint
+/// cost the pool no capacity at all when it landed.
 ///
 /// A buffer of its own rather than three more bytes on [`Vertex`], so `Vertex`
 /// stays 24 bytes and [`VERTEX_CAPACITY`] does not move. 11,000,000 x 4 =
@@ -703,10 +703,23 @@ impl MeshPool {
             "one mask byte per vertex, or the tail of this brick reads the previous tenant's \
              attributes"
         );
+        debug_assert!(
+            mesh.colour.is_empty() || mesh.colour.len() == mesh.vertices.len(),
+            "colour must be one byte per vertex or absent entirely"
+        );
         // Widened into the kept buffer before anything else is borrowed, so
         // that the three writes below can share `&self`. See `staging`.
         self.staging.clear();
-        self.staging.extend(mesh.mask.iter().map(|byte| [*byte, 0, 0, 0]));
+        // Byte 0 the mask, byte 1 the painted slot -- the layout `ATTRIBUTE_BYTES`
+        // reserved. Zipped rather than a second pass: `upload` runs inside
+        // `prepare` on the frame path, and `staging` is a kept buffer precisely
+        // so this allocates nothing.
+        self.staging.extend(
+            mesh.mask
+                .iter()
+                .zip(mesh.colour.iter().chain(std::iter::repeat(&0)))
+                .map(|(mask, slot)| [*mask, *slot, 0, 0]),
+        );
 
         let pair = &self.buffers[slot.vertices.buffer as usize];
         queue.write_buffer(
@@ -1323,7 +1336,9 @@ mod tests {
             vertices: vec![Vertex { position: [0.0; 3], normal: [0.0, 1.0, 0.0] }; vertices],
             indices: (0..indices as u32).map(|index| index % vertices.max(1) as u32).collect(),
             cells: Vec::new(),
+            partners: Vec::new(),
             mask: vec![0; vertices],
+            colour: vec![0; vertices],
         }
     }
 

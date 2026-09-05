@@ -11,6 +11,7 @@ use crate::brick::{
     APRON_VOXELS, BRICK_DIM, BRICK_VOXELS, Brick, BrickCoord, INSIDE, NARROW_BAND, OUTSIDE,
     StoredBrick, apron_index, brick_index,
 };
+use crate::colour::{ColourBrick, ColourEdit, ColourField};
 use crate::mask::{MaskBrick, MaskEdit, MaskField, MaskSlab, PROTECTED, UNMASKED};
 use crate::mesh::{BrickMesh, MeshScratch, mesh_apron};
 use crate::region::FieldRegion;
@@ -44,7 +45,18 @@ pub struct VolumeStats {
     pub mask_dense_bricks: usize,
     /// Bytes of mask data, excluding the map that indexes it.
     pub mask_bytes: usize,
-    /// Bytes of voxel data, mask data, and the maps that index them.
+    /// Colour bricks, of which [`VolumeStats::colour_dense_bricks`] carry an
+    /// array.
+    ///
+    /// Counted apart from the field's bricks for the same reason the mask's
+    /// are: the two censuses do not cover the same coordinates.
+    pub colour_bricks: usize,
+    /// Colour bricks holding a full byte array, at 32,768 bytes each.
+    pub colour_dense_bricks: usize,
+    /// Bytes of painted-slot data, excluding the map that indexes it.
+    pub colour_bytes: usize,
+    /// Bytes of voxel data, mask data, colour data, and the maps that index
+    /// them.
     pub resident_bytes: usize,
 }
 
@@ -437,9 +449,15 @@ pub struct Volume {
     /// and vice versa, and `apply_edit` would then remove field bricks a mask
     /// stroke never touched.
     mask_recorder: Option<FxHashMap<BrickCoord, Option<MaskBrick>>>,
+    /// And a third, for the colour, on the terms the second sets out.
+    colour_recorder: Option<FxHashMap<BrickCoord, Option<ColourBrick>>>,
     /// The mask's polarity when the current stroke opened, once something in
     /// the stroke has changed it. See [`crate::undo::StrokeEdit`].
     mask_polarity: Option<bool>,
+    /// The painted filament slot per voxel. Beside the mask and inside the
+    /// volume for exactly the reasons [`crate::colour`] gives, which are the
+    /// mask's three plus the undo arithmetic that decided it.
+    colour: ColourField,
     scratch: EditScratch,
 }
 
@@ -458,7 +476,9 @@ impl Volume {
             dirty: FxHashSet::default(),
             recorder: None,
             mask_recorder: None,
+            colour_recorder: None,
             mask_polarity: None,
+            colour: ColourField::default(),
             scratch: EditScratch::default(),
         }
     }
@@ -491,6 +511,17 @@ impl Volume {
     #[inline]
     pub fn mask_mut(&mut self) -> &mut MaskField {
         &mut self.mask
+    }
+
+    /// The painted slots of this body.
+    #[inline]
+    pub fn colour(&self) -> &ColourField {
+        &self.colour
+    }
+
+    #[inline]
+    pub fn colour_mut(&mut self) -> &mut ColourField {
+        &mut self.colour
     }
 
     /// Swap a whole mask onto this body and hand back the one that was there.
@@ -558,7 +589,7 @@ impl Volume {
     pub fn flip_mask_polarity(&mut self) -> StrokeEdit {
         let was = self.mask.inverted();
         self.mask.set_inverted(!was);
-        StrokeEdit::from_parts(Vec::new(), Vec::new(), Some(was))
+        StrokeEdit::from_parts(Vec::new(), Vec::new(), Vec::new(), Some(was))
     }
 
     /// Mark every brick a mask holds an entry for, and their neighbours.
@@ -664,6 +695,10 @@ impl Volume {
         // unmasked would have no undo and nothing on screen to say so: the
         // duplicate looks right, and the protection the user painted is gone.
         copy.mask = self.mask.translated(offset_bricks);
+        // And the paint, for the same reason with a sharper consequence: a
+        // duplicate that arrived unpainted would print in one filament, and
+        // nothing on screen but the paint itself says so.
+        copy.colour = self.colour.translated(offset_bricks);
         // A stroke in progress is NOT carried over. `recorder` holds the prior
         // contents of the bricks this volume's own gesture touched, and those
         // name an undo entry that belongs to the body being copied; a copy that
@@ -829,10 +864,22 @@ impl Volume {
         }
         mesh_apron(&scratch.apron, coord, self.voxel_size, &mut scratch.surface_nets, out);
         self.mask.bytes_at_cells(coord, &out.cells, &mut out.mask);
+        // The same walk for the painted slot. An unpainted body takes the
+        // empty-map fast path inside and pays a `resize` of zeros, which is
+        // what keeps this free for someone who never paints.
+        self.colour.slots_at_cells(coord, &out.cells, &mut out.colour);
+        // After both attributes are on, because the cut reads the slots and
+        // makes the midpoints' own attributes from their ends.
+        crate::mesh::split_paint_boundaries(out);
         debug_assert_eq!(
             out.mask.len(),
             out.vertices.len(),
             "one mask byte per vertex, or the pool writes a short attribute slice"
+        );
+        debug_assert_eq!(
+            out.colour.len(),
+            out.vertices.len(),
+            "one colour byte per vertex, or the pool writes a short attribute slice"
         );
     }
 }
@@ -1576,6 +1623,7 @@ impl Volume {
         );
         self.recorder = Some(FxHashMap::default());
         self.mask_recorder = Some(FxHashMap::default());
+        self.colour_recorder = Some(FxHashMap::default());
         self.mask_polarity = None;
     }
 
@@ -1593,9 +1641,11 @@ impl Volume {
     /// them.
     pub fn end_stroke(&mut self) -> Option<StrokeEdit> {
         self.mask.collapse();
+        self.colour.collapse();
         let recorder = self.recorder.take()?;
         let masks = self.mask_recorder.take().unwrap_or_default();
-        StrokeEdit::from_recording(recorder, masks, self.mask_polarity.take())
+        let colours = self.colour_recorder.take().unwrap_or_default();
+        StrokeEdit::from_recording(recorder, masks, colours, self.mask_polarity.take())
     }
 
     /// True while a stroke is being recorded.
@@ -1656,7 +1706,7 @@ impl Volume {
     /// mask stroke and seeing the old tint stay is the same class of bug as
     /// undoing a carve and seeing the old triangles stay.
     pub fn apply_edit(&mut self, edit: StrokeEdit) -> StrokeEdit {
-        let (bricks, masks, polarity) = edit.into_parts();
+        let (bricks, masks, colours, polarity) = edit.into_parts();
         let mut inverse = Vec::with_capacity(bricks.len());
         for (coord, brick) in bricks {
             // Decoded on the way in and re-encoded on the way out. The live
@@ -1679,6 +1729,17 @@ impl Volume {
             self.mark_brick_and_neighbours_dirty(coord);
         }
 
+        // The colour half marks dirty for the reason the mask half does: the
+        // slot is a vertex attribute baked at mesh time, so a brick put back
+        // and not remeshed is a body drawn in the paint the undo just removed.
+        let mut colour_inverse = Vec::with_capacity(colours.len());
+        for (coord, brick) in colours {
+            let previous = self.colour.brick(coord).cloned();
+            self.colour.restore_brick(coord, brick);
+            colour_inverse.push((coord, previous));
+            self.mark_brick_and_neighbours_dirty(coord);
+        }
+
         let polarity = polarity.map(|was| {
             let now = self.mask.inverted();
             self.mask.set_inverted(was);
@@ -1694,7 +1755,7 @@ impl Volume {
             now
         });
 
-        StrokeEdit::from_parts(inverse, mask_inverse, polarity)
+        StrokeEdit::from_parts(inverse, mask_inverse, colour_inverse, polarity)
     }
 
     /// Mark a brick and the twenty-six around it as needing a remesh.
@@ -1765,6 +1826,86 @@ impl Volume {
         self.mark_dirty_voxel_range(lo, hi);
     }
 
+    /// Apply `edit` to the painted slot of every PAINTABLE voxel in an
+    /// inclusive voxel box.
+    ///
+    /// The colour twin of [`Volume::edit_mask`], with one thing the mask does
+    /// not need: the field decides which voxels may be painted at all. Only a
+    /// voxel inside the narrow band -- see [`ColourField::paintable`] -- is
+    /// offered to `edit`, and **a brick whose field is saturated throughout is
+    /// never opened**, which is what keeps a paint stamp from promoting the
+    /// zero-heap interior bricks under the surface it is painting. The
+    /// bounding cube of a stamp is mostly such bricks.
+    ///
+    /// `edit` receives each voxel, its world position, the slot it holds and
+    /// the RESOLVED protection at it, and returns the slot it should hold.
+    /// There is no polarity to resolve on the slot; a slot index has no
+    /// inverse. The protection is handed over rather than applied here
+    /// because the two callers want different things of it: a stamp refuses
+    /// a protected voxel, while the Move brush reads its own locked copy and
+    /// ignores the live one.
+    pub fn edit_colour(&mut self, lo: IVec3, hi: IVec3, edit: impl Fn(IVec3, Vec3, u8, u8) -> u8) {
+        let voxel_size = self.voxel_size;
+        let b_min = BrickCoord::containing(lo).0;
+        let b_max = BrickCoord::containing(hi).0;
+
+        let mut colour = std::mem::take(&mut self.colour);
+        let mask = &self.mask;
+        for bz in b_min.z..=b_max.z {
+            for by in b_min.y..=b_max.y {
+                for bx in b_min.x..=b_max.x {
+                    let coord = BrickCoord::new(bx, by, bz);
+                    let origin = coord.origin();
+                    let from = lo.max(origin);
+                    let to = hi.min(coord.max_voxel());
+                    if from.cmpgt(to).any() {
+                        continue;
+                    }
+                    // Resolved once per brick, like the slab: protection is
+                    // read by brick index inside the closure below.
+                    let protection = mask.slab(coord);
+                    let edit = |voxel: IVec3, position: Vec3, held: u8| {
+                        let local = voxel - origin;
+                        let byte = protection.byte_at(brick_index(
+                            local.x as usize,
+                            local.y as usize,
+                            local.z as usize,
+                        ));
+                        edit(voxel, position, held, mask.resolve(byte))
+                    };
+                    // Resolved once per brick: a saturated tile -- and an absent
+                    // brick reads as one -- has no paintable voxel, and a
+                    // uniform mid-band tile has nothing but.
+                    let outcome = match self.bricks.get(&coord) {
+                        None => continue,
+                        Some(Brick::Uniform(value)) => {
+                            if !ColourField::paintable(*value) {
+                                continue;
+                            }
+                            colour.edit_brick(coord, from, to, voxel_size, &|_| true, &edit)
+                        }
+                        Some(Brick::Dense(values)) => colour.edit_brick(
+                            coord,
+                            from,
+                            to,
+                            voxel_size,
+                            &|index| ColourField::paintable(values[index]),
+                            &edit,
+                        ),
+                    };
+                    let ColourEdit::Changed(prior) = outcome else {
+                        continue;
+                    };
+                    if let Some(recorder) = self.colour_recorder.as_mut() {
+                        recorder.entry(coord).or_insert(prior);
+                    }
+                }
+            }
+        }
+        self.colour = colour;
+        self.mark_dirty_voxel_range(lo, hi);
+    }
+
     /// Copy the resolved protection over a box into a region, as `0..=255`
     /// floats.
     ///
@@ -1820,6 +1961,149 @@ impl Volume {
                                         mask.resolve(byte) as f32
                                     }
                                 };
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Take `source`'s paint, keeping only the slots under this field's own
+    /// band.
+    ///
+    /// The colour half of a split: each half is built from the source's bricks
+    /// with the other half's material written out to `OUTSIDE` per voxel, so
+    /// copying colour bricks whole would hand each half the other's paint
+    /// under voxels it holds nothing at -- invisible to the mesh, but real to
+    /// a later merge, which would write that stale copy over fresh paint.
+    /// Per voxel here, against this field, so the split's rule "no voxel in
+    /// both halves" holds for the paint as it does for the material.
+    pub(crate) fn adopt_paint(&mut self, source: &ColourField) {
+        let mut colour = ColourField::default();
+        for (coord, brick) in &self.bricks {
+            let Some(theirs) = source.brick(*coord) else {
+                continue;
+            };
+            // A saturated tile has no surface in it; a mid-band tile is a
+            // flat patch of surface throughout.
+            if let Brick::Uniform(value) = brick
+                && !ColourField::paintable(*value)
+            {
+                continue;
+            }
+            let origin = coord.origin();
+            let mut mine = theirs.clone();
+            let data = mine.make_dense();
+            for (index, slot) in data.iter_mut().enumerate() {
+                if *slot == crate::colour::UNPAINTED {
+                    continue;
+                }
+                let local = IVec3::new(
+                    (index % BRICK_DIM) as i32,
+                    ((index / BRICK_DIM) % BRICK_DIM) as i32,
+                    (index / (BRICK_DIM * BRICK_DIM)) as i32,
+                );
+                if !self.has_material_at(origin + local) {
+                    *slot = crate::colour::UNPAINTED;
+                }
+            }
+            colour.insert(*coord, mine);
+        }
+        colour.collapse();
+        self.colour = colour;
+    }
+
+    /// Whether a slot at `cell` is on THIS body's surface: the cell is in
+    /// band and one of the 27 cells around it is solid.
+    ///
+    /// The rule the mesher reads by, near enough: a vertex sits in a cell the
+    /// zero crossing passes through, which has a solid corner within one step.
+    /// "In band" alone is not it -- the outer band of a neighbouring body, or
+    /// of material a cut removed, is in band with nothing solid anywhere near,
+    /// and paint left there is not this body's.
+    pub(crate) fn has_material_at(&self, cell: IVec3) -> bool {
+        if !ColourField::paintable(self.sample_voxel(cell)) {
+            return false;
+        }
+        for dz in -1..=1 {
+            for dy in -1..=1 {
+                for dx in -1..=1 {
+                    if self.sample_voxel(cell + IVec3::new(dx, dy, dz)) < 0.0 {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
+    }
+
+    /// Take `other`'s paint where `other` has material at the surface,
+    /// recording the bricks it overwrites so the open stroke can put them
+    /// back. See [`Volume::has_material_at`].
+    ///
+    /// The colour half of [`Volume::union_from`]. Marked dirty per brick that
+    /// changed, because a slot can change under a voxel whose distance the
+    /// field's own `min` left exactly where it was.
+    pub(crate) fn union_colour_from(&mut self, other: &Volume) {
+        let recorder = &mut self.colour_recorder;
+        let changed = self.colour.union_from(
+            other.colour(),
+            |coord, index| {
+                let local = IVec3::new(
+                    (index % BRICK_DIM) as i32,
+                    ((index / BRICK_DIM) % BRICK_DIM) as i32,
+                    (index / (BRICK_DIM * BRICK_DIM)) as i32,
+                );
+                other.has_material_at(coord.origin() + local)
+            },
+            |coord, prior| {
+                if let Some(recorder) = recorder.as_mut() {
+                    recorder.entry(coord).or_insert(prior);
+                }
+            },
+        );
+        for coord in changed {
+            self.mark_brick_and_neighbours_dirty(coord);
+        }
+    }
+
+    /// Copy the painted slots over a box into a region, as floats.
+    ///
+    /// [`Volume::snapshot_mask`]'s twin, for the Move brush's lock: a slot is
+    /// a small exact integer, so an `f32` holds it bit for bit and the region's
+    /// clamped `get` is the nearest-neighbour read the warp wants. Grown by
+    /// one voxel on every side by [`Volume::snapshot`]'s own rule.
+    pub fn snapshot_colour(&self, lo: IVec3, hi: IVec3, region: &mut FieldRegion) {
+        let lo = lo - IVec3::ONE;
+        let hi = hi + IVec3::ONE;
+        let size = hi - lo + IVec3::ONE;
+        let values = region.resize(lo, hi);
+
+        let b_min = BrickCoord::containing(lo).0;
+        let b_max = BrickCoord::containing(hi).0;
+        for bz in b_min.z..=b_max.z {
+            for by in b_min.y..=b_max.y {
+                for bx in b_min.x..=b_max.x {
+                    let coord = BrickCoord::new(bx, by, bz);
+                    let slab = self.colour.slab(coord);
+                    let origin = coord.origin();
+                    let from = lo.max(origin);
+                    let to = hi.min(coord.max_voxel());
+                    if from.cmpgt(to).any() {
+                        continue;
+                    }
+                    for z in from.z..=to.z {
+                        for y in from.y..=to.y {
+                            for x in from.x..=to.x {
+                                let index =
+                                    (x - lo.x) + (y - lo.y) * size.x + (z - lo.z) * size.x * size.y;
+                                let local = IVec3::new(x, y, z) - origin;
+                                values[index as usize] = f32::from(slab.slot_at(brick_index(
+                                    local.x as usize,
+                                    local.y as usize,
+                                    local.z as usize,
+                                )));
                             }
                         }
                     }
@@ -1943,6 +2227,10 @@ impl Volume {
         // a generated mask writes a value at every surface voxel -- leaving it
         // out under-reports by up to 25% at the moment the document is largest.
         self.mask.add_to_stats(&mut stats);
+        // And the colour, on the same basis and for the same reason. Missing
+        // this is how the growth guard, the debug overlay and every bug report
+        // come to under-report a painted document by up to 25%.
+        self.colour.add_to_stats(&mut stats);
         stats
     }
 
@@ -3183,5 +3471,165 @@ mod tests {
         let mut copy = source.duplicated(IVec3::ZERO);
         assert!(!copy.is_recording(), "the copy inherited the original's recording");
         assert!(copy.end_stroke().is_none(), "the copy handed back an edit it never made");
+    }
+
+    // ------------------------------------------------------------- colour
+
+    /// Paint everything inside a box, which is what a stamp does after its
+    /// radius test.
+    fn paint_box(volume: &mut Volume, lo: IVec3, hi: IVec3, slot: u8) {
+        volume.edit_colour(lo, hi, |_, _, _, _| slot);
+    }
+
+    /// A paint stamp's box is mostly saturated bricks, and not one of them may
+    /// become an allocation. The mask has no such rule -- protection over empty
+    /// space is a thing -- so this is the one property of the colour path that
+    /// its twin does not already prove.
+    #[test]
+    fn painting_through_a_sphere_allocates_only_where_the_field_is_in_band() {
+        let mut volume = Volume::new(1.0);
+        volume.seed_sphere(Vec3::ZERO, 60.0);
+        let before = volume.stats();
+
+        let reach = IVec3::splat(70);
+        paint_box(&mut volume, -reach, reach, 2);
+        let after = volume.stats();
+
+        assert!(after.colour_bricks > 0, "nothing was painted at all");
+        assert_eq!(
+            after.colour_dense_bricks, before.dense_bricks,
+            "a colour brick was opened where the field brick is a saturated tile, or a shell \
+             brick was missed"
+        );
+        // And the interior really is unpainted, not merely unallocated -- in a
+        // DENSE field brick, where only the per-voxel predicate stands between
+        // the stamp and a saturated cell. `IVec3::ZERO` sits in a uniform
+        // tile the brick-level skip answers for, and probing it alone let a
+        // predicate of `true` pass the whole suite.
+        let deep = IVec3::new(55, 0, 0);
+        assert!(
+            matches!(volume.brick(BrickCoord::containing(deep)), Some(Brick::Dense(_))),
+            "the probe must sit in a dense field brick"
+        );
+        assert!(
+            !ColourField::paintable(volume.sample_voxel(deep)),
+            "the probe must be out of band"
+        );
+        assert_eq!(
+            volume.colour().at(deep),
+            crate::colour::UNPAINTED,
+            "an interior voxel of a dense brick got painted"
+        );
+        assert_eq!(volume.colour().at(IVec3::ZERO), crate::colour::UNPAINTED);
+        assert_eq!(volume.colour().at(IVec3::new(60, 0, 0)), 2, "the surface was not painted");
+    }
+
+    /// The slot is a vertex attribute baked at mesh time, so a paint edit that
+    /// told the mesher nothing would leave the body drawn in its old paint.
+    #[test]
+    fn a_paint_edit_marks_its_box_dirty() {
+        let mut volume = Volume::new(1.0);
+        volume.seed_sphere(Vec3::ZERO, 24.0);
+        let mut dirty = Vec::new();
+        volume.take_dirty(&mut dirty);
+        paint_box(&mut volume, IVec3::new(22, -2, -2), IVec3::new(26, 2, 2), 1);
+        assert!(volume.dirty_count() > 0, "the paint edit marked nothing for remesh");
+    }
+
+    /// A protected voxel is handed to the edit with its resolved protection,
+    /// both polarities, so a caller can refuse it.
+    #[test]
+    fn edit_colour_hands_over_the_resolved_protection() {
+        let mut volume = Volume::new(1.0);
+        volume.seed_sphere(Vec3::ZERO, 24.0);
+        let cell = IVec3::new(24, 0, 0);
+        volume.mask_mut().write(cell, PROTECTED);
+        let seen = std::cell::RefCell::new(Vec::new());
+        volume.edit_colour(cell, cell, |_, _, held, protection| {
+            seen.borrow_mut().push(protection);
+            held
+        });
+        assert_eq!(*seen.borrow(), vec![PROTECTED]);
+        volume.mask_mut().set_inverted(true);
+        volume.edit_colour(cell, cell, |_, _, held, protection| {
+            seen.borrow_mut().push(protection);
+            held
+        });
+        assert_eq!(*seen.borrow(), vec![PROTECTED, crate::UNMASKED], "polarity not applied");
+    }
+
+    #[test]
+    fn a_paint_stroke_records_colour_bricks_and_no_field_bricks() {
+        let mut volume = Volume::new(1.0);
+        volume.seed_sphere(Vec3::ZERO, 24.0);
+        volume.begin_stroke();
+        paint_box(&mut volume, IVec3::new(20, -4, -4), IVec3::new(28, 4, 4), 1);
+        let edit = volume.end_stroke().expect("painting recorded nothing");
+        assert_eq!(edit.len(), 0, "a paint stroke recorded field bricks");
+        assert_eq!(edit.mask_len(), 0, "a paint stroke recorded mask bricks");
+        assert!(edit.colour_len() > 0, "a paint stroke recorded no colour bricks");
+    }
+
+    /// Undo puts the paint back bit for bit and marks the bricks dirty, for the
+    /// reason the mask's own version of this test gives: the slot is baked into
+    /// a vertex attribute, so a brick put back and not remeshed is still drawn
+    /// in the undone paint.
+    #[test]
+    fn undoing_a_paint_stroke_restores_the_slots_and_dirties_the_bricks() {
+        let mut volume = Volume::new(1.0);
+        volume.seed_sphere(Vec3::ZERO, 24.0);
+        let cell = IVec3::new(24, 0, 0);
+        volume.mark_everything_dirty();
+        let mut dirty = Vec::new();
+        volume.take_dirty(&mut dirty);
+
+        volume.begin_stroke();
+        paint_box(&mut volume, cell - IVec3::splat(2), cell + IVec3::splat(2), 5);
+        let edit = volume.end_stroke().expect("painting recorded nothing");
+        volume.take_dirty(&mut dirty);
+        assert_eq!(volume.colour().at(cell), 5);
+
+        let redo = volume.apply_edit(edit);
+        assert_eq!(volume.colour().at(cell), crate::colour::UNPAINTED, "undo left the paint");
+        assert!(volume.colour().is_empty(), "undo left an entry for a brick that had none");
+        assert!(volume.dirty_count() > 0, "undo restored the slots and told the mesher nothing");
+
+        volume.take_dirty(&mut dirty);
+        volume.apply_edit(redo);
+        assert_eq!(volume.colour().at(cell), 5, "redo did not put the paint back");
+        assert!(volume.dirty_count() > 0, "redo told the mesher nothing");
+    }
+
+    #[test]
+    fn a_stroke_end_collapses_a_brick_painted_one_slot_throughout() {
+        let mut volume = Volume::new(1.0);
+        // A flat slab so one brick's every in-band voxel is paintable, and
+        // painted the same, without a sphere's curvature leaving some out.
+        let coord = BrickCoord::containing(IVec3::ZERO);
+        volume.insert_brick(coord, Brick::Uniform(0.0));
+        volume.begin_stroke();
+        paint_box(&mut volume, coord.origin(), coord.max_voxel(), 3);
+        let mid_stroke = volume.stats();
+        assert_eq!(mid_stroke.colour_dense_bricks, 1, "the stamp should write a dense brick");
+        volume.end_stroke();
+        let after = volume.stats();
+        assert_eq!(after.colour_bricks, 1);
+        assert_eq!(after.colour_dense_bricks, 0, "a one-slot brick kept its 32 KB past the stroke");
+    }
+
+    #[test]
+    fn a_copy_carries_the_paint_to_the_same_world_point() {
+        let mut source = Volume::new(0.5);
+        source.seed_sphere(Vec3::ZERO, 20.0);
+        let cell = IVec3::new(3, 4, 5);
+        source.colour_mut().write(cell, 4);
+
+        let offset = IVec3::new(2, 0, 0);
+        let copy = source.duplicated(offset);
+        let moved = cell + offset * BRICK_DIM as i32;
+
+        assert_eq!(copy.colour().at(moved), 4, "the copy lost the paint");
+        assert_eq!(copy.colour().at(cell), crate::colour::UNPAINTED, "the paint did not move");
+        assert_eq!(source.colour().at(cell), 4, "the original's paint moved");
     }
 }

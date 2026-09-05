@@ -175,6 +175,7 @@ impl Volume {
         // brick with no field brick under it would be left behind by a walk of
         // `brick_coords`.
         *shifted.mask_mut() = self.mask().shifted(offset_voxels);
+        *shifted.colour_mut() = self.colour().shifted(offset_voxels);
         shifted.mark_everything_dirty();
         shifted
     }
@@ -205,6 +206,7 @@ impl Volume {
         // same reason: a mask can protect empty space, so a body with no bricks
         // at all can still have one to carry.
         *warped.mask_mut() = self.mask().warped(by, voxel_size);
+        *warped.colour_mut() = self.colour().warped(by, voxel_size);
         let Some((world_min, world_max)) = self.world_bounds() else {
             return warped;
         };
@@ -511,6 +513,22 @@ mod tests {
         assert_eq!(shifted.mask().at(on_the_body + offset), PROTECTED);
         assert_eq!(shifted.mask().at(in_empty_space + offset), 200);
         assert_eq!(shifted.mask().at(on_the_body), UNMASKED, "the mask did not move with the body");
+    }
+
+    #[test]
+    fn a_shift_carries_the_paint_to_the_same_world_voxel() {
+        use crate::colour::UNPAINTED;
+
+        let mut volume = sphere(0.5);
+        let on_the_body = IVec3::new(3, 40, 7);
+        volume.colour_mut().write(on_the_body, 4);
+
+        // Sub-brick, so the gather path runs rather than the whole-brick move.
+        let offset = IVec3::new(5, -3, 9);
+        let shifted = volume.shifted(offset);
+
+        assert_eq!(shifted.colour().at(on_the_body + offset), 4);
+        assert_eq!(shifted.colour().at(on_the_body), UNPAINTED, "the paint did not move");
     }
 
     /// Mask All is a polarity bit over an EMPTY brick map, so for that state the
@@ -843,6 +861,61 @@ mod tests {
             PROTECTED,
             "the protection did not travel with the body"
         );
+    }
+
+    #[test]
+    fn a_warp_carries_the_paint_to_where_the_body_went() {
+        let mut volume = sphere(0.5);
+        let cell = IVec3::new(0, 40, 0);
+        volume.colour_mut().write(cell, 2);
+
+        let placement = Similarity::moving(Vec3::new(6.0, 0.0, 0.0));
+        let warped = volume.warped(placement);
+
+        let moved = placement.transform_point(cell.as_vec3() * 0.5) / 0.5;
+        assert_eq!(
+            warped.colour().at(moved.round().as_ivec3()),
+            2,
+            "the paint did not travel with the body"
+        );
+    }
+
+    /// Rotation and scale through the warp, not only translation: a warp that
+    /// read only `by.translation` passed the test above.
+    ///
+    /// Checked against the continuous map and not against `rotated`: the
+    /// exact lattice turn pivots on a voxel corner where the similarity pivots
+    /// on the origin point, so the two land one cell apart on the flipped
+    /// axis, which the field test tolerates in its 0.3 and a slot cannot.
+    #[test]
+    fn a_warped_turn_and_a_warped_scale_carry_the_paint_where_the_material_goes() {
+        use crate::colour::UNPAINTED;
+
+        // Off axis, so a turn that did nothing would be caught.
+        let mut volume = Volume::new(0.5);
+        volume.seed_sphere(Vec3::new(0.0, 30.0, 0.0), 8.0);
+        let cell = IVec3::new(0, 76, 0); // on the shell, at y = 38 mm
+        assert!(crate::colour::ColourField::paintable(volume.sample_voxel(cell)), "fixture");
+        volume.colour_mut().write(cell, 3);
+        let image =
+            |by: Similarity| (by.transform_point(cell.as_vec3() * 0.5) / 0.5).round().as_ivec3();
+
+        let turn = Similarity::about(
+            Vec3::ZERO,
+            Quat::from_rotation_x(std::f32::consts::FRAC_PI_2),
+            Vec3::ONE,
+            Vec3::ZERO,
+        );
+        let turned = volume.warped(turn);
+        assert_ne!(image(turn), cell, "the fixture turn must move the cell");
+        assert_eq!(turned.colour().at(image(turn)), 3, "the warp did not turn the paint");
+        assert_eq!(turned.colour().at(cell), UNPAINTED, "the paint stayed where it was");
+
+        let grow = Similarity::about(Vec3::ZERO, Quat::IDENTITY, Vec3::splat(2.0), Vec3::ZERO);
+        let scaled = volume.warped(grow);
+        assert_eq!(image(grow), cell * 2);
+        assert_eq!(scaled.colour().at(cell * 2), 3, "the scale did not carry the paint outward");
+        assert_eq!(scaled.colour().at(cell), UNPAINTED);
     }
 
     #[test]

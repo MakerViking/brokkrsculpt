@@ -91,6 +91,7 @@ impl Volume {
         // space -- that is what stops Draw growing material there -- so a body
         // with no bricks at all can still have one to carry.
         *resampled.mask_mut() = self.mask().resampled(self.voxel_size(), voxel_size);
+        *resampled.colour_mut() = self.colour().resampled(self.voxel_size(), voxel_size);
         let Some((world_min, world_max)) = self.world_bounds() else {
             return resampled;
         };
@@ -240,6 +241,44 @@ mod tests {
             UNMASKED,
             "the mask spread across the model"
         );
+    }
+
+    #[test]
+    fn resampling_carries_the_paint_to_the_same_world_point() {
+        use crate::colour::UNPAINTED;
+        use glam::IVec3;
+
+        let mut coarse = sphere(1.0);
+        let world = Vec3::new(RADIUS, 0.0, 0.0);
+        let cell = (world / coarse.voxel_size()).round().as_ivec3();
+        coarse.colour_mut().write(cell, 3);
+
+        let fine = coarse.resampled(0.5);
+
+        let fine_cell = (world / 0.5).round().as_ivec3();
+        assert_eq!(fine.colour().at(fine_cell), 3, "the paint is not on the world point it was on");
+        assert_eq!(
+            fine.colour().at(fine_cell + IVec3::new(0, 0, 40)),
+            UNPAINTED,
+            "the paint spread"
+        );
+    }
+
+    /// Past a 2x refinement the destination cells that round back to a
+    /// brick's last source cell run half a ratio past its scaled box, and a
+    /// footprint padded by one voxel dropped them -- mask and paint alike.
+    #[test]
+    fn a_fine_resample_keeps_the_mask_and_paint_on_a_bricks_far_face() {
+        use glam::IVec3;
+
+        let mut coarse = Volume::new(1.0);
+        coarse.mask_mut().write(IVec3::new(63, 0, 0), 200);
+        coarse.colour_mut().write(IVec3::new(63, 0, 0), 3);
+        let fine = coarse.resampled(0.104);
+        // 608 * 0.104 = 63.2, which rounds to source cell 63.
+        let far = IVec3::new(608, 0, 0);
+        assert_eq!(fine.mask().at(far), 200, "the mask fell off the brick's far face");
+        assert_eq!(fine.colour().at(far), 3, "the paint fell off the brick's far face");
     }
 
     /// A mask over empty space is real -- it is what stops Draw growing

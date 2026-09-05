@@ -93,6 +93,7 @@ use glam::{IVec3, Vec3};
 
 use crate::body::{Document, MAX_BODIES, MAX_DEPTH, MAX_NODES, Node, NodeId, NodeMeta};
 use crate::brick::{BRICK_DIM, BRICK_VOXELS, Brick, BrickCoord, INSIDE, NARROW_BAND, OUTSIDE};
+use crate::colour::{ColourBrick, ColourField};
 use crate::mask::{MaskBrick, MaskField};
 use crate::volume::Volume;
 
@@ -138,7 +139,7 @@ const OLDEST_CONTAINER_VERSION: u16 = 1;
 /// This is the NEWEST encoding this build understands, and what it *writes* is
 /// [`lowest_field_version`] rather than this. See [`OLDEST_FIELD_VERSION`] for
 /// why both halves of that are needed.
-const FIELD_VERSION: u16 = 2;
+const FIELD_VERSION: u16 = 3;
 
 /// The field encoding that carries a mask.
 ///
@@ -146,6 +147,16 @@ const FIELD_VERSION: u16 = 2;
 /// against it -- the writer, the reader, and one test at each end -- because
 /// the day a colour makes it 3 those four have to keep meaning *mask*.
 const FIELD_VERSION_WITH_MASK: u16 = 2;
+
+/// The field version that first carried a painted filament slot per voxel.
+///
+/// A THIRD stream per body, appended after the mask's, for the reason the
+/// module header gives: adding a per-voxel channel is a field version change
+/// and never a container one. A document that has never been painted still
+/// stamps 2, or 1 if it has no mask either -- see [`lowest_field_version`], and
+/// see `tests/fixtures/field-v2.brokkr` for the artefact that keeps the older
+/// encoding readable.
+const FIELD_VERSION_WITH_COLOUR: u16 = 3;
 
 /// The oldest field encoding this build still reads.
 ///
@@ -178,7 +189,11 @@ const OLDEST_FIELD_VERSION: u16 = 1;
 /// where the whole model is protected and not one byte is stored -- and
 /// dropping the polarity would reopen the file with the protection gone.
 fn lowest_field_version(doc: &Document) -> u16 {
-    if doc.bodies().any(|(_, volume)| !volume.mask().is_free()) {
+    // Asked highest first: a painted document needs the newest encoding
+    // whether or not it is also masked.
+    if doc.bodies().any(|(_, volume)| !volume.colour().is_empty()) {
+        FIELD_VERSION_WITH_COLOUR
+    } else if doc.bodies().any(|(_, volume)| !volume.mask().is_free()) {
         FIELD_VERSION_WITH_MASK
     } else {
         OLDEST_FIELD_VERSION
@@ -410,6 +425,21 @@ const MASK_BRICK_BYTES: usize = BRICK_VOXELS;
 const TAG_MASK_UNIFORM: u8 = 0;
 /// Tag for a mask brick stored as a full byte array.
 const TAG_MASK_DENSE: u8 = 1;
+
+/// Bytes a dense colour brick occupies in the file: one slot index per voxel.
+const COLOUR_BRICK_BYTES: usize = BRICK_VOXELS;
+
+/// Tag for a colour brick stored as a single slot.
+const TAG_COLOUR_UNIFORM: u8 = 0;
+/// Tag for a colour brick stored as a full slot array.
+const TAG_COLOUR_DENSE: u8 = 1;
+
+/// What one colour record costs, for the running document total.
+const COLOUR_ENTRY_BYTES: u64 = MASK_ENTRY_BYTES;
+
+const fn colour_brick_bytes(dense: bool) -> u64 {
+    COLOUR_ENTRY_BYTES + if dense { COLOUR_BRICK_BYTES as u64 } else { 0 }
+}
 
 /// `mask_flags` bit 0: this body's mask is read inverted.
 ///
@@ -648,6 +678,8 @@ pub enum ProjectError {
     /// stream sits between two bodies' bricks, so "after it" is the rest of the
     /// document.
     UnknownMaskTag(u8),
+    /// A colour brick tag this build does not know.
+    UnknownColourTag(u8),
     /// A mask stream with one of the seven reserved flag bits set.
     ReservedMaskFlags {
         found: u8,
@@ -720,6 +752,9 @@ impl std::fmt::Display for ProjectError {
             ProjectError::NoBodies => write!(f, "the file holds no bodies at all"),
             ProjectError::UnknownBrickTag(tag) => write!(f, "unknown brick kind {tag}"),
             ProjectError::UnknownMaskTag(tag) => write!(f, "unknown mask brick kind {tag}"),
+            ProjectError::UnknownColourTag(tag) => {
+                write!(f, "unknown colour brick kind {tag}")
+            }
             ProjectError::ReservedMaskFlags { found } => {
                 write!(f, "a mask sets a reserved flag bit: {found:#010b}")
             }
@@ -914,6 +949,9 @@ pub fn write(out: &mut impl Write, doc: &Document, state: &ProjectState) -> Resu
         write_bricks(out, volume)?;
         if field >= FIELD_VERSION_WITH_MASK {
             write_mask(out, volume.mask())?;
+        }
+        if field >= FIELD_VERSION_WITH_COLOUR {
+            write_colour(out, volume.colour())?;
         }
     }
 
@@ -1166,6 +1204,33 @@ fn write_mask(out: &mut impl Write, mask: &MaskField) -> Result<()> {
                 // endianness to be explicit about and the array goes out whole.
                 out.write_all(&[TAG_MASK_DENSE])?;
                 out.write_all(values.as_slice())?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// One body's painted slots, sorted so the bytes are deterministic.
+///
+/// No flags byte, unlike the mask's: a slot index has no polarity, so there is
+/// nothing to resolve at read and nothing to reserve a bit for. Adding one
+/// "for symmetry" would be a byte in every file forever that no reader may
+/// ever interpret.
+fn write_colour(out: &mut impl Write, colour: &ColourField) -> Result<()> {
+    let mut coords: Vec<BrickCoord> = colour.bricks().keys().copied().collect();
+    coords.sort_unstable();
+
+    write_u64(out, coords.len() as u64)?;
+    for coord in coords {
+        let brick = &colour.bricks()[&coord];
+        for component in coord.0.to_array() {
+            out.write_all(&component.to_le_bytes())?;
+        }
+        match brick {
+            ColourBrick::Uniform(slot) => out.write_all(&[TAG_COLOUR_UNIFORM, *slot])?,
+            ColourBrick::Dense(slots) => {
+                out.write_all(&[TAG_COLOUR_DENSE])?;
+                out.write_all(slots.as_slice())?;
             }
         }
     }
@@ -1531,6 +1596,11 @@ fn read_understanding_field_versions_to(
         if header.field >= FIELD_VERSION_WITH_MASK {
             read_mask(input, volume.mask_mut(), &mut bytes)?;
         }
+        // And the colour, after the mask, for the same reason in the same
+        // order: one forward pass, one section per body.
+        if header.field >= FIELD_VERSION_WITH_COLOUR {
+            read_colour(input, volume.colour_mut(), &mut bytes)?;
+        }
         loaded.push((row.meta, Some(volume)));
     }
 
@@ -1682,6 +1752,55 @@ fn read_mask(input: &mut impl Read, mask: &mut MaskField, document_bytes: &mut u
         // distance there is nothing here to refuse or repair -- which is why
         // this stream has two refusals and not three.
         mask.restore_brick(coord, Some(brick));
+    }
+    Ok(())
+}
+
+/// One body's painted slots, back off the disk.
+///
+/// **There is no `checked_slot`, and that is deliberate rather than missed.**
+/// A distance is refused when it is not finite or falls outside the band
+/// because those are corrupt states a reader must not propagate. Every byte in
+/// `0..=255` is a legal slot index, so there is nothing here to refuse or
+/// repair -- the same reasoning `read_mask` states for protection values, and
+/// the reason this stream has one refusal rather than two.
+///
+/// A slot beyond what the 3MF writer can encode is still legal here. It simply
+/// exports as unpainted, which is an export concern and not a file-integrity
+/// one; refusing it would make a file this build wrote unreadable by a build
+/// that later widened the palette.
+fn read_colour(
+    input: &mut impl Read,
+    colour: &mut ColourField,
+    document_bytes: &mut u64,
+) -> Result<()> {
+    let count = read_u64(input)?;
+    // The claim at its floor, before anything is read from it, exactly as the
+    // mask's stream does: a count of a billion is refused here rather than
+    // after a billion map insertions.
+    let floor = document_bytes.saturating_add(count.saturating_mul(colour_brick_bytes(false)));
+    if floor > MAX_DOCUMENT_BYTES {
+        return Err(ProjectError::TooMuchData { bytes: floor, limit: MAX_DOCUMENT_BYTES });
+    }
+
+    for _ in 0..count {
+        let coord = read_brick_coord(input)?;
+        let tag: [u8; 1] = read_exact(input)?;
+        charge(document_bytes, colour_brick_bytes(tag[0] == TAG_COLOUR_DENSE), MAX_DOCUMENT_BYTES)?;
+        let brick = match tag[0] {
+            TAG_COLOUR_UNIFORM => ColourBrick::Uniform(read_exact::<1>(input)?[0]),
+            TAG_COLOUR_DENSE => {
+                let mut slots = vec![0u8; COLOUR_BRICK_BYTES];
+                input.read_exact(&mut slots)?;
+                let boxed: Box<[u8; BRICK_VOXELS]> = slots
+                    .into_boxed_slice()
+                    .try_into()
+                    .expect("the vector was built at exactly BRICK_VOXELS");
+                ColourBrick::Dense(boxed)
+            }
+            other => return Err(ProjectError::UnknownColourTag(other)),
+        };
+        colour.insert(coord, brick);
     }
     Ok(())
 }
@@ -3533,6 +3652,105 @@ mod tests {
         assert_eq!(differs, None, "write, read and write again differ at byte {differs:?}");
     }
 
+    /// A masked but unpainted document still stamps field version 2.
+    ///
+    /// **The same protection the mask's own bump needed, one version on.** The
+    /// range check lets a new build read an old file; this is what lets an OLD
+    /// build read a new one, and without it every save from the day painting
+    /// shipped would stamp 3 and be refused by every build that predates it --
+    /// including the one a rolled-back updater puts back.
+    #[test]
+    fn a_masked_but_unpainted_document_still_writes_field_version_2() {
+        let doc = Document::from_volume(masked_fixture_volume());
+        assert!(doc.active_volume().colour().is_empty(), "the fixture arrived painted");
+
+        let mut bytes = Vec::new();
+        write(&mut bytes, &doc, &ProjectState::default()).expect("write failed");
+        assert_eq!(
+            u16::from_le_bytes([bytes[10], bytes[11]]),
+            2,
+            "an unpainted document was stamped with the colour encoding"
+        );
+    }
+
+    /// Painting one voxel is what moves the stamp, and the slots come back.
+    #[test]
+    fn a_painted_document_writes_field_version_3_and_round_trips_its_slots() {
+        let mut volume = fixture_volume();
+        for (cell, slot) in [
+            (IVec3::new(0, 0, 0), 1u8),
+            (IVec3::new(1, 2, 3), 4),
+            (IVec3::new(-5, -5, -5), 16),
+            // Outside every field brick: paint over empty space, the case that
+            // could not exist if colour lived inside `Brick`.
+            (IVec3::new(400, 400, 400), 9),
+        ] {
+            volume.colour_mut().write(cell, slot);
+        }
+        let doc = Document::from_volume(volume);
+
+        let mut bytes = Vec::new();
+        write(&mut bytes, &doc, &ProjectState::default()).expect("write failed");
+        assert_eq!(
+            u16::from_le_bytes([bytes[10], bytes[11]]),
+            3,
+            "a painted document was not stamped with the colour encoding"
+        );
+
+        let (reread, _) = read(&mut bytes.as_slice()).expect("a painted file was refused");
+        let colour = reread.active_volume().colour();
+        for (cell, slot) in [
+            (IVec3::new(0, 0, 0), 1u8),
+            (IVec3::new(1, 2, 3), 4),
+            (IVec3::new(-5, -5, -5), 16),
+            (IVec3::new(400, 400, 400), 9),
+        ] {
+            assert_eq!(colour.at(cell), slot, "the slot at {cell:?} did not survive the read");
+        }
+        assert_eq!(
+            colour.at(IVec3::new(9, 9, 9)),
+            crate::colour::UNPAINTED,
+            "the reader smeared a slot across the brick it landed in"
+        );
+
+        // Deterministic, like every other stream here.
+        let mut again = Vec::new();
+        write(&mut again, &reread, &ProjectState::default()).expect("write failed");
+        assert_eq!(bytes, again, "write, read and write again differ for a painted document");
+    }
+
+    /// A colour tag from the future is refused rather than read as something
+    /// else, the way an unknown mask tag is.
+    #[test]
+    fn an_unknown_colour_tag_is_refused() {
+        let mut volume = fixture_volume();
+        volume.colour_mut().write(IVec3::new(0, 0, 0), 3);
+        let doc = Document::from_volume(volume);
+        let mut bytes = Vec::new();
+        write(&mut bytes, &doc, &ProjectState::default()).expect("write failed");
+
+        // The colour stream's single brick record: 12 bytes of coordinate then
+        // the tag. Found by searching rather than by a literal offset, so this
+        // does not rot the next time the header grows.
+        let tag_at = bytes
+            .windows(1)
+            .len()
+            .checked_sub(1)
+            .and_then(|_| {
+                // The dense tag is the last byte before 32,768 slot bytes.
+                bytes.len().checked_sub(COLOUR_BRICK_BYTES + EMPTY_TRAILER_BYTES + 1)
+            })
+            .expect("the file is shorter than one dense colour brick");
+        assert_eq!(bytes[tag_at], TAG_COLOUR_DENSE, "the tag is not where this test looked");
+
+        bytes[tag_at] = 7;
+        match read(&mut bytes.as_slice()) {
+            Err(ProjectError::UnknownColourTag(tag)) => assert_eq!(tag, 7),
+            Err(other) => panic!("refused for the wrong reason: {other}"),
+            Ok(_) => panic!("an unknown colour tag was read as something else"),
+        }
+    }
+
     /// A document nobody masked is byte for byte what the pre-mask writer
     /// produced, and says so at bytes 10..12.
     ///
@@ -3964,6 +4182,46 @@ mod tests {
     /// The session settings both fixtures carry. Deliberately not the
     /// defaults: a reader that skipped the view entirely would still pass
     /// against default values.
+    /// The same volume with a mask on it, which is what makes a file stamp
+    /// field version 2 rather than 1.
+    ///
+    /// **The fixture the mask's own version bump never got.** Both committed
+    /// container fixtures are stamped field version 1, so when `FIELD_VERSION`
+    /// went 1 -> 2 for the mask there was no on-disk artefact on either side of
+    /// it: nothing proving a field-1 file still opened, and nothing recording
+    /// what a field-2 file looks like. This is written BEFORE the next bump for
+    /// exactly that reason -- once the writer moves on, no build can produce
+    /// one of these again.
+    ///
+    /// One of the masked cells is deliberately outside every brick the field
+    /// fixture placed: a mask over empty space is the case that cannot be
+    /// expressed inside `Brick` at all, so it is the one most worth pinning.
+    fn masked_fixture_volume() -> Volume {
+        let mut volume = fixture_volume();
+        let mask = volume.mask_mut();
+        for (cell, value) in [
+            (IVec3::new(0, 0, 0), 255u8),
+            (IVec3::new(1, 2, 3), 128),
+            (IVec3::new(-5, -5, -5), 7),
+            (IVec3::new(400, 400, 400), 64),
+        ] {
+            mask.write(cell, value);
+        }
+        volume
+    }
+
+    /// A whole file for a masked document, as this build writes one.
+    fn masked_fixture() -> Vec<u8> {
+        let mut bytes = Vec::new();
+        write(
+            &mut bytes,
+            &Document::from_volume(masked_fixture_volume()),
+            &fixture_state(Vec::new()),
+        )
+        .expect("write failed");
+        bytes
+    }
+
     fn fixture_state(keys: Vec<Keyframe>) -> ProjectState {
         ProjectState {
             view: View {
@@ -4080,6 +4338,7 @@ mod tests {
         for (name, bytes) in [
             ("container-v1.brokkr", manufactured_fixture(1, Vec::new())),
             ("container-v2.brokkr", manufactured_fixture(2, fixture_keys())),
+            ("field-v2.brokkr", masked_fixture()),
         ] {
             let path = fixture_path(name);
             std::fs::write(&path, &bytes).expect("could not write the fixture");
@@ -4134,6 +4393,49 @@ mod tests {
 
     /// A version 1 file -- the layout of every `.brokkr` written before the
     /// timeline existed, and of three of the real projects on disk -- still
+    /// A file written when the field encoding was version 2 still opens, and
+    /// its mask still comes back.
+    ///
+    /// **This is the test the mask's own version bump never had, and its whole
+    /// value is that it keeps passing after the NEXT bump.** A field version is
+    /// a range, not an equality, so every future encoding has to keep reading
+    /// this file; without a committed artefact that promise is untestable and
+    /// stays untested, which is how it was until now.
+    ///
+    /// Read from the committed bytes rather than from this build's writer on
+    /// purpose. A test that writes and reads back agrees with itself whatever
+    /// both halves do.
+    #[test]
+    fn a_field_version_2_file_still_opens_and_its_mask_survives() {
+        let bytes = committed_fixture("field-v2.brokkr");
+        assert_eq!(
+            u16::from_le_bytes([bytes[10], bytes[11]]),
+            2,
+            "the field version 2 fixture is not stamped field version 2"
+        );
+
+        let mut progress = Progress::default();
+        let (doc, state) = read_reporting(&mut bytes.as_slice(), &mut progress)
+            .expect("a field version 2 file was refused");
+
+        assert_eq!(state.view, fixture_state(Vec::new()).view);
+        assert_same_bricks(&masked_fixture_volume(), doc.active_volume());
+
+        // The mask itself, cell by cell, including the one over empty space.
+        let mask = doc.active_volume().mask();
+        for (cell, expected) in [
+            (IVec3::new(0, 0, 0), 255u8),
+            (IVec3::new(1, 2, 3), 128),
+            (IVec3::new(-5, -5, -5), 7),
+            (IVec3::new(400, 400, 400), 64),
+        ] {
+            assert_eq!(mask.at(cell), expected, "the mask at {cell:?} did not survive the read");
+        }
+        // And an untouched cell is still unmasked, so the reader did not smear
+        // a value across the brick it landed in.
+        assert_eq!(mask.at(IVec3::new(9, 9, 9)), crate::mask::UNMASKED);
+    }
+
     /// opens, from a committed file rather than from this build's own writer.
     #[test]
     fn the_committed_version_1_fixture_opens_with_its_geometry_and_settings() {

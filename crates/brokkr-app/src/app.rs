@@ -698,6 +698,14 @@ pub struct Brokkr {
     /// file. Every other setting in this application is loaded once into state
     /// the same way -- see `recent` above and `spacemouse.config`.
     welcome_on_startup: bool,
+    /// The filament loaded in each of the printer's slots. See
+    /// [`crate::palette`] for why this is machine state rather than part of the
+    /// document: a sculpt stores a slot NUMBER, and which filament that is
+    /// belongs to the machine in front of you.
+    ///
+    /// Loaded once into state for the same reason `welcome_on_startup` is --
+    /// the panel draws it every frame and must not open a file to do so.
+    palette: crate::palette::Palette,
     /// The TinkerAtlas articles that screen shows. See [`crate::articles`] for
     /// why this is fetched only while the screen is actually up.
     feed: crate::articles::Feed,
@@ -833,6 +841,18 @@ pub struct Brokkr {
     /// tint it replaces. Revisit on the first report of a stroke that "did
     /// nothing" while the tint was off.
     show_mask: bool,
+    /// Which filament slot the paint brush writes, 1-based.
+    ///
+    /// The brush's own state lives on the application and not on
+    /// [`Brush`], the way the mask's operation does: it is what the interface
+    /// has chosen, threaded into every stamp by [`Brokkr::paint_to`].
+    paint_slot: u8,
+    /// Whether painted slots are drawn in their filament colours.
+    ///
+    /// View state: see [`brokkr_gpu::Uniforms::paint_shown`]. Nothing about it
+    /// changes what a stroke writes, and a document saved with it off carries
+    /// every slot it was painted with.
+    show_paint: bool,
     /// How strong the tint is when it is shown at all, 0..1.
     ///
     /// The shader has its own floor under this (`0.30 + 0.70 * m`), which is
@@ -1795,6 +1815,10 @@ impl Brokkr {
         // what the tests build through, and a test that picked up whoever is
         // signed in on the machine running it would pass or fail on that.
         app.account = crate::account::load();
+        // And the palette, for exactly that reason again -- a suite that read
+        // the developer's own `filaments.conf` would assert against whatever
+        // happens to be loaded in their printer.
+        app.palette = crate::palette::Palette::load();
         // The screen is up, so its articles are wanted. The only other place
         // that raises it, `Message::WelcomeOpened`, asks for them too.
         let mut boot =
@@ -2032,6 +2056,7 @@ impl Brokkr {
             gizmo_baked: None,
             welcome: false,
             welcome_on_startup: true,
+            palette: crate::palette::Palette::default(),
             feed: crate::articles::Feed::default(),
             account: None,
             signing_in: false,
@@ -2070,6 +2095,8 @@ impl Brokkr {
             // switch in the panel covers the heavy import.
             thumbnails: true,
             show_mask: true,
+            paint_slot: 1,
+            show_paint: true,
             mask_tint: DEFAULT_MASK_TINT,
             mask_peek: false,
             mask_filter: MaskFilter::Blur,
@@ -2108,7 +2135,17 @@ impl Brokkr {
         // knows it is there, and the File menu is not somewhere you look
         // unprompted.
         if app.has_autosave() {
-            app.status = "an autosave from a previous session is in File > Recover".to_string();
+            // Checked BEFORE the offer, so nobody is invited to recover a file
+            // this build cannot open -- and, far more importantly, before the
+            // 120-second autosave timer gets a chance to overwrite it.
+            app.status = match app.preserve_unreadable_autosave() {
+                Some(aside) => format!(
+                    "an autosave from a previous session could not be read by this build — \
+                     it has been kept as {}",
+                    aside.display()
+                ),
+                None => "an autosave from a previous session is in File > Recover".to_string(),
+            };
         }
         // **And a crash outranks it**, because it is the rarer message and the
         // one with something to do about it. Taken rather than read, so it is
@@ -5391,12 +5428,73 @@ impl Brokkr {
         self.remesh_dirty();
     }
 
+    /// Paint the chosen filament slot along the stroke path up to the point
+    /// under the cursor.
+    ///
+    /// `mask_to`'s twin, and the same shape for the same reasons: the same
+    /// stroke walker at the same spacing, the same lazy recorder, and the
+    /// active body only. The inverted direction is the eraser, which writes
+    /// [`brokkr_core::colour::UNPAINTED`]; there is no third operation.
+    fn paint_to(&mut self, pixel: Vec2, direction: BrushDirection, start: bool) {
+        let Some(point) = self.surface_under(pixel) else {
+            return;
+        };
+        self.arm_recorder();
+
+        let started = Instant::now();
+        self.stamp_centres.clear();
+        if start {
+            self.stroke.begin(point, &mut self.stamp_centres);
+        } else {
+            let spacing = self.brush.spacing(self.doc.voxel_size());
+            self.stroke.advance(point, spacing, &mut self.stamp_centres);
+        }
+
+        let slot = match direction {
+            BrushDirection::Add => self.paint_slot,
+            BrushDirection::Subtract => brokkr_core::colour::UNPAINTED,
+        };
+        let brush = self.brush;
+        let lean = self.pen_lean();
+        let tangent = self.stroke.direction().unwrap_or(Vec3::ZERO);
+        // Pressure is sampled so the readout stays honest; the brush does not
+        // read it, because a slot has no half. See `BrushKind::Paint`.
+        let pressure = self.tablet.stamp_pressure(self.pressure_enabled, self.pressure_curve);
+
+        for index in 0..self.stamp_centres.len() {
+            let centre = self.stamp_centres[index];
+            let normal = lean_normal(self.doc.active_volume().gradient_world(centre), lean);
+            let stamp =
+                Stamp::new(centre, normal, direction).with_pressure(pressure).with_tangent(tangent);
+            brush.apply_paint_symmetric(
+                self.doc.active_volume_mut(),
+                &stamp,
+                slot,
+                self.symmetry,
+                MIRROR_CENTRE,
+                &mut self.brush_scratch,
+            );
+        }
+
+        self.perf.stamps = self.stamp_centres.len();
+        self.perf.pressure = pressure;
+        self.perf.edit_ms = started.elapsed().as_secs_f32() * 1000.0;
+        self.remesh_dirty();
+    }
+
     fn sculpt_to(&mut self, pixel: Vec2, direction: BrushDirection, start: bool) {
         // Move is handled before anything else, because it wants the pointer
         // rather than the surface under the pointer, and it must keep working
         // once the cursor has been dragged off the model.
         if self.effective_brush().kind == BrushKind::Move {
             self.move_to(pixel, start);
+            return;
+        }
+        // Paint has no field path either. `effective_brush` so that shift
+        // still smooths with the paint brush selected, as it does with every
+        // other.
+        if self.effective_brush().kind == BrushKind::Paint {
+            self.paint_to(pixel, direction, start);
             return;
         }
 
@@ -5479,8 +5577,23 @@ impl Brokkr {
     /// then has to notice a key being released while the window is unfocused,
     /// and the tool strip does not flicker between two highlights during a
     /// stroke. The selection is never touched, so there is nothing to restore.
+    ///
+    /// **Shift over the paint brush smooths at Smooth's OWN remembered
+    /// strength**, not the paint brush's. Paint's strength is a fixed 1.0 the
+    /// panel hides -- a slot has no half -- and carrying it into Smooth meant
+    /// shift-drag smoothed at 2.5x Smooth's default and above the slider's
+    /// ceiling, with no control on screen to say so. Every other brush keeps
+    /// its own strength under shift, as before.
     fn effective_brush(&self) -> Brush {
-        if self.shift { Brush { kind: BrushKind::Smooth, ..self.brush } } else { self.brush }
+        if !self.shift {
+            return self.brush;
+        }
+        let strength = if self.brush.kind == BrushKind::Paint {
+            self.strengths[Self::strength_slot(BrushKind::Smooth)]
+        } else {
+            self.brush.strength
+        };
+        Brush { kind: BrushKind::Smooth, strength, ..self.brush }
     }
 
     /// Direction for a new stroke, honouring the invert modifier, the eraser
@@ -6650,6 +6763,60 @@ impl Brokkr {
         self.autosave_file.as_ref().is_some_and(|path| path.is_file())
     }
 
+    /// Move an autosave this build cannot read out of the way, so the next one
+    /// cannot destroy it.
+    ///
+    /// **The updater supports downgrade, and that is what makes this
+    /// necessary.** Publishing a manifest naming an older build is how a bad
+    /// release is walked back, and `apply.rs` states outright that the build
+    /// reading a file can be older than the build that wrote it. Compose that
+    /// with the autosave: a newer build writes a crash net in a field encoding
+    /// the older one refuses, the user is told an autosave is waiting, File >
+    /// Recover fails with a version message, they shrug and start sculpting --
+    /// and 120 seconds later the older build overwrites the only copy of their
+    /// work with an empty sphere. Nothing in the write path notices that the
+    /// file it is about to replace is one it could not read.
+    ///
+    /// Probed with [`read_outline`], which reads a header and a node table
+    /// rather than a document, so the check costs a few hundred bytes on a file
+    /// that may be a gigabyte. Any error moves it aside, not only a version
+    /// one: a truncated or corrupt crash net is equally worth keeping, since
+    /// it is the only copy of something and this application cannot say what a
+    /// later build or a hex editor will make of it.
+    ///
+    /// Named by the first free number rather than by a timestamp, so a test can
+    /// assert the name it lands on.
+    fn preserve_unreadable_autosave(&mut self) -> Option<std::path::PathBuf> {
+        let path = self.autosave_file.clone()?;
+        let file = std::fs::File::open(&path).ok()?;
+        let mut reader = std::io::BufReader::new(file);
+        if brokkr_core::project::read_outline(&mut reader).is_ok() {
+            return None;
+        }
+        drop(reader);
+
+        // A bounded search: a directory already holding this many refused crash
+        // nets is a bigger problem than the naming, and spinning here would be
+        // worse than giving up.
+        for attempt in 1..100 {
+            let aside = path.with_file_name(format!("autosave-unreadable-{attempt}.brokkr"));
+            if aside.exists() {
+                continue;
+            }
+            return match std::fs::rename(&path, &aside) {
+                Ok(()) => {
+                    log::warn!("kept an unreadable autosave as {}", aside.display());
+                    Some(aside)
+                }
+                Err(error) => {
+                    log::error!("could not move {} aside: {error}", path.display());
+                    None
+                }
+            };
+        }
+        None
+    }
+
     /// Load the crash net, and deliberately do not adopt its path.
     ///
     /// `open_project` would leave `project_path` pointing at the autosave file,
@@ -6955,15 +7122,31 @@ impl Brokkr {
         let parts: Vec<(&str, &brokkr_core::ExportMesh)> =
             bodies.iter().map(|(meta, mesh, _)| (meta.name.as_str(), mesh)).collect();
 
+        let filaments = self.palette.as_filaments();
+        // Read once, here, rather than inside the writer: both of these walk the
+        // user's OrcaSlicer presets off disk, which is not something an export
+        // writer should be doing per body.
+        let placement =
+            brokkr_core::export::threemf::Placement { plate_centre: crate::slicer::plate_centre() };
+        let settings = crate::slicer::project_settings_body(&self.palette);
         let write = || -> std::io::Result<()> {
             let file = std::fs::File::create(path)?;
             let mut file = std::io::BufWriter::new(file);
             match format {
                 ExportFormat::Stl => brokkr_core::export::stl::write_all(&parts, &mut file)?,
                 ExportFormat::Obj => brokkr_core::export::obj::write_all(&parts, &mut file)?,
-                ExportFormat::ThreeMf => {
-                    brokkr_core::export::threemf::write_all(&parts, &mut file)?
-                }
+                // The 3MF carries the user's own filament slots, sits on their
+                // bed, and names the presets their slicer already has -- none of
+                // which the geometry knows anything about.
+                ExportFormat::ThreeMf => brokkr_core::export::threemf::write_project(
+                    &parts,
+                    &brokkr_core::export::threemf::Project {
+                        filaments: filaments.clone(),
+                        placement,
+                        settings: settings.as_deref(),
+                    },
+                    &mut file,
+                )?,
             }
             std::io::Write::flush(&mut file)
         };
@@ -6975,15 +7158,26 @@ impl Brokkr {
                 // arrive in a slicer as one part. Said here rather than
                 // discovered after slicing.
                 let fused = matches!(format, ExportFormat::Stl) && parts.len() > 1;
+                // No silent fallback. Without the user's presets the file still
+                // opens, but OrcaSlicer invents a machine named after it and
+                // displaces whatever printer they had selected -- which looks
+                // like the application broke their slicer rather than like a
+                // setting that could not be read.
+                let unbound = matches!(format, ExportFormat::ThreeMf) && settings.is_none();
                 self.status = format!(
                     "exported {} of {} bodies; {omitted} hidden{} -- {summary} to {} \
-                     ({:.1} MB, {:.0} ms)",
+                     ({:.1} MB, {:.0} ms){}",
                     parts.len(),
                     self.doc.body_count(),
                     if fused { " (STL fuses them into one part)" } else { "" },
                     path.display(),
                     bytes as f64 / (1024.0 * 1024.0),
-                    started.elapsed().as_secs_f64() * 1000.0
+                    started.elapsed().as_secs_f64() * 1000.0,
+                    if unbound {
+                        " — no printer named: pick your machine in OrcaSlicer, then export again"
+                    } else {
+                        ""
+                    }
                 );
                 log::info!("{}", self.status);
             }
@@ -7651,6 +7845,12 @@ impl Brokkr {
         self.shared.set_mask_view(crate::viewport::MaskView {
             inverted,
             tint: if shown { self.mask_tint } else { 0.0 },
+        });
+        // Published beside the mask's view for the same reason and at the same
+        // cost: a fixed array and no allocation, on the frame path.
+        self.shared.set_paint_view(crate::viewport::PaintView {
+            shown: self.show_paint,
+            palette: self.palette.shader_palette(),
         });
     }
 
@@ -9414,12 +9614,12 @@ impl Brokkr {
             Message::PrinterChecked => {
                 self.top_menu = None;
                 let Some(printer) =
-                    crate::printer::configured(crate::paths::config_file("printer").as_deref())
+                    crate::printer::configured(crate::printer::config_path().as_deref())
                 else {
                     // Says where to write it rather than only that it is
                     // missing: a setting with no interface needs its file named
                     // or it may as well not exist.
-                    self.status = match crate::paths::config_file("printer") {
+                    self.status = match crate::printer::config_path() {
                         Some(path) => format!(
                             "no printer set — put `host = 192.0.2.46` in {}",
                             path.display()
@@ -9440,6 +9640,63 @@ impl Brokkr {
             Message::PrinterAnswered(answer) => {
                 self.status = match answer {
                     Ok(summary) => summary,
+                    Err(why) => format!("could not reach the printer: {why}"),
+                };
+            }
+            Message::PaletteSyncRequested => {
+                self.top_menu = None;
+                let Some(printer) =
+                    crate::printer::configured(crate::printer::config_path().as_deref())
+                else {
+                    // Same wording as `PrinterChecked`, and for the same
+                    // reason: a setting with no interface needs its file named.
+                    self.status = match crate::printer::config_path() {
+                        Some(path) => format!(
+                            "no printer set — put `host = 192.0.2.46` in {}",
+                            path.display()
+                        ),
+                        None => "could not work out where the printer config lives".to_string(),
+                    };
+                    return Task::none();
+                };
+                self.status = format!("asking {} what is loaded…", printer.host);
+                return Task::perform(
+                    async move { crate::printer::filaments(&printer.host, printer.port) },
+                    Message::PaletteSynced,
+                );
+            }
+            Message::PaletteSynced(answer) => {
+                self.status = match answer {
+                    Ok(Some(reported)) => {
+                        let skipped = self.palette.sync_from_printer(&reported);
+                        let loaded = reported.len() - skipped.len();
+                        // The pictures in the body list are drawn through the
+                        // palette and refresh on brick changes only, so a
+                        // painted body's thumbnail would keep the old colours
+                        // while the viewport showed the new ones.
+                        self.thumbs.stale_everything();
+                        let plural = |count: usize| if count == 1 { "" } else { "s" };
+                        // Saved here rather than on quit: this is the only
+                        // moment the palette is known to match the machine, and
+                        // a crash between here and quitting would lose the one
+                        // thing the user pressed a button to get.
+                        let mut said = match self.palette.save() {
+                            Ok(()) => format!("synced {loaded} filament{}", plural(loaded)),
+                            Err(why) => format!("synced, but not saved: {why}"),
+                        };
+                        // Never a silent partial sync: an empty head is left
+                        // alone deliberately, and the user should hear which.
+                        if !skipped.is_empty() {
+                            let list: Vec<String> = skipped.iter().map(usize::to_string).collect();
+                            said.push_str(&format!(
+                                " — slot{} {} empty, left alone",
+                                plural(skipped.len()),
+                                list.join(", ")
+                            ));
+                        }
+                        said
+                    }
+                    Ok(None) => "that printer does not report which filament is loaded".to_string(),
                     Err(why) => format!("could not reach the printer: {why}"),
                 };
             }
@@ -9805,6 +10062,16 @@ impl Brokkr {
             Message::CameraFramedOnActive => self.frame_active(),
             Message::MaskPeekStarted => self.mask_peek = true,
             Message::MaskPeekEnded => self.mask_peek = false,
+            // Clamped rather than trusted, for the reason the radius is: a
+            // message can arrive from anything, and a slot past the machine's
+            // heads would paint a filament that does not exist. The palette
+            // only grows in a session -- `sync_from_printer` never removes a
+            // slot -- so a chosen slot cannot be orphaned after the fact.
+            Message::PaintSlotChanged(slot) => {
+                let last = self.palette.slots.len().clamp(1, usize::from(u8::MAX)) as u8;
+                self.paint_slot = slot.clamp(1, last);
+            }
+            Message::ShowPaintToggled => self.show_paint = !self.show_paint,
             // And the verbs, which DO change protection and all of which are
             // undoable in one entry apiece.
             Message::MaskCleared => self.clear_mask(),
@@ -11830,6 +12097,76 @@ mod tests {
         app.open_project(&gone);
         assert!(app.status.contains("could not"), "reported: {}", app.status);
         assert!(app.recent.is_empty(), "a file that cannot be opened stayed in the list");
+
+        std::fs::remove_dir_all(&directory).ok();
+    }
+
+    /// A crash net this build cannot read is kept, not overwritten.
+    ///
+    /// **This is a data-loss guard, and the loss is silent.** The updater
+    /// supports downgrade, so an older build can meet a newer build's autosave;
+    /// it refuses to open it, says so, and then the 120-second timer replaces
+    /// the only copy of the user's work with whatever is on screen.
+    ///
+    /// The unreadable file is manufactured by bumping the FIELD version in the
+    /// header of a real autosave, which is exactly the shape a downgrade
+    /// produces -- rather than by writing rubbish, which would prove only that
+    /// rubbish is refused.
+    #[test]
+    fn an_autosave_this_build_cannot_read_is_kept_rather_than_overwritten() {
+        let directory = scratch("autosave-unreadable");
+        let path = directory.join("autosave.brokkr");
+
+        // A genuine autosave first, so the bytes are real in every other way.
+        let mut app = app_with_unsaved_work();
+        app.autosave_file = Some(path.clone());
+        app.write_autosave();
+        let good = std::fs::read(&path).expect("the autosave should be there");
+
+        // Bytes 10..12 are the field version. One past what this build can READ
+        // is a file from a newer build -- and that is NOT one past what it just
+        // wrote: an unpainted, unmasked document deliberately stamps the OLDEST
+        // encoding that can carry it, which is the whole backward-compatibility
+        // mechanism. So the boundary is found rather than assumed, which also
+        // stops this test rotting at the next field bump.
+        let mut from_the_future = good.clone();
+        let mut version = u16::from_le_bytes([good[10], good[11]]);
+        loop {
+            version += 1;
+            assert!(version < 64, "no field version in range was refused");
+            from_the_future[10..12].copy_from_slice(&version.to_le_bytes());
+            if brokkr_core::project::read_outline(&mut from_the_future.as_slice()).is_err() {
+                break;
+            }
+        }
+        std::fs::write(&path, &from_the_future).expect("write failed");
+
+        let mut older = Brokkr::with_tablet(crate::tablet::Tablet::inert());
+        older.autosave_file = Some(path.clone());
+        let aside = older.preserve_unreadable_autosave().expect("it should have been kept");
+
+        assert!(
+            !path.exists(),
+            "the unreadable autosave was left where the timer would clobber it"
+        );
+        assert!(aside.exists(), "it was moved somewhere that does not exist");
+        assert_eq!(
+            std::fs::read(&aside).expect("read failed"),
+            from_the_future,
+            "the kept file is not the bytes that were there"
+        );
+        assert_eq!(aside.file_name().unwrap(), "autosave-unreadable-1.brokkr");
+
+        // A second one does not overwrite the first.
+        std::fs::write(&path, &from_the_future).expect("write failed");
+        let second = older.preserve_unreadable_autosave().expect("the second should be kept too");
+        assert_eq!(second.file_name().unwrap(), "autosave-unreadable-2.brokkr");
+        assert!(aside.exists(), "the second refusal destroyed the first one");
+
+        // And a file this build CAN read is left exactly where it is.
+        std::fs::write(&path, &good).expect("write failed");
+        assert_eq!(older.preserve_unreadable_autosave(), None, "a good autosave was moved aside");
+        assert!(path.exists(), "a readable autosave was taken away from File > Recover");
 
         std::fs::remove_dir_all(&directory).ok();
     }
@@ -15502,6 +15839,124 @@ mod export_tests {
         std::fs::remove_dir_all(&directory).ok();
     }
 
+    /// The user's own filament slots reach the exported package.
+    ///
+    /// **This is the whole of what increment 1 is for.** The `paint_color`
+    /// writer and its `Filaments` shipped complete and unreferenced: nothing
+    /// outside `export/threemf.rs` mentioned either, so every 3MF a user ever
+    /// received declared the four built-in colours regardless of what was in
+    /// their machine. The assertion is a substring rather than a parsed zip
+    /// because the writer stores its entries uncompressed, so the settings part
+    /// is literally in the file -- and reaching for a zip reader to check one
+    /// string would be the more fragile of the two.
+    #[test]
+    fn the_users_own_filaments_reach_the_exported_package() {
+        let directory = scratch("export-palette");
+        let path = directory.join("painted.3mf");
+        let mut app = app();
+        app.palette.slots[0].colour = "#123456".to_string();
+        app.palette.slots[1].material = "PETG".to_string();
+
+        app.export(ExportFormat::ThreeMf, &path);
+        let written =
+            String::from_utf8_lossy(&std::fs::read(&path).expect("the file should be there"))
+                .into_owned();
+
+        assert!(
+            written.contains("\"#123456\""),
+            "the export declared the built-in colours instead of the user's"
+        );
+        assert!(written.contains("\"PETG\""), "the material did not travel");
+
+        std::fs::remove_dir_all(&directory).ok();
+    }
+
+    /// A user who never touches the palette gets exactly the file they got
+    /// before, byte for byte.
+    ///
+    /// The default palette is DERIVED from `Filaments::default()` rather than
+    /// restating it, and this is what holds that true: if the two ever drift,
+    /// every existing export silently changes and this fails.
+    #[test]
+    fn an_untouched_palette_exports_the_same_bytes_as_before() {
+        let directory = scratch("export-palette-default");
+        let path = directory.join("plain.3mf");
+        let mut app = app();
+
+        app.export(ExportFormat::ThreeMf, &path);
+        let written =
+            String::from_utf8_lossy(&std::fs::read(&path).expect("the file should be there"))
+                .into_owned();
+
+        // The default palette must still be the writer's own defaults. Asserted
+        // on the settings part rather than on the whole file's bytes, because
+        // the placement transform is read from the developer's own OrcaSlicer
+        // presets -- a byte comparison here would pass or fail depending on
+        // which printer the machine running the suite happens to have selected.
+        for colour in brokkr_core::export::threemf::Filaments::default().colours {
+            assert!(
+                written.contains(&format!("\"{colour}\"")),
+                "the default palette and the writer's own defaults have drifted apart: \
+                 {colour} is missing"
+            );
+        }
+
+        std::fs::remove_dir_all(&directory).ok();
+    }
+
+    /// The exported model sits ON the bed, not half under it.
+    ///
+    /// A 3MF opened as a project is placed exactly where the file says, and
+    /// with no transform that was the plate's front-left corner with half the
+    /// sculpt below z = 0 -- reported from OrcaSlicer against a real export on
+    /// 2026-09-02. The centring half needs the user's plate size and is absent
+    /// on a machine with no OrcaSlicer; the drop onto the bed is unconditional
+    /// and is what this pins.
+    #[test]
+    fn an_exported_model_sits_on_the_bed_rather_than_half_under_it() {
+        let directory = scratch("export-on-bed");
+        let path = directory.join("placed.3mf");
+        let mut app = app();
+
+        app.export(ExportFormat::ThreeMf, &path);
+        let written =
+            String::from_utf8_lossy(&std::fs::read(&path).expect("the file should be there"))
+                .into_owned();
+
+        let item = written
+            .lines()
+            .find(|line| line.contains("<item "))
+            .expect("the build has to reference the object")
+            .to_string();
+        let transform = item
+            .split_once("transform=\"")
+            .map(|(_, rest)| rest.split('"').next().unwrap_or_default().to_string())
+            .expect("a default sphere straddles z = 0, so it must carry a transform");
+        let numbers: Vec<f32> =
+            transform.split_whitespace().filter_map(|word| word.parse().ok()).collect();
+        assert_eq!(numbers.len(), 12, "a 3MF item transform is 12 numbers: {transform}");
+
+        // The lowest point of the sphere, in print space, plus the lift the
+        // transform applies, has to land on the bed.
+        let lifted = numbers[11];
+        let mut lowest = f32::INFINITY;
+        for line in written.lines().filter(|line| line.contains("<vertex ")) {
+            if let Some((_, rest)) = line.split_once("z=\"")
+                && let Ok(z) = rest.split('"').next().unwrap_or_default().parse::<f32>()
+            {
+                lowest = lowest.min(z);
+            }
+        }
+        assert!(lowest.is_finite(), "no vertices in the exported file");
+        assert!(
+            (lowest + lifted).abs() < 1.0e-3,
+            "the model's lowest point lands at {} instead of on the bed",
+            lowest + lifted
+        );
+
+        std::fs::remove_dir_all(&directory).ok();
+    }
+
     /// Several bodies in one STL are named as fused, because the format has
     /// nowhere to put an object boundary and a slicer will load them as one
     /// part. Better said here than discovered after slicing.
@@ -18179,17 +18634,30 @@ mod body_panel_tests {
         }
     }
 
-    /// The sixth section is FIRST and open, and DETAIL is what paid for it.
+    /// BODIES is FIRST and open; DETAIL and FILAMENT start closed.
+    ///
+    /// The count is pinned so that adding a section is a deliberate act: the
+    /// budget is a 1080 high window with every heading reachable without a
+    /// scroll, and a section added without thinking about that budget is how
+    /// the one below it goes under the fold.
     #[test]
-    fn the_bodies_section_is_first_and_open_and_detail_now_starts_closed() {
+    fn the_bodies_section_is_first_and_open_and_the_long_ones_start_closed() {
         assert_eq!(PanelSection::ALL[0], PanelSection::Bodies);
-        assert_eq!(PanelSection::ALL.len(), 6);
+        assert_eq!(PanelSection::ALL.len(), 7);
         assert!(PanelSection::Bodies.open_by_default());
         assert!(!PanelSection::Detail.open_by_default());
+        assert!(!PanelSection::Filament.open_by_default());
+        // FILAMENT sits directly above EXPORT: it says what the sculpt's slot
+        // numbers mean, and it is read when somebody exports.
+        let position = |which: PanelSection| {
+            PanelSection::ALL.iter().position(|section| *section == which).expect("in ALL")
+        };
+        assert_eq!(position(PanelSection::Filament) + 1, position(PanelSection::Export));
 
         let app = app();
         assert!(app.expanded[PanelSection::Bodies as usize], "BODIES did not start open");
         assert!(!app.expanded[PanelSection::Detail as usize], "DETAIL did not start closed");
+        assert!(!app.expanded[PanelSection::Filament as usize], "FILAMENT did not start closed");
     }
 
     // --- folders -------------------------------------------------------------
@@ -20489,6 +20957,214 @@ mod mask_tool_tests {
             "a press onto protected material reported: {}",
             app.status
         );
+    }
+}
+
+/// The paint brush through the application: the digit, the drag, the eraser,
+/// the undo, and what the shader is told.
+#[cfg(test)]
+mod paint_brush_tests {
+    use super::*;
+    use iced::Vector;
+
+    const SIZE: Vector = Vector { x: 800.0, y: 600.0 };
+
+    fn update(app: &mut Brokkr, message: Message) {
+        drop(app.update(message));
+    }
+
+    fn app() -> Brokkr {
+        let mut app = Brokkr::with_tablet(crate::tablet::Tablet::inert());
+        update(&mut app, Message::BrushKindChanged(BrushKind::Paint));
+        app
+    }
+
+    fn centre_of_viewport() -> Vector {
+        Vector::new(SIZE.x / 2.0, SIZE.y / 2.0)
+    }
+
+    fn press(app: &mut Brokkr, at: Vector) {
+        update(
+            app,
+            Message::Pointer(PointerEvent::Pressed {
+                button: PointerButton::Left,
+                position: at,
+                size: SIZE,
+            }),
+        );
+    }
+
+    fn drag_to(app: &mut Brokkr, at: Vector) {
+        update(app, Message::Pointer(PointerEvent::Moved { position: at, size: SIZE }));
+    }
+
+    fn release(app: &mut Brokkr) {
+        update(app, Message::Pointer(PointerEvent::Released { button: PointerButton::Left }));
+    }
+
+    /// A short drag across the middle of the model.
+    fn paint_drag(app: &mut Brokkr) {
+        let centre = centre_of_viewport();
+        press(app, centre);
+        drag_to(app, Vector::new(centre.x + 20.0, centre.y));
+        drag_to(app, Vector::new(centre.x + 40.0, centre.y));
+        release(app);
+    }
+
+    /// How many painted colour bricks the active body carries.
+    fn painted_bricks(app: &Brokkr) -> usize {
+        app.doc.active_volume().stats().colour_bricks
+    }
+
+    #[test]
+    fn a_paint_drag_paints_the_active_body_with_the_chosen_slot_and_is_undoable() {
+        let mut app = app();
+        update(&mut app, Message::PaintSlotChanged(3));
+        assert_eq!(painted_bricks(&app), 0);
+        let field_before = app.doc.active_volume().stats().dense_bricks;
+
+        paint_drag(&mut app);
+        assert!(painted_bricks(&app) > 0, "the drag painted nothing");
+        assert!(app.unsaved, "a paint stroke did not mark the document unsaved");
+        assert_eq!(
+            app.doc.active_volume().stats().dense_bricks,
+            field_before,
+            "a paint stroke changed the field's own allocation"
+        );
+        // The slot that was chosen, and not slot 1, somewhere on the body.
+        let volume = app.doc.active_volume();
+        let painted = volume.brick_coords().any(|coord| {
+            let origin = coord.origin();
+            (0..32 * 32 * 32).any(|index| {
+                let cell = origin + glam::IVec3::new(index % 32, (index / 32) % 32, index / 1024);
+                volume.colour().at(cell) == 3
+            })
+        });
+        assert!(painted, "no voxel carries slot 3");
+
+        assert!(app.history.can_undo(), "a paint stroke pushed no history entry");
+        update(&mut app, Message::Undo);
+        assert_eq!(painted_bricks(&app), 0, "undo left the paint on the body");
+        update(&mut app, Message::Redo);
+        assert!(painted_bricks(&app) > 0, "redo did not put the paint back");
+    }
+
+    #[test]
+    fn ctrl_drag_erases_the_paint() {
+        let mut app = app();
+        paint_drag(&mut app);
+        assert!(painted_bricks(&app) > 0, "the fixture painted nothing");
+
+        app.control = true;
+        for _ in 0..3 {
+            paint_drag(&mut app);
+        }
+        assert_eq!(painted_bricks(&app), 0, "the eraser left painted bricks behind");
+    }
+
+    #[test]
+    fn a_paint_drag_moves_no_field_value() {
+        let mut app = app();
+        let before: Vec<f32> = {
+            let volume = app.doc.active_volume();
+            let mut coords: Vec<_> = volume.brick_coords().collect();
+            coords.sort_by_key(|coord| (coord.0.z, coord.0.y, coord.0.x));
+            coords
+                .iter()
+                .flat_map(|coord| {
+                    let origin = coord.origin();
+                    (0..32).map(move |i| volume.sample_voxel(origin + glam::IVec3::new(i, i, i)))
+                })
+                .collect()
+        };
+        paint_drag(&mut app);
+        let after: Vec<f32> = {
+            let volume = app.doc.active_volume();
+            let mut coords: Vec<_> = volume.brick_coords().collect();
+            coords.sort_by_key(|coord| (coord.0.z, coord.0.y, coord.0.x));
+            coords
+                .iter()
+                .flat_map(|coord| {
+                    let origin = coord.origin();
+                    (0..32).map(move |i| volume.sample_voxel(origin + glam::IVec3::new(i, i, i)))
+                })
+                .collect()
+        };
+        assert_eq!(before.len(), after.len(), "a paint stroke added or removed field bricks");
+        assert!(
+            before.iter().zip(&after).all(|(a, b)| a.to_bits() == b.to_bits()),
+            "a paint stroke moved the field"
+        );
+    }
+
+    /// Shift over the paint brush smooths at Smooth's own strength, within
+    /// the slider's ceiling. Paint's 1.0 is not a sculpting strength.
+    #[test]
+    fn shift_over_the_paint_brush_smooths_at_smooths_own_strength() {
+        let mut app = app();
+        assert_eq!(app.brush.strength, 1.0, "the fixture expects paint's fixed 1.0");
+        app.shift = true;
+        let effective = app.effective_brush();
+        assert_eq!(effective.kind, BrushKind::Smooth);
+        assert!(effective.strength <= MAX_STRENGTH, "shift-smooth ran at {}", effective.strength);
+        assert_eq!(effective.strength, BrushKind::Smooth.default_strength());
+    }
+
+    /// A palette change recolours the viewport through the uniforms every
+    /// message; the thumbnails are drawn on brick changes, so they have to be
+    /// told.
+    #[test]
+    fn syncing_the_palette_marks_every_thumbnail_stale() {
+        let mut app = app();
+        paint_drag(&mut app);
+        app.thumbs.settle_now();
+        while let Some(body) = app.thumbs.next_stale() {
+            app.thumbs.requested(body);
+        }
+        assert_eq!(app.thumbs.stale_count(), 0, "the fixture should start with nothing stale");
+
+        let reported = vec![crate::printer::Filament {
+            vendor: "Different".to_string(),
+            material: "PLA".to_string(),
+            sub_type: String::new(),
+            colour: "#123456".to_string(),
+            present: true,
+        }];
+        update(&mut app, Message::PaletteSynced(Ok(Some(reported))));
+        assert!(app.thumbs.stale_count() > 0, "a palette change left the thumbnails as they were");
+    }
+
+    #[test]
+    fn the_slot_is_clamped_to_the_palette() {
+        let mut app = app();
+        let last = app.palette.slots.len() as u8;
+        update(&mut app, Message::PaintSlotChanged(0));
+        assert_eq!(app.paint_slot, 1, "slot 0 is unpainted and cannot be chosen");
+        update(&mut app, Message::PaintSlotChanged(200));
+        assert_eq!(app.paint_slot, last, "a slot past the palette was accepted");
+    }
+
+    /// The toggle reaches the shader and touches nothing else: no brick dirty,
+    /// no document change, no slot moved.
+    #[test]
+    fn the_show_paint_toggle_reaches_the_renderer_and_dirties_nothing() {
+        let mut app = app();
+        paint_drag(&mut app);
+        let bricks = painted_bricks(&app);
+        app.unsaved = false;
+        let mut dirty = Vec::new();
+        app.doc.active_volume_mut().take_dirty(&mut dirty);
+
+        assert!(app.shared.paint_view().shown, "paint should start shown");
+        update(&mut app, Message::ShowPaintToggled);
+        assert!(!app.shared.paint_view().shown, "the toggle did not reach the shared frame");
+        assert!(!app.unsaved, "a view toggle dirtied the document");
+        assert_eq!(app.doc.active_volume().dirty_count(), 0, "a view toggle dirtied bricks");
+        assert_eq!(painted_bricks(&app), bricks, "a view toggle changed the paint");
+
+        // And the palette the shader sees is the machine's, slot by slot.
+        let palette = app.shared.paint_view().palette;
+        assert_eq!(palette[1], app.palette.slots[0].swatch().into_linear());
     }
 }
 

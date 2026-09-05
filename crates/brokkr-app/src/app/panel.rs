@@ -899,7 +899,7 @@ impl Brokkr {
         };
         let keys = row![
             column![
-                key("1 – 7", "pick a brush"),
+                key("1 – 8", "pick a brush"),
                 key("shift", "smooth, while held"),
                 key("ctrl / alt", "carve instead of add"),
                 key("[ and ]", "brush size"),
@@ -1729,17 +1729,27 @@ impl Brokkr {
                 0.05,
                 Message::BrushRadiusChanged
             ),
-            numeric(
-                "Strength",
-                SizingTarget::Strength,
-                super::MIN_STRENGTH..=self.max_strength(),
-                0.01,
-                Message::BrushStrengthChanged
-            ),
-            text("Falloff").size(theme::CAPTION_SIZE).color(theme::TEXT_DIM),
-            falloff,
         ]
         .spacing(theme::S3);
+
+        // The same substitution the panel makes: while painting there is no
+        // strength and no falloff to offer, and the thing to offer instead is
+        // the filament. A menu that listed both under PAINT contradicted the
+        // panel beside it.
+        if self.brush.kind == BrushKind::Paint && self.tool != Tool::Mask {
+            body = body.push(self.filament_picker());
+        } else {
+            body = body
+                .push(numeric(
+                    "Strength",
+                    SizingTarget::Strength,
+                    super::MIN_STRENGTH..=self.max_strength(),
+                    0.01,
+                    Message::BrushStrengthChanged,
+                ))
+                .push(text("Falloff").size(theme::CAPTION_SIZE).color(theme::TEXT_DIM))
+                .push(falloff);
+        }
 
         if self.tool == Tool::Mask {
             // The pattern's own row is NOT built here, and the mask block
@@ -2246,13 +2256,18 @@ impl Brokkr {
         // In mask mode the modifier means something else entirely, and it means
         // it for every brush -- the mask has no "no opposite" case, because
         // protection always has one. Reading `brush.kind.is_directional()` here
-        // while masking would tell three of the seven brushes that ctrl does
+        // while masking would tell three of the eight brushes that ctrl does
         // nothing, when it is the unmask gesture.
         let invert_hint = match (self.tool, self.brush.kind.is_directional()) {
             (Tool::Mask, _) => "ctrl or alt drag unmasks",
+            (_, _) if self.brush.kind == BrushKind::Paint => "ctrl or alt drag erases the paint",
             (_, true) => "ctrl or alt drag removes",
             (_, false) => "no opposite: ctrl does nothing",
         };
+        // Strength means nothing to the paint brush -- a slot has no half, see
+        // `BrushKind::Paint` -- so its place is taken by the thing that does:
+        // which filament the stroke lays down.
+        let painting = self.brush.kind == BrushKind::Paint && self.tool != Tool::Mask;
 
         let radius = column![
             text(format!("Radius  {:.2} mm", self.brush.radius))
@@ -2274,35 +2289,28 @@ impl Brokkr {
         ]
         .spacing(theme::S2);
 
-        let strength = column![
-            text(format!("Strength  {:.2}", self.brush.strength))
-                .size(theme::TEXT_SIZE_SMALL)
-                .color(theme::TEXT_DIM),
-            slider(
-                super::MIN_STRENGTH..=self.max_strength(),
-                self.brush.strength,
-                Message::BrushStrengthChanged
-            )
-            .step(0.01_f32),
-        ]
-        .spacing(theme::S2);
-
-        let falloff = column![
-            text("Falloff").size(theme::TEXT_SIZE_SMALL).color(theme::TEXT_DIM),
-            FalloffCurve::ALL.into_iter().fold(row![].spacing(theme::S1), |assembled, curve| {
-                assembled.push(
-                    button(text(curve.label()).size(theme::CAPTION_SIZE))
-                        .width(Length::Fill)
-                        .style(if curve == self.brush.falloff {
-                            theme::tool_button_active
-                        } else {
-                            theme::tool_button
-                        })
-                        .on_press(Message::FalloffChanged(curve)),
+        let strength: Element<'_, Message> = if painting {
+            self.filament_picker()
+        } else {
+            column![
+                text(format!("Strength  {:.2}", self.brush.strength))
+                    .size(theme::TEXT_SIZE_SMALL)
+                    .color(theme::TEXT_DIM),
+                slider(
+                    super::MIN_STRENGTH..=self.max_strength(),
+                    self.brush.strength,
+                    Message::BrushStrengthChanged
                 )
-            }),
-        ]
-        .spacing(theme::S2);
+                .step(0.01_f32),
+            ]
+            .spacing(theme::S2)
+            .into()
+        };
+
+        // Falloff goes the way strength does while painting: a slot has no
+        // rim to feather, so the row would be four buttons that change nothing.
+        let falloff: Element<'_, Message> =
+            if painting { column![].into() } else { self.falloff_row() };
 
         let history = row![
             button(text("Undo").size(theme::TEXT_SIZE_SMALL))
@@ -2333,19 +2341,20 @@ impl Brokkr {
                 text("HISTORY").size(theme::CAPTION_SIZE).color(theme::TEXT_MUTE),
                 history,
                 self.section(PanelSection::Detail, || self.detail_panel()),
+                self.section(PanelSection::Filament, || self.filament_panel()),
                 self.section(PanelSection::Export, || self.export_panel()),
                 button(text("Reset sphere").size(theme::TEXT_SIZE_SMALL))
                     .style(theme::tool_button)
                     .on_press(Message::ResetSphere),
-                // `1-7`, not `1-6`: `BrushKind::ALL` has been seven since Move
-                // landed and this line was wrong before masking touched it.
+                // `1-8`: `BrushKind::ALL` is eight since Paint landed, and the
+                // line was `1-6` for a while after Move made it seven.
                 //
                 // The ctrl line is here because the half-space mask has no
                 // button anywhere: it rides the cut's own drag, which is what
                 // makes it free, and a gesture with no control on screen is a
                 // gesture nobody finds.
                 text(
-                    "drag: sculpt\nctrl or alt drag: invert\nshift drag: smooth\nright drag: orbit\nshift right drag: pan\nwheel: zoom\n1-7: brush\nm: mask\nctrl + cut drag or loop: mask it\nhold h: show the mask\nx y z: mirror\n[ ]: radius\nctrl z, ctrl shift z: undo, redo"
+                    "drag: sculpt\nctrl or alt drag: invert\nshift drag: smooth\nright drag: orbit\nshift right drag: pan\nwheel: zoom\n1-8: brush\nm: mask\nctrl + cut drag or loop: mask it\nhold h: show the mask\nx y z: mirror\n[ ]: radius\nctrl z, ctrl shift z: undo, redo"
                 )
                 .size(theme::CAPTION_SIZE)
                 .color(theme::TEXT_MUTE),
@@ -3517,6 +3526,124 @@ impl Brokkr {
             // show beside it is what the current resolution MEANS at that size.
             // Without this the field reads as a detail control, which it is not.
             text(&self.detail_advice).size(theme::TEXT_SIZE_SMALL).color(theme::TEXT_DIM),
+        ]
+        .spacing(theme::S2)
+        .into()
+    }
+
+    /// The four falloff curves, the live one lit.
+    fn falloff_row(&self) -> Element<'_, Message> {
+        column![
+            text("Falloff").size(theme::TEXT_SIZE_SMALL).color(theme::TEXT_DIM),
+            FalloffCurve::ALL.into_iter().fold(row![].spacing(theme::S1), |assembled, curve| {
+                assembled.push(
+                    button(text(curve.label()).size(theme::CAPTION_SIZE))
+                        .width(Length::Fill)
+                        .style(if curve == self.brush.falloff {
+                            theme::tool_button_active
+                        } else {
+                            theme::tool_button
+                        })
+                        .on_press(Message::FalloffChanged(curve)),
+                )
+            }),
+        ]
+        .spacing(theme::S2)
+        .into()
+    }
+
+    /// Which filament the paint brush lays down: one swatch per slot, the live
+    /// one lit the way the tool strip lights its brush.
+    ///
+    /// Lives in the brush block and not in FILAMENT below, because it is
+    /// consulted while sculpting and FILAMENT is consulted while exporting.
+    fn filament_picker(&self) -> Element<'_, Message> {
+        let swatches = self.palette.slots.iter().enumerate().fold(
+            row![].spacing(theme::S1),
+            |assembled, (index, slot)| {
+                let number = (index + 1).min(usize::from(u8::MAX)) as u8;
+                let live = number == self.paint_slot;
+                let (style, _) = theme::tool_toggle(live);
+                assembled.push(
+                    button(
+                        row![
+                            container(text(""))
+                                .width(12)
+                                .height(12)
+                                .style(theme::swatch(slot.swatch())),
+                            text(format!("{number}")).size(theme::CAPTION_SIZE),
+                        ]
+                        .spacing(theme::S1)
+                        .align_y(Alignment::Center),
+                    )
+                    .style(style)
+                    .on_press(Message::PaintSlotChanged(number)),
+                )
+            },
+        );
+        let chosen = self
+            .palette
+            .slots
+            .get(usize::from(self.paint_slot).saturating_sub(1))
+            .map(|slot| slot.name.as_str())
+            .unwrap_or("no such slot");
+        column![
+            text(format!("Filament  {}. {chosen}", self.paint_slot))
+                .size(theme::TEXT_SIZE_SMALL)
+                .color(theme::TEXT_DIM),
+            swatches,
+        ]
+        .spacing(theme::S2)
+        .into()
+    }
+
+    /// The filament loaded in each slot, and a way to ask the printer.
+    ///
+    /// **This is what the sculpt's slot numbers MEAN**, which is why it sits
+    /// directly above EXPORT: it is read at the moment somebody sends a model
+    /// to a printer, not while they sculpt.
+    ///
+    /// Read-only for now. A slot is edited by hand in `filaments.conf` or taken
+    /// from the machine with the button; there is no colour picker here because
+    /// the answer that matters is what is physically loaded, and the printer
+    /// knows that better than a mouse does.
+    fn filament_panel(&self) -> Element<'_, Message> {
+        let rows = self.palette.slots.iter().enumerate().fold(
+            column![].spacing(theme::S1),
+            |assembled, (index, slot)| {
+                assembled.push(
+                    row![
+                        // A fixed square rather than a Fill: this sits inside a
+                        // column that is already sized by the panel, and a Fill
+                        // swatch would take the whole row and push the label off.
+                        container(text(""))
+                            .width(14)
+                            .height(14)
+                            .style(theme::swatch(slot.swatch())),
+                        text(format!("{}. {}", index + 1, slot.name))
+                            .size(theme::TEXT_SIZE_SMALL)
+                            .color(theme::TEXT),
+                        text(slot.material.clone())
+                            .size(theme::CAPTION_SIZE)
+                            .color(theme::TEXT_MUTE),
+                    ]
+                    .spacing(theme::S2)
+                    .align_y(iced::Alignment::Center),
+                )
+            },
+        );
+
+        column![
+            rows,
+            button(text("Sync filaments from printer").size(theme::TEXT_SIZE_SMALL))
+                .style(theme::tool_button)
+                .on_press(Message::PaletteSyncRequested),
+            // View state, beside the colours it shows. Off draws every body as
+            // bare clay and changes nothing a stroke wrote.
+            checkbox(self.show_paint)
+                .label("show paint")
+                .on_toggle(|_| Message::ShowPaintToggled)
+                .text_size(theme::CAPTION_SIZE),
         ]
         .spacing(theme::S2)
         .into()

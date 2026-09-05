@@ -53,7 +53,14 @@ import sys
 import time
 
 UINPUT = "/dev/uinput"
-WINDOW_CLASS = "brokkrsculpt"
+# Which window to drive. Overridable the way `shot.sh` already takes
+# `BROKKR_WINDOW_CLASS`, because the application is not the only window a test
+# has to reach: an export puts up a native save dialog, which is its own window
+# with its own class (`org.freedesktop.impl.portal.desktop.kde` here), and
+# without this the driver activates the application behind the dialog and every
+# keystroke lands in the wrong place. Geometry is read for whichever window
+# this names, so coordinates stay window-local either way.
+WINDOW_CLASS = os.environ.get("BROKKR_WINDOW_CLASS", "brokkrsculpt")
 
 EV_SYN, EV_KEY, EV_REL, EV_ABS = 0, 1, 2, 3
 SYN_REPORT = 0
@@ -61,9 +68,9 @@ ABS_X, ABS_Y = 0, 1
 REL_WHEEL = 8
 BTN = {"left": 0x110, "right": 0x111, "middle": 0x112}
 KEYS = {
-    "esc": 1, "1": 2, "2": 3, "3": 4, "4": 5, "5": 6, "6": 7, "7": 8,
-    "q": 16, "w": 17, "e": 18, "r": 19, "t": 20, "y": 21, "u": 22,
-    "s": 31, "f": 33, "z": 44, "x": 45, "c": 46, "v": 47, "m": 50,
+    "esc": 1, "1": 2, "2": 3, "3": 4, "4": 5, "5": 6, "6": 7, "7": 8, "8": 9,
+    "q": 16, "w": 17, "e": 18, "r": 19, "t": 20, "y": 21, "u": 22, "[": 26, "]": 27,
+    "s": 31, "f": 33, "h": 35, "z": 44, "x": 45, "c": 46, "v": 47, "m": 50,
     "ctrl": 29, "shift": 42, "alt": 56, "space": 57, "tab": 15, "enter": 28,
 }
 

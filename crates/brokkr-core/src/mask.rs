@@ -1075,10 +1075,13 @@ impl MaskField {
         // alone: a mask over empty space has no field brick to be found through.
         let ratio = from_voxel / to_voxel;
         let dim = BRICK_DIM as i32;
+        // Half the ratio and not one voxel; see `crate::colour::gather_pad`,
+        // which names the bytes a pad of one dropped past a 2x refinement.
+        let pad = IVec3::splat(crate::colour::gather_pad(ratio));
         let mut wanted: FxHashSet<BrickCoord> = FxHashSet::default();
         for coord in self.bricks.keys() {
-            let low = (coord.origin().as_vec3() * ratio).floor().as_ivec3() - IVec3::ONE;
-            let high = (coord.max_voxel().as_vec3() * ratio).ceil().as_ivec3() + IVec3::ONE;
+            let low = (coord.origin().as_vec3() * ratio).floor().as_ivec3() - pad;
+            let high = (coord.max_voxel().as_vec3() * ratio).ceil().as_ivec3() + pad;
             let b_low = BrickCoord::containing(low).0;
             let b_high = BrickCoord::containing(high).0;
             for bz in b_low.z..=b_high.z {
@@ -1258,8 +1261,9 @@ impl MaskField {
             // [`Similarity::inverse_bounds`] makes for the backward one --
             // which is what `inverse().inverse_bounds(..)` says.
             let (low, high) = crate::transform::forward_bounds(by, source_low, source_high);
-            let low = BrickCoord::containing((low / voxel_size).floor().as_ivec3() - IVec3::ONE).0;
-            let high = BrickCoord::containing((high / voxel_size).ceil().as_ivec3() + IVec3::ONE).0;
+            let pad = IVec3::splat(crate::colour::gather_pad(by.scale.max_element()));
+            let low = BrickCoord::containing((low / voxel_size).floor().as_ivec3() - pad).0;
+            let high = BrickCoord::containing((high / voxel_size).ceil().as_ivec3() + pad).0;
             for bz in low.z..=high.z {
                 for byy in low.y..=high.y {
                     for bx in low.x..=high.x {

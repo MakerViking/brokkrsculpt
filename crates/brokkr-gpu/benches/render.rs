@@ -278,7 +278,10 @@ fn main() {
             // measuring the branch it is meant to be measuring the cost of.
             mask_inverted: 0,
             mask_tint: 1.0,
-            padding: [0; 1],
+            // Shown, on the same grounds: the paint branch is on by default
+            // and every painted pixel takes it.
+            paint_shown: 1,
+            palette: Uniforms::default().palette,
         };
         renderer.write_uniforms(&queue, &uniforms);
 

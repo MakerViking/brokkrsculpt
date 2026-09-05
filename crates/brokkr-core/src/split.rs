@@ -875,6 +875,12 @@ impl Document {
                 rest.insert_brick(coord, brick);
             }
         }
+        // Each half keeps the paint under its own band, per voxel. Unlike the
+        // mask, which is dropped on purpose, paint is what the body IS; and
+        // per voxel rather than per brick, or a brick the plane passes through
+        // hands each half the other's paint under material it does not have.
+        masked.adopt_paint(volume.colour());
+        rest.adopt_paint(volume.colour());
         // Both halves are brand new to the renderer, and a volume built by
         // `insert_brick` has marked nothing.
         masked.mark_everything_dirty();
@@ -924,12 +930,13 @@ impl Document {
                 volumes[output as usize].insert_brick(coord, brick);
             }
         }
-        for volume in &mut volumes {
+        for output in &mut volumes {
+            output.adopt_paint(volume.colour());
             // Every output is brand new to the renderer, and a volume built by
             // `insert_brick` has marked nothing. Without this the bodies are
             // right in every headless assertion and invisible on screen, which
             // is a failure this project has shipped twice.
-            volume.mark_everything_dirty();
+            output.mark_everything_dirty();
         }
         Some(volumes)
     }
@@ -1937,6 +1944,157 @@ mod tests {
             let volume = doc.volume(half).expect("the half is there");
             assert!(volume.mask().is_free(), "the {what} half arrived carrying a mask");
         }
+    }
+
+    /// Every surface voxel of every part -- the cells the mesher reads, see
+    /// `Volume::has_material_at` -- carries the slot the source was painted
+    /// with: a split moves material, and material carries its paint.
+    fn assert_every_shell_voxel_carries(doc: &Document, body: NodeId, slot: u8, what: &str) {
+        let volume = doc.volume(body).expect("the part is there");
+        let mut shell = 0;
+        for coord in volume.brick_coords() {
+            let origin = coord.origin();
+            for z in 0..BRICK_DIM as i32 {
+                for y in 0..BRICK_DIM as i32 {
+                    for x in 0..BRICK_DIM as i32 {
+                        let cell = origin + IVec3::new(x, y, z);
+                        if !volume.has_material_at(cell) {
+                            continue;
+                        }
+                        shell += 1;
+                        assert_eq!(
+                            volume.colour().at(cell),
+                            slot,
+                            "{what}: {cell:?} lost its paint"
+                        );
+                    }
+                }
+            }
+        }
+        assert!(shell > 0, "{what}: no shell to check");
+    }
+
+    #[test]
+    fn both_halves_of_a_masked_split_keep_their_paint() {
+        let mut volume = half_masked_sphere();
+        volume.edit_colour(IVec3::splat(-40), IVec3::splat(40), |_, _, _, _| 4);
+        let (mut doc, id) = document_of(volume);
+        let outcome = doc.split_masked(id).expect("a half masked sphere divides");
+        assert_every_shell_voxel_carries(&doc, outcome.masked, 4, "masked half");
+        assert_every_shell_voxel_carries(&doc, outcome.rest, 4, "rest");
+    }
+
+    /// Every stored slot of a body, for asserting what a part does NOT carry.
+    fn stored_slots(volume: &Volume) -> std::collections::BTreeSet<u8> {
+        let mut slots = std::collections::BTreeSet::new();
+        for coord in volume.brick_coords() {
+            let origin = coord.origin();
+            for z in 0..BRICK_DIM as i32 {
+                for y in 0..BRICK_DIM as i32 {
+                    for x in 0..BRICK_DIM as i32 {
+                        let slot = volume.colour().at(origin + IVec3::new(x, y, z));
+                        if slot != crate::colour::UNPAINTED {
+                            slots.insert(slot);
+                        }
+                    }
+                }
+            }
+        }
+        slots
+    }
+
+    /// Two balls inside ONE brick, painted two different slots: each part
+    /// carries its own slot at every shell voxel and does not carry the
+    /// other's anywhere. A single-slot fixture cannot tell "each part has its
+    /// own paint" from "each part has all the paint", and a per-brick copy
+    /// gave every part all of it.
+    #[test]
+    fn every_part_of_a_split_keeps_its_own_paint_and_only_its_own() {
+        let mut volume =
+            balls(&[(Vec3::new(4.0, 4.0, 4.0), 1.5), (Vec3::new(10.0, 4.0, 4.0), 1.5)]);
+        volume.edit_colour(
+            IVec3::splat(-40),
+            IVec3::splat(40),
+            |_, at, _, _| {
+                if at.x < 7.0 { 5 } else { 6 }
+            },
+        );
+        let (mut doc, id) = document_of(volume);
+        let plan = doc.split_plan(id).expect("the body is there");
+        let outcome = doc.split(plan).expect("two balls is a split");
+        assert_eq!(outcome.bodies.len(), 2);
+        let mut seen = Vec::new();
+        for body in &outcome.bodies {
+            let part = doc.volume(*body).expect("a new body");
+            let slots = stored_slots(part);
+            assert_eq!(
+                slots.len(),
+                1,
+                "a part carries {slots:?}: the other part's paint came along"
+            );
+            let slot = *slots.iter().next().expect("one slot");
+            assert_every_shell_voxel_carries(&doc, *body, slot, "part");
+            seen.push(slot);
+        }
+        seen.sort_unstable();
+        assert_eq!(seen, vec![5, 6], "each part should carry a different ball's slot");
+    }
+
+    /// The masked split's version: the plane OFF the brick plane, so the
+    /// bricks it passes through are divided per voxel and the paint has to be.
+    #[test]
+    fn both_halves_of_an_off_brick_masked_split_carry_only_their_own_paint() {
+        let mut volume = Volume::new(VOXEL);
+        volume.seed_sphere(Vec3::ZERO, 8.0);
+        let lo = IVec3::splat(-40);
+        let hi = IVec3::splat(40);
+        volume.edit_mask(lo, hi, |_, at, _| {
+            let across = ((at.x - 4.0) / 2.0).clamp(-1.0, 1.0) * 0.5 + 0.5;
+            (across * 255.0).round() as u8
+        });
+        volume.edit_colour(lo, hi, |_, at, _, _| if at.x < 4.0 { 5 } else { 6 });
+        volume.mark_everything_dirty();
+        let (mut doc, id) = document_of(volume);
+        let outcome = doc.split_masked(id).expect("a half masked sphere divides");
+        let masked = stored_slots(doc.volume(outcome.masked).expect("half"));
+        let rest = stored_slots(doc.volume(outcome.rest).expect("half"));
+        // The feathered rim straddles the paint boundary by a voxel or two,
+        // so each half may legitimately hold a few of the other's slots AT ITS
+        // SHELL; what it must not hold is the other half's paint under
+        // material it does not have. Count stored bytes of the wrong slot
+        // deep inside, where no shell voxel could be.
+        let deep_wrong = |half: &Volume, wrong: u8| {
+            let mut count = 0;
+            for coord in half.brick_coords() {
+                let origin = coord.origin();
+                for z in 0..BRICK_DIM as i32 {
+                    for y in 0..BRICK_DIM as i32 {
+                        for x in 0..BRICK_DIM as i32 {
+                            let cell = origin + IVec3::new(x, y, z);
+                            if half.colour().at(cell) == wrong
+                                && !crate::colour::ColourField::paintable(half.sample_voxel(cell))
+                            {
+                                count += 1;
+                            }
+                        }
+                    }
+                }
+            }
+            count
+        };
+        assert!(masked.contains(&6) && rest.contains(&5), "the fixture did not paint both halves");
+        let masked_half = doc.volume(outcome.masked).expect("half");
+        let rest_half = doc.volume(outcome.rest).expect("half");
+        assert_eq!(
+            deep_wrong(masked_half, 5),
+            0,
+            "the masked half carries the rest's paint off its band"
+        );
+        assert_eq!(
+            deep_wrong(rest_half, 6),
+            0,
+            "the rest carries the masked half's paint off its band"
+        );
     }
 
     #[test]

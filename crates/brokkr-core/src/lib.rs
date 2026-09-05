@@ -26,6 +26,7 @@ pub mod brick;
 pub mod brush;
 pub mod cavity;
 pub mod clip;
+pub mod colour;
 pub mod export;
 pub mod generate;
 pub mod import;

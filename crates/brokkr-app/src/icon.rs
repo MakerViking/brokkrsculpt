@@ -526,6 +526,28 @@ const BRUSH_MOVE: Glyph = Glyph {
     ],
 };
 
+/// Paint: a brush, handle up to the right, and the drop it has left.
+///
+/// The drop is the one filled shape in the brush row, on the house rule that
+/// solid ink marks the thing itself: here the paint, which is the whole point
+/// of the brush.
+const BRUSH_PAINT: Glyph = Glyph {
+    subs: &[
+        Sub {
+            segs: &[
+                Seg::Move(19.5, 4.5),
+                Seg::Line(10.5, 13.5),
+                Seg::Quad { cx: 7.0, cy: 17.5, x: 5.5, y: 18.5 },
+                Seg::Quad { cx: 9.5, cy: 17.0, x: 12.5, y: 15.5 },
+                Seg::Line(19.5, 4.5),
+                Seg::Close,
+            ],
+            ink: Ink::Stroke,
+        },
+        Sub { segs: &[Seg::Circle { cx: 17.5, cy: 17.5, r: 2.0 }], ink: Ink::Fill },
+    ],
+};
+
 /// The plane cut: a solid, and the plane going through it.
 const CUT_PLANE: Glyph = Glyph {
     subs: &[
@@ -805,6 +827,7 @@ pub enum IconName {
     BrushPinch,
     BrushFlatten,
     BrushMove,
+    BrushPaint,
     CutPlane,
     Mask,
     Gizmo,
@@ -827,7 +850,7 @@ impl IconName {
     /// set's index, and anything that needs the whole set rather than one icon
     /// starts here.
     #[allow(dead_code)]
-    pub const ALL: [IconName; 32] = [
+    pub const ALL: [IconName; 33] = [
         IconName::Close,
         IconName::Minimise,
         IconName::Maximise,
@@ -850,6 +873,7 @@ impl IconName {
         IconName::BrushPinch,
         IconName::BrushFlatten,
         IconName::BrushMove,
+        IconName::BrushPaint,
         IconName::CutPlane,
         IconName::Mask,
         IconName::Eye,
@@ -875,6 +899,7 @@ impl IconName {
             BrushKind::Pinch => IconName::BrushPinch,
             BrushKind::Flatten => IconName::BrushFlatten,
             BrushKind::Move => IconName::BrushMove,
+            BrushKind::Paint => IconName::BrushPaint,
         }
     }
 
@@ -919,6 +944,7 @@ impl IconName {
             IconName::BrushPinch => &BRUSH_PINCH,
             IconName::BrushFlatten => &BRUSH_FLATTEN,
             IconName::BrushMove => &BRUSH_MOVE,
+            IconName::BrushPaint => &BRUSH_PAINT,
             IconName::CutPlane => &CUT_PLANE,
             IconName::Mask => &MASK,
             IconName::Gizmo => &GIZMO,

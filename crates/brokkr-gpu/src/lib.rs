@@ -20,5 +20,5 @@ pub use mesh_pool::{
     TOTAL_INDEX_CAPACITY, TOTAL_VERTEX_CAPACITY, VERTEX_CAPACITY,
 };
 pub use overlay::{OverlayBatch, OverlayRenderer, OverlayVertex};
-pub use renderer::{PixelRect, SculptRenderer, Uniforms};
+pub use renderer::{PALETTE_SLOTS, PixelRect, SculptRenderer, UNKNOWN_FILAMENT, Uniforms};
 pub use thumbnail::{THUMBNAIL_BACKGROUND, THUMBNAIL_SIZE, ThumbnailAtlas, background_texel};

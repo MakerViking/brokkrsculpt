@@ -38,24 +38,28 @@
 //! voxel on each side, which is precisely the 26 neighbours. Mark only what was
 //! written and there is a crack along the join that no slicer will accept.
 //!
-//! # Whose filament slot survives, when colour lands
+//! # Whose filament slot survives
 //!
-//! **The one whose distance won the `min`, per voxel; a tie goes to the
-//! target.** That is right rather than merely deterministic: the union's
-//! surface is exactly where the winning body's own surface is outermost, so the
-//! argmin IS the body whose surface you can see at that voxel. Every branch
-//! below states which side won, and the per-voxel comparison is written as a
-//! strict `<` against the target's value rather than as `f32::min`, which
-//! erases it. Colour adds a slot write inside those branches and does not have
-//! to revisit the classifier.
+//! **The incoming body's, wherever it is painted AND has material in band;
+//! the target's everywhere else.** An earlier draft of this header planned the
+//! argmin -- the slot of whichever distance won the `min` -- and that is not
+//! what landed, for a reason the argmin cannot see: a slot is written only in
+//! the band and can be left behind outside it, so "the incoming body is
+//! painted here" has to be checked against the incoming FIELD, not the colour
+//! map alone. `ColourField::union_from` takes that predicate from
+//! [`Volume::union_colour_from`]. Where both bodies are painted in band the
+//! incoming one wins, because its material is what the merge is adding.
+//! Neither rule can unpaint anything. The bricks it overwrites go into the
+//! open stroke's recorder, so undoing a merge puts the target's own paint
+//! back -- which the mask half below still does not do.
 //!
 //! The mask is the other way round: **`max` of the two masks, never the
-//! argmin's mask.** Protection is a veto and vetoes union; the argmin rule that
-//! is right for a filament slot would let an unmasked source strip protection
-//! along the exact seam the merge just created. That half is live -- see the
-//! end of [`Volume::union_from`] -- and unlike the field half it is not in the
-//! undo entry yet. `StrokeEdit` gained a mask list in increment 21, so the
-//! shape now exists; what is missing is `union_max_from` handing back the
+//! argmin's mask.** Protection is a veto and vetoes union; a rule that let the
+//! incoming body win would let an unmasked source strip protection along the
+//! exact seam the merge just created. That half is live -- see the end of
+//! [`Volume::union_from`] -- and unlike the field and colour halves it is not
+//! in the undo entry yet. `StrokeEdit` gained a mask list in increment 21, so
+//! the shape now exists; what is missing is `union_max_from` handing back the
 //! bricks it overwrote. Revisit when a merge's undo is next touched.
 
 use crate::body::{Document, NodeId};
@@ -271,6 +275,9 @@ impl Volume {
         // that a reader would otherwise assume was covered.
         let mask = other.mask();
         self.mask_mut().union_max_from(mask, other.brick_coords());
+        // And the paint: the incoming body's material brings its own slot,
+        // where it really has material. Recorded, unlike the mask above.
+        self.union_colour_from(other);
 
         written
     }
@@ -730,6 +737,70 @@ mod tests {
     /// Both saturated directions, because they end differently: `INSIDE` goes
     /// back as a tile and `OUTSIDE` is dropped, since an absent brick already
     /// reads that way.
+    /// The incoming body's paint arrives where it has material, the target's
+    /// own paint stands where it has none, and the stroke that brackets the
+    /// merge puts the target's paint back on undo -- the entry is APPLIED
+    /// here, because a first version that discarded it passed with the colour
+    /// union unrecorded and undo destroying paint.
+    #[test]
+    fn a_merged_body_brings_its_paint_leaves_ours_and_undoes_cleanly() {
+        use crate::colour::UNPAINTED;
+
+        let coord = BrickCoord::new(0, 0, 0);
+        let mut into = Volume::new(VOXEL);
+        into.insert_brick(coord, Brick::Uniform(0.5));
+        let ours = coord.origin() + IVec3::new(1, 1, 1);
+        let shared = coord.origin() + IVec3::new(3, 3, 3);
+        let theirs = coord.origin() + IVec3::new(5, 5, 5);
+        into.colour_mut().write(ours, 1);
+        into.colour_mut().write(shared, 1);
+
+        let mut from = Volume::new(VOXEL);
+        // In band throughout, so every incoming slot is admitted.
+        from.insert_brick(coord, Brick::Uniform(-0.5));
+        from.colour_mut().write(theirs, 3);
+        from.colour_mut().write(shared, 3);
+
+        into.begin_stroke();
+        into.union_from(&from);
+        let edit = into.end_stroke().expect("a merge that changed the field recorded nothing");
+
+        assert_eq!(into.colour().at(theirs), 3, "the incoming body's paint did not arrive");
+        assert_eq!(into.colour().at(shared), 3, "where both are painted the incoming one wins");
+        assert_eq!(into.colour().at(ours), 1, "the incoming body's unpainted voxel erased ours");
+        assert_eq!(into.colour().at(coord.origin()), UNPAINTED);
+        assert!(edit.colour_len() > 0, "the merge recorded no colour brick");
+
+        let redo = into.apply_edit(edit);
+        assert_eq!(into.colour().at(shared), 1, "undo did not put the target's own paint back");
+        assert_eq!(into.colour().at(theirs), UNPAINTED, "undo left the incoming paint behind");
+        into.apply_edit(redo);
+        assert_eq!(into.colour().at(shared), 3, "redo did not re-merge the paint");
+    }
+
+    /// A slot the incoming body left behind outside its band -- carved away
+    /// under it, or dragged out from under it -- is not material and must not
+    /// arrive.
+    #[test]
+    fn a_merge_ignores_incoming_paint_where_the_incoming_body_has_no_material() {
+        let coord = BrickCoord::new(0, 0, 0);
+        let mut into = Volume::new(VOXEL);
+        into.insert_brick(coord, Brick::Uniform(0.5));
+        let cell = coord.origin() + IVec3::new(2, 2, 2);
+        into.colour_mut().write(cell, 1);
+
+        let mut from = Volume::new(VOXEL);
+        // Solid throughout: saturated, so nothing in this brick is in band.
+        from.insert_brick(coord, Brick::Uniform(INSIDE));
+        from.colour_mut().write(cell, 3);
+
+        into.begin_stroke();
+        into.union_from(&from);
+        let edit = into.end_stroke().expect("the field changed");
+        assert_eq!(into.colour().at(cell), 1, "a stale incoming slot overwrote fresh paint");
+        assert_eq!(edit.colour_len(), 0, "nothing changed, so nothing should be recorded");
+    }
+
     #[test]
     fn a_dense_merge_that_comes_out_saturated_releases_the_allocation() {
         let solid = BrickCoord::new(0, 0, 0);

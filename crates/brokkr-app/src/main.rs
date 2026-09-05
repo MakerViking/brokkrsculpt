@@ -44,6 +44,7 @@ mod input_watch;
 mod logo;
 mod message;
 mod navcube;
+mod palette;
 mod paths;
 mod printer;
 // Reading HID devices on macOS and on Windows, the way `input_watch` reads

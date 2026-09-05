@@ -165,7 +165,7 @@ pub const ICON_CHROME: f32 = 14.0;
 /// The tool strip, above the tool's name.
 ///
 /// Eighteen rather than the twenty-four the grid is drawn on, because the strip
-/// has a vertical budget: seven brushes, three mirror toggles, the cut and the
+/// has a vertical budget: eight brushes, three mirror toggles, the cut and the
 /// mask have to fit a 768-high window without scrolling. A properties panel
 /// taller than its window has already happened here once and put every
 /// SpaceMouse binding out of reach. Adding the mask as the eleventh button was
@@ -223,6 +223,25 @@ pub fn panel(_theme: &iced::Theme) -> iced::widget::container::Style {
         background: Some(PANEL.into()),
         text_color: Some(TEXT),
         border: iced::Border { color: LINE, width: 1.0, radius: RADIUS_MD.into() },
+        ..Default::default()
+    }
+}
+
+/// A filament swatch: a block of one slot's colour.
+///
+/// **The first style here that takes a colour**, and so the first that returns
+/// a closure rather than a `fn`. Every other style in this module is a plain
+/// function pointer because the palette is fixed at compile time; a filament's
+/// colour is not, so the value has to be captured. `iced` takes any
+/// `Fn(&Theme) -> Style` for a container, so this costs nothing but the move.
+///
+/// It carries a border in the panel's own line colour rather than none, because
+/// a white filament against the panel would otherwise have no edge at all and
+/// read as a hole rather than as a swatch.
+pub fn swatch(colour: Color) -> impl Fn(&iced::Theme) -> iced::widget::container::Style {
+    move |_theme: &iced::Theme| iced::widget::container::Style {
+        background: Some(colour.into()),
+        border: iced::Border { color: LINE, width: 1.0, radius: RADIUS_SM.into() },
         ..Default::default()
     }
 }

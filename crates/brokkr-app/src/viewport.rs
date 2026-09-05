@@ -120,6 +120,28 @@ impl Default for MaskView {
     }
 }
 
+/// What the sculpt shader is told about paint this frame.
+///
+/// View state, on the same terms as [`MaskView`]: the toggle hides paint and
+/// changes no slot, and the palette is the machine's filament colours, which
+/// are not the document's either. Slot NUMBERS are document state and they
+/// travel in the mesh; this is only what each number looks like today.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PaintView {
+    /// Whether painted slots are drawn at all.
+    pub shown: bool,
+    /// Linear RGB per slot. See [`brokkr_gpu::Uniforms::palette`].
+    pub palette: [[f32; 4]; brokkr_gpu::PALETTE_SLOTS],
+}
+
+impl Default for PaintView {
+    /// Shown, in the unknown-filament colour, for the reason [`MaskView`]'s
+    /// default is tinted: the default has to fail visibly.
+    fn default() -> Self {
+        Self { shown: true, palette: Uniforms::default().palette }
+    }
+}
+
 /// The hand off between the application and the render callbacks.
 #[derive(Debug, Default)]
 pub struct SharedFrame {
@@ -165,6 +187,8 @@ pub struct SharedFrame {
     /// How the mask is to be drawn. See [`MaskView`] and
     /// [`SharedFrame::set_mask_view`].
     mask: Mutex<MaskView>,
+    /// How paint is to be drawn. See [`PaintView`].
+    paint: Mutex<PaintView>,
     /// The one thumbnail waiting to be drawn.
     ///
     /// **Capacity one, so the per-frame cap IS the type.** "At most one body
@@ -391,6 +415,18 @@ impl SharedFrame {
     /// tick, which is what lets it be unconditional.
     pub fn set_mask_view(&self, view: MaskView) {
         *self.mask.lock().expect("shared frame poisoned") = view;
+    }
+
+    /// Replace what the shader is told about paint. See [`PaintView`].
+    pub fn set_paint_view(&self, view: PaintView) {
+        *self.paint.lock().expect("shared frame poisoned") = view;
+    }
+
+    /// What the renderer will be told about paint, for tests that have to
+    /// tell "the toggle arrived" from "the toggle was flipped".
+    #[cfg(test)]
+    pub fn paint_view(&self) -> PaintView {
+        *self.paint.lock().expect("shared frame poisoned")
     }
 
     /// Replace the set of bodies drawn with the opposite of
@@ -947,6 +983,7 @@ impl shader::Primitive for SculptPrimitive {
 
         let camera = *shared.camera.lock().expect("shared frame poisoned");
         let mask = *shared.mask.lock().expect("shared frame poisoned");
+        let paint = *shared.paint.lock().expect("shared frame poisoned");
         let aspect = bounds.width / bounds.height.max(1.0);
         let view = camera.view();
         let view_projection = camera.projection(aspect) * view;
@@ -956,7 +993,8 @@ impl shader::Primitive for SculptPrimitive {
             srgb_target: u32::from(pipeline.renderer.target_is_srgb()),
             mask_inverted: u32::from(mask.inverted),
             mask_tint: mask.tint,
-            padding: [0; 1],
+            paint_shown: u32::from(paint.shown),
+            palette: paint.palette,
         };
         pipeline.renderer.write_uniforms(queue, &uniforms);
         {
@@ -1303,7 +1341,9 @@ mod apply_tests {
             vertices: vec![Vertex { position: [0.0; 3], normal: [0.0, 1.0, 0.0] }; 64],
             indices: (0..64).collect(),
             cells: Vec::new(),
+            partners: Vec::new(),
             mask: vec![0; 64],
+            colour: vec![0; 64],
         }
     }
 
@@ -1342,7 +1382,9 @@ mod apply_tests {
             ],
             indices: vec![0, 1, 2, 0, 2, 3],
             cells: Vec::new(),
+            partners: Vec::new(),
             mask: vec![0; 4],
+            colour: vec![0; 4],
         }
     }
 

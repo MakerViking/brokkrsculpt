@@ -71,7 +71,7 @@ moving to a point over the model and confirming the ring is where you aimed.
 - **Middle or right drag** orbits; **shift** with them pans. Right *click*
   opens the brush menu, so use middle for orbiting.
 - **Wheel** zooms about the surface under the cursor.
-- `w` arms the transform gizmo, `1`-`7` pick a brush, `x`/`y`/`z` toggle a
+- `w` arms the transform gizmo, `1`-`8` pick a brush, `x`/`y`/`z` toggle a
   mirror plane, `m` masks, `esc` cancels a live drag, `ctrl+z` undoes.
 - A **release with no motion is deliberately a no-op** — it will not re-bake.
   If you are testing a drag, move at least a few pixels.
