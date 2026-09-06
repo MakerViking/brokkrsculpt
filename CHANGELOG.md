@@ -69,6 +69,17 @@ real hardware.
 
 ### Fixed
 
+- **Windows said "no tablet found" to everyone.** The PEN panel and the bug
+  report read a device list that only the Linux scanner ever filled, so on
+  Windows the line was a default rather than a finding, whether or not a pen
+  was reporting. Windows now enumerates its HID devices at startup, names the
+  pen with its pressure range, tilt and eraser, and listens for a pen whichever
+  of the two top-level usages its driver presents. `brokkrsculpt.exe --tablets
+  > tablets.txt` lists every HID device and says why each is or is not a
+  stylus, including the mouse-mode case, which is the one to check first: a
+  tablet whose driver has Windows Ink switched off is a mouse to every
+  application. A tablet plugged in after launch is not seen until a relaunch.
+
 - **Vendor forks and every packaging format are found, not just OrcaSlicer.**
   Snapmaker ships its own OrcaSlicer fork, BambuStudio is the same lineage again,
   and any of them can arrive as a native package, an AppImage, a flatpak or a

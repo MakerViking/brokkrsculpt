@@ -1098,8 +1098,7 @@ mod backend {
             .spawn(move || {
                 raw_input::pump(
                     "BrokkrPuckSink",
-                    PAGE_GENERIC,
-                    USAGE_MULTI_AXIS,
+                    &[(PAGE_GENERIC, USAGE_MULTI_AXIS)],
                     |data, report| {
                         decode(&shared, data, report);
                     },
