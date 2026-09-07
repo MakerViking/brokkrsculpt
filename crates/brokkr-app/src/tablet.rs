@@ -387,8 +387,10 @@ fn normalise_signed(value: i32, minimum: i32, maximum: i32) -> f32 {
 ///
 /// Platform independent so the verdicts and the `--tablets` wording are
 /// tested here, on the machine that has the test suite, rather than only on
-/// the machine that has the tablet.
-#[cfg_attr(target_os = "linux", allow(dead_code))]
+/// the machine that has the tablet. Compiled for Windows, which reads it, and
+/// for every test build, which is where it is exercised; a release build on
+/// Linux or macOS has no use for it and `-D warnings` would say so.
+#[cfg(any(target_os = "windows", test))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct HidSummary {
     pub vendor: u16,
@@ -403,12 +405,18 @@ pub(crate) struct HidSummary {
 }
 
 /// The HID digitizer page, and the two top-level usages a pen arrives as.
+#[cfg(any(target_os = "windows", test))]
 pub(crate) const HID_PAGE_DIGITIZER: u16 = 0x0D;
+#[cfg(any(target_os = "windows", test))]
 pub(crate) const HID_USAGE_DIGITIZER: u16 = 0x01;
+#[cfg(any(target_os = "windows", test))]
 pub(crate) const HID_USAGE_PEN: u16 = 0x02;
+#[cfg(any(target_os = "windows", test))]
 const HID_USAGE_TOUCH_SCREEN: u16 = 0x04;
+#[cfg(any(target_os = "windows", test))]
 const HID_USAGE_TOUCH_PAD: u16 = 0x05;
 
+#[cfg(any(target_os = "windows", test))]
 impl HidSummary {
     /// A name a person can read, from the vendor id when it is one this
     /// application knows and the raw ids otherwise.
@@ -455,7 +463,7 @@ impl HidSummary {
 
 /// The `--tablets` report for a scanner that sees HID devices, from what it
 /// found and whether the live pipe has heard anything.
-#[cfg_attr(target_os = "linux", allow(dead_code))]
+#[cfg(any(target_os = "windows", test))]
 pub(crate) fn hid_report(devices: &[HidSummary], pipe: &str) -> String {
     use std::fmt::Write;
     let mut out = String::new();
