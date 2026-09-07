@@ -28,13 +28,15 @@
 //! rather than ours.
 
 use windows_sys::Win32::Devices::HumanInterfaceDevice::{
-    HIDP_STATUS_SUCCESS, HIDP_VALUE_CAPS, HidP_GetUsageValue, HidP_GetUsages, HidP_GetValueCaps,
-    HidP_Input, PHIDP_PREPARSED_DATA,
+    HIDP_BUTTON_CAPS, HIDP_STATUS_SUCCESS, HIDP_VALUE_CAPS, HidP_GetButtonCaps, HidP_GetUsageValue,
+    HidP_GetUsages, HidP_GetValueCaps, HidP_Input, PHIDP_PREPARSED_DATA,
 };
-use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
+use windows_sys::Win32::Foundation::{HANDLE, HWND, LPARAM, LRESULT, WPARAM};
 use windows_sys::Win32::UI::Input::{
-    GetRawInputData, GetRawInputDeviceInfoW, HRAWINPUT, RAWINPUT, RAWINPUTDEVICE, RAWINPUTHEADER,
-    RID_INPUT, RIDEV_INPUTSINK, RIDI_PREPARSEDDATA, RegisterRawInputDevices,
+    GetRawInputData, GetRawInputDeviceInfoW, GetRawInputDeviceList, HRAWINPUT, RAWINPUT,
+    RAWINPUTDEVICE, RAWINPUTDEVICELIST, RAWINPUTHEADER, RID_DEVICE_INFO, RID_INPUT,
+    RIDEV_INPUTSINK, RIDI_DEVICEINFO, RIDI_DEVICENAME, RIDI_PREPARSEDDATA, RIM_TYPEHID,
+    RegisterRawInputDevices,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DispatchMessageW, GetMessageW, HWND_MESSAGE, MSG,
@@ -55,12 +57,7 @@ pub const PAGE_DIGITIZER: u16 = 0x0D;
 ///
 /// `class` must be unique per caller. Registering a window class twice fails,
 /// and two devices read on two threads need two windows.
-pub fn pump(
-    class: &str,
-    usage_page: u16,
-    usage: u16,
-    on_report: impl Fn(PHIDP_PREPARSED_DATA, &[u8]),
-) {
+pub fn pump(class: &str, usages: &[(u16, u16)], on_report: impl Fn(PHIDP_PREPARSED_DATA, &[u8])) {
     let class_name: Vec<u16> = class.encode_utf16().chain(std::iter::once(0)).collect();
     let mut descriptor: WNDCLASSW = unsafe { std::mem::zeroed() };
     descriptor.lpfnWndProc = Some(wndproc);
@@ -89,15 +86,29 @@ pub fn pump(
         return;
     }
 
-    let device = RAWINPUTDEVICE {
-        usUsagePage: usage_page,
-        usUsage: usage,
-        // Delivered even unfocused, which this window always is: without this
-        // flag a message-only window receives nothing at all.
-        dwFlags: RIDEV_INPUTSINK,
-        hwndTarget: window,
+    // Every usage in one registration. A pen is usage 0x02 on the digitizer
+    // page by the HID specification, but a vendor driver may present its
+    // top-level collection as 0x01, the plain "digitizer", and a registration
+    // for the one would never hear from the other.
+    let devices: Vec<RAWINPUTDEVICE> = usages
+        .iter()
+        .map(|(usage_page, usage)| RAWINPUTDEVICE {
+            usUsagePage: *usage_page,
+            usUsage: *usage,
+            // Delivered even unfocused, which this window always is: without
+            // this flag a message-only window receives nothing at all.
+            dwFlags: RIDEV_INPUTSINK,
+            hwndTarget: window,
+        })
+        .collect();
+    let registered = unsafe {
+        RegisterRawInputDevices(
+            devices.as_ptr(),
+            devices.len() as u32,
+            size_of::<RAWINPUTDEVICE>() as u32,
+        )
     };
-    if unsafe { RegisterRawInputDevices(&device, 1, size_of::<RAWINPUTDEVICE>() as u32) } == 0 {
+    if registered == 0 {
         return;
     }
 
@@ -255,5 +266,122 @@ pub fn range(data: PHIDP_PREPARSED_DATA, usage_page: u16, usage: u16) -> Option<
             && !cap.IsRange
             && unsafe { cap.Anonymous.NotRange.Usage } == usage;
         matches.then_some((cap.LogicalMin, cap.LogicalMax))
+    })
+}
+
+/// One HID device Windows knows about, as Raw Input describes it.
+#[derive(Debug, Clone)]
+pub struct HidDevice {
+    pub handle: HANDLE,
+    /// The device interface path, which carries the vendor and product ids
+    /// and is the only name available without opening the device.
+    pub path: String,
+    pub usage_page: u16,
+    pub usage: u16,
+    pub vendor: u16,
+    pub product: u16,
+}
+
+/// Every HID device Raw Input can see right now.
+///
+/// **This is what makes "no tablet found" a statement rather than a default
+/// on Windows.** The pen pipe used to be the only thing that ran here: a
+/// registration and a message loop, with no enumeration at all, so the device
+/// list the panel and the bug report read from stayed empty for every Windows
+/// user whether or not a pen was reporting. Mice and keyboards are skipped;
+/// they are not HID collections to Raw Input.
+pub fn devices() -> Vec<HidDevice> {
+    let mut count = 0u32;
+    let size = size_of::<RAWINPUTDEVICELIST>() as u32;
+    if unsafe { GetRawInputDeviceList(std::ptr::null_mut(), &mut count, size) } == u32::MAX
+        || count == 0
+    {
+        return Vec::new();
+    }
+    let mut list: Vec<RAWINPUTDEVICELIST> = vec![unsafe { std::mem::zeroed() }; count as usize];
+    let got = unsafe { GetRawInputDeviceList(list.as_mut_ptr(), &mut count, size) };
+    if got == u32::MAX {
+        return Vec::new();
+    }
+    list.truncate(got as usize);
+
+    list.into_iter()
+        .filter(|entry| entry.dwType == RIM_TYPEHID)
+        .filter_map(|entry| {
+            let mut info: RID_DEVICE_INFO = unsafe { std::mem::zeroed() };
+            info.cbSize = size_of::<RID_DEVICE_INFO>() as u32;
+            let mut size = info.cbSize;
+            let read = unsafe {
+                GetRawInputDeviceInfoW(
+                    entry.hDevice,
+                    RIDI_DEVICEINFO,
+                    (&mut info as *mut RID_DEVICE_INFO).cast(),
+                    &mut size,
+                )
+            };
+            if read == u32::MAX || info.dwType != RIM_TYPEHID {
+                return None;
+            }
+            let hid = unsafe { info.Anonymous.hid };
+            Some(HidDevice {
+                handle: entry.hDevice,
+                path: device_name(entry.hDevice),
+                usage_page: hid.usUsagePage,
+                usage: hid.usUsage,
+                vendor: hid.dwVendorId as u16,
+                product: hid.dwProductId as u16,
+            })
+        })
+        .collect()
+}
+
+/// The device interface path, or an empty string when Windows will not say.
+fn device_name(device: HANDLE) -> String {
+    let mut length = 0u32;
+    unsafe { GetRawInputDeviceInfoW(device, RIDI_DEVICENAME, std::ptr::null_mut(), &mut length) };
+    if length == 0 {
+        return String::new();
+    }
+    let mut buffer: Vec<u16> = vec![0; length as usize];
+    let read = unsafe {
+        GetRawInputDeviceInfoW(device, RIDI_DEVICENAME, buffer.as_mut_ptr().cast(), &mut length)
+    };
+    if read == u32::MAX {
+        return String::new();
+    }
+    let end = buffer.iter().position(|c| *c == 0).unwrap_or(buffer.len());
+    String::from_utf16_lossy(&buffer[..end])
+}
+
+/// The preparsed report descriptor of a device, for asking about its usages
+/// before any report has arrived.
+pub fn preparsed(device: HANDLE) -> Option<Vec<u8>> {
+    preparsed_data(device)
+}
+
+/// Whether the device declares a button usage at all, whatever its state.
+///
+/// [`button`] answers for one report; this answers for the device, which is
+/// what a panel that says "eraser" before the pen has been turned over needs.
+pub fn has_button(data: PHIDP_PREPARSED_DATA, usage_page: u16, usage: u16) -> bool {
+    let mut count = 0u16;
+    unsafe { HidP_GetButtonCaps(HidP_Input, std::ptr::null_mut(), &mut count, data) };
+    if count == 0 {
+        return false;
+    }
+    let mut caps: Vec<HIDP_BUTTON_CAPS> = vec![unsafe { std::mem::zeroed() }; count as usize];
+    let status = unsafe { HidP_GetButtonCaps(HidP_Input, caps.as_mut_ptr(), &mut count, data) };
+    if status != HIDP_STATUS_SUCCESS {
+        return false;
+    }
+    caps[..count as usize].iter().any(|cap| {
+        cap.UsagePage == usage_page
+            && if cap.IsRange {
+                let range = unsafe { cap.Anonymous.Range };
+                (range.UsageMin..=range.UsageMax).contains(&usage)
+            } else {
+                let single = unsafe { cap.Anonymous.NotRange.Usage };
+                single == usage
+            }
     })
 }

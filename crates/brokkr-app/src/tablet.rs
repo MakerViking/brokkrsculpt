@@ -382,6 +382,141 @@ fn normalise_signed(value: i32, minimum: i32, maximum: i32) -> f32 {
     (value as f32 / extent as f32).clamp(-1.0, 1.0)
 }
 
+/// One HID device as the Windows and macOS scanners describe it, reduced to
+/// what decides whether it is a stylus.
+///
+/// Platform independent so the verdicts and the `--tablets` wording are
+/// tested here, on the machine that has the test suite, rather than only on
+/// the machine that has the tablet. Compiled for Windows, which reads it, and
+/// for every test build, which is where it is exercised; a release build on
+/// Linux or macOS has no use for it and `-D warnings` would say so.
+#[cfg(any(target_os = "windows", test))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct HidSummary {
+    pub vendor: u16,
+    pub product: u16,
+    pub usage_page: u16,
+    pub usage: u16,
+    /// The tip pressure range the descriptor declares, if it declares one.
+    pub pressure: Option<(i32, i32)>,
+    pub has_tilt: bool,
+    pub has_eraser: bool,
+    pub path: String,
+}
+
+/// The HID digitizer page, and the two top-level usages a pen arrives as.
+#[cfg(any(target_os = "windows", test))]
+pub(crate) const HID_PAGE_DIGITIZER: u16 = 0x0D;
+#[cfg(any(target_os = "windows", test))]
+pub(crate) const HID_USAGE_DIGITIZER: u16 = 0x01;
+#[cfg(any(target_os = "windows", test))]
+pub(crate) const HID_USAGE_PEN: u16 = 0x02;
+#[cfg(any(target_os = "windows", test))]
+const HID_USAGE_TOUCH_SCREEN: u16 = 0x04;
+#[cfg(any(target_os = "windows", test))]
+const HID_USAGE_TOUCH_PAD: u16 = 0x05;
+
+#[cfg(any(target_os = "windows", test))]
+impl HidSummary {
+    /// A name a person can read, from the vendor id when it is one this
+    /// application knows and the raw ids otherwise.
+    pub fn name(&self) -> String {
+        let vendor = match self.vendor {
+            0x056A => "Wacom",
+            0x256C => "Huion or Gaomon",
+            0x28BD => "XP-Pen",
+            0x2D1F => "Wacom (Intuos)",
+            0x04F3 => "Elan",
+            0x1B96 => "N-Trig",
+            _ => "",
+        };
+        if vendor.is_empty() {
+            format!("HID {:04X}:{:04X}", self.vendor, self.product)
+        } else {
+            format!("{vendor} {:04X}:{:04X}", self.vendor, self.product)
+        }
+    }
+
+    /// `Ok` with what will be read from it, or `Err` with why it is not a
+    /// stylus. Mirrors the Linux scanner's rules: a pen without pressure is
+    /// not worth opening, and a touch device is not a pen however much
+    /// pressure it reports.
+    pub fn verdict(&self) -> Result<&'static str, &'static str> {
+        if self.usage_page != HID_PAGE_DIGITIZER {
+            return Err("ignored: not a digitizer");
+        }
+        match self.usage {
+            HID_USAGE_TOUCH_SCREEN | HID_USAGE_TOUCH_PAD => {
+                Err("ignored: a touch device, not a pen")
+            }
+            HID_USAGE_PEN | HID_USAGE_DIGITIZER => match self.pressure {
+                Some(_) => Ok("STYLUS, pressure will be read from this"),
+                None => {
+                    Err("ignored: a digitizer that declares no tip pressure -- the driver is in \
+                     mouse mode, or this collection is the tablet's buttons")
+                }
+            },
+            _ => Err("ignored: a digitizer collection that is not a pen"),
+        }
+    }
+}
+
+/// The `--tablets` report for a scanner that sees HID devices, from what it
+/// found and whether the live pipe has heard anything.
+#[cfg(any(target_os = "windows", test))]
+pub(crate) fn hid_report(devices: &[HidSummary], pipe: &str) -> String {
+    use std::fmt::Write;
+    let mut out = String::new();
+    let _ = writeln!(out, "HID devices, as the tablet scanner sees them.\n");
+    if devices.is_empty() {
+        let _ = writeln!(out, "No HID devices at all, which usually means the enumeration failed.");
+    }
+    let mut found = 0usize;
+    for device in devices {
+        let range = device
+            .pressure
+            .map(|(low, high)| format!("{low} to {high}"))
+            .unwrap_or_else(|| "none".into());
+        let mut extras = Vec::new();
+        if device.has_tilt {
+            extras.push("tilt");
+        }
+        if device.has_eraser {
+            extras.push("eraser");
+        }
+        let also =
+            if extras.is_empty() { String::new() } else { format!(", {}", extras.join(", ")) };
+        let verdict = match device.verdict() {
+            Ok(verdict) => {
+                found += 1;
+                verdict
+            }
+            Err(why) => why,
+        };
+        let _ = writeln!(
+            out,
+            "{}\n  usage page {:#04X} usage {:#04X}\n  pressure range {range}{also}\n  {verdict}\n",
+            if device.path.is_empty() {
+                device.name()
+            } else {
+                format!("{} at {}", device.name(), device.path)
+            },
+            device.usage_page,
+            device.usage
+        );
+    }
+    let _ = writeln!(out, "{found} stylus device(s) usable. {pipe}");
+    if found == 0 {
+        let _ = writeln!(
+            out,
+            "No stylus found. A tablet whose driver is in mouse-only mode does not appear as a\n\
+             pen at all: switch on Windows Ink in the driver's settings (Huion, Gaomon and\n\
+             XP-Pen call it that; Wacom calls it \"Use Windows Ink\"), then unplug and replug."
+        );
+    }
+    out
+}
+
 /// Print what every input device looks like to the scanner, and why each was
 /// accepted or rejected.
 ///
@@ -709,20 +844,73 @@ mod backend {
     static SAW_A_REPORT: AtomicBool = AtomicBool::new(false);
 
     pub fn report() -> String {
-        if SAW_A_REPORT.load(Ordering::Relaxed) {
-            "Reading the pen through Raw Input.".to_string()
+        let pipe = if SAW_A_REPORT.load(Ordering::Relaxed) {
+            "Reading the pen through Raw Input."
         } else {
-            "Listening for a pen through Raw Input; none has reported yet.".to_string()
-        }
+            "Listening for a pen through Raw Input; none has reported yet."
+        };
+        super::hid_report(&scan(), pipe)
+    }
+
+    /// Every HID device, reduced to what decides whether it is a stylus.
+    ///
+    /// The tip pressure range and the tilt and eraser usages are read out of
+    /// the preparsed descriptor, which Raw Input hands over without the
+    /// device being opened, so this needs no permission and no report.
+    fn scan() -> Vec<super::HidSummary> {
+        raw_input::devices()
+            .into_iter()
+            .map(|device| {
+                let preparsed = raw_input::preparsed(device.handle);
+                let data = preparsed.as_ref().map(|bytes| bytes.as_ptr() as PHIDP_PREPARSED_DATA);
+                let range =
+                    |usage| data.and_then(|data| raw_input::range(data, PAGE_DIGITIZER, usage));
+                super::HidSummary {
+                    vendor: device.vendor,
+                    product: device.product,
+                    usage_page: device.usage_page,
+                    usage: device.usage,
+                    pressure: range(USAGE_TIP_PRESSURE),
+                    has_tilt: range(USAGE_X_TILT).is_some(),
+                    has_eraser: data.is_some_and(|data| {
+                        raw_input::has_button(data, PAGE_DIGITIZER, USAGE_ERASER)
+                    }),
+                    path: device.path,
+                }
+            })
+            .collect()
     }
 
     pub fn spawn(shared: Arc<Shared>) {
+        // The device list first, on the caller's thread, so the panel and
+        // the bug report have something to say from the first frame. Read
+        // once: Windows raises no event this code listens for when a tablet
+        // is plugged in later, and a relaunch is the answer until it does.
+        {
+            let mut devices = shared.devices.lock().expect("tablet state poisoned");
+            for device in scan() {
+                if device.verdict().is_err() {
+                    continue;
+                }
+                devices.push(super::TabletDevice {
+                    name: device.name(),
+                    path: device.path.clone(),
+                    pressure_max: device.pressure.map_or(0, |(_, high)| high),
+                    has_tilt: device.has_tilt,
+                    has_eraser: device.has_eraser,
+                });
+            }
+        }
         std::thread::Builder::new()
             .name("brokkr-pen".to_string())
             .spawn(move || {
-                raw_input::pump("BrokkrPenSink", PAGE_DIGITIZER, USAGE_PEN, |data, report| {
-                    decode(&shared, data, report);
-                });
+                raw_input::pump(
+                    "BrokkrPenSink",
+                    &[(PAGE_DIGITIZER, USAGE_PEN), (PAGE_DIGITIZER, super::HID_USAGE_DIGITIZER)],
+                    |data, report| {
+                        decode(&shared, data, report);
+                    },
+                );
             })
             .ok();
     }
@@ -1065,6 +1253,49 @@ mod tests {
 
         tablet.shared.set_tool(Some(false), None);
         assert_eq!(tablet.state().tilt, Vec2::ZERO);
+    }
+
+    fn hid(usage_page: u16, usage: u16, pressure: Option<(i32, i32)>) -> HidSummary {
+        HidSummary {
+            vendor: 0x256C,
+            product: 0x006D,
+            usage_page,
+            usage,
+            pressure,
+            has_tilt: true,
+            has_eraser: false,
+            path: String::new(),
+        }
+    }
+
+    /// The verdicts the Windows and macOS scanners hand out, pinned here where
+    /// they can run: a pen with pressure is a stylus whichever of the two
+    /// top-level usages its driver chose, a touch device never is, and a
+    /// digitizer without pressure is named as the mouse-mode case it usually
+    /// is rather than silently skipped.
+    #[test]
+    fn a_hid_device_is_a_stylus_only_when_it_is_a_pen_with_pressure() {
+        assert!(hid(HID_PAGE_DIGITIZER, HID_USAGE_PEN, Some((0, 8191))).verdict().is_ok());
+        assert!(hid(HID_PAGE_DIGITIZER, HID_USAGE_DIGITIZER, Some((0, 4095))).verdict().is_ok());
+        assert!(hid(HID_PAGE_DIGITIZER, 0x04, Some((0, 255))).verdict().is_err(), "touch");
+        assert!(hid(0x01, 0x02, Some((0, 255))).verdict().is_err(), "a mouse is not a pen");
+        let mouse_mode = hid(HID_PAGE_DIGITIZER, HID_USAGE_PEN, None).verdict().unwrap_err();
+        assert!(mouse_mode.contains("mouse mode"), "{mouse_mode}");
+    }
+
+    #[test]
+    fn the_hid_report_names_the_device_and_says_what_to_do_when_none_is_a_stylus() {
+        let report = hid_report(&[hid(HID_PAGE_DIGITIZER, HID_USAGE_PEN, Some((0, 8191)))], "pipe");
+        assert!(report.contains("Huion or Gaomon 256C:006D"), "{report}");
+        assert!(report.contains("0 to 8191"), "{report}");
+        assert!(report.contains("1 stylus device(s) usable. pipe"), "{report}");
+        assert!(!report.contains("Windows Ink"), "advice given when a stylus was found");
+
+        let none = hid_report(&[hid(HID_PAGE_DIGITIZER, HID_USAGE_PEN, None)], "pipe");
+        assert!(none.contains("0 stylus device(s) usable"), "{none}");
+        assert!(none.contains("Windows Ink"), "{none}");
+        let empty = hid_report(&[], "pipe");
+        assert!(empty.contains("No HID devices at all"), "{empty}");
     }
 
     #[test]
