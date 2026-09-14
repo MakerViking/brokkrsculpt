@@ -100,6 +100,44 @@ pub const CLOSE_RADIUS_PX: f32 = 28.0;
 /// making, small enough that the numbers stay far from where `f32` gets coarse.
 const EXTENSION_SPANS: f32 = 8.0;
 
+/// How much of the stroke, at each end, the direction of travel is measured
+/// over before it is extended.
+///
+/// The extension used to follow the LAST SEGMENT, which after simplification
+/// can be two points a couple of pixels apart -- and a hand letting go of a
+/// button jogs by a couple of pixels in a direction that has nothing to do
+/// with the stroke. Multiplied by [`EXTENSION_SPANS`], that jog swung the far
+/// corner of the region across the whole view from one motion event to the
+/// next, which is the "folds on itself" a user reported. Sixteen pixels is
+/// longer than any release jitter and shorter than any curve worth drawing.
+const EXTENSION_TAIL_PX: f32 = 16.0;
+
+/// How sharply an open stroke may turn and still be a drawn curve.
+///
+/// **A curve is drawn in one movement; a corner means the pointer was
+/// re-aimed.** The user who reported the plane cut as "finicky" expected what
+/// every other cutting tool does: the press is one end of the line and the
+/// pointer is the other, wherever it went in between. Read as a stroke, that
+/// wandering is a bent path, which the tolerance above correctly refuses to
+/// call straight -- and then reads as a curve, extends along whatever
+/// direction the aiming ended in, and hulls into a region the user never drew.
+///
+/// So an open stroke with a corner in it is a line between its ends. A
+/// deliberately drawn arc turns gently the whole way and never reaches this;
+/// a stroke that went out and then sideways, or out and then swept round to
+/// aim, turns through more than this at the point where the aiming began. In
+/// degrees, because that is how the number reads when it is being argued
+/// about; the comparison is on the cosine.
+const AIM_CORNER_DEGREES: f32 = 60.0;
+
+/// How coarsely the stroke is simplified before it is checked for corners.
+///
+/// Coarser than [`CUT_PATH_SPACING_PX`], on purpose: at two pixels a shaky hand
+/// puts a sharp angle between every pair of neighbouring points, and every
+/// stroke would have a corner. Six pixels drops the tremor and keeps any turn a
+/// hand made deliberately.
+const AIM_CORNER_EPSILON_PX: f32 = 6.0;
+
 /// How the stroke was read.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CutShape {
@@ -158,7 +196,11 @@ pub fn read_stroke(path: &[Vec2], click_slop_px: f32) -> Option<CutGesture> {
     if !closed {
         let chord = first.distance(last);
         let tolerance = LASSO_DEVIATION_PX.max(chord * LASSO_DEVIATION_FRACTION);
-        if straightness(path) <= tolerance {
+        // Straight enough to be a line, or bent in the way an aimed line is
+        // bent rather than the way a drawn curve is -- see
+        // [`AIM_CORNER_DEGREES`]. Either way the line runs between the press
+        // and the release, which is the rubber band every cutting tool draws.
+        if straightness(path) <= tolerance || has_a_corner(path) {
             // Deliberately the raw ends and not a hull. This is today's cut and
             // it must stay today's cut: two points, one plane, one cross
             // product, and the side convention that a test observes rather than
@@ -211,6 +253,36 @@ fn distance_to_segment(point: Vec2, from: Vec2, to: Vec2) -> f32 {
     point.distance(from + along * t)
 }
 
+/// Whether an open stroke turns sharply anywhere. See [`AIM_CORNER_DEGREES`].
+fn has_a_corner(path: &[Vec2]) -> bool {
+    let limit = AIM_CORNER_DEGREES.to_radians().cos();
+    simplify(path, AIM_CORNER_EPSILON_PX).windows(3).any(|corner| {
+        let (Some(arriving), Some(leaving)) =
+            ((corner[1] - corner[0]).try_normalize(), (corner[2] - corner[1]).try_normalize())
+        else {
+            return false;
+        };
+        arriving.dot(leaving) < limit
+    })
+}
+
+/// The direction the stroke was travelling when it reached its last point,
+/// measured over at least [`EXTENSION_TAIL_PX`] of path rather than over the
+/// last segment alone. `None` for a path too short to have a direction.
+fn direction_at_end(path: &[Vec2]) -> Option<Vec2> {
+    let last = *path.last()?;
+    let mut walked = 0.0;
+    let mut from = last;
+    for pair in path.windows(2).rev() {
+        walked += pair[0].distance(pair[1]);
+        from = pair[0];
+        if walked >= EXTENSION_TAIL_PX {
+            break;
+        }
+    }
+    (last - from).try_normalize()
+}
+
 /// The stroke with a far point added past each end, along the direction the
 /// stroke was going when it got there.
 ///
@@ -222,18 +294,16 @@ fn extended(path: &[Vec2], span: f32) -> Vec<Vec2> {
     let mut points = path.to_vec();
     let reach = span * EXTENSION_SPANS;
 
-    // Taken from the end SEGMENT rather than from the whole chord: the
+    // Taken from the end of the stroke rather than from the whole chord: the
     // extension has to continue the direction the stroke was travelling when it
     // stopped, which on a curve is nothing like the direction from end to end.
-    if let (Some(&first), Some(&second)) = (path.first(), path.get(1))
-        && let Some(away) = (first - second).try_normalize()
-    {
+    // And from a TAIL of it rather than the last segment, for the reason
+    // `EXTENSION_TAIL_PX` gives.
+    let reversed: Vec<Vec2> = path.iter().rev().copied().collect();
+    if let (Some(&first), Some(away)) = (path.first(), direction_at_end(&reversed)) {
         points.push(first + away * reach);
     }
-    if path.len() >= 2
-        && let (Some(&last), Some(&before)) = (path.last(), path.get(path.len() - 2))
-        && let Some(away) = (last - before).try_normalize()
-    {
+    if let (Some(&last), Some(away)) = (path.last(), direction_at_end(path)) {
         points.push(last + away * reach);
     }
     points
@@ -515,6 +585,89 @@ mod tests {
         assert!(
             reach > 800.0,
             "the curve's hull stayed inside the stroke, so it is the crescent: reach {reach}"
+        );
+    }
+
+    /// **The report this exists for.** A user who presses, drags across, and
+    /// then nudges the end up to aim the line has drawn a bent path, but they
+    /// have aimed a line, and the line runs from the press to the release.
+    #[test]
+    fn an_aimed_line_is_a_line_however_it_got_there() {
+        let mut path = line(Vec2::new(100.0, 300.0), Vec2::new(400.0, 300.0), 75);
+        path.extend(line(Vec2::new(400.0, 300.0), Vec2::new(400.0, 240.0), 15).into_iter().skip(1));
+        let gesture = read_stroke(&path, SLOP).expect("a long drag is a gesture");
+        assert_eq!(gesture.shape, CutShape::Line, "aiming the end of a line made it a region");
+        assert_eq!(gesture.hull, vec![path[0], *path.last().unwrap()]);
+    }
+
+    /// The other way to aim: hold the start and swing the end round until the
+    /// angle looks right. The path is an arc about the press, which is nothing
+    /// like straight and nothing like a drawn curve either -- it starts with a
+    /// right-angle turn onto the arc.
+    #[test]
+    fn a_pivot_sweep_is_a_line() {
+        let anchor = Vec2::new(100.0, 300.0);
+        let mut path = line(anchor, anchor + Vec2::new(250.0, 0.0), 60);
+        path.extend((1..=40).map(|step| {
+            let angle = -(step as f32 / 40.0) * 40.0_f32.to_radians();
+            anchor + Vec2::new(angle.cos(), angle.sin()) * 250.0
+        }));
+        let gesture = read_stroke(&path, SLOP).expect("a sweep is a gesture");
+        assert_eq!(gesture.shape, CutShape::Line, "swinging a line to aim it made it a region");
+        assert_eq!(gesture.hull, vec![path[0], *path.last().unwrap()]);
+    }
+
+    /// A drawn arc turns gently the whole way, so the corner rule must not
+    /// catch it. Same arc as `a_deliberate_arc_is_a_curve`, with hand tremor
+    /// laid over it, which at the raw spacing is a sharp angle at every point.
+    #[test]
+    fn a_shaky_arc_is_still_a_curve() {
+        let path: Vec<Vec2> = (0..=200)
+            .map(|step| {
+                let t = step as f32 / 200.0;
+                let tremor = (step as f32 * 2.3).sin() * 1.5;
+                Vec2::new(
+                    100.0 + t * 800.0,
+                    400.0 - (t * std::f32::consts::PI).sin() * 250.0 + tremor,
+                )
+            })
+            .collect();
+        let gesture = read_stroke(&path, SLOP).expect("an arc is a gesture");
+        assert_eq!(gesture.shape, CutShape::Curve, "tremor on a curve read as a corner");
+    }
+
+    /// The extension continues the stroke, not the last couple of pixels the
+    /// hand moved while letting go. Two copies of one arc, one with a release
+    /// jog at the end, have to produce the same far corner.
+    #[test]
+    fn a_release_jog_does_not_swing_the_extension() {
+        let arc: Vec<Vec2> = (0..=100)
+            .map(|step| {
+                let t = step as f32 / 100.0;
+                Vec2::new(100.0 + t * 800.0, 400.0 - (t * std::f32::consts::PI).sin() * 250.0)
+            })
+            .collect();
+        let mut jogged = arc.clone();
+        // Three pixels straight up, at right angles to where the arc was going.
+        let last = *jogged.last().unwrap();
+        jogged.push(last + Vec2::new(0.0, -3.0));
+
+        let far = |path: &[Vec2]| {
+            let gesture = read_stroke(path, SLOP).expect("an arc is a gesture");
+            assert_eq!(gesture.shape, CutShape::Curve);
+            let middle = Vec2::new(500.0, 400.0);
+            gesture
+                .hull
+                .iter()
+                .copied()
+                .max_by(|a, b| a.distance(middle).total_cmp(&b.distance(middle)))
+                .unwrap()
+        };
+        let (clean, jogged) = (far(&arc), far(&jogged));
+        let reach = clean.distance(Vec2::new(500.0, 400.0));
+        assert!(
+            clean.distance(jogged) < reach * 0.2,
+            "a 3 px jog moved the far corner from {clean:?} to {jogged:?}"
         );
     }
 

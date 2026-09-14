@@ -473,7 +473,7 @@ pub struct Symmetry {
 /// centre is the lattice origin and would send every mirrored stroke across the
 /// model the day it is not.
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub(crate) struct Flip {
+pub struct Flip {
     /// Componentwise sign, `-1` on each mirrored axis. This alone reflects a
     /// direction.
     pub sign: Vec3,
@@ -529,7 +529,11 @@ impl Symmetry {
     /// A mirror is a reflection, so it acts on a position, a normal and a
     /// direction of travel alike -- but only the sign is shared between those
     /// three, which is why this hands back a [`Flip`] and not a bare vector.
-    pub(crate) fn flips(self, centre: Vec3, out: &mut [Flip; Self::MAX_MIRRORS]) -> usize {
+    ///
+    /// Public because the cut preview mirrors its outline with the same flips
+    /// the cut itself uses, so what is drawn on the other side of the plane is
+    /// what goes there.
+    pub fn flips(self, centre: Vec3, out: &mut [Flip; Self::MAX_MIRRORS]) -> usize {
         let mut count = 0;
         // Each combination is a bit per axis; 0 is the original, which is the
         // caller's to apply and not a twin.

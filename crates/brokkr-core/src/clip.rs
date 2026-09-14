@@ -134,6 +134,7 @@ use glam::{IVec3, Vec3};
 
 use crate::body::{Document, NodeId};
 use crate::brick::{BRICK_DIM, Brick, BrickCoord, INSIDE, NARROW_BAND, OUTSIDE, brick_index};
+use crate::brush::{Flip, Symmetry};
 use crate::mask::{MaskField, UNMASKED};
 use crate::undo::{Change, Entry};
 use crate::volume::{Freedom, Volume};
@@ -170,6 +171,17 @@ impl ClipPlane {
         (at - self.point).dot(self.normal)
     }
 
+    /// This plane reflected through a mirror.
+    ///
+    /// The point is a position and takes the flip's offset; the normal is a
+    /// direction and takes only its sign -- the distinction [`Flip`] exists to
+    /// make. A componentwise sign of `+-1` keeps a unit normal unit, so the
+    /// result needs no renormalising and cannot fail the way [`ClipPlane::new`]
+    /// can.
+    pub fn mirrored(&self, flip: Flip) -> Self {
+        Self { point: flip.point(self.point), normal: self.normal * flip.sign }
+    }
+
     /// The smallest and largest signed distance over an axis aligned box.
     ///
     /// The distance is linear, so the extremes are at opposite corners and can
@@ -186,6 +198,30 @@ impl ClipPlane {
             + half.y * self.normal.y.abs()
             + half.z * self.normal.z.abs();
         (middle - reach, middle + reach)
+    }
+}
+
+impl Symmetry {
+    /// Every mirrored twin of a convex cutter about `centre`, never including
+    /// the cutter itself. Empty when no axis is on.
+    ///
+    /// **A cut honours the mirror the same way a stroke does.** A stroke with X
+    /// on lands on both sides, so a cut with X on has to take both sides too;
+    /// the report that prompted this was a user who cut one arm off and found
+    /// the other still there, when every brush they had used that session had
+    /// gone to both. A cutter is a set of planes, and reflecting each plane
+    /// reflects the region they enclose, depth cap included -- so a bounded
+    /// lasso stays bounded on the other side.
+    ///
+    /// Allocates, unlike [`Symmetry::mirrors`], because a gesture produces one
+    /// cutter and not thousands of stamps.
+    pub fn mirrored_cutters(self, planes: &[ClipPlane], centre: Vec3) -> Vec<Vec<ClipPlane>> {
+        let mut flips = [Flip::IDENTITY; Self::MAX_MIRRORS];
+        let count = self.flips(centre, &mut flips);
+        flips[..count]
+            .iter()
+            .map(|flip| planes.iter().map(|plane| plane.mirrored(*flip)).collect())
+            .collect()
     }
 }
 
@@ -910,16 +946,53 @@ impl Document {
     /// cheap to walk, and the arm would be a second place where "the mask can
     /// veto a whole-brick drop" has to be remembered.
     pub fn clip_convex(&mut self, planes: &[ClipPlane], visible: &[bool]) -> CutOutcome {
+        self.clip_cutters(&[planes], visible)
+    }
+
+    /// Cut every body that is DRAWN with several convex cutters at once, as one
+    /// gesture.
+    ///
+    /// The region removed is the UNION of the cutters, which is what a mirrored
+    /// cut is: the cutter the user drew and its reflection through each enabled
+    /// mirror plane, from [`Symmetry::mirrored_cutters`]. [`Document::clip_convex`]
+    /// is this with one cutter, and everything its documentation says holds
+    /// here -- the gesture acts on what is drawn, a body no cutter reaches is
+    /// skipped without walking its brick map, and the whole gesture is ONE
+    /// [`Entry`].
+    ///
+    /// # Why a union of cutters is several passes and not one bigger cutter
+    ///
+    /// [`Volume::clip_convex`] takes the INTERSECTION of its planes, so handing
+    /// it the original's planes and the twin's together would remove only where
+    /// both agree -- for a mirrored half-space, a slab that is usually empty.
+    /// The union is had by running each cutter through the same open stroke
+    /// recorder: the recorder keeps a brick as it was before the FIRST write,
+    /// so two cutters crossing one brick record it once and one ctrl+Z puts it
+    /// back once. That is also why the brick count below is read off the
+    /// recording rather than summed from the passes, which would count a brick
+    /// on the mirror plane twice.
+    pub fn clip_cutters(&mut self, cutters: &[&[ClipPlane]], visible: &[bool]) -> CutOutcome {
         debug_assert_eq!(
             visible.len(),
             self.nodes().len(),
             "the visibility mask is indexed by node position"
         );
+        // An empty cutter would remove nothing at the volume and would still
+        // count as having reached every body; see `Volume::clip_convex` for
+        // why it is refused rather than read as all of space.
+        let cutters: Vec<&[ClipPlane]> =
+            cutters.iter().copied().filter(|planes| !planes.is_empty()).collect();
 
         let band_mm = NARROW_BAND * self.voxel_size();
+        // Whether one cutter can reach a box at all. Wholly behind ANY ONE of
+        // its planes by at least the band: every brick in the box would
+        // classify as `Keeps`, so there is nothing to do.
+        let reaches = |planes: &[ClipPlane], centre: Vec3, half: Vec3| {
+            planes.iter().all(|plane| plane.range_over_box(centre, half).1 > -band_mm)
+        };
         // Resolved up front, so the loop below can take each body mutably in
         // turn without holding a borrow of the node list.
-        let crossed: Vec<NodeId> = if planes.is_empty() {
+        let crossed: Vec<NodeId> = if cutters.is_empty() {
             // No cutter reaches nothing. Returning every visible body here
             // would report "the cut crossed 3 bodies and found nothing", which
             // describes a cut that happened.
@@ -933,12 +1006,9 @@ impl Document {
                     let (low, high) = node.bounds()?;
                     let centre = (low + high) * 0.5;
                     let half = (high - low) * 0.5;
-                    // Wholly behind ANY ONE plane by at least the band: every
-                    // brick in it would classify as `Keeps`, so there is
-                    // nothing to do and the gesture did not reach this body at
-                    // all.
-                    let reached =
-                        planes.iter().all(|plane| plane.range_over_box(centre, half).1 > -band_mm);
+                    // Any one cutter reaching the body is enough to walk it;
+                    // the ones that do not are skipped again per body below.
+                    let reached = cutters.iter().any(|planes| reaches(planes, centre, half));
                     reached.then_some(node.id)
                 })
                 .collect()
@@ -955,24 +1025,37 @@ impl Document {
         let mut changes = Vec::new();
 
         for body in crossed {
+            let bounds = self.node(body).and_then(|node| node.bounds());
             let Some(volume) = self.volume_mut(body) else {
                 continue;
             };
             volume.begin_stroke();
-            let counts = volume.clip_convex(planes);
+            let mut spared_by_mask = 0;
+            for planes in &cutters {
+                // The body gate again, per cutter: a twin that lies wholly on
+                // the far side of this body would walk its whole brick map to
+                // classify everything `Keeps`.
+                if let Some((low, high)) = bounds
+                    && !reaches(planes, (low + high) * 0.5, (high - low) * 0.5)
+                {
+                    continue;
+                }
+                spared_by_mask += volume.clip_convex(planes).spared_by_mask;
+            }
             let edit = volume.end_stroke();
             // Counted whatever else happened in this body: a cut that removed
             // half a body and was blocked on the other half spared bricks just
             // as much as one that was blocked outright.
-            if counts.spared_by_mask > 0 {
-                outcome.bricks_spared_by_mask += counts.spared_by_mask;
+            if spared_by_mask > 0 {
+                outcome.bricks_spared_by_mask += spared_by_mask;
                 outcome.bodies_spared_by_mask.push(body);
             }
             // The recorder is the authority on whether anything changed: a
             // count with no edit behind it would push an entry that restores
-            // nothing.
+            // nothing. Its length is also the honest brick count -- each brick
+            // once, however many cutters crossed it.
             if let Some(edit) = edit.filter(|edit| !edit.is_empty()) {
-                outcome.bricks += counts.changed;
+                outcome.bricks += edit.len();
                 outcome.bodies_cut.push(body);
                 changes.push(Change::Bricks { body, edit });
             }
@@ -1252,6 +1335,85 @@ mod across_the_document {
                 "the cut left {id:?} whole"
             );
         }
+    }
+
+    /// A cut with X mirroring on takes both sides, exactly as a stroke lands on
+    /// both: the cutter the user drew and its reflection.
+    #[test]
+    fn a_mirrored_cut_takes_both_sides_as_one_entry() {
+        let mut volume = Volume::new(VOXEL);
+        volume.seed_sphere(Vec3::ZERO, 20.0);
+        volume.mark_everything_dirty();
+        let mut doc = Document::from_volume(volume);
+        let id = doc.active();
+
+        // Everything past x = 10 goes; with X on, everything before x = -10
+        // goes too.
+        let planes = vec![ClipPlane::new(Vec3::new(10.0, 0.0, 0.0), Vec3::X).unwrap()];
+        let twins = Symmetry::X.mirrored_cutters(&planes, Vec3::ZERO);
+        assert_eq!(twins.len(), 1, "X alone has one twin");
+        assert_eq!(twins[0][0].point, Vec3::new(-10.0, 0.0, 0.0));
+        assert_eq!(twins[0][0].normal, -Vec3::X);
+        let cutters: Vec<&[ClipPlane]> =
+            std::iter::once(planes.as_slice()).chain(twins.iter().map(Vec::as_slice)).collect();
+
+        let visible = shown(&doc);
+        let outcome = doc.clip_cutters(&cutters, &visible);
+        assert!(outcome.bricks > 0, "the mirrored cut did nothing");
+        let sample = |doc: &Document, at| doc.volume(id).unwrap().sample_world(at);
+        assert!(sample(&doc, Vec3::new(15.0, 0.0, 0.0)) > 0.0, "the drawn side stayed");
+        assert!(sample(&doc, Vec3::new(-15.0, 0.0, 0.0)) > 0.0, "the mirrored side stayed");
+        assert!(sample(&doc, Vec3::ZERO) < 0.0, "the middle went too");
+
+        let mut history = History::new(64 * 1024 * 1024);
+        history.push(outcome.entry.expect("a cut that changed bricks records an entry"));
+        assert_eq!(history.stats().undo_entries, 1, "one mirrored gesture became two entries");
+        let visible = shown(&doc);
+        assert!(matches!(history.undo(&mut doc, &visible), UndoOutcome::Applied(_)));
+        assert!(sample(&doc, Vec3::new(15.0, 0.0, 0.0)) < 0.0, "undo left the drawn side cut");
+        assert!(sample(&doc, Vec3::new(-15.0, 0.0, 0.0)) < 0.0, "undo left the mirror side cut");
+    }
+
+    /// A brick both cutters cross is counted once, and the count is the number
+    /// of bricks the entry restores -- the number the status line reports.
+    #[test]
+    fn a_brick_two_cutters_cross_is_counted_once() {
+        let ball = || {
+            let mut volume = Volume::new(VOXEL);
+            volume.seed_sphere(Vec3::ZERO, 20.0);
+            volume.mark_everything_dirty();
+            Document::from_volume(volume)
+        };
+        // The same half-space twice: every brick the first pass changes, the
+        // second pass crosses again and changes nothing more.
+        let plane = ClipPlane::new(Vec3::ZERO, Vec3::X).unwrap();
+        let once = std::slice::from_ref(&plane);
+
+        let mut single = ball();
+        let visible = shown(&single);
+        let alone = single.clip_cutters(&[once], &visible);
+        let mut doubled = ball();
+        let visible = shown(&doubled);
+        let twice = doubled.clip_cutters(&[once, once], &visible);
+        assert!(alone.bricks > 0);
+        assert_eq!(twice.bricks, alone.bricks, "a brick crossed twice was counted twice");
+    }
+
+    /// Nothing changes for a cut with no mirror: one cutter through the new
+    /// path is the old path.
+    #[test]
+    fn one_cutter_is_the_plain_convex_cut() {
+        let mut through_planes = two_bodies();
+        let mut through_cutters = two_bodies();
+        let plane = ClipPlane::new(Vec3::new(0.0, 2.0, 0.0), Vec3::Y).unwrap();
+
+        let visible = shown(&through_planes);
+        let a = through_planes.clip_convex(std::slice::from_ref(&plane), &visible);
+        let visible = shown(&through_cutters);
+        let b = through_cutters.clip_cutters(&[std::slice::from_ref(&plane)], &visible);
+        assert_eq!(a.bricks, b.bricks);
+        assert_eq!(a.bodies_cut, b.bodies_cut);
+        assert_eq!(a.bodies_crossed, b.bodies_crossed);
     }
 
     /// One gesture is ONE undo entry, however many bodies it touched. Undoing it
