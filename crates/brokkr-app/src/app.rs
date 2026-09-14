@@ -4802,29 +4802,65 @@ impl Brokkr {
                 [only] => Some(only.normal),
                 _ => None,
             });
+        // A straight drag is infinite whatever shift says, so it is always
+        // the denser shading; a shaped cut is bounded unless shift asks
+        // otherwise.
+        let through = self.shift || gesture.shape == cut::CutShape::Line;
+        let at = |pixel: Vec2| {
+            let (origin, ray) = self.ray_through(pixel);
+            // Where the ray crosses the plane through the target. The dot
+            // product cannot be zero for a ray inside the frustum, but a
+            // fallback costs nothing and a division by it would put a
+            // vertex at infinity.
+            let denominator = ray.dot(facing);
+            if denominator.abs() < 1.0e-6 {
+                return origin + ray * depth;
+            }
+            origin + ray * ((plane_at - origin).dot(facing) / denominator)
+        };
         cut_preview::build(
             batch,
             &gesture.hull,
             gesture.shape,
             self.model_radius,
             doomed,
-            // A straight drag is infinite whatever shift says, so it is always
-            // the denser shading; a shaped cut is bounded unless shift asks
-            // otherwise.
-            self.shift || gesture.shape == cut::CutShape::Line,
-            |pixel| {
-                let (origin, ray) = self.ray_through(pixel);
-                // Where the ray crosses the plane through the target. The dot
-                // product cannot be zero for a ray inside the frustum, but a
-                // fallback costs nothing and a division by it would put a
-                // vertex at infinity.
-                let denominator = ray.dot(facing);
-                if denominator.abs() < 1.0e-6 {
-                    return origin + ray * depth;
-                }
-                origin + ray * ((plane_at - origin).dot(facing) / denominator)
-            },
+            through,
+            at,
         );
+
+        // **The twins, one per enabled mirror**, because the cut takes them
+        // too and a preview that showed one side of a two-sided cut would be
+        // lying about half of what is about to go. Each outline is reflected
+        // through the plane exactly as the cutter is, then brought back onto
+        // the preview plane along the eye's own rays -- so it sits in front of
+        // the model like the original rather than inside it, where the depth
+        // test would hide the very shape it is describing. That projection
+        // is exact at the focus depth and the same approximation the preview
+        // already makes everywhere else.
+        let mut flips = [brokkr_core::Flip::IDENTITY; Symmetry::MAX_MIRRORS];
+        let count = self.symmetry.flips(MIRROR_CENTRE, &mut flips);
+        for flip in &flips[..count] {
+            let mirrored_at = |pixel: Vec2| {
+                let reflected = flip.point(at(pixel));
+                let along = reflected - eye;
+                let denominator = along.dot(facing);
+                if denominator <= 1.0e-6 {
+                    // Behind the eye: left where it is, and the near plane
+                    // clips it rather than a division sending it to infinity.
+                    return reflected;
+                }
+                eye + along * (depth / denominator)
+            };
+            cut_preview::build(
+                batch,
+                &gesture.hull,
+                gesture.shape,
+                self.model_radius,
+                doomed.map(|normal| normal * flip.sign),
+                through,
+                mirrored_at,
+            );
+        }
     }
 
     /// Where the pointer meets the surface, and on which body, remembered for
@@ -6129,8 +6165,25 @@ impl Brokkr {
         // the shaped cut has existed, which is how its status line came to
         // describe a lasso and name a button that only a half-space user could
         // ever have found.)
+        // **The cut honours the mirror the way every brush does.** With X on,
+        // a stroke lands on both sides, so a cut with X on takes both sides:
+        // the cutter the user drew and its reflection through each enabled
+        // plane, depth cap included, as ONE gesture and ONE undo entry. The
+        // report that prompted this had a user cut one side of a model with X
+        // on and find the other side untouched, after a session in which every
+        // stroke had gone to both. The preview draws the twin for the same
+        // reason: what is shown is what goes, on both sides of the plane.
+        let twins = self.symmetry.mirrored_cutters(&planes, MIRROR_CENTRE);
+        let mut cutters: Vec<&[brokkr_core::ClipPlane]> = vec![&planes];
+        cutters.extend(twins.iter().map(Vec::as_slice));
+        let mirrored = if twins.is_empty() {
+            String::new()
+        } else {
+            format!(", mirrored {}", self.symmetry.label())
+        };
+
         if self.control {
-            self.mask_cutter(&planes, gesture.shape);
+            self.mask_cutter(&cutters, gesture.shape);
             // One shot per arming, exactly as the cut is: the assignment below
             // carries that property and this arm must not skip it.
             self.tool = Tool::Sculpt;
@@ -6139,12 +6192,12 @@ impl Brokkr {
         }
 
         // **The cut crosses every VISIBLE body**, which is what
-        // `Document::clip_convex` is for: solo narrows the set, a hidden body
+        // `Document::clip_cutters` is for: solo narrows the set, a hidden body
         // the gesture passes over comes back bit-identical, and the whole
         // gesture is ONE undo entry of N `Change::Bricks`. Direct manipulation
         // acts on what is drawn.
         let visible = self.drawn_nodes();
-        let outcome = self.doc.clip_convex(&planes, &visible);
+        let outcome = self.doc.clip_cutters(&cutters, &visible);
         if outcome.bricks > 0 {
             let before = self.history.stats();
             if let Some(entry) = outcome.entry {
@@ -6172,7 +6225,7 @@ impl Brokkr {
                 String::new()
             };
             self.status = format!(
-                "cut {} bricks{where_}{body_count}{how_deep}{}",
+                "cut {} bricks{where_}{body_count}{mirrored}{how_deep}{}",
                 outcome.bricks,
                 self.loose_pieces_note(&outcome.bodies_cut)
             );
@@ -8333,7 +8386,7 @@ impl Brokkr {
     /// a line the user draws across what they can see, and a mask drawn the same
     /// way has to mean the same thing. One compound entry of N
     /// `Change::WholeMask`, so one ctrl+Z takes the whole gesture back.
-    fn mask_cutter(&mut self, planes: &[brokkr_core::ClipPlane], shape: cut::CutShape) {
+    fn mask_cutter(&mut self, cutters: &[&[brokkr_core::ClipPlane]], shape: cut::CutShape) {
         let feather_mm = HALFSPACE_FEATHER_VOXELS * self.doc.voxel_size();
         let drawn = self.drawn_nodes();
         let bodies: Vec<NodeId> = self
@@ -8365,7 +8418,7 @@ impl Brokkr {
             // `Arc` would cost the `Copy`, and a fixed array would put several
             // hundred bytes into every message the application sends. The
             // recipe stays the single-plane one it always was.
-            let mask = volume.cutter_mask(planes, feather_mm);
+            let mask = volume.cutters_mask(cutters, feather_mm);
             if mask.is_free() {
                 // The plane missed this body entirely, so it keeps whatever it
                 // was carrying. Replacing it with an empty mask would throw a
@@ -12776,6 +12829,139 @@ mod tests {
             below < 0.0 && above > 0.0,
             "a left to right drag should keep the LOWER half on screen: \
              above {above}, below {below}"
+        );
+    }
+
+    /// The pixel column whose view ray crosses the z = 0 plane at world `x`,
+    /// for a camera looking straight down -Z. A vertical drag there is a plane
+    /// that stands at that x where the model's equator is.
+    fn column_at_world_x(app: &Brokkr, x: f32) -> f32 {
+        let x_at = |px: f32| {
+            let (origin, ray) = app.ray_through(Vec2::new(px, SIZE.y / 2.0));
+            origin.x + ray.x * (-origin.z / ray.z)
+        };
+        let (mut low, mut high) = (0.0_f32, SIZE.x);
+        for _ in 0..40 {
+            let middle = (low + high) / 2.0;
+            if x_at(middle) < x {
+                low = middle;
+            } else {
+                high = middle;
+            }
+        }
+        (low + high) / 2.0
+    }
+
+    /// **The report this exists for**: with X mirroring on, a plane cut down
+    /// one side of the model took that side and left the other -- while every
+    /// stroke that session had landed on both. Now the cut takes both, as one
+    /// gesture and one undo entry.
+    #[test]
+    fn a_cut_with_x_mirror_on_takes_both_sides() {
+        let mut app = app();
+        app.camera.yaw = 0.0;
+        app.camera.pitch = 0.0;
+        app.publish_camera();
+        app.viewport_size = Vec2::new(SIZE.x, SIZE.y);
+        update(&mut app, Message::SymmetryAxisToggled(MirrorAxis::X));
+        assert!(app.symmetry.axis(MirrorAxis::X), "X did not turn on");
+
+        // A plane standing at x = 10 on the equator, dragged top to bottom: the
+        // left of the arrow is screen-right, so everything past x = 10 goes.
+        let column = column_at_world_x(&app, 10.0);
+        let sample =
+            |app: &Brokkr, x: f32| app.doc.active_volume().sample_world(Vec3::new(x, 0.0, 0.0));
+        assert!(sample(&app, 14.0) < 0.0 && sample(&app, -14.0) < 0.0, "the fixture is not a ball");
+        let entries_before = app.history.stats().undo_entries;
+
+        update(&mut app, Message::ToolChanged(Tool::Cut));
+        press(&mut app, Vector::new(column, SIZE.y * 0.1));
+        app.on_pointer(PointerEvent::Moved {
+            position: Vector::new(column, SIZE.y * 0.9),
+            size: SIZE,
+        });
+        release(&mut app);
+
+        assert!(sample(&app, 14.0) > 0.0, "the drawn side stayed: {}", app.status);
+        assert!(sample(&app, -14.0) > 0.0, "the mirrored side stayed: {}", app.status);
+        assert!(sample(&app, 0.0) < 0.0, "the middle went too: {}", app.status);
+        assert_eq!(
+            app.history.stats().undo_entries,
+            entries_before + 1,
+            "a mirrored cut is one gesture and one entry"
+        );
+        assert!(app.status.contains("mirrored X"), "the status did not say so: {}", app.status);
+    }
+
+    /// And with the mirror off, the same drag takes one side only -- the cut
+    /// that has always shipped is untouched.
+    #[test]
+    fn a_cut_with_the_mirror_off_takes_one_side() {
+        let mut app = app();
+        app.camera.yaw = 0.0;
+        app.camera.pitch = 0.0;
+        app.publish_camera();
+        app.viewport_size = Vec2::new(SIZE.x, SIZE.y);
+        assert!(app.symmetry.is_off());
+
+        let column = column_at_world_x(&app, 10.0);
+        update(&mut app, Message::ToolChanged(Tool::Cut));
+        press(&mut app, Vector::new(column, SIZE.y * 0.1));
+        app.on_pointer(PointerEvent::Moved {
+            position: Vector::new(column, SIZE.y * 0.9),
+            size: SIZE,
+        });
+        release(&mut app);
+
+        let sample = |x: f32| app.doc.active_volume().sample_world(Vec3::new(x, 0.0, 0.0));
+        assert!(sample(14.0) > 0.0, "the drawn side stayed: {}", app.status);
+        assert!(sample(-14.0) < 0.0, "the other side went with no mirror on: {}", app.status);
+        assert!(!app.status.contains("mirrored"), "{}", app.status);
+    }
+
+    /// What is shown is what goes, on both sides: with a mirror on, the
+    /// preview draws the twin as well as the outline that was drawn.
+    #[test]
+    fn the_cut_preview_draws_the_twin_when_a_mirror_is_on() {
+        let mut app = app();
+        // Looking straight down -Z, so world x and screen x agree and the
+        // side assertion below means what it says.
+        app.camera.yaw = 0.0;
+        app.camera.pitch = 0.0;
+        app.publish_camera();
+        app.viewport_size = Vec2::new(SIZE.x, SIZE.y);
+        update(&mut app, Message::ToolChanged(Tool::Cut));
+        press(&mut app, Vector::new(SIZE.x * 0.65, SIZE.y * 0.2));
+        app.on_pointer(PointerEvent::Moved {
+            position: Vector::new(SIZE.x * 0.65, SIZE.y * 0.8),
+            size: SIZE,
+        });
+
+        let mut alone = brokkr_gpu::OverlayBatch::default();
+        app.add_cut_preview(&mut alone);
+        assert!(!alone.lines.is_empty(), "no preview at all");
+
+        update(&mut app, Message::SymmetryAxisToggled(MirrorAxis::X));
+        assert!(app.symmetry.axis(MirrorAxis::X), "X did not turn on");
+        let mut mirrored = brokkr_gpu::OverlayBatch::default();
+        app.add_cut_preview(&mut mirrored);
+        assert_eq!(mirrored.lines.len(), alone.lines.len() * 2, "the twin was not drawn");
+        assert_eq!(
+            mirrored.surfaces.len(),
+            alone.surfaces.len() * 2,
+            "the twin's side was not shaded"
+        );
+
+        // The twin sits on the other side of the plane. The drag was to the
+        // right of centre, so the outline is at positive x and its twin, once
+        // reflected and brought back onto the preview plane, at negative x.
+        let mean_x = |vertices: &[brokkr_gpu::OverlayVertex]| {
+            vertices.iter().map(|vertex| vertex.position[0]).sum::<f32>() / vertices.len() as f32
+        };
+        assert!(mean_x(&alone.lines) > 0.0, "the fixture's outline is not at positive x");
+        assert!(
+            mean_x(&mirrored.lines[alone.lines.len()..]) < 0.0,
+            "the twin is not across the plane"
         );
     }
 

@@ -368,7 +368,26 @@ impl Volume {
     /// anywhere other than where the cut would have gone would make ctrl and
     /// no-ctrl disagree about what the gesture selected.
     pub fn cutter_mask(&self, planes: &[ClipPlane], feather_mm: f32) -> MaskField {
-        if planes.is_empty() {
+        self.cutters_mask(&[planes], feather_mm)
+    }
+
+    /// The union of several convex cutters, written as protection.
+    ///
+    /// [`Volume::cutter_mask`] is this with one cutter. Several is the mirrored
+    /// gesture: the region the user drew and its twin through each enabled
+    /// mirror plane, so that ctrl-selecting one ear with X on selects both, the
+    /// same way the mask brush lands on both. A voxel's protection is the
+    /// GREATEST any cutter gives it -- the union of two protections is the
+    /// higher one, as [`MaskField::union_max_from`] says of merging -- and a
+    /// brick wholly inside any one cutter is protected outright.
+    ///
+    /// An empty cutter is skipped rather than read as all of space, for the
+    /// reason the single-cutter version gives; no cutters at all protects
+    /// nothing.
+    pub fn cutters_mask(&self, cutters: &[&[ClipPlane]], feather_mm: f32) -> MaskField {
+        let cutters: Vec<&[ClipPlane]> =
+            cutters.iter().copied().filter(|planes| !planes.is_empty()).collect();
+        if cutters.is_empty() {
             // No region protects nothing. The alternative reading -- the
             // intersection of no half-spaces is everything -- would protect the
             // whole model from a gesture whose construction failed.
@@ -394,22 +413,36 @@ impl Volume {
                 // the feather instead of the narrow band, and with the same
                 // per-brick pruning: a plane already saturated across this
                 // brick writes `PROTECTED` there whatever the others say, so
-                // dropping it from the minimum cannot change a byte.
-                let mut active: Vec<ClipPlane> = Vec::with_capacity(planes.len());
-                for plane in planes {
-                    let (nearest, farthest) = plane.range_over_box(centre, half);
-                    if farthest <= -feather {
-                        // Wholly on the kept side of ONE plane is wholly
-                        // outside the region: no entry at all, which is what
-                        // keeps this proportional to the boundary.
-                        return None;
+                // dropping it from the minimum cannot change a byte. Per
+                // cutter: a cutter wholly on the kept side of ONE of its planes
+                // contributes nothing to this brick, and one with no plane left
+                // active protects the brick outright.
+                let mut crossing: Vec<Vec<ClipPlane>> = Vec::with_capacity(cutters.len());
+                for planes in &cutters {
+                    let mut active: Vec<ClipPlane> = Vec::with_capacity(planes.len());
+                    let mut outside = false;
+                    for plane in *planes {
+                        let (nearest, farthest) = plane.range_over_box(centre, half);
+                        if farthest <= -feather {
+                            outside = true;
+                            break;
+                        }
+                        if nearest < feather {
+                            active.push(*plane);
+                        }
                     }
-                    if nearest < feather {
-                        active.push(*plane);
+                    if outside {
+                        continue;
                     }
+                    if active.is_empty() {
+                        return Some((*coord, MaskBrick::Uniform(PROTECTED)));
+                    }
+                    crossing.push(active);
                 }
-                if active.is_empty() {
-                    return Some((*coord, MaskBrick::Uniform(PROTECTED)));
+                if crossing.is_empty() {
+                    // Wholly outside every cutter: no entry at all, which is
+                    // what keeps this proportional to the boundary.
+                    return None;
                 }
                 let mut brick = MaskBrick::dense_filled(UNMASKED);
                 let data = brick.make_dense();
@@ -418,8 +451,13 @@ impl Volume {
                         for x in 0..BRICK_DIM {
                             let at = (origin + IVec3::new(x as i32, y as i32, z as i32)).as_vec3()
                                 * voxel_size;
-                            data[brick_index(x, y, z)] =
-                                feathered(crate::clip::cut_distance(&active, at) / feather);
+                            // The union: the deepest any cutter puts this
+                            // voxel inside its region.
+                            let inside = crossing
+                                .iter()
+                                .map(|active| crate::clip::cut_distance(active, at))
+                                .fold(f32::NEG_INFINITY, f32::max);
+                            data[brick_index(x, y, z)] = feathered(inside / feather);
                         }
                     }
                 }
@@ -1172,6 +1210,38 @@ mod tests {
             volume.cutter_mask(&planes, VOXEL * 2.0).is_free(),
             "a region far from the model still generated protection"
         );
+    }
+
+    /// The mirrored select: a region and its twin protect both sides, and a
+    /// voxel inside either is protected outright.
+    #[test]
+    fn a_union_of_cutters_protects_the_inside_of_each() {
+        let mut volume = Volume::new(VOXEL);
+        volume.seed_sphere(Vec3::ZERO, 20.0);
+        volume.mark_everything_dirty();
+
+        // A box around the +X cap and its reflection around the -X cap.
+        let (low, high) = (Vec3::new(8.0, -30.0, -30.0), Vec3::new(30.0, 30.0, 30.0));
+        let mut planes = Vec::new();
+        for axis in [Vec3::X, Vec3::Y, Vec3::Z] {
+            planes.push(ClipPlane::new(low, axis).unwrap());
+            planes.push(ClipPlane::new(high, -axis).unwrap());
+        }
+        let twins = Symmetry::X.mirrored_cutters(&planes, Vec3::ZERO);
+        let cutters: Vec<&[ClipPlane]> =
+            std::iter::once(planes.as_slice()).chain(twins.iter().map(Vec::as_slice)).collect();
+
+        let mask = volume.cutters_mask(&cutters, VOXEL * 2.0);
+        assert_eq!(mask.at(cell(Vec3::new(15.0, 0.0, 0.0))), PROTECTED, "the drawn side");
+        assert_eq!(mask.at(cell(Vec3::new(-15.0, 0.0, 0.0))), PROTECTED, "the mirrored side");
+        assert_eq!(mask.at(cell(Vec3::ZERO)), UNMASKED, "the middle, in neither");
+
+        // The union is at least what either cutter gives, everywhere.
+        let alone = volume.cutter_mask(&planes, VOXEL * 2.0);
+        for x in [-16.0, -9.0, -7.0, 0.0, 7.0, 9.0, 16.0] {
+            let at = cell(Vec3::new(x, 0.0, 0.0));
+            assert!(mask.at(at) >= alone.at(at), "the union unprotected x = {x}");
+        }
     }
 
     /// One plane through `cutter_mask` is the half-space mask, which is what
