@@ -1096,13 +1096,19 @@ mod backend {
         std::thread::Builder::new()
             .name("brokkr-puck".to_string())
             .spawn(move || {
-                raw_input::pump(
+                // Logged and not shown: the puck panel has no failure line of
+                // its own yet, and its "found, waiting to be moved" state is
+                // the honest one until it does. The pen records the same
+                // failure where its panel shows it.
+                if let Err(failure) = raw_input::pump(
                     "BrokkrPuckSink",
                     &[(PAGE_GENERIC, USAGE_MULTI_AXIS)],
                     |data, report| {
                         decode(&shared, data, report);
                     },
-                );
+                ) {
+                    log::warn!("spacemouse: {failure}");
+                }
             })
             .ok();
     }

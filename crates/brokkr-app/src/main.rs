@@ -74,6 +74,12 @@ fn app_theme(_state: &Brokkr) -> iced::Theme {
     theme::theme()
 }
 
+/// How long `--tablets` runs the real pipe waiting for the pen to report.
+///
+/// Long enough to find the pen and press it after reading the instruction,
+/// short enough that a redirected run does not look hung.
+const TABLET_LISTEN: std::time::Duration = std::time::Duration::from_secs(8);
+
 fn main() -> iced::Result {
     // **The channel CI reads the build ordinal back out of.**
     //
@@ -102,7 +108,18 @@ fn main() -> iced::Result {
     // A tablet that does not work is hard to diagnose from inside a running
     // application, so the same detection logic is available without one.
     if std::env::args().any(|argument| argument == "--tablets") {
+        use std::io::Write;
         print!("{}", tablet::report());
+        // The scan says what is listed; only running the pipe says whether it
+        // delivers, and a tablet in mouse mode is listed and silent. Flushed,
+        // because the release binary's output is usually a redirect and the
+        // instruction has to be readable before the wait, not after it.
+        println!(
+            "Press the pen to the tablet now: listening for {} seconds.",
+            TABLET_LISTEN.as_secs()
+        );
+        let _ = std::io::stdout().flush();
+        print!("{}", tablet::listen(TABLET_LISTEN));
         return Ok(());
     }
     // Likewise for the puck: "it is plugged in and nothing happens" is
