@@ -31,7 +31,7 @@ use windows_sys::Win32::Devices::HumanInterfaceDevice::{
     HIDP_BUTTON_CAPS, HIDP_STATUS_SUCCESS, HIDP_VALUE_CAPS, HidP_GetButtonCaps, HidP_GetUsageValue,
     HidP_GetUsages, HidP_GetValueCaps, HidP_Input, PHIDP_PREPARSED_DATA,
 };
-use windows_sys::Win32::Foundation::{HANDLE, HWND, LPARAM, LRESULT, WPARAM};
+use windows_sys::Win32::Foundation::{GetLastError, HANDLE, HWND, LPARAM, LRESULT, WPARAM};
 use windows_sys::Win32::UI::Input::{
     GetRawInputData, GetRawInputDeviceInfoW, GetRawInputDeviceList, HRAWINPUT, RAWINPUT,
     RAWINPUTDEVICE, RAWINPUTDEVICELIST, RAWINPUTHEADER, RID_DEVICE_INFO, RID_INPUT,
@@ -47,21 +47,59 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 pub const PAGE_GENERIC: u16 = 0x01;
 pub const PAGE_DIGITIZER: u16 = 0x0D;
 
+/// Why [`pump`] could not start, in words a panel can show.
+///
+/// Each carries the `GetLastError` code, because on a machine nobody here can
+/// reach that number is the whole difference between a guess and a diagnosis.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PumpFailure {
+    /// The message-only sink window could not be created.
+    Window(u32),
+    /// No usage could be registered. Every `(page, usage, error)` that failed.
+    Registration(Vec<(u16, u16, u32)>),
+}
+
+impl std::fmt::Display for PumpFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PumpFailure::Window(error) => {
+                write!(f, "the Raw Input sink window could not be created (error {error})")
+            }
+            PumpFailure::Registration(failed) => {
+                write!(f, "Raw Input refused every registration:")?;
+                for (page, usage, error) in failed {
+                    write!(f, " page {page:#04X} usage {usage:#04X} error {error};")?;
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
 /// Read one kind of device until the process ends, handing every report to
 /// `on_report` along with the parsed descriptor it should be read against.
 ///
-/// Returns only on failure, and silently: a device that cannot be read must
-/// never stop the application starting. Both callers report the difference
-/// between "set up" and "receiving" in their own panel instead, which is the
-/// thing a user can actually act on.
+/// Returns only on failure, and says why: a device that cannot be read must
+/// never stop the application starting, but a pipe that failed to set up must
+/// not sit behind a panel saying the device was found. The caller records the
+/// failure where its panel can show it. `Ok` is the message loop ending, which
+/// only `WM_QUIT` does.
 ///
 /// `class` must be unique per caller. Registering a window class twice fails,
 /// and two devices read on two threads need two windows.
-pub fn pump(class: &str, usages: &[(u16, u16)], on_report: impl Fn(PHIDP_PREPARSED_DATA, &[u8])) {
+pub fn pump(
+    class: &str,
+    usages: &[(u16, u16)],
+    on_report: impl Fn(PHIDP_PREPARSED_DATA, &[u8]),
+) -> Result<(), PumpFailure> {
     let class_name: Vec<u16> = class.encode_utf16().chain(std::iter::once(0)).collect();
     let mut descriptor: WNDCLASSW = unsafe { std::mem::zeroed() };
     descriptor.lpfnWndProc = Some(wndproc);
     descriptor.lpszClassName = class_name.as_ptr();
+    // The return is not checked on purpose: the one failure that matters --
+    // the class already exists -- is followed by a window creation that then
+    // succeeds against it, and any other failure is reported by that creation
+    // failing.
     unsafe { RegisterClassW(&descriptor) };
 
     // `HWND_MESSAGE` is a window that is never shown, never focused and never
@@ -83,33 +121,41 @@ pub fn pump(class: &str, usages: &[(u16, u16)], on_report: impl Fn(PHIDP_PREPARS
         )
     };
     if window.is_null() {
-        return;
+        return Err(PumpFailure::Window(unsafe { GetLastError() }));
     }
 
-    // Every usage in one registration. A pen is usage 0x02 on the digitizer
-    // page by the HID specification, but a vendor driver may present its
-    // top-level collection as 0x01, the plain "digitizer", and a registration
-    // for the one would never hear from the other.
-    let devices: Vec<RAWINPUTDEVICE> = usages
-        .iter()
-        .map(|(usage_page, usage)| RAWINPUTDEVICE {
+    // One registration per usage, and the pump runs if ANY succeeded. A pen is
+    // usage 0x02 on the digitizer page by the HID specification, but a vendor
+    // driver may present its top-level collection as 0x01, the plain
+    // "digitizer", and a registration for the one would never hear from the
+    // other -- so both are asked for. They were asked for in ONE call, and
+    // `RegisterRawInputDevices` is all or nothing across its array: one usage
+    // Windows would not take would have refused the pen as well, leaving a
+    // two-usage registration strictly worse than the one-usage call it
+    // replaced. Separately, the one that is refused costs nothing but a log
+    // line.
+    let mut failed = Vec::new();
+    for (usage_page, usage) in usages {
+        let device = RAWINPUTDEVICE {
             usUsagePage: *usage_page,
             usUsage: *usage,
             // Delivered even unfocused, which this window always is: without
             // this flag a message-only window receives nothing at all.
             dwFlags: RIDEV_INPUTSINK,
             hwndTarget: window,
-        })
-        .collect();
-    let registered = unsafe {
-        RegisterRawInputDevices(
-            devices.as_ptr(),
-            devices.len() as u32,
-            size_of::<RAWINPUTDEVICE>() as u32,
-        )
-    };
-    if registered == 0 {
-        return;
+        };
+        let registered =
+            unsafe { RegisterRawInputDevices(&device, 1, size_of::<RAWINPUTDEVICE>() as u32) };
+        if registered == 0 {
+            let error = unsafe { GetLastError() };
+            log::warn!(
+                "{class}: Raw Input refused page {usage_page:#04X} usage {usage:#04X}, error {error}"
+            );
+            failed.push((*usage_page, *usage, error));
+        }
+    }
+    if failed.len() == usages.len() {
+        return Err(PumpFailure::Registration(failed));
     }
 
     let mut message: MSG = unsafe { std::mem::zeroed() };
@@ -121,6 +167,7 @@ pub fn pump(class: &str, usages: &[(u16, u16)], on_report: impl Fn(PHIDP_PREPARS
         }
         unsafe { DispatchMessageW(&message) };
     }
+    Ok(())
 }
 
 /// Nothing to do: `WM_INPUT` is taken from the message loop rather than from

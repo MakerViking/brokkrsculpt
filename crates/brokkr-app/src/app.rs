@@ -6314,7 +6314,7 @@ impl Brokkr {
             std::env::var("XDG_SESSION_TYPE").unwrap_or_else(|_| "unknown".into()),
             std::env::var("XDG_CURRENT_DESKTOP").unwrap_or_else(|_| "unknown".into()),
         ));
-        self.breadcrumbs.sticky_fact(&format!("[tablet] {}", self.tablet.diagnosis().explain()));
+        self.breadcrumbs.sticky_fact(&format!("[tablet] {}", self.tablet.describe()));
         self.breadcrumbs
             .sticky_fact(&format!("[spacemouse] {}", self.spacemouse.diagnosis().explain()));
     }
@@ -6415,7 +6415,7 @@ impl Brokkr {
                 0.0
             },
         );
-        let _ = writeln!(out, "tablet: {}", self.tablet.diagnosis().explain());
+        let _ = writeln!(out, "tablet: {}", self.tablet.describe());
         let _ = writeln!(out, "spacemouse: {}", self.spacemouse.diagnosis().explain());
         if !self.status.is_empty() {
             let _ = writeln!(out, "last message: {}", self.status);

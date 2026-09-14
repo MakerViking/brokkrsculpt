@@ -1500,7 +1500,7 @@ impl Brokkr {
                 pool.bricks,
                 match self.tablet.devices().first() {
                     Some(device) => format!("{:.2} ({})", self.perf.pressure, device.name),
-                    None => self.tablet.diagnosis().explain().to_string(),
+                    None => self.tablet.describe(),
                 }
             ),
             format!(
@@ -3690,19 +3690,34 @@ impl Brokkr {
     /// answerable in a few seconds.
     fn pen_panel(&self) -> Element<'_, Message> {
         let devices = self.tablet.devices();
+        let diagnosis = self.tablet.diagnosis();
         let status: Element<'_, Message> = match devices.first() {
-            Some(device) => column![
-                text(device.name.clone()).size(theme::CAPTION_SIZE).color(theme::OK),
-                text(format!("{} levels", device.pressure_max))
-                    .size(theme::CAPTION_SIZE)
-                    .color(theme::TEXT_MUTE),
-            ]
-            .spacing(1)
-            .into(),
-            None => text(self.tablet.diagnosis().explain())
+            Some(device) => {
+                let mut lines = column![
+                    text(device.name.clone()).size(theme::CAPTION_SIZE).color(theme::OK),
+                    text(format!("{} levels", device.pressure_max))
+                        .size(theme::CAPTION_SIZE)
+                        .color(theme::TEXT_MUTE),
+                ]
+                .spacing(1);
+                // **A named device over a silent pipe is the one state this
+                // panel must not leave unsaid.** The name and the level count
+                // come from the descriptor and are true whether or not a
+                // report ever arrives; "found, nothing received" and "the
+                // pipe failed" are what tell a user whose pen does nothing
+                // where to look. Reading, the two lines above are the whole
+                // story and this adds nothing.
+                if diagnosis != Diagnosis::Listening {
+                    lines = lines.push(
+                        text(self.tablet.describe()).size(theme::CAPTION_SIZE).color(theme::WARN),
+                    );
+                }
+                lines.into()
+            }
+            None => text(self.tablet.describe())
                 .size(theme::CAPTION_SIZE)
-                .color(match self.tablet.diagnosis() {
-                    Diagnosis::PermissionDenied => theme::WARN,
+                .color(match diagnosis {
+                    Diagnosis::PermissionDenied | Diagnosis::PipeFailed => theme::WARN,
                     _ => theme::TEXT_MUTE,
                 })
                 .into(),

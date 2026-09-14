@@ -20,8 +20,9 @@ use std::sync::{Arc, Mutex};
 use brokkr_core::{BrickCoord, BrickMesh, BrushKind, MirrorAxis, NodeId};
 use brokkr_gpu::{Frustum, OverlayBatch, PixelRect, PoolStats, SculptRenderer, SlotKey, Uniforms};
 use iced::mouse;
+use iced::touch;
 use iced::widget::shader;
-use iced::{Rectangle, Vector};
+use iced::{Point, Rectangle, Vector};
 
 use crate::app::{SizingTarget, Tool};
 use crate::camera::OrbitCamera;
@@ -653,11 +654,17 @@ impl Viewport {
 fn pointer_position(bounds: Rectangle, cursor: mouse::Cursor) -> Option<(Vector, Vector)> {
     // Deliberately not `position_in`: a drag that leaves the widget must keep
     // orbiting, so positions outside the bounds are wanted, not discarded.
-    let position = cursor.position()?;
-    Some((
+    Some(widget_local(bounds, cursor.position()?))
+}
+
+/// A window point as the widget sees it: relative to its own origin, with the
+/// widget's size alongside. Shared by the mouse arms, which read the point off
+/// the cursor, and the touch arms, which carry their own.
+fn widget_local(bounds: Rectangle, position: Point) -> (Vector, Vector) {
+    (
         Vector::new(position.x - bounds.x, position.y - bounds.y),
         Vector::new(bounds.width, bounds.height),
-    ))
+    )
 }
 
 fn button_of(button: mouse::Button) -> Option<PointerButton> {
@@ -853,6 +860,48 @@ fn route_pointer(
                 mouse::ScrollDelta::Pixels { y, .. } => *y / 40.0,
             };
             (PointerEvent::Scrolled { amount, position, size }, true)
+        }
+        // **A pen on Windows arrives here as a touch, never as a mouse.** winit
+        // 0.30 turns a `WM_POINTER*` message whose pointer is `PT_PEN` into
+        // `WindowEvent::Touch` and returns without calling `DefWindowProc`
+        // (`platform_impl/windows/event_loop.rs`, the `WM_POINTERDOWN |
+        // WM_POINTERUPDATE | WM_POINTERUP` arm in 0.30.13), and only
+        // `DefWindowProc` promotes pointer input to the legacy mouse messages.
+        // So with the driver in Windows Ink mode the pen is `Event::Touch` all
+        // the way to this widget. iced's own buttons and sliders match touch
+        // as well as mouse, which is why the panel worked with the pen while
+        // the viewport did nothing -- the exact shape of bug report
+        // `fdbc405b`: "says there is a pen now, but the pen still doesn't
+        // work". With the driver in mouse mode the pen is injected as mouse
+        // messages instead and the arms above see it.
+        //
+        // One contact is the left button, because winit reads only the
+        // down/up/update flags and drops the barrel and eraser buttons. The
+        // same path carries a finger on a touchscreen and is treated the same
+        // way; a second finger while the first is down is a second left press,
+        // which the application's drag guard refuses.
+        iced::Event::Touch(touch::Event::FingerPressed { position, .. }) => {
+            // The same rule as a mouse press: only a contact that began inside
+            // the viewport is ours, and only that may capture.
+            if !bounds.contains(*position) {
+                return None;
+            }
+            let (position, size) = widget_local(bounds, *position);
+            (PointerEvent::Pressed { button: PointerButton::Left, position, size }, true)
+        }
+        // A move, wherever it is, and never a contact: a pen in range but off
+        // the surface reports `FingerMoved` too (a `POINTER_FLAG_UPDATE` with
+        // no contact), so hover and drag both come through here and the
+        // press above is the only thing that starts a stroke.
+        iced::Event::Touch(touch::Event::FingerMoved { position, .. }) => {
+            let (position, size) = widget_local(bounds, *position);
+            (PointerEvent::Moved { position, size }, false)
+        }
+        // Lost is Windows cancelling the contact -- the pen left range mid
+        // stroke, or the window lost it -- and has to end the drag exactly as
+        // a lift does, or the stroke would carry on under the next hover.
+        iced::Event::Touch(touch::Event::FingerLifted { .. } | touch::Event::FingerLost { .. }) => {
+            (PointerEvent::Released { button: PointerButton::Left }, false)
         }
         iced::Event::Keyboard(iced::keyboard::Event::ModifiersChanged(modifiers)) => (
             PointerEvent::Modifiers {
@@ -1182,6 +1231,64 @@ mod tests {
             route_pointer(&pressed, bounds(), outside).is_none(),
             "a press outside the viewport must not reach the sculpt at all"
         );
+    }
+
+    /// **The Windows pen.** It reaches the widget as a touch, so a touch has to
+    /// route exactly as the left mouse button does: press inside captures,
+    /// press outside is not ours, moves and lifts are routed wherever they are
+    /// and never capture.
+    #[test]
+    fn a_pen_arriving_as_a_touch_is_the_left_button() {
+        use iced::touch::{Event as Touch, Finger};
+        let finger = Finger(7);
+        // The cursor is irrelevant to a touch, which carries its own position;
+        // set to somewhere that would be WRONG if it were read.
+        let cursor = mouse::Cursor::Available(Point::new(950.0, 690.0));
+
+        let pressed = iced::Event::Touch(Touch::FingerPressed {
+            id: finger,
+            position: Point::new(300.0, 200.0),
+        });
+        let (event, captures) = route_pointer(&pressed, bounds(), cursor).expect("a pen press");
+        assert!(captures, "a pen press inside the viewport should be claimed");
+        match event {
+            PointerEvent::Pressed { button, position, size } => {
+                assert_eq!(button, PointerButton::Left, "a pen is the left button");
+                assert_eq!((position.x, position.y), (200.0, 150.0), "not widget local");
+                assert_eq!((size.x, size.y), (800.0, 600.0));
+            }
+            other => panic!("expected a press, got {other:?}"),
+        }
+
+        let outside = iced::Event::Touch(Touch::FingerPressed {
+            id: finger,
+            position: Point::new(950.0, 690.0),
+        });
+        assert!(
+            route_pointer(&outside, bounds(), cursor).is_none(),
+            "a pen press outside the viewport must not reach the sculpt at all"
+        );
+
+        let moved = iced::Event::Touch(Touch::FingerMoved {
+            id: finger,
+            position: Point::new(950.0, 690.0),
+        });
+        let (event, captures) = route_pointer(&moved, bounds(), cursor).expect("moves are routed");
+        assert!(!captures, "a pen move was captured");
+        assert!(matches!(event, PointerEvent::Moved { .. }), "got {event:?}");
+
+        for ended in [
+            Touch::FingerLifted { id: finger, position: Point::new(950.0, 690.0) },
+            Touch::FingerLost { id: finger, position: Point::new(950.0, 690.0) },
+        ] {
+            let (event, captures) =
+                route_pointer(&iced::Event::Touch(ended), bounds(), cursor).expect("routed");
+            assert!(!captures, "a pen lift was captured");
+            assert!(
+                matches!(event, PointerEvent::Released { button: PointerButton::Left }),
+                "got {event:?}"
+            );
+        }
     }
 
     /// Keyboard events are none of `route_pointer`'s business: shortcuts fire

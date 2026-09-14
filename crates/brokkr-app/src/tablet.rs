@@ -89,14 +89,28 @@ pub struct TabletDevice {
 }
 
 /// Why no pressure is arriving, for the interface to explain.
+///
+/// **"Found" and "reading" are two different states, and the difference is
+/// the whole value of the line on a machine nobody here can test.** They used
+/// to be one word, "listening", which meant only that a device had been
+/// enumerated -- and a Windows report then arrived saying the panel showed a
+/// pen while the pen did nothing, which that word could neither confirm nor
+/// deny. The puck's diagnosis had told the two apart from the start.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Diagnosis {
-    /// A tablet is open and being read.
+    /// A tablet is open and has reported at least once.
     Listening,
+    /// A stylus device is open, and nothing has arrived from it yet. Either the
+    /// pen has not touched down since launch, or it never will: a driver in
+    /// mouse mode, or a pipe that is registered but not delivering.
+    Found,
     /// Nothing that looks like a stylus is connected.
     NoTabletFound,
     /// Devices exist but could not be opened. Almost always group membership.
     PermissionDenied,
+    /// The reading pipe itself failed to set up. [`Tablet::describe`] carries
+    /// the detail.
+    PipeFailed,
     /// This platform has no implementation yet.
     Unsupported,
 }
@@ -104,11 +118,13 @@ pub enum Diagnosis {
 impl Diagnosis {
     pub fn explain(self) -> &'static str {
         match self {
-            Diagnosis::Listening => "listening",
+            Diagnosis::Listening => "reading the pen",
+            Diagnosis::Found => "pen found, nothing received from it yet",
             Diagnosis::NoTabletFound => "no tablet found, using full pressure",
             Diagnosis::PermissionDenied => {
                 "cannot read /dev/input, add your user to the input group"
             }
+            Diagnosis::PipeFailed => "the pen pipe could not be set up",
             Diagnosis::Unsupported => "pen pressure is Linux only so far",
         }
     }
@@ -137,9 +153,18 @@ struct Shared {
     tilt_y: AtomicU32,
     /// Milliseconds since `started` at the last pen event.
     last_event_ms: AtomicU64,
+    /// Whether any pen event has EVER arrived. `last_event_ms` cannot answer
+    /// that once the timeout has passed, and this is what separates
+    /// [`Diagnosis::Found`] from [`Diagnosis::Listening`].
+    seen: AtomicBool,
     started: Instant,
     devices: Mutex<Vec<TabletDevice>>,
     permission_denied: AtomicBool,
+    /// Why the reading pipe failed to set up, when it did. Written by a backend
+    /// whose setup can fail after the device list is filled -- Raw Input's
+    /// window and registration -- so the panel can say so instead of showing a
+    /// device name over a pipe that will never deliver.
+    pipe_failure: Mutex<Option<String>>,
 }
 
 impl Shared {
@@ -153,9 +178,11 @@ impl Shared {
             tilt_x: AtomicU32::new(0),
             tilt_y: AtomicU32::new(0),
             last_event_ms: AtomicU64::new(0),
+            seen: AtomicBool::new(false),
             started: Instant::now(),
             devices: Mutex::new(Vec::new()),
             permission_denied: AtomicBool::new(false),
+            pipe_failure: Mutex::new(None),
         }
     }
 
@@ -172,6 +199,14 @@ impl Shared {
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     fn touch(&self) {
         self.last_event_ms.store(self.now_ms(), Ordering::Relaxed);
+        self.seen.store(true, Ordering::Relaxed);
+    }
+
+    /// Record that the reading pipe could not be set up. Kept rather than
+    /// cfg'd to Windows for the reason the setters above are.
+    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+    fn set_pipe_failure(&self, why: String) {
+        *self.pipe_failure.lock().expect("tablet state poisoned") = Some(why);
     }
 
     // Same as the rest of these: written by the evdev reader alone.
@@ -307,13 +342,39 @@ impl Tablet {
         if !backend::SUPPORTED {
             return Diagnosis::Unsupported;
         }
+        // Before the device list: a pipe that failed delivers from no device,
+        // however many were found.
+        if self.pipe_failure().is_some() {
+            return Diagnosis::PipeFailed;
+        }
         if !self.devices().is_empty() {
-            return Diagnosis::Listening;
+            return if self.shared.seen.load(Ordering::Relaxed) {
+                Diagnosis::Listening
+            } else {
+                Diagnosis::Found
+            };
         }
         if self.shared.permission_denied.load(Ordering::Relaxed) {
             return Diagnosis::PermissionDenied;
         }
         Diagnosis::NoTabletFound
+    }
+
+    /// Why the reading pipe failed to set up, if it did.
+    pub fn pipe_failure(&self) -> Option<String> {
+        self.shared.pipe_failure.lock().expect("tablet state poisoned").clone()
+    }
+
+    /// The diagnosis as a sentence, with the pipe failure's own words when
+    /// there is one. What the panel, the breadcrumbs and the bug report print.
+    pub fn describe(&self) -> String {
+        let diagnosis = self.diagnosis();
+        match self.pipe_failure() {
+            Some(why) if diagnosis == Diagnosis::PipeFailed => {
+                format!("{}: {why}", diagnosis.explain())
+            }
+            _ => diagnosis.explain().to_string(),
+        }
     }
 
     /// The pressure to apply to a stamp right now.
@@ -461,10 +522,13 @@ impl HidSummary {
     }
 }
 
-/// The `--tablets` report for a scanner that sees HID devices, from what it
-/// found and whether the live pipe has heard anything.
+/// The `--tablets` report for a scanner that sees HID devices: what it found
+/// and what it made of each. Whether anything is HEARD from them is
+/// [`listen`]'s job, which runs the pipe for real; this used to end with a line
+/// about the pipe that was printed before the pipe existed and so always said
+/// the same thing.
 #[cfg(any(target_os = "windows", test))]
-pub(crate) fn hid_report(devices: &[HidSummary], pipe: &str) -> String {
+pub(crate) fn hid_report(devices: &[HidSummary]) -> String {
     use std::fmt::Write;
     let mut out = String::new();
     let _ = writeln!(out, "HID devices, as the tablet scanner sees them.\n");
@@ -505,7 +569,7 @@ pub(crate) fn hid_report(devices: &[HidSummary], pipe: &str) -> String {
             device.usage
         );
     }
-    let _ = writeln!(out, "{found} stylus device(s) usable. {pipe}");
+    let _ = writeln!(out, "{found} stylus device(s) usable.");
     if found == 0 {
         let _ = writeln!(
             out,
@@ -528,6 +592,69 @@ pub fn report() -> String {
     backend::report()
 }
 
+/// Run the real pipe for `patience` and say whether the pen reported.
+///
+/// **This is the half of `--tablets` that answers the question.** The scan
+/// above reads descriptors, which a device publishes whether or not its driver
+/// will ever send a report on them -- a tablet in mouse mode lists its pen
+/// collection, pressure range and all, and is silent on it. Only running the
+/// pipe and pressing the pen tells that apart from a pipe that works, and the
+/// old report claimed to while doing neither: it returned before the pipe was
+/// ever started, so its last line was a constant.
+///
+/// The advice for silence is the backend's, because the likely cause differs
+/// per platform.
+pub fn listen(patience: std::time::Duration) -> String {
+    use std::fmt::Write;
+    let tablet = Tablet::start();
+    std::thread::sleep(patience);
+
+    let mut out = String::new();
+    let devices = tablet.devices();
+    match tablet.diagnosis() {
+        Diagnosis::Listening => {
+            let pen = tablet.state();
+            let _ = writeln!(
+                out,
+                "The pen reported. Peak pressure {:.2} of full range{}.",
+                tablet.peak(),
+                if pen.in_proximity { ", pen in range now" } else { "" }
+            );
+            if tablet.peak() <= 0.0 {
+                let _ = writeln!(
+                    out,
+                    "Reports arrived but every pressure read zero: the pen was not pressed, or \
+                     the device reports pressure on a collection this does not read."
+                );
+            }
+        }
+        Diagnosis::Found => {
+            let _ = writeln!(
+                out,
+                "{} stylus device(s) open, and nothing arrived from them in {} seconds.",
+                devices.len(),
+                patience.as_secs()
+            );
+            let _ = writeln!(out, "{}", backend::SILENT_ADVICE);
+        }
+        Diagnosis::PipeFailed => {
+            let _ = writeln!(out, "{}", tablet.describe());
+            let _ = writeln!(
+                out,
+                "Nothing can arrive through a pipe that did not open. This output is what to \
+                 send."
+            );
+        }
+        Diagnosis::NoTabletFound => {
+            let _ = writeln!(out, "No stylus device to listen to.");
+        }
+        other => {
+            let _ = writeln!(out, "{}", other.explain());
+        }
+    }
+    out
+}
+
 #[cfg(target_os = "linux")]
 mod backend {
     use super::{Shared, TabletDevice, normalise, normalise_signed};
@@ -540,6 +667,11 @@ mod backend {
     use glam::Vec2;
 
     pub const SUPPORTED: bool = true;
+
+    /// What to try when a stylus is open and silent. See [`super::listen`].
+    pub const SILENT_ADVICE: &str = "The device is open but sent nothing. Check that the pen \
+                                     draws in another application, and that this is the pen's \
+                                     own event node rather than the tablet's pad or buttons.";
 
     /// How often to look for a tablet that was plugged in after startup.
     ///
@@ -824,7 +956,6 @@ mod backend {
     use crate::raw_input::{self, PAGE_DIGITIZER};
     use glam::Vec2;
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, Ordering};
     use windows_sys::Win32::Devices::HumanInterfaceDevice::PHIDP_PREPARSED_DATA;
 
     pub const SUPPORTED: bool = true;
@@ -838,18 +969,23 @@ mod backend {
     const USAGE_TIP_SWITCH: u16 = 0x42;
     const USAGE_ERASER: u16 = 0x45;
 
-    /// Set once a report has been decoded, so the panel can say whether the
-    /// pipe is LIVE rather than only whether it was set up. On a platform
-    /// nobody here can test, that difference is the whole value of the panel.
-    static SAW_A_REPORT: AtomicBool = AtomicBool::new(false);
+    /// What to try when a stylus is listed and silent. See [`super::listen`].
+    ///
+    /// Mouse mode first, because it is the common case and the user's to fix:
+    /// a driver with Windows Ink off routes the pen through its mouse
+    /// collection and never reports on the pen collection it still lists. The
+    /// pipe itself is the other possibility, and the one this code cannot
+    /// rule out blind.
+    pub const SILENT_ADVICE: &str = "A tablet whose driver is in mouse-only mode still lists \
+                                     its pen collection but never reports on it. Switch on \
+                                     Windows Ink in the driver's settings (Huion, Gaomon and \
+                                     XP-Pen call it that; Wacom calls it \"Use Windows Ink\"), \
+                                     unplug and replug, and run this again. If it still \
+                                     reports nothing, the Raw Input pipe is at fault and this \
+                                     output is what to send.";
 
     pub fn report() -> String {
-        let pipe = if SAW_A_REPORT.load(Ordering::Relaxed) {
-            "Reading the pen through Raw Input."
-        } else {
-            "Listening for a pen through Raw Input; none has reported yet."
-        };
-        super::hid_report(&scan(), pipe)
+        super::hid_report(&scan())
     }
 
     /// Every HID device, reduced to what decides whether it is a stylus.
@@ -901,42 +1037,65 @@ mod backend {
                 });
             }
         }
-        std::thread::Builder::new()
-            .name("brokkr-pen".to_string())
-            .spawn(move || {
-                raw_input::pump(
+        let spawned = std::thread::Builder::new().name("brokkr-pen".to_string()).spawn({
+            let shared = Arc::clone(&shared);
+            move || {
+                // The pump returns only when it could not be set up, and
+                // silently -- it must never stop the application starting. What
+                // it could not do is recorded here, so the panel says "the
+                // pipe failed" over the device name instead of "found" over a
+                // pipe that will never deliver.
+                if let Err(failure) = raw_input::pump(
                     "BrokkrPenSink",
                     &[(PAGE_DIGITIZER, USAGE_PEN), (PAGE_DIGITIZER, super::HID_USAGE_DIGITIZER)],
                     |data, report| {
                         decode(&shared, data, report);
                     },
-                );
-            })
-            .ok();
+                ) {
+                    shared.set_pipe_failure(failure.to_string());
+                }
+            }
+        });
+        if let Err(error) = spawned {
+            shared.set_pipe_failure(format!("the pen thread could not start: {error}"));
+        }
     }
 
     fn decode(shared: &Arc<Shared>, data: PHIDP_PREPARSED_DATA, report: &[u8]) {
         let at = |usage| raw_input::button(data, report, PAGE_DIGITIZER, usage);
         let (tip, eraser, in_range) = (at(USAGE_TIP_SWITCH), at(USAGE_ERASER), at(USAGE_IN_RANGE));
+        let pressure = scaled(data, report, USAGE_TIP_PRESSURE);
 
         // Proximity FIRST: `set_tool` clears pressure and tilt when the pen
         // leaves, so doing it afterwards would wipe the values just written.
         match (in_range, tip, eraser) {
             (Some(false), _, _) => shared.set_tool(Some(false), Some(false)),
             (_, tip, eraser) if tip.is_some() || eraser.is_some() => shared.set_tool(tip, eraser),
-            _ => {}
+            // **No switch this device can be asked about, so contact is
+            // proximity.** `HidP_GetUsages` fails for a report whose id
+            // carries no digitizer buttons, and a device that puts its
+            // switches on another collection answers `None` for all three on
+            // every report. Leaving proximity alone there kept it false for
+            // ever, and `stamp_pressure` reads "not in proximity" as a mouse:
+            // full pressure, no tilt, no eraser, with the panel saying "pen
+            // away" while its peak climbed. A pen that is pressing is in
+            // range, and one reading zero has lifted; the timeout covers a
+            // pen that leaves without a last report.
+            _ => {
+                if let Some(pressure) = pressure {
+                    shared.set_tool(Some(pressure > 0.0), None);
+                }
+            }
         }
 
-        if let Some(pressure) = scaled(data, report, USAGE_TIP_PRESSURE) {
+        if let Some(pressure) = pressure {
             shared.set_pressure(pressure);
-            SAW_A_REPORT.store(true, Ordering::Relaxed);
         }
 
         let x = signed(data, report, USAGE_X_TILT);
         let y = signed(data, report, USAGE_Y_TILT);
         if x.is_some() || y.is_some() {
             shared.set_tilt(Vec2::new(x.unwrap_or(0.0), y.unwrap_or(0.0)));
-            SAW_A_REPORT.store(true, Ordering::Relaxed);
         }
     }
 
@@ -977,6 +1136,11 @@ mod backend {
     use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
     pub const SUPPORTED: bool = true;
+
+    /// What to try when a stylus is open and silent. See [`super::listen`].
+    pub const SILENT_ADVICE: &str = "The device is open but sent nothing. macOS may need Input \
+                                     Monitoring for BrokkrSculpt in Privacy & Security; check \
+                                     that the pen draws in another application.";
 
     const USAGE_PEN: u32 = 0x02;
     const USAGE_TIP_PRESSURE: u32 = 0x30;
@@ -1058,6 +1222,10 @@ mod backend {
     use std::sync::Arc;
 
     pub const SUPPORTED: bool = false;
+
+    /// Never printed: `listen` reaches for it only from `Diagnosis::Found`,
+    /// which an unsupported backend never reports.
+    pub const SILENT_ADVICE: &str = "";
 
     /// macOS would use `IOHIDManager`, which is a milestone away, and the
     /// application degrades to full pressure in the meantime -- which is what
@@ -1285,16 +1453,20 @@ mod tests {
 
     #[test]
     fn the_hid_report_names_the_device_and_says_what_to_do_when_none_is_a_stylus() {
-        let report = hid_report(&[hid(HID_PAGE_DIGITIZER, HID_USAGE_PEN, Some((0, 8191)))], "pipe");
+        let report = hid_report(&[hid(HID_PAGE_DIGITIZER, HID_USAGE_PEN, Some((0, 8191)))]);
         assert!(report.contains("Huion or Gaomon 256C:006D"), "{report}");
         assert!(report.contains("0 to 8191"), "{report}");
-        assert!(report.contains("1 stylus device(s) usable. pipe"), "{report}");
+        assert!(report.contains("1 stylus device(s) usable."), "{report}");
         assert!(!report.contains("Windows Ink"), "advice given when a stylus was found");
+        assert!(
+            !report.contains("Listening") && !report.contains("reported"),
+            "the scan claimed to know whether the pipe delivers: {report}"
+        );
 
-        let none = hid_report(&[hid(HID_PAGE_DIGITIZER, HID_USAGE_PEN, None)], "pipe");
+        let none = hid_report(&[hid(HID_PAGE_DIGITIZER, HID_USAGE_PEN, None)]);
         assert!(none.contains("0 stylus device(s) usable"), "{none}");
         assert!(none.contains("Windows Ink"), "{none}");
-        let empty = hid_report(&[], "pipe");
+        let empty = hid_report(&[]);
         assert!(empty.contains("No HID devices at all"), "{empty}");
     }
 
@@ -1476,7 +1648,8 @@ mod uinput_tests {
             !devices.iter().any(|device| device.name == "BrokkrSculpt test touchscreen"),
             "a device with pressure but no pen tool was mistaken for a stylus"
         );
-        assert_eq!(tablet.diagnosis(), Diagnosis::Listening);
+        // Open and silent is "found", not "reading": nothing has arrived yet.
+        assert_eq!(tablet.diagnosis(), Diagnosis::Found);
 
         // Pen enters range and presses to half of its range.
         emit(&mut stylus, &[pen_tool_event(true), pressure_event(PRESSURE_MAX / 2)]);
@@ -1487,6 +1660,11 @@ mod uinput_tests {
             }),
             "half pressure never arrived, got {:?}",
             tablet.state()
+        );
+        assert_eq!(
+            tablet.diagnosis(),
+            Diagnosis::Listening,
+            "a report arrived and it still said found"
         );
         // The number the brush would actually use.
         assert!((tablet.stamp_pressure(true, 1.0) - 0.5).abs() < 0.01);
