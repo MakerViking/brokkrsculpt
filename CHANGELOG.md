@@ -23,6 +23,47 @@ before it, see the
 
 ## Unreleased
 
+### Full Spectrum: paint with 22 colours on a four-head U1
+
+The paint brush now offers **Full Spectrum mixes** beside your four
+filaments: every pair of tool heads at 1:1, 2:1 and 1:2, which Snapmaker
+Orca prints by alternating the two filaments layer by layer. That makes 18
+mixes and 22 colours in all. Each swatch is drawn with the same colour model
+Snapmaker Orca uses, so what you paint is what the slicer shows.
+
+A 3MF that uses a mix tells Snapmaker Orca how to make it, so the mixes are
+already set up when the file opens. One that uses no mix is exactly the file
+it was before. **Mixes need Snapmaker Orca 2.3.3 or newer.** Stock OrcaSlicer
+does not read them.
+
+### Open in Snapmaker Orca
+
+The EXPORT panel has a button that hands the sculpt straight to **Snapmaker
+Orca**, the U1's own slicer, when it is installed. The model opens on your U1
+preset with your filaments and mixes already set, and Snapmaker Orca's
+**Print** button sends it to the printer. If Snapmaker Orca isn't installed,
+the button opens OrcaSlicer as before.
+
+### Set the printer's address in the app
+
+The FILAMENT panel has a **Printer address** field. Type your U1's IP address,
+or paste the `http://…` address from your browser, and press **set**. You no
+longer need to find and edit `printer.conf` by hand.
+
+### Fixed: 3MF exports lost their colours in Snapmaker Orca
+
+If BrokkrSculpt read your printer presets from Snapmaker Orca, an exported 3MF
+opened there with Snapmaker's default filament colours and its own made-up
+presets, instead of yours. Snapmaker Orca was rejecting the file's whole
+settings block over three details in how we wrote it, including the leftover
+printer name "MyToolChanger" in Snapmaker's own U1 profile. The file now opens
+on your U1 preset, your filaments and your colours.
+
+### Fixed: the newest slicer is the one that opens
+
+With more than one OrcaSlicer AppImage in `~/Applications`, "Open in
+OrcaSlicer" launched the **oldest**. It now opens the newest.
+
 ### The first public build
 
 BrokkrSculpt is now downloadable for **Linux, Windows and macOS**. Nothing is

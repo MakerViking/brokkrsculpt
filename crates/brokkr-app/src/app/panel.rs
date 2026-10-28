@@ -1132,7 +1132,7 @@ impl Brokkr {
                     .push(exports)
                     // Below the exports, because it IS an export -- of a file
                     // the user does not have to name or find afterwards.
-                    .push(entry("Open in OrcaSlicer", Message::OpenInSlicer))
+                    .push(entry(self.open_in_slicer_label(), Message::OpenInSlicer))
                     .push(entry("Check the printer", Message::PrinterChecked))
             }
             // No Settings menu: the properties panel already carries every
@@ -3557,43 +3557,72 @@ impl Brokkr {
     ///
     /// Lives in the brush block and not in FILAMENT below, because it is
     /// consulted while sculpting and FILAMENT is consulted while exporting.
+    ///
+    /// The tool heads are one row; the Full Spectrum mixes under them are one
+    /// row per pair, its three ratios side by side, so the grid reads as "these
+    /// two heads, more of one or the other" rather than eighteen loose chips.
     fn filament_picker(&self) -> Element<'_, Message> {
-        let swatches = self.palette.slots.iter().enumerate().fold(
-            row![].spacing(theme::S1),
-            |assembled, (index, slot)| {
-                let number = (index + 1).min(usize::from(u8::MAX)) as u8;
-                let live = number == self.paint_slot;
-                let (style, _) = theme::tool_toggle(live);
-                assembled.push(
-                    button(
-                        row![
-                            container(text(""))
-                                .width(12)
-                                .height(12)
-                                .style(theme::swatch(slot.swatch())),
-                            text(format!("{number}")).size(theme::CAPTION_SIZE),
-                        ]
-                        .spacing(theme::S1)
-                        .align_y(Alignment::Center),
-                    )
-                    .style(style)
-                    .on_press(Message::PaintSlotChanged(number)),
-                )
-            },
-        );
-        let chosen = self
-            .palette
-            .slots
-            .get(usize::from(self.paint_slot).saturating_sub(1))
-            .map(|slot| slot.name.as_str())
-            .unwrap_or("no such slot");
-        column![
+        let heads =
+            (1..=self.palette.slots.len()).fold(row![].spacing(theme::S1), |assembled, number| {
+                assembled.push(self.slot_swatch(number.min(usize::from(u8::MAX)) as u8, true))
+            });
+
+        let mixes = self.palette.mixes();
+        let first_mix = self.palette.slots.len() + 1;
+        let mut pairs = column![].spacing(theme::S1);
+        for (pair, ratios) in mixes.chunks(brokkr_core::spectrum::RATIOS.len()).enumerate() {
+            let Some(mix) = ratios.first() else { continue };
+            let start = first_mix + pair * brokkr_core::spectrum::RATIOS.len();
+            let swatches = (0..ratios.len()).fold(
+                row![
+                    text(format!("{}+{}", mix.a, mix.b))
+                        .size(theme::CAPTION_SIZE)
+                        .color(theme::TEXT_MUTE)
+                        .width(28)
+                ]
+                .spacing(theme::S1)
+                .align_y(Alignment::Center),
+                |assembled, offset| assembled.push(self.slot_swatch((start + offset) as u8, false)),
+            );
+            pairs = pairs.push(swatches);
+        }
+
+        let chosen =
+            self.palette.name_of(self.paint_slot).unwrap_or_else(|| "no such slot".to_string());
+        let mut picker = column![
             text(format!("Filament  {}. {chosen}", self.paint_slot))
                 .size(theme::TEXT_SIZE_SMALL)
                 .color(theme::TEXT_DIM),
-            swatches,
+            heads,
         ]
-        .spacing(theme::S2)
+        .spacing(theme::S2);
+        if !mixes.is_empty() {
+            picker = picker
+                .push(text("Full Spectrum").size(theme::CAPTION_SIZE).color(theme::TEXT_DIM))
+                .push(pairs);
+        }
+        picker.into()
+    }
+
+    /// One slot's button in [`Self::filament_picker`]: a swatch, and the slot
+    /// number for a head or the layer ratio for a mix.
+    fn slot_swatch(&self, number: u8, head: bool) -> Element<'_, Message> {
+        let label = match (head, self.palette.mix_of(number)) {
+            (false, Some(mix)) => format!("{}:{}", mix.layers_a, mix.layers_b),
+            _ => format!("{number}"),
+        };
+        let swatch = self.palette.swatch_of(number).unwrap_or(iced::Color::from_rgb(0.5, 0.5, 0.5));
+        let (style, _) = theme::tool_toggle(number == self.paint_slot);
+        button(
+            row![
+                container(text("")).width(12).height(12).style(theme::swatch(swatch)),
+                text(label).size(theme::CAPTION_SIZE),
+            ]
+            .spacing(theme::S1)
+            .align_y(Alignment::Center),
+        )
+        .style(style)
+        .on_press(Message::PaintSlotChanged(number))
         .into()
     }
 
@@ -3603,10 +3632,11 @@ impl Brokkr {
     /// directly above EXPORT: it is read at the moment somebody sends a model
     /// to a printer, not while they sculpt.
     ///
-    /// Read-only for now. A slot is edited by hand in `filaments.conf` or taken
-    /// from the machine with the button; there is no colour picker here because
-    /// the answer that matters is what is physically loaded, and the printer
-    /// knows that better than a mouse does.
+    /// The slots are read-only: a slot is edited by hand in `filaments.conf` or
+    /// taken from the machine with the button; there is no colour picker here
+    /// because the answer that matters is what is physically loaded, and the
+    /// printer knows that better than a mouse does. The printer's address IS
+    /// set here, because without it the button does nothing.
     fn filament_panel(&self) -> Element<'_, Message> {
         let rows = self.palette.slots.iter().enumerate().fold(
             column![].spacing(theme::S1),
@@ -3635,6 +3665,21 @@ impl Brokkr {
 
         column![
             rows,
+            // The printer's address, set here rather than in a file: it is
+            // what Sync below and Check the printer both talk to, and a U1
+            // owner's first five minutes should not include finding a
+            // config directory.
+            text("Printer address").size(theme::TEXT_SIZE_SMALL).color(theme::TEXT_DIM),
+            row![
+                text_input("192.168.1.50", &self.printer_field)
+                    .on_input(Message::PrinterAddressTyped)
+                    .on_submit(Message::PrinterAddressSaved)
+                    .size(theme::TEXT_SIZE_SMALL),
+                button(text("set").size(theme::TEXT_SIZE_SMALL))
+                    .style(theme::tool_button)
+                    .on_press(Message::PrinterAddressSaved),
+            ]
+            .spacing(theme::S2),
             button(text("Sync filaments from printer").size(theme::TEXT_SIZE_SMALL))
                 .style(theme::tool_button)
                 .on_press(Message::PaletteSyncRequested),
@@ -3678,7 +3723,23 @@ impl Brokkr {
                 .into()
         };
 
-        column![buttons, status].spacing(theme::S2).into()
+        // The handoff, under the files it is an alternative to. Its own row
+        // and the accent style, because for a U1 owner it IS the export:
+        // sculpt, then this, then Print in Snapmaker Orca.
+        let handoff = button(text(self.open_in_slicer_label()).size(theme::TEXT_SIZE_SMALL))
+            .style(theme::tool_button_active)
+            .width(Length::Fill)
+            .on_press(Message::OpenInSlicer);
+
+        column![buttons, handoff, status].spacing(theme::S2).into()
+    }
+
+    /// "Open in Snapmaker Orca", or OrcaSlicer, by what was found at startup.
+    fn open_in_slicer_label(&self) -> &'static str {
+        match self.slicer_name {
+            Some("Snapmaker Orca") => "Open in Snapmaker Orca",
+            _ => "Open in OrcaSlicer",
+        }
     }
 
     /// Pen controls, plus enough of a live readout that a user can tell whether

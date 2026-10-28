@@ -43,6 +43,7 @@ pub mod region;
 pub mod resample;
 pub mod rotate;
 pub mod similarity;
+pub mod spectrum;
 pub mod split;
 pub mod stroke;
 #[cfg(test)]

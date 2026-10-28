@@ -132,6 +132,46 @@ where most of the dependency count went.
   and <https://github.com/rust-cli/env_logger>.
 - **pollster** — Apache-2.0/MIT — <https://github.com/zesterer/pollster>.
 
+## Code ported from other projects
+
+### FilamentMixer — MIT
+
+`crates/brokkr-core/src/spectrum/pigment.rs` is a Rust port of
+`filament_mixer::lerp`, and `crates/brokkr-core/src/spectrum/pigment_table.rs`
+carries its coefficients copied as text, both from `filament_mixer_model.h` in
+[Snapmaker/OrcaSlicer](https://github.com/Snapmaker/OrcaSlicer) (commit
+`229efa64b`). It is what Snapmaker Orca draws a Full Spectrum mix's swatch
+with, ported so the two agree to the byte. The header is MIT-licensed by its
+author, separately from the slicer around it, and its notice is reproduced in
+full as that licence requires:
+
+```text
+MIT License
+
+Copyright (c) 2026 Justin Hayes
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in
+all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+THE SOFTWARE.
+```
+
+The header states that it contains no Mixbox source, binaries or data: it is
+a polynomial fitted to approximate Mixbox's output.
+
 ## Assets
 
 **Nothing here is third-party.** Every image and mark in this repository was

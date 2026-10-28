@@ -276,6 +276,11 @@ pub enum Message {
     PrinterChecked,
     /// What it said.
     PrinterAnswered(Result<String, String>),
+    /// Typing in the printer address field. Held as text, like the working
+    /// size, so a half-typed address is not judged mid-keystroke.
+    PrinterAddressTyped(String),
+    /// Commit the printer address field: check it, and write `printer.conf`.
+    PrinterAddressSaved,
     /// Ask the printer which filament is loaded, and take it into the palette.
     PaletteSyncRequested,
     /// What it said. `Ok(None)` is a printer that does not report filament,

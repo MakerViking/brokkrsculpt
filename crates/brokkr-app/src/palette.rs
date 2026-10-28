@@ -30,7 +30,8 @@
 //! forgiveness `printer.rs` gives an unparseable port. The failure worth
 //! avoiding is a hand-edited typo in slot 4 silently discarding slots 1 to 3.
 
-use brokkr_core::export::threemf::{Filaments, MAX_SLOTS};
+use brokkr_core::export::threemf::{Filaments, MAX_PAINT_SLOT, MAX_SLOTS};
+use brokkr_core::spectrum::{self, Mix};
 
 /// The file the palette lives in.
 const FILE: &str = "filaments.conf";
@@ -133,10 +134,67 @@ impl Palette {
     /// machine with more heads shows where rather than showing clay.
     pub fn shader_palette(&self) -> [[f32; 4]; brokkr_gpu::PALETTE_SLOTS] {
         let mut palette = [brokkr_gpu::UNKNOWN_FILAMENT; brokkr_gpu::PALETTE_SLOTS];
-        for (index, slot) in self.slots.iter().enumerate().take(brokkr_gpu::PALETTE_SLOTS - 1) {
-            palette[index + 1] = slot.swatch().into_linear();
+        // The last entry stays unknown whatever the palette holds, so a slot
+        // past the end always clamps onto a colour that says so.
+        let last = brokkr_gpu::PALETTE_SLOTS - 1;
+        for (number, entry) in palette.iter_mut().enumerate().take(last).skip(1) {
+            if let Some(swatch) = self.swatch_of(number as u8) {
+                *entry = swatch.into_linear();
+            }
         }
         palette
+    }
+
+    /// The Full Spectrum mixes this machine can print, in slot order after the
+    /// tool heads. See [`brokkr_core::spectrum`].
+    ///
+    /// **None at all when they would not fit** under [`MAX_PAINT_SLOT`]: five
+    /// heads make thirty mixes, thirty-five slots. Offering the first
+    /// twenty-seven of them would hide a whole head's pairs for no reason a
+    /// user could see, and the U1 this is for has four.
+    pub fn mixes(&self) -> Vec<Mix> {
+        let mixes = spectrum::full_spectrum(self.slots.len());
+        if self.slots.len() + mixes.len() <= usize::from(MAX_PAINT_SLOT) {
+            mixes
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// Every slot a stroke can paint with: the tool heads, then the mixes.
+    pub fn slot_count(&self) -> usize {
+        self.slots.len() + self.mixes().len()
+    }
+
+    /// The mix a slot number names, when it names one.
+    pub fn mix_of(&self, number: u8) -> Option<Mix> {
+        let index = usize::from(number).checked_sub(self.slots.len() + 1)?;
+        self.mixes().get(index).copied()
+    }
+
+    /// What a slot looks like: a head's filament, or the slicer's own swatch
+    /// for a mix of two of them.
+    pub fn swatch_of(&self, number: u8) -> Option<iced::Color> {
+        if let Some(slot) =
+            usize::from(number).checked_sub(1).and_then(|index| self.slots.get(index))
+        {
+            return Some(slot.swatch());
+        }
+        let heads: Vec<[u8; 3]> = self.slots.iter().map(|slot| slot.rgb()).collect();
+        let [r, g, b] = self.mix_of(number)?.colour(&heads)?;
+        Some(iced::Color::from_rgb8(r, g, b))
+    }
+
+    /// What to call a slot in the panel: the head's own name, or which heads a
+    /// mix alternates and in what ratio, `1+3 2:1`.
+    pub fn name_of(&self, number: u8) -> Option<String> {
+        if let Some(slot) =
+            usize::from(number).checked_sub(1).and_then(|index| self.slots.get(index))
+        {
+            return Some(slot.name.clone());
+        }
+        let mix = self.mix_of(number)?;
+        Some(format!("{}+{} {}:{}", mix.a, mix.b, mix.layers_a, mix.layers_b))
     }
 
     /// The palette on this machine, or the defaults when there is no file.
@@ -231,11 +289,16 @@ impl Palette {
     ///
     /// `base` is slot 1: it is the slot an *unpainted* triangle prints with,
     /// and until there is a paint tool that is every triangle.
-    pub fn as_filaments(&self) -> Filaments {
+    ///
+    /// `with_mixes` is whether the export paints a mix -- see
+    /// [`brokkr_core::export::threemf::paints_a_mix`]. Without one, the file is
+    /// exactly what it was before Full Spectrum existed.
+    pub fn as_filaments(&self, with_mixes: bool) -> Filaments {
         Filaments {
             colours: self.slots.iter().map(|slot| slot.colour.clone()).collect(),
             materials: self.slots.iter().map(|slot| slot.material.clone()).collect(),
             base: 1,
+            mixes: if with_mixes { self.mixes() } else { Vec::new() },
         }
     }
 
@@ -321,6 +384,13 @@ impl Slot {
     pub fn swatch(&self) -> iced::Color {
         parse_rgb(&self.colour).unwrap_or(iced::Color::from_rgb(0.5, 0.5, 0.5))
     }
+
+    /// The colour as the bytes it was written in, which is what the slicer's
+    /// mixer takes. Grey on a bad colour, the same fallback as [`Slot::swatch`].
+    fn rgb(&self) -> [u8; 3] {
+        let [r, g, b, _] = self.swatch().into_rgba8();
+        [r, g, b]
+    }
 }
 
 /// `#RRGGBB` to a colour, for the panel.
@@ -351,8 +421,17 @@ mod tests {
             (grey - 0.216).abs() < 0.01,
             "slot colours must reach the shader linear, got {grey}"
         );
-        // Past the machine's slots is the unknown-filament colour, not clay.
-        assert_eq!(shader[palette.slots.len() + 1], brokkr_gpu::UNKNOWN_FILAMENT);
+        // The mixes follow the heads, drawn in the slicer's own swatch.
+        let shader = palette.shader_palette();
+        let first_mix = palette.slots.len() + 1;
+        assert_eq!(
+            Some(shader[first_mix]),
+            palette.swatch_of(first_mix as u8).map(iced::Color::into_linear),
+            "slot 5 on four heads is the 1+2 mix"
+        );
+        assert_ne!(shader[first_mix], brokkr_gpu::UNKNOWN_FILAMENT);
+        // Past the machine's slots and mixes is the unknown-filament colour.
+        assert_eq!(shader[palette.slot_count() + 1], brokkr_gpu::UNKNOWN_FILAMENT);
         // And a palette longer than the shader can hold does not panic.
         while palette.slots.len() < brokkr_gpu::PALETTE_SLOTS + 4 {
             palette.slots.push(palette.slots[0].clone());
@@ -366,7 +445,7 @@ mod tests {
         let filaments = Filaments::default();
         assert_eq!(palette.slots.len(), filaments.colours.len());
         assert_eq!(
-            palette.as_filaments().colours,
+            palette.as_filaments(false).colours,
             filaments.colours,
             "the palette invented its own colours instead of taking the writer's"
         );
@@ -395,7 +474,7 @@ slot2 = Black, #202020, PETG
         // and everything else in the pipeline is upper case by literal.
         let palette = Palette::parse("slot1 = Grey, #a0b1c2, PLA\n");
         assert_eq!(palette.slots[0].colour, "#A0B1C2");
-        assert_eq!(palette.as_filaments().colours[0], "#A0B1C2");
+        assert_eq!(palette.as_filaments(false).colours[0], "#A0B1C2");
     }
 
     #[test]

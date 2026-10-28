@@ -168,3 +168,53 @@ fn a_banded_sphere_is_written_for_a_slicer_to_judge() {
         bytes.len()
     );
 }
+
+/// A sphere banded in tool heads AND Full Spectrum mixes, for Snapmaker Orca.
+///
+/// The question nothing here can answer: **does Snapmaker Orca read a mix off
+/// a triangle and print it as alternating layers?** The bands pick the slots
+/// whose encoding differs, not the ones that look nice:
+///
+/// - Slot 1, a head, and slot 5, the first mix (1+2 at 1:1), `"2C"`.
+/// - Slot 9, 1+3 at 2:1, so a ratio other than even is in the file.
+/// - **Slot 17, `"EC"`, the last single-nibble code; slot 18, `"0FC"`, the
+///   first chunked one; and slot 22, `"4FC"`, the last mix on four heads.**
+///   Stock OrcaSlicer 2.4 misreads the last two, which is why they are here.
+///
+/// Open it in Snapmaker Orca with a U1: the filament list should show the
+/// four heads and eighteen mixes, the bands should sit on 1, 5, 9, 17, 18 and
+/// 22, and slicing should alternate heads layer by layer inside a mixed band.
+#[test]
+fn a_full_spectrum_sphere_is_written_for_snapmaker_orca() {
+    let volume = sculpted();
+    let (mut mesh, report) = volume.export_mesh();
+    assert!(report.is_printable(), "{}", report.summary());
+
+    let bands = [1u8, 5, 9, 17, 18, 22];
+    let (lowest, highest) =
+        mesh.positions.iter().fold((f32::MAX, f32::MIN), |(lo, hi), p| (lo.min(p.y), hi.max(p.y)));
+    let span = (highest - lowest).max(f32::MIN_POSITIVE);
+    mesh.slots = mesh
+        .positions
+        .iter()
+        .map(|p| {
+            let t = ((p.y - lowest) / span).clamp(0.0, 0.999);
+            bands[(t * bands.len() as f32) as usize]
+        })
+        .collect();
+    let used: std::collections::BTreeSet<u8> = mesh.slots.iter().copied().collect();
+    assert_eq!(used, bands.into_iter().collect(), "every band must reach the file");
+
+    let parts = [("Full Spectrum", &mesh)];
+    assert!(threemf::paints_a_mix(&parts, 4));
+    let filaments = threemf::Filaments {
+        mixes: brokkr_core::spectrum::full_spectrum(4),
+        ..threemf::Filaments::default()
+    };
+
+    let path = output_directory().join("spectrum.3mf");
+    let mut file = fs::File::create(&path).expect("could not create the spectrum 3MF");
+    threemf::write_with_all(&parts, &filaments, &mut file).expect("could not write it");
+    drop(file);
+    println!("wrote {} -- open this in Snapmaker Orca", path.display());
+}

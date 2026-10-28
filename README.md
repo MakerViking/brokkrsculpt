@@ -32,6 +32,7 @@ than on a hollow surface, so the things that usually go wrong between sculpting
 and printing mostly cannot happen here.
 
 - **Eight brushes** — draw, clay, smooth, inflate, pinch, flatten, move and paint, which writes a filament slot for multi-colour printing
+- **Full Spectrum colour** — 22 colours from a four-head Snapmaker U1, by alternating filaments layer by layer
 - **Symmetry** across any combination of the three axes
 - **Surface patterns** — scales, weave, cracks, hair and noise
 - **A plane cut** that leaves a closed, printable face
@@ -39,7 +40,7 @@ and printing mostly cannot happen here.
 - **Import** STL, OBJ and 3MF, including multi-part project files
 - **Copes with broken models** — holes, hollow shells and scanner noise
 - **Export** that is checked before it is written, and refused if it would not print
-- **One click into OrcaSlicer**
+- **Built around the Snapmaker U1** — read the filaments it has loaded, paint with them, and open the result in Snapmaker Orca ready to print
 
 It is free, open source, and **honestly not finished**. It is being built in the
 open by one person.
@@ -197,7 +198,7 @@ sudo usermod -aG input $USER
 | shift right drag | pan |
 | right click | the current tool's settings, at the cursor |
 | wheel | zoom |
-| `1`–`7` | select a brush, in the order the strip shows them |
+| `1`–`8` | select a brush, in the order the strip shows them |
 | `x` `y` `z` | toggle a mirror plane |
 | `[` `]` | scale the brush radius |
 | hold `s`, drag | resize the brush (ZBrush's Draw Size) |
@@ -221,25 +222,51 @@ on glass is the right way to do this and there is no good reason a voxel engine
 cannot go there. That part is not done. Saying so is not the same as not caring
 about it.
 
-## Printing
+## Printing on a Snapmaker U1
 
-BrokkrSculpt does not slice, and should not. What it does is hand off cleanly to
-the things that do.
+BrokkrSculpt does not slice, and should not. It knows what your U1 has loaded,
+lets you paint with exactly that, and hands the model to the U1's own slicer
+with everything already set up.
 
-- **One click into OrcaSlicer.** *File > Open in OrcaSlicer* exports a 3MF and
-  launches the slicer on it. The table of places a slicer might be installed is
-  shared with SindriCAD, because every path in it was earned by a real bug
-  report.
-- **Colour that lands on filament slots.** The 3MF writer paints each triangle
-  with a **filament slot number**, not an RGB value — which makes it a print
-  instruction rather than a decoration. Verified against OrcaSlicer 2.4.0-alpha:
-  a banded model opens with its bands on filaments 1 to 4.
-- **Check your printer.** A read-only Moonraker query against a Snapmaker U1 on
-  your own network. Put `host = 192.0.2.46` in
-  `$XDG_CONFIG_HOME/brokkrsculpt/printer.conf`. Verified against real hardware
-  on firmware 1.3.0.168.
+**You need** a Snapmaker U1 on your network and
+[Snapmaker Orca](https://github.com/Snapmaker/OrcaSlicer/releases) 2.3.3 or
+newer, opened once so it has your U1 selected.
 
-Nothing paints those slots by hand yet — that part is designed and not built.
+1. **Tell BrokkrSculpt where the printer is.** In the FILAMENT panel, type the
+   U1's address under *Printer address* and press **set**. That is its IP
+   address on your network, like `192.168.1.50`; a full `http://…` address
+   pasted from a browser works too.
+2. **Read what is loaded.** Press **Sync filaments from printer**. The four
+   slots now show the filament in each tool head, with its real colour.
+3. **Paint.** Press `8` for the paint brush. The swatches under *Filament* are
+   your four tool heads, and the **Full Spectrum** grid under them is every
+   pair of heads at 1:1, 2:1 and 1:2: eighteen more colours, which the U1
+   prints by alternating the two filaments layer by layer. A mix is shown in
+   the colour Snapmaker Orca shows for it, worked out the same way.
+4. **Open in Snapmaker Orca.** The button in the EXPORT panel (or *File > Open
+   in Snapmaker Orca*) exports a 3MF and opens it on your U1 preset, with your
+   filaments, your colours and any mixes you painted already in the filament
+   list.
+5. **Slice, then Print** in Snapmaker Orca. Its Print button sends the job to
+   the U1.
+
+*Check the printer* in the File menu asks the U1 what it is doing, so you can
+see a print finish without leaving the sculpt.
+
+**Without a U1, or with another slicer:** the same button opens OrcaSlicer when
+Snapmaker Orca is not installed, and every 3MF export carries the painted
+filament slots, which OrcaSlicer and Snapmaker Orca both read (verified in
+each).
+Full Spectrum mixes are the exception: **only Snapmaker Orca understands
+them**, and they are written into a file only when you have painted with one.
+The address is kept in `printer.conf` in BrokkrSculpt's config folder
+(`~/.config/brokkrsculpt` on Linux, `%APPDATA%\brokkrsculpt` on Windows,
+`~/Library/Application Support/brokkrsculpt` on macOS) if you would rather
+edit it there.
+
+Verified against a real U1 on firmware 1.3.0.168 and Snapmaker Orca 2.4.0. The
+mix swatches are byte-identical to Snapmaker Orca's own, because the colour
+model is a port of the one it uses.
 
 <details>
 <summary>Why the 3MF colour is written the "wrong" way</summary>
@@ -288,11 +315,12 @@ with the material it displaces instead of leaving it behind in the air.
 ## Status
 
 Milestones M0 through M3 of [docs/BUILD-SPEC.md](docs/BUILD-SPEC.md) are
-complete, and a good deal beyond them. **1411 tests pass**, clippy is at zero
+complete, and a good deal beyond them. **1638 tests pass**, clippy is at zero
 warnings, and three performance gates fail the build if a budget is blown.
 
-**Not there yet:** procedural primitives, painting filament slots by hand, and
-signed installers. All on the list rather than ruled out.
+**Not there yet:** procedural primitives, sending a job to the printer
+without opening the slicer, and signed installers. All on the list rather than
+ruled out.
 
 ### What works on which platform
 
@@ -432,6 +460,7 @@ fast-drag row sits close enough to its budget that a busy desktop decides it.
 | Pinch | squeezes the field toward the brush axis, sharpening ridges |
 | Flatten | blends toward the tangent plane under the cursor |
 | Move | grabs the material and pulls it with the pointer |
+| Paint | writes a filament slot onto the surface, and leaves the shape alone |
 
 Smooth and flatten have no opposite, so inverting them does nothing and the
 interface says so.
