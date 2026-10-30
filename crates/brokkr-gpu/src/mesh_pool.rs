@@ -476,6 +476,11 @@ pub struct MeshPool {
     /// somewhere; it happens once into a vector that keeps its capacity, which
     /// after the first few bricks is every brick.
     staging: Vec<[u8; ATTRIBUTE_BYTES as usize]>,
+    /// One brick's indices, made ABSOLUTE on their way to the GPU: each one has
+    /// the brick's vertex block offset added, so `draw` passes a base vertex of
+    /// zero. See [`MeshPool::draw`] for why the base vertex is not used. Kept
+    /// for the reason `staging` is.
+    index_staging: Vec<u32>,
 }
 
 impl MeshPool {
@@ -510,6 +515,7 @@ impl MeshPool {
             culled: AtomicUsize::new(0),
             skipped_as_hidden: AtomicUsize::new(0),
             staging: Vec::new(),
+            index_staging: Vec::new(),
         }
     }
 
@@ -727,10 +733,16 @@ impl MeshPool {
             slot.vertices.offset * size_of::<Vertex>() as u64,
             bytemuck::cast_slice(&mesh.vertices),
         );
+        // Absolute, not brick-local: the block offset is added here rather than
+        // handed to the draw as a base vertex. A pool pair holds at most
+        // `VERTEX_CAPACITY` vertices, so the sum stays far inside a `u32`.
+        let base = slot.vertices.offset as u32;
+        self.index_staging.clear();
+        self.index_staging.extend(mesh.indices.iter().map(|index| index + base));
         queue.write_buffer(
             &pair.indices,
             slot.indices.offset * size_of::<u32>() as u64,
-            bytemuck::cast_slice(&mesh.indices),
+            bytemuck::cast_slice(&self.index_staging),
         );
         // The same block offset as the vertices, in the same order: the
         // attribute buffer is suballocated by the vertex allocator and has none
@@ -852,11 +864,8 @@ impl MeshPool {
                 }
                 drawn += 1;
                 let start = slot.indices.offset as u32;
-                pass.draw_indexed(
-                    start..start + slot.index_count,
-                    slot.vertices.offset as i32,
-                    0..1,
-                );
+                // Base vertex zero: the indices were made absolute at upload.
+                pass.draw_indexed(start..start + slot.index_count, 0, 0..1);
             }
         }
         self.drawn.store(drawn, Ordering::Relaxed);
@@ -1059,11 +1068,8 @@ impl MeshPool {
                     bound = true;
                 }
                 let start = slot.indices.offset as u32;
-                pass.draw_indexed(
-                    start..start + slot.index_count,
-                    slot.vertices.offset as i32,
-                    0..1,
-                );
+                // Base vertex zero: the indices were made absolute at upload.
+                pass.draw_indexed(start..start + slot.index_count, 0, 0..1);
             }
         }
     }
