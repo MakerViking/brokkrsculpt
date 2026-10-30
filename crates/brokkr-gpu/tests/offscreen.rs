@@ -72,6 +72,7 @@ impl Harness {
             pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default()))
                 .ok()?;
         eprintln!("offscreen test adapter: {:?}", adapter.get_info());
+        eprintln!("offscreen test downlevel: {:?}", adapter.get_downlevel_capabilities());
 
         let (device, queue) =
             pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default())).ok()?;

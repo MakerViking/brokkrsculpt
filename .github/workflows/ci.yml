@@ -140,6 +140,18 @@ jobs:
       - name: Test
         run: cargo test --workspace
 
+      - name: Dump the offscreen frames (diagnostic)
+        if: always() && matrix.os == 'macos-latest'
+        run: |
+          mkdir -p "$RUNNER_TEMP/frames"
+          BROKKR_DUMP_FRAMES="$RUNNER_TEMP/frames" cargo test -p brokkr-gpu --test offscreen -- --test-threads=1 --nocapture || true
+
+      - uses: actions/upload-artifact@v4
+        if: always() && matrix.os == 'macos-latest'
+        with:
+          name: macos-frames
+          path: ${{ runner.temp }}/frames
+
   budget:
     name: Performance budget
     runs-on: ubuntu-latest
