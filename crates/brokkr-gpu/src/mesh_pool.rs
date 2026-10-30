@@ -278,19 +278,25 @@ impl BufferPair {
             vertices: device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("brokkr brick vertices"),
                 size: vertices * size_of::<Vertex>() as u64,
-                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                usage: wgpu::BufferUsages::VERTEX
+                    | wgpu::BufferUsages::COPY_DST
+                    | wgpu::BufferUsages::COPY_SRC,
                 mapped_at_creation: false,
             }),
             indices: device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("brokkr brick indices"),
                 size: indices * size_of::<u32>() as u64,
-                usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
+                usage: wgpu::BufferUsages::INDEX
+                    | wgpu::BufferUsages::COPY_DST
+                    | wgpu::BufferUsages::COPY_SRC,
                 mapped_at_creation: false,
             }),
             attributes: device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("brokkr brick attributes"),
                 size: vertices * ATTRIBUTE_BYTES,
-                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                usage: wgpu::BufferUsages::VERTEX
+                    | wgpu::BufferUsages::COPY_DST
+                    | wgpu::BufferUsages::COPY_SRC,
                 mapped_at_creation: false,
             }),
             vertex_allocator: BlockAllocator::new(vertices, index),
@@ -476,6 +482,12 @@ pub struct MeshPool {
     /// somewhere; it happens once into a vector that keeps its capacity, which
     /// after the first few bricks is every brick.
     staging: Vec<[u8; ATTRIBUTE_BYTES as usize]>,
+    /// DIAGNOSTIC (metal-diag branch only): what was written, per slot.
+    pub diag_shadow: std::sync::Mutex<Vec<(u16, u64, u64, Vec<Vertex>, Vec<u32>)>>,
+}
+
+fn diag_rebase() -> bool {
+    std::env::var_os("BROKKR_DIAG_REBASE").is_some()
 }
 
 impl MeshPool {
@@ -510,6 +522,7 @@ impl MeshPool {
             culled: AtomicUsize::new(0),
             skipped_as_hidden: AtomicUsize::new(0),
             staging: Vec::new(),
+            diag_shadow: Default::default(),
         }
     }
 
@@ -727,11 +740,23 @@ impl MeshPool {
             slot.vertices.offset * size_of::<Vertex>() as u64,
             bytemuck::cast_slice(&mesh.vertices),
         );
+        let rebased: Vec<u32> = if diag_rebase() {
+            mesh.indices.iter().map(|i| i + slot.vertices.offset as u32).collect()
+        } else {
+            mesh.indices.clone()
+        };
         queue.write_buffer(
             &pair.indices,
             slot.indices.offset * size_of::<u32>() as u64,
-            bytemuck::cast_slice(&mesh.indices),
+            bytemuck::cast_slice(&rebased),
         );
+        self.diag_shadow.lock().unwrap().push((
+            slot.vertices.buffer,
+            slot.vertices.offset,
+            slot.indices.offset,
+            mesh.vertices.clone(),
+            rebased,
+        ));
         // The same block offset as the vertices, in the same order: the
         // attribute buffer is suballocated by the vertex allocator and has none
         // of its own.
@@ -854,7 +879,7 @@ impl MeshPool {
                 let start = slot.indices.offset as u32;
                 pass.draw_indexed(
                     start..start + slot.index_count,
-                    slot.vertices.offset as i32,
+                    if diag_rebase() { 0 } else { slot.vertices.offset as i32 },
                     0..1,
                 );
             }
@@ -1077,6 +1102,79 @@ impl MeshPool {
     ///
     /// **The caller must remesh everything after this**, or the model is not on
     /// the GPU any more. `Volume::mark_everything_dirty` is the partner.
+    /// DIAGNOSTIC: read every pool buffer back and compare with what was written.
+    pub fn diag_verify(&self, device: &wgpu::Device, queue: &wgpu::Queue) -> String {
+        let read = |buffer: &wgpu::Buffer| -> Vec<u8> {
+            let size = buffer.size();
+            let readback = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("diag readback"),
+                size,
+                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                mapped_at_creation: false,
+            });
+            let mut encoder = device.create_command_encoder(&Default::default());
+            encoder.copy_buffer_to_buffer(buffer, 0, &readback, 0, size);
+            queue.submit([encoder.finish()]);
+            let slice = readback.slice(..);
+            slice.map_async(wgpu::MapMode::Read, |r| r.expect("map"));
+            device.poll(wgpu::PollType::wait_indefinitely()).expect("poll");
+            let bytes = slice.get_mapped_range().to_vec();
+            readback.unmap();
+            bytes
+        };
+        let mut report = String::new();
+        let shadow = self.diag_shadow.lock().unwrap();
+        let mut cache: FxHashMap<u16, (Vec<u8>, Vec<u8>)> = FxHashMap::default();
+        let (mut bad_v, mut bad_i, mut slots) = (0usize, 0usize, 0usize);
+        // Only the LAST write of each (buffer, vertex offset) is current.
+        let mut latest: FxHashMap<(u16, u64), usize> = FxHashMap::default();
+        for (n, entry) in shadow.iter().enumerate() {
+            latest.insert((entry.0, entry.1), n);
+        }
+        for (n, (buffer, voff, ioff, vertices, indices)) in shadow.iter().enumerate() {
+            if latest.get(&(*buffer, *voff)) != Some(&n) {
+                continue;
+            }
+            slots += 1;
+            let (vb, ib) = cache.entry(*buffer).or_insert_with(|| {
+                let pair = &self.buffers[*buffer as usize];
+                (read(&pair.vertices), read(&pair.indices))
+            });
+            let vbytes: &[u8] = bytemuck::cast_slice(vertices);
+            let vstart = (*voff as usize) * size_of::<Vertex>();
+            let vgot = &vb[vstart..vstart + vbytes.len()];
+            if vgot != vbytes {
+                bad_v += 1;
+                let first = vgot.iter().zip(vbytes).position(|(a, b)| a != b).unwrap();
+                report += &format!(
+                    "VERTEX MISMATCH slot#{n} buf{buffer} voff={voff} count={} first_bad_byte={first} (vertex {})\n",
+                    vertices.len(),
+                    first / size_of::<Vertex>()
+                );
+            }
+            let ibytes: &[u8] = bytemuck::cast_slice(indices);
+            let istart = (*ioff as usize) * 4;
+            let igot = &ib[istart..istart + ibytes.len()];
+            if igot != ibytes {
+                bad_i += 1;
+                let first = igot.iter().zip(ibytes).position(|(a, b)| a != b).unwrap();
+                report += &format!(
+                    "INDEX MISMATCH slot#{n} buf{buffer} ioff={ioff} count={} first_bad_byte={first}\n",
+                    indices.len()
+                );
+            }
+            let max_index = indices.iter().max().copied().unwrap_or(0);
+            report += &format!(
+                "slot#{n} voff={voff} vcount={} ioff={ioff} icount={} max_index={max_index}\n",
+                vertices.len(),
+                indices.len()
+            );
+        }
+        report +=
+            &format!("SUMMARY slots={slots} vertex_mismatches={bad_v} index_mismatches={bad_i}\n");
+        report
+    }
+
     pub fn reset(&mut self) {
         self.buckets.clear();
         for pair in &mut self.buffers {

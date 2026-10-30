@@ -2352,3 +2352,23 @@ fn the_gizmo_pass_occludes_its_own_far_side() {
          {differing} pixels changed when the two quads were submitted the other way round"
     );
 }
+
+/// DIAGNOSTIC (metal-diag branch): is the pool's data on the GPU what was
+/// written, and does the bare sphere tear?
+#[test]
+fn diag_metal_pool_readback() {
+    let Some(harness) = Harness::new() else {
+        return;
+    };
+    let distance = MODEL_RADIUS * 3.0;
+    let mut renderer = SculptRenderer::new(&harness.device, &harness.queue, TARGET_FORMAT);
+    renderer.resize(&harness.device, WIDTH, HEIGHT);
+    renderer.write_uniforms(&harness.queue, &uniforms(distance));
+    let mut volume = Volume::new(VOXEL_SIZE);
+    volume.seed_sphere(Vec3::ZERO, MODEL_RADIUS);
+    upload_all(&mut renderer, &harness.device, &harness.queue, &mut volume);
+    let frame = harness.frame(&renderer);
+    let tag = if std::env::var_os("BROKKR_DIAG_REBASE").is_some() { "rebased" } else { "based" };
+    dump(&format!("diag-sphere-{tag}"), &frame);
+    eprintln!("DIAG[{tag}]\n{}", renderer.diag_verify(&harness.device, &harness.queue));
+}

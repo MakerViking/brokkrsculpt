@@ -606,6 +606,11 @@ impl SculptRenderer {
         uniforms
     }
 
+    /// DIAGNOSTIC.
+    pub fn diag_verify(&self, device: &wgpu::Device, queue: &wgpu::Queue) -> String {
+        self.pool.diag_verify(device, queue)
+    }
+
     /// The thumbnail atlas, for the readback in the offscreen tests.
     pub fn thumbnails(&self) -> &ThumbnailAtlas {
         &self.thumbnails
