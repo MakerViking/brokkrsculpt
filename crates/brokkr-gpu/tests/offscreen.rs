@@ -2368,7 +2368,11 @@ fn diag_metal_pool_readback() {
     volume.seed_sphere(Vec3::ZERO, MODEL_RADIUS);
     upload_all(&mut renderer, &harness.device, &harness.queue, &mut volume);
     let frame = harness.frame(&renderer);
-    let tag = if std::env::var_os("BROKKR_DIAG_REBASE").is_some() { "rebased" } else { "based" };
+    let tag = format!(
+        "{}-pad{}",
+        if std::env::var_os("BROKKR_DIAG_REBASE").is_some() { "rebased" } else { "based" },
+        std::env::var("BROKKR_DIAG_PAD").unwrap_or_default()
+    );
     dump(&format!("diag-sphere-{tag}"), &frame);
     eprintln!("DIAG[{tag}]\n{}", renderer.diag_verify(&harness.device, &harness.queue));
 }

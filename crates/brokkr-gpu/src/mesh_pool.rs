@@ -504,6 +504,16 @@ impl MeshPool {
     /// [`TOTAL_VERTEX_CAPACITY`] vertices across 4.58 GB of buffers is not one
     /// a test can reach.
     fn with_capacities(device: &wgpu::Device, vertices: u64, indices: u64) -> Self {
+        let mut pool = Self::with_capacities_inner(device, vertices, indices);
+        if let Some(pad) = std::env::var("BROKKR_DIAG_PAD").ok().and_then(|v| v.parse::<u64>().ok())
+        {
+            // Burn `pad` vertices of the first pair so every brick lands above it.
+            let _ = pool.buffers[0].vertex_allocator.allocate(pad);
+        }
+        pool
+    }
+
+    fn with_capacities_inner(device: &wgpu::Device, vertices: u64, indices: u64) -> Self {
         Self {
             buffers: vec![BufferPair::new(device, 0, vertices, indices)],
             buckets: FxHashMap::default(),

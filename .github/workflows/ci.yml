@@ -146,6 +146,7 @@ jobs:
           mkdir -p "$RUNNER_TEMP/frames"
           BROKKR_DUMP_FRAMES="$RUNNER_TEMP/frames" cargo test -p brokkr-gpu --test offscreen -- --test-threads=1 --nocapture || true
           BROKKR_DUMP_FRAMES="$RUNNER_TEMP/frames" cargo test -p brokkr-gpu --test offscreen diag_ -- --nocapture 2>&1 | tee "$RUNNER_TEMP/frames/diag-based.txt" || true
+          for pad in 0 30000 65536 70000 131072; do BROKKR_DIAG_PAD=$pad BROKKR_DUMP_FRAMES="$RUNNER_TEMP/frames" cargo test -p brokkr-gpu --test offscreen diag_ -- --nocapture 2>&1 | grep -E "SUMMARY|MISMATCH" || true; done
           BROKKR_DIAG_REBASE=1 BROKKR_DUMP_FRAMES="$RUNNER_TEMP/frames" cargo test -p brokkr-gpu --test offscreen diag_ -- --nocapture 2>&1 | tee "$RUNNER_TEMP/frames/diag-rebased.txt" || true
 
       - uses: actions/upload-artifact@v4
