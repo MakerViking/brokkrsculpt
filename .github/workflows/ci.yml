@@ -93,21 +93,19 @@ jobs:
   # information, not a regression. Nothing depends on it and it must not be
   # made a required check until it is actually green.
   #
-  # Windows GATES and macOS does not, and that asymmetry is the current state
-  # of the port rather than a preference.
+  # Windows and macOS both GATE now.
   #
   # Windows builds and passes the whole suite, so it is held to the same bar as
   # Linux: warnings are errors there again, because this platform is now being
   # kept rather than measured.
   #
-  # macOS builds and passes 16 of 20 offscreen render tests. The four that fail
-  # are a Metal/Vulkan divergence in what reaches the screen -- a uniformly
-  # masked body showing a 58 level tint jump at a brick seam, which the seam
-  # test itself predicts is "a vertex that fell back to the unmasked byte".
-  # Nobody has yet run this on a Mac to see it, and a pixel divergence cannot be
-  # diagnosed through a CI log. Informational until someone can watch it, which
-  # is honest about the state; deleting the job or leaving main red are the two
-  # worse options. **macOS must gate before it ships to anyone.**
+  # macOS gates too, since 2026-10-30. Its four offscreen failures were one
+  # fault, found by dumping the frames as a CI artifact rather than reading
+  # the log: under wgpu's Metal vertex pulling, a vertex whose base vertex plus
+  # index reached 65,536 was fetched as zero, so bricks deep in the mesh pool
+  # drew as spikes to the origin. The pool now uploads absolute indices and
+  # draws with a base vertex of zero; `a_body_far_into_the_pool_draws_exactly_
+  # as_one_at_its_start` is the test that fails on this runner without it.
   cross:
     name: Build and test (${{ matrix.os }})
     strategy:
@@ -119,7 +117,7 @@ jobs:
           - os: windows-latest
             informational: false
           - os: macos-latest
-            informational: true
+            informational: false
     runs-on: ${{ matrix.os }}
     continue-on-error: ${{ matrix.informational }}
     env:
