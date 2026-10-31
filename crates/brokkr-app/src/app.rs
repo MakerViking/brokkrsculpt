@@ -180,6 +180,11 @@ pub(crate) const HALFSPACE_FEATHER_VOXELS: f32 = 2.0;
 const RADIUS_PER_PIXEL: f32 = 0.006;
 const STRENGTH_PER_PIXEL: f32 = 0.002;
 
+/// What "Check the printer" and "Sync filaments" say when no printer is set.
+/// One constant because both say it, and a second copy is the shape that has
+/// drifted in this repository before.
+const NO_PRINTER_SET: &str = "no printer set — type its address under FILAMENT and press set";
+
 /// Range the voxel size may be resampled to, in millimetres.
 ///
 /// **The lower bound is a resin printing target, not a pool limit.** It used to
@@ -627,6 +632,10 @@ pub struct Brokkr {
     /// What is typed in the working-size field, before it is committed. Held as
     /// text so a half-typed number is not rounded or rejected mid-keystroke.
     pub(crate) working_size_field: String,
+    /// The printer address field, as typed. Seeded from `printer.conf` at
+    /// startup so the panel shows what is set rather than an empty box that
+    /// reads as "not configured".
+    pub(crate) printer_field: String,
     /// The cached one-line readout of what the current resolution means.
     ///
     /// CACHED because computing it walks every dense brick, and the widget tree
@@ -853,6 +862,11 @@ pub struct Brokkr {
     /// changes what a stroke writes, and a document saved with it off carries
     /// every slot it was painted with.
     show_paint: bool,
+    /// The slicer the handoff opens, as found at startup, for the button
+    /// labels: "Open in Snapmaker Orca" is a promise the label should only
+    /// make when that is what will open. `hand_to_slicer` looks again, so an
+    /// install made mid-session still works and only the label lags.
+    slicer_name: Option<&'static str>,
     /// How strong the tint is when it is shown at all, 0..1.
     ///
     /// The shader has its own floor under this (`0.30 + 0.70 * m`), which is
@@ -2043,6 +2057,12 @@ impl Brokkr {
             dynamic_radius: false,
             model_radius: MODEL_RADIUS_MM,
             working_size_field: String::new(),
+            printer_field: crate::printer::configured(crate::printer::config_path().as_deref())
+                .map(|printer| match printer.port {
+                    crate::printer::MOONRAKER_PORT => printer.host,
+                    port => format!("{}:{port}", printer.host),
+                })
+                .unwrap_or_default(),
             detail_advice: String::new(),
             timeline: crate::timeline::Timeline::new(),
             breadcrumbs: crate::breadcrumbs::Breadcrumbs::new(),
@@ -2097,6 +2117,7 @@ impl Brokkr {
             show_mask: true,
             paint_slot: 1,
             show_paint: true,
+            slicer_name: crate::slicer::find().as_deref().map(crate::slicer::display_name),
             mask_tint: DEFAULT_MASK_TINT,
             mask_peek: false,
             mask_filter: MaskFilter::Blur,
@@ -7175,13 +7196,16 @@ impl Brokkr {
         let parts: Vec<(&str, &brokkr_core::ExportMesh)> =
             bodies.iter().map(|(meta, mesh, _)| (meta.name.as_str(), mesh)).collect();
 
-        let filaments = self.palette.as_filaments();
+        // Mixes are defined only when a triangle uses one, so a plain export
+        // is byte for byte what it was before Full Spectrum.
+        let mixed = brokkr_core::export::threemf::paints_a_mix(&parts, self.palette.slots.len());
+        let filaments = self.palette.as_filaments(mixed);
         // Read once, here, rather than inside the writer: both of these walk the
         // user's OrcaSlicer presets off disk, which is not something an export
         // writer should be doing per body.
         let placement =
             brokkr_core::export::threemf::Placement { plate_centre: crate::slicer::plate_centre() };
-        let settings = crate::slicer::project_settings_body(&self.palette);
+        let settings = crate::slicer::project_settings_body(&self.palette, mixed);
         let write = || -> std::io::Result<()> {
             let file = std::fs::File::create(path)?;
             let mut file = std::io::BufWriter::new(file);
@@ -7241,7 +7265,15 @@ impl Brokkr {
         }
     }
 
-    /// Export the sculpt to a staging file and open it in OrcaSlicer.
+    /// Export the sculpt to a staging file and open it in the slicer:
+    /// Snapmaker Orca when it is installed, OrcaSlicer otherwise. See
+    /// [`crate::slicer::is_snapmaker`].
+    ///
+    /// **This is the U1's "send to printer", deliberately one step short.**
+    /// Snapmaker Orca opens the project on the user's own U1 preset with the
+    /// sculpt's filaments and mixes, and its Print button uploads to the
+    /// machine. Slicing here, headless, was tried and rejected on 2026-10-23:
+    /// OrcaSlicer 2.4.2's command line printed a painted sculpt on one head.
     ///
     /// A staging path under the state directory rather than a dialog: this is a
     /// handoff and not a save, the file is the slicer's input rather than the
@@ -7256,9 +7288,11 @@ impl Brokkr {
     /// is the slow half and it is the same work the Export buttons do.
     fn hand_to_slicer(&mut self) {
         let Some(slicer) = crate::slicer::find() else {
-            self.status = "could not find OrcaSlicer — install it and try again".to_string();
+            self.status = "could not find Snapmaker Orca or OrcaSlicer — install one and try again"
+                .to_string();
             return;
         };
+        self.slicer_name = Some(crate::slicer::display_name(&slicer));
         let Some(staged) = crate::paths::state_file("handoff.3mf") else {
             self.status = "could not work out where to put the file".to_string();
             return;
@@ -7280,7 +7314,7 @@ impl Brokkr {
 
         match crate::slicer::open(&slicer, &staged) {
             Ok(()) => {
-                self.status = format!("opened in {}", slicer.display());
+                self.status = format!("opened in {}", crate::slicer::display_name(&slicer));
             }
             Err(why) => self.status = format!("could not open the slicer: {why}"),
         }
@@ -9669,16 +9703,9 @@ impl Brokkr {
                 let Some(printer) =
                     crate::printer::configured(crate::printer::config_path().as_deref())
                 else {
-                    // Says where to write it rather than only that it is
-                    // missing: a setting with no interface needs its file named
-                    // or it may as well not exist.
-                    self.status = match crate::printer::config_path() {
-                        Some(path) => format!(
-                            "no printer set — put `host = 192.0.2.46` in {}",
-                            path.display()
-                        ),
-                        None => "could not work out where the printer config lives".to_string(),
-                    };
+                    // Says where to set it rather than only that it is
+                    // missing.
+                    self.status = NO_PRINTER_SET.to_string();
                     return Task::none();
                 };
                 self.status = format!("asking {}…", printer.host);
@@ -9689,6 +9716,26 @@ impl Brokkr {
                     },
                     Message::PrinterAnswered,
                 );
+            }
+            Message::PrinterAddressTyped(typed) => self.printer_field = typed,
+            Message::PrinterAddressSaved => {
+                self.status = match crate::printer::parse_address(&self.printer_field) {
+                    Ok(printer) => match crate::printer::save(&printer) {
+                        Ok(()) => {
+                            let said = format!(
+                                "printer set to {} — Sync filaments reads what is loaded",
+                                printer.host
+                            );
+                            self.printer_field = printer.host;
+                            if printer.port != crate::printer::MOONRAKER_PORT {
+                                self.printer_field.push_str(&format!(":{}", printer.port));
+                            }
+                            said
+                        }
+                        Err(why) => format!("printer not saved: {why}"),
+                    },
+                    Err(why) => format!("printer not saved: {why}"),
+                };
             }
             Message::PrinterAnswered(answer) => {
                 self.status = match answer {
@@ -9701,15 +9748,8 @@ impl Brokkr {
                 let Some(printer) =
                     crate::printer::configured(crate::printer::config_path().as_deref())
                 else {
-                    // Same wording as `PrinterChecked`, and for the same
-                    // reason: a setting with no interface needs its file named.
-                    self.status = match crate::printer::config_path() {
-                        Some(path) => format!(
-                            "no printer set — put `host = 192.0.2.46` in {}",
-                            path.display()
-                        ),
-                        None => "could not work out where the printer config lives".to_string(),
-                    };
+                    // Same wording as `PrinterChecked`, from one constant.
+                    self.status = NO_PRINTER_SET.to_string();
                     return Task::none();
                 };
                 self.status = format!("asking {} what is loaded…", printer.host);
@@ -9723,6 +9763,11 @@ impl Brokkr {
                     Ok(Some(reported)) => {
                         let skipped = self.palette.sync_from_printer(&reported);
                         let loaded = reported.len() - skipped.len();
+                        // A new head renumbers the mixes after it, and a fifth
+                        // removes them, so the chosen slot can now be past the
+                        // end. Heads alone never shrink; the mixes can.
+                        let last = self.palette.slot_count().clamp(1, usize::from(u8::MAX)) as u8;
+                        self.paint_slot = self.paint_slot.min(last);
                         // The pictures in the body list are drawn through the
                         // palette and refresh on brick changes only, so a
                         // painted body's thumbnail would keep the old colours
@@ -10117,11 +10162,11 @@ impl Brokkr {
             Message::MaskPeekEnded => self.mask_peek = false,
             // Clamped rather than trusted, for the reason the radius is: a
             // message can arrive from anything, and a slot past the machine's
-            // heads would paint a filament that does not exist. The palette
-            // only grows in a session -- `sync_from_printer` never removes a
-            // slot -- so a chosen slot cannot be orphaned after the fact.
+            // heads and mixes would paint a filament that does not exist. A
+            // sync can shrink that range -- see `PaletteSynced` -- and clamps
+            // the chosen slot again there.
             Message::PaintSlotChanged(slot) => {
-                let last = self.palette.slots.len().clamp(1, usize::from(u8::MAX)) as u8;
+                let last = self.palette.slot_count().clamp(1, usize::from(u8::MAX)) as u8;
                 self.paint_slot = slot.clamp(1, last);
             }
             Message::ShowPaintToggled => self.show_paint = !self.show_paint,
@@ -21320,10 +21365,31 @@ mod paint_brush_tests {
         assert!(app.thumbs.stale_count() > 0, "a palette change left the thumbnails as they were");
     }
 
+    /// The field writes the printer and says so; a bad address says why and
+    /// leaves the typed text alone so it can be corrected rather than retyped.
+    /// `printer::save` is inert under test, so this never touches the real
+    /// `printer.conf`.
+    #[test]
+    fn the_printer_address_field_sets_the_printer_or_says_why_not() {
+        let mut app = app();
+        update(&mut app, Message::PrinterAddressTyped("http://192.0.2.46/".to_string()));
+        update(&mut app, Message::PrinterAddressSaved);
+        assert_eq!(app.printer_field, "192.0.2.46", "the pasted URL was not tidied to a host");
+        assert!(app.status.starts_with("printer set to 192.0.2.46"), "{}", app.status);
+
+        update(&mut app, Message::PrinterAddressTyped("my printer".to_string()));
+        update(&mut app, Message::PrinterAddressSaved);
+        assert!(app.status.starts_with("printer not saved"), "{}", app.status);
+        assert_eq!(app.printer_field, "my printer", "a refused address was thrown away");
+    }
+
     #[test]
     fn the_slot_is_clamped_to_the_palette() {
         let mut app = app();
-        let last = app.palette.slots.len() as u8;
+        let last = app.palette.slot_count() as u8;
+        assert_eq!(last, 22, "four heads and their eighteen mixes");
+        update(&mut app, Message::PaintSlotChanged(9));
+        assert_eq!(app.paint_slot, 9, "a mix is a slot like any other");
         update(&mut app, Message::PaintSlotChanged(0));
         assert_eq!(app.paint_slot, 1, "slot 0 is unpainted and cannot be chosen");
         update(&mut app, Message::PaintSlotChanged(200));

@@ -34,6 +34,32 @@ use std::path::{Path, PathBuf};
 /// all. Ported along with the bug.
 const ORCA_FLATPAK_IDS: [&str; 2] = ["com.orcaslicer.OrcaSlicer", "io.github.softfever.OrcaSlicer"];
 
+/// Snapmaker Orca's flatpak app id, from `scripts/flatpak/` in its repository.
+const SNAPMAKER_FLATPAK_ID: &str = "io.github.Snapmaker.Snapmaker_Orca";
+
+/// The directory Snapmaker Orca keeps its presets in, on every platform: its
+/// `SLIC3R_APP_KEY` (`version.inc`), which is what the lineage names it after.
+const SNAPMAKER_DATADIR: &str = "Snapmaker_Orca";
+
+/// Whether a slicer binary is Snapmaker's fork rather than OrcaSlicer.
+///
+/// **Snapmaker Orca is looked for first, everywhere.** It is the U1's own
+/// slicer, it ships the U1's profiles, and it is the only one that reads Full
+/// Spectrum mixes -- stock OrcaSlicer drops them. By the binary's path, which
+/// every install of it carries: `Snapmaker_Orca` in the AppImage, the flatpak
+/// id and the Windows folder, `Snapmaker Orca.app` on a Mac.
+pub(crate) fn is_snapmaker(slicer: &Path) -> bool {
+    let text = slicer.to_string_lossy().to_ascii_lowercase();
+    text.contains("snapmaker_orca")
+        || text.contains("snapmaker orca")
+        || text.contains("snapmaker-orca")
+}
+
+/// What to call a slicer binary in the interface.
+pub(crate) fn display_name(slicer: &Path) -> &'static str {
+    if is_snapmaker(slicer) { "Snapmaker Orca" } else { "OrcaSlicer" }
+}
+
 /// This user's home directory.
 ///
 /// **`HOME` is not set on Windows** -- it is `USERPROFILE` there, and `HOME`
@@ -77,11 +103,19 @@ fn candidates_for(
 
     let candidates = match os {
         "windows" => vec![
+            // `$PROGRAMFILES64\Snapmaker_Orca`, from its `installer.nsi`.
+            under_env("ProgramFiles", "Snapmaker_Orca/snapmaker-orca.exe"),
             under_env("ProgramFiles", "OrcaSlicer/orca-slicer.exe"),
             under_env("LOCALAPPDATA", "Programs/OrcaSlicer/orca-slicer.exe"),
             under_env("ProgramFiles(x86)", "OrcaSlicer/orca-slicer.exe"),
         ],
         "macos" => vec![
+            // The bundle is `Snapmaker Orca.app` (`build_release_macos.sh`);
+            // the executable inside it is not named anywhere a script could
+            // be read, so both spellings the build could produce are tried.
+            // Unverified on a Mac.
+            Some(PathBuf::from("/Applications/Snapmaker Orca.app/Contents/MacOS/Snapmaker Orca")),
+            Some(PathBuf::from("/Applications/Snapmaker Orca.app/Contents/MacOS/snapmaker-orca")),
             Some(PathBuf::from("/Applications/OrcaSlicer.app/Contents/MacOS/OrcaSlicer")),
             under_home("Applications/OrcaSlicer.app/Contents/MacOS/OrcaSlicer"),
         ],
@@ -97,6 +131,11 @@ fn candidates_for(
             // so spawning it with the file path is enough -- no `flatpak run`
             // special casing, and no scope for this to guess wrong.
             let user_bin = xdg_data_home(home, env).map(|dir| dir.join("flatpak/exports/bin"));
+            linux.insert(0, user_bin.as_ref().map(|dir| dir.join(SNAPMAKER_FLATPAK_ID)));
+            linux.insert(
+                1,
+                Some(PathBuf::from("/var/lib/flatpak/exports/bin").join(SNAPMAKER_FLATPAK_ID)),
+            );
             for id in ORCA_FLATPAK_IDS {
                 linux.push(user_bin.as_ref().map(|dir| dir.join(id)));
             }
@@ -120,29 +159,42 @@ pub(crate) fn find() -> Option<PathBuf> {
     let env = |key: &str| std::env::var_os(key).map(PathBuf::from);
     let mut candidates = candidates_for(std::env::consts::OS, home.as_ref(), &env);
 
-    // Any AppImage in ~/Applications whose name starts with OrcaSlicer, newest
-    // name last so the highest version wins a lexical sort.
+    // Any AppImage in ~/Applications whose name starts with OrcaSlicer or
+    // Snapmaker_Orca. Ahead of the fixed table: an explicitly installed
+    // AppImage is a stronger signal than a package that may be a leftover.
     if let Some(home) = &home
         && let Ok(entries) = std::fs::read_dir(home.join("Applications"))
     {
-        let mut images: Vec<PathBuf> = entries
-            .flatten()
-            .map(|entry| entry.path())
-            .filter(|path| {
-                path.file_name().and_then(|name| name.to_str()).is_some_and(|name| {
-                    name.starts_with("OrcaSlicer") && name.ends_with(".AppImage")
-                })
-            })
-            .collect();
-        images.sort();
-        // Ahead of the fixed table: an explicitly installed AppImage is a
-        // stronger signal than a package that may be a leftover.
-        for image in images.into_iter().rev() {
-            candidates.insert(0, image);
-        }
+        let images: Vec<PathBuf> = entries.flatten().map(|entry| entry.path()).collect();
+        candidates.splice(0..0, rank_appimages(images));
     }
 
     candidates.into_iter().find(|path| path.is_file())
+}
+
+/// The slicer AppImages among `paths`, the one to launch first.
+///
+/// Snapmaker Orca ahead of OrcaSlicer whatever the versions say (see
+/// [`is_snapmaker`]), and within each the highest version by a lexical sort of
+/// the name, which is where every AppImage here puts it.
+///
+/// **This used to pick the OLDEST.** The list was sorted ascending and then
+/// each entry inserted at index 0 in reverse, which reverses it again: with
+/// `OrcaSlicer_V2.4.0-alpha` and `OrcaSlicer_V2.4.2` both installed, the alpha
+/// was launched. Found on 2026-10-28 when Snapmaker Orca, sorted to the end to
+/// come out first, came out last instead.
+fn rank_appimages(paths: Vec<PathBuf>) -> Vec<PathBuf> {
+    let mut images: Vec<PathBuf> = paths
+        .into_iter()
+        .filter(|path| {
+            path.file_name().and_then(|name| name.to_str()).is_some_and(|name| {
+                (name.starts_with("OrcaSlicer") || name.starts_with("Snapmaker_Orca"))
+                    && name.ends_with(".AppImage")
+            })
+        })
+        .collect();
+    images.sort_by_key(|path| std::cmp::Reverse((is_snapmaker(path), path.clone())));
+    images
 }
 
 // --- Where the plate is ------------------------------------------------------
@@ -157,7 +209,7 @@ pub(crate) fn find() -> Option<PathBuf> {
 /// The flatpak app id this binary belongs to, if it is a flatpak export.
 fn flatpak_id(slicer: &Path) -> Option<&'static str> {
     let text = slicer.to_str()?;
-    ORCA_FLATPAK_IDS.into_iter().find(|id| text.ends_with(id))
+    ORCA_FLATPAK_IDS.into_iter().chain([SNAPMAKER_FLATPAK_ID]).find(|id| text.ends_with(id))
 }
 
 /// OrcaSlicer's own data directory, where its presets live.
@@ -173,13 +225,16 @@ fn datadir_for(
     env: &dyn Fn(&str) -> Option<PathBuf>,
     slicer: Option<&Path>,
 ) -> Option<PathBuf> {
+    // Snapmaker Orca keeps its presets under its own name, so the datadir has
+    // to follow the binary or the presets read are a different slicer's.
+    let name = if slicer.is_some_and(is_snapmaker) { SNAPMAKER_DATADIR } else { "OrcaSlicer" };
     if let Some(id) = slicer.and_then(flatpak_id) {
-        return home.map(|home| home.join(".var/app").join(id).join("config/OrcaSlicer"));
+        return home.map(|home| home.join(".var/app").join(id).join("config").join(name));
     }
     match os {
-        "windows" => env("APPDATA").map(|base| base.join("OrcaSlicer")),
-        "macos" => home.map(|home| home.join("Library/Application Support/OrcaSlicer")),
-        _ => home.map(|home| home.join(".config/OrcaSlicer")),
+        "windows" => env("APPDATA").map(|base| base.join(name)),
+        "macos" => home.map(|home| home.join("Library/Application Support").join(name)),
+        _ => home.map(|home| home.join(".config").join(name)),
     }
 }
 
@@ -673,11 +728,12 @@ pub(crate) fn project_settings(slots: usize) -> Option<serde_json::Map<String, s
         && let Some((filament, _)) = resolve_chain(&filaments, &name)
     {
         for (key, value) in filament {
-            let one = match &value {
-                serde_json::Value::Array(entries) if !entries.is_empty() => entries[0].clone(),
-                other => other.clone(),
-            };
-            config.insert(key, serde_json::Value::Array(vec![one; slots]));
+            // A preset's own identity is not a per-slot option, and the
+            // slicer reads it as a plain string; see `PRESET_METADATA`.
+            if PRESET_METADATA.contains(&key.as_str()) {
+                continue;
+            }
+            config.insert(key, per_slot(&value, slots));
         }
         config.insert(
             "filament_settings_id".into(),
@@ -685,12 +741,64 @@ pub(crate) fn project_settings(slots: usize) -> Option<serde_json::Map<String, s
         );
     }
 
-    config.entry("printer_settings_id").or_insert_with(|| machine.into());
+    // Always the preset the user has selected, never whatever the preset file
+    // says about itself: Snapmaker's own `Snapmaker U1 (0.2 nozzle).json`
+    // ships `"printer_settings_id": "MyToolChanger 0.4 nozzle - Copy"`, a
+    // leftover from whoever built it, and keeping that sent every handoff to
+    // the slicer named as a machine nobody has. Seen 2026-10-28.
+    config.insert("printer_settings_id".into(), machine.into());
     // The palette owns the colours, and a compatibility list means nothing in a
     // project. Both are re-added or dropped by the caller.
     config.remove("filament_colour");
     config.remove("compatible_printers");
+    config.remove("compatible_prints");
     Some(config)
+}
+
+/// The keys a preset file carries about ITSELF rather than about printing.
+///
+/// Snapmaker Orca's `ConfigBase::load_from_json` (`Config.cpp`) reads these as
+/// plain strings before it looks at any option, so a list in any of them throws
+/// `type must be string, but is array` and the whole project config is thrown
+/// away -- colours, presets and Full Spectrum mixes together. They were being
+/// spread per slot like any filament option until 2026-10-28, when a handoff
+/// opened with Snapmaker's default colours and no mixes. A filament preset's
+/// `name` or `inherits` describes that preset, not the project, so they are
+/// dropped from the spread rather than collapsed to one value.
+const PRESET_METADATA: [&str; 12] = [
+    "version",
+    "is_custom_defined",
+    "url",
+    "name",
+    "description",
+    "type",
+    "from",
+    "setting_id",
+    "filament_id",
+    "inherits",
+    "instantiation",
+    "renamed_from",
+];
+
+/// One filament preset value spread across `slots` tool heads.
+///
+/// A preset stores most values as a one-entry list, and a project wants one
+/// entry per head, so the first entry is repeated. **An EMPTY list must not
+/// become a list of empty lists.** Snapmaker Orca's filament presets carry
+/// `compatible_prints: []`, and spreading that as `[[], [], [], []]` made its
+/// JSON loader throw on the nested array and discard the WHOLE project config:
+/// the colours, the presets and the Full Spectrum mixes, which unmapped every
+/// painted mix triangle back to filament 1. Seen in its log on 2026-10-28 as
+/// `invalid json array for compatible_prints`. An empty list repeats an empty
+/// string instead, which is what a project file holds for an unset value.
+fn per_slot(value: &serde_json::Value, slots: usize) -> serde_json::Value {
+    let one = match value {
+        serde_json::Value::Array(entries) => {
+            entries.first().cloned().unwrap_or_else(|| serde_json::Value::String(String::new()))
+        }
+        other => other.clone(),
+    };
+    serde_json::Value::Array(vec![one; slots])
 }
 
 /// The whole `project_settings.config` body for an export, palette included.
@@ -702,11 +810,26 @@ pub(crate) fn project_settings(slots: usize) -> Option<serde_json::Map<String, s
 /// **The palette is applied last and wins.** The flattened filament preset
 /// carries a `filament_colour` of its own, and letting that through would show
 /// the user the preset's colours rather than the ones their sculpt declares.
-pub(crate) fn project_settings_body(palette: &crate::palette::Palette) -> Option<String> {
+///
+/// `with_mixes` adds Snapmaker Orca's `mixed_filament_definitions`, and is
+/// true only when the export paints a mix; see [`crate::palette::Palette::as_filaments`].
+/// Inserted rather than merged, so a value the flattened presets happened to
+/// carry can never leave the slot numbering to chance.
+pub(crate) fn project_settings_body(
+    palette: &crate::palette::Palette,
+    with_mixes: bool,
+) -> Option<String> {
     let mut config = project_settings(palette.slots.len())?;
-    let filaments = palette.as_filaments();
+    let filaments = palette.as_filaments(with_mixes);
     config.insert("filament_colour".into(), filaments.colours.into());
     config.insert("filament_type".into(), filaments.materials.into());
+    config.remove("mixed_filament_definitions");
+    if !filaments.mixes.is_empty() {
+        config.insert(
+            "mixed_filament_definitions".into(),
+            brokkr_core::spectrum::definitions(&filaments.mixes).into(),
+        );
+    }
     config.insert("from".into(), "project".into());
     serde_json::to_string_pretty(&serde_json::Value::Object(config)).ok()
 }
@@ -964,7 +1087,7 @@ mod tests {
     fn the_palette_owns_the_colours_in_the_project_settings() {
         let mut palette = crate::palette::Palette::default();
         palette.slots[0].colour = "#ABCDEF".to_string();
-        let Some(body) = project_settings_body(&palette) else {
+        let Some(body) = project_settings_body(&palette, false) else {
             println!("skipping: no OrcaSlicer presets on this machine");
             return;
         };
@@ -1005,13 +1128,62 @@ mod tests {
         assert!(filament.is_some(), "no filament preset was compatible with the active machine");
     }
 
+    /// The real installation's presets with Full Spectrum mixes, as the
+    /// handoff writes them, so the slicer can be pointed at the result.
+    ///
+    /// Not a check, an artefact: whether Snapmaker Orca binds the presets AND
+    /// lists the eighteen mixes is only answered by opening it. Done on
+    /// 2026-10-28 for the minimal-settings sphere (`export_files.rs`); this is
+    /// the same sphere through the path the button takes.
+    #[test]
+    #[ignore = "writes a file for a human to open in Snapmaker Orca"]
+    fn a_full_spectrum_handoff_is_written_with_the_real_presets() {
+        let palette = crate::palette::Palette::default();
+        let Some(body) = project_settings_body(&palette, true) else {
+            println!("skipped: no slicer presets on this machine");
+            return;
+        };
+        let parsed: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
+        let rows = parsed["mixed_filament_definitions"].as_str().expect("the mixes are defined");
+        assert_eq!(rows.split(';').count(), 18);
+
+        let mut volume = brokkr_core::Volume::new(0.5);
+        volume.seed_sphere(glam::Vec3::ZERO, 15.0);
+        let (mut mesh, _) = volume.export_mesh();
+        let bands = [1u8, 5, 9, 17, 18, 22];
+        let (low, high) = mesh
+            .positions
+            .iter()
+            .fold((f32::MAX, f32::MIN), |(lo, hi), p| (lo.min(p.y), hi.max(p.y)));
+        mesh.slots = mesh
+            .positions
+            .iter()
+            .map(|p| bands[(((p.y - low) / (high - low)).clamp(0.0, 0.999) * 6.0) as usize])
+            .collect();
+        let parts = [("Full Spectrum", &mesh)];
+        let path = std::env::temp_dir().join("brokkr-export-test/handoff-spectrum.3mf");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let mut file = std::fs::File::create(&path).unwrap();
+        brokkr_core::export::threemf::write_project(
+            &parts,
+            &brokkr_core::export::threemf::Project {
+                filaments: palette.as_filaments(true),
+                placement: brokkr_core::export::threemf::Placement { plate_centre: plate_centre() },
+                settings: Some(&body),
+            },
+            &mut file,
+        )
+        .unwrap();
+        println!("wrote {} for {:?}", path.display(), datadir());
+    }
+
     /// Against the real installation, and this one is a privacy check rather
     /// than a behaviour check: whatever this machine's presets hold, none of it
     /// may reach a file the user might share.
     #[test]
     fn the_real_project_settings_carry_no_address_and_no_credential() {
         let palette = crate::palette::Palette::default();
-        let Some(body) = project_settings_body(&palette) else {
+        let Some(body) = project_settings_body(&palette, false) else {
             println!("skipping: no OrcaSlicer presets on this machine");
             return;
         };
@@ -1204,6 +1376,121 @@ mod tests {
             found.iter().any(|path| path.display().to_string().contains(".local/share/flatpak")),
             "refusing it should fall back to ~/.local/share, not give up"
         );
+    }
+
+    #[test]
+    fn snapmaker_orca_is_looked_for_ahead_of_orcaslicer_everywhere() {
+        let with_program_files = |key: &str| match key {
+            "ProgramFiles" => Some(PathBuf::from(r"C:\Program Files")),
+            _ => None,
+        };
+        for (os, env) in [
+            ("windows", &with_program_files as &dyn Fn(&str) -> Option<PathBuf>),
+            ("macos", &no_env),
+            ("linux", &no_env),
+        ] {
+            let found = candidates_for(os, Some(&home()), env);
+            let first_snapmaker = found.iter().position(|path| is_snapmaker(path));
+            let first_orca = found.iter().position(|path| !is_snapmaker(path));
+            assert!(first_snapmaker.is_some(), "{os} never looks for Snapmaker Orca");
+            assert!(first_snapmaker < first_orca, "{os} prefers OrcaSlicer: {found:?}");
+        }
+    }
+
+    #[test]
+    fn a_spread_filament_value_is_never_a_list_of_lists() {
+        use serde_json::json;
+        assert_eq!(per_slot(&json!(["0.02"]), 3), json!(["0.02", "0.02", "0.02"]));
+        assert_eq!(per_slot(&json!("PLA"), 2), json!(["PLA", "PLA"]));
+        // Snapmaker's `compatible_prints: []`, which once made the slicer
+        // discard the whole project config.
+        assert_eq!(per_slot(&json!([]), 2), json!(["", ""]));
+    }
+
+    /// The real presets, flattened, hold no nested array anywhere and no list
+    /// where the slicer reads a string. Both are shapes Snapmaker Orca refuses
+    /// by discarding the whole project config, and a key nobody here has heard
+    /// of can carry them as easily as `compatible_prints` and `name` did.
+    #[test]
+    fn the_real_project_settings_hold_nothing_the_slicer_refuses() {
+        let Some(body) = project_settings_body(&crate::palette::Palette::default(), true) else {
+            println!("skipped: no slicer presets on this machine");
+            return;
+        };
+        let parsed: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
+        let conf = datadir()
+            .and_then(|dir| conf_path(&dir))
+            .and_then(|path| std::fs::read_to_string(path).ok());
+        if let Some(selected) = conf.as_deref().and_then(active_machine) {
+            assert_eq!(
+                parsed["printer_settings_id"].as_str(),
+                Some(selected.as_str()),
+                "the file names a machine other than the one selected"
+            );
+        }
+        for (key, value) in parsed.as_object().expect("an object") {
+            assert!(
+                !PRESET_METADATA.contains(&key.as_str()) || value.is_string(),
+                "{key} must be a plain string for the slicer to read the file: {value}"
+            );
+            if let serde_json::Value::Array(entries) = value {
+                assert!(
+                    entries.iter().all(|entry| !entry.is_array() && !entry.is_object()),
+                    "{key} is a nested list: {value}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_appimage_launched_is_snapmakers_then_the_newest() {
+        let apps = home().join("Applications");
+        let ranked = rank_appimages(
+            [
+                "OrcaSlicer_V2.4.0-alpha.AppImage",
+                "Snapmaker_Orca_Linux_AppImage_Ubuntu2404_V2.4.0.AppImage",
+                "OrcaSlicer_V2.4.2.AppImage",
+                "invoice.docx",
+                "OrcaSlicer_V2.4.2.AppImage.zsync",
+            ]
+            .map(|name| apps.join(name))
+            .to_vec(),
+        );
+        let names: Vec<_> = ranked
+            .iter()
+            .map(|path| path.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            names,
+            [
+                "Snapmaker_Orca_Linux_AppImage_Ubuntu2404_V2.4.0.AppImage",
+                "OrcaSlicer_V2.4.2.AppImage",
+                "OrcaSlicer_V2.4.0-alpha.AppImage",
+            ]
+        );
+    }
+
+    #[test]
+    fn snapmakers_presets_are_read_from_its_own_directory() {
+        let appimage =
+            home().join("Applications/Snapmaker_Orca_Linux_AppImage_Ubuntu2404_V2.4.0.AppImage");
+        assert_eq!(
+            datadir_for("linux", Some(&home()), &no_env, Some(&appimage)),
+            Some(home().join(".config/Snapmaker_Orca"))
+        );
+        let flatpak = PathBuf::from("/var/lib/flatpak/exports/bin").join(SNAPMAKER_FLATPAK_ID);
+        assert_eq!(
+            datadir_for("linux", Some(&home()), &no_env, Some(&flatpak)),
+            Some(home().join(".var/app/io.github.Snapmaker.Snapmaker_Orca/config/Snapmaker_Orca"))
+        );
+        // And an OrcaSlicer binary is still read from OrcaSlicer's.
+        let orca = home().join("Applications/OrcaSlicer_V2.4.2.AppImage");
+        assert_eq!(
+            datadir_for("linux", Some(&home()), &no_env, Some(&orca)),
+            Some(home().join(".config/OrcaSlicer"))
+        );
+        assert_eq!(display_name(&appimage), "Snapmaker Orca");
+        assert_eq!(display_name(&orca), "OrcaSlicer");
     }
 
     #[test]

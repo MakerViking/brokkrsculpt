@@ -580,6 +580,71 @@ pub(crate) fn configured(from: Option<&std::path::Path>) -> Option<Printer> {
     Some(Printer { host, port })
 }
 
+/// A printer from what somebody typed or pasted into the address field.
+///
+/// Forgiving about the shapes an address arrives in -- `192.168.1.50`,
+/// `u1.local`, `192.168.1.50:7125`, and the `http://192.168.1.50/` a browser
+/// shows for Fluidd or Mainsail -- and then exactly as strict as
+/// [`configured`] is on read, because the result goes into a URL. Pure, so the
+/// whole of that is testable without a file.
+pub(crate) fn parse_address(typed: &str) -> Result<Printer, String> {
+    let mut rest = typed.trim();
+    for scheme in ["http://", "https://"] {
+        if let Some(stripped) = rest.strip_prefix(scheme) {
+            rest = stripped;
+        }
+    }
+    let rest = rest.split('/').next().unwrap_or_default();
+    let (host, port) = match rest.rsplit_once(':') {
+        Some((host, port)) => {
+            let port = port.parse::<u16>().map_err(|_| format!("{port:?} is not a port"))?;
+            (host, port)
+        }
+        None => (rest, MOONRAKER_PORT),
+    };
+    if !valid_host(host) {
+        return Err(if host.is_empty() {
+            "type the printer's address, like 192.168.1.50".to_string()
+        } else {
+            format!("{host:?} is not an address")
+        });
+    }
+    Ok(Printer { host: host.to_string(), port })
+}
+
+/// The config text for a printer, ready to write back.
+pub(crate) fn config_text(printer: &Printer) -> String {
+    format!(
+        "# BrokkrSculpt printer: written by the FILAMENT panel, safe to edit by hand.\n\
+         host = {}\nport = {}\n",
+        printer.host, printer.port
+    )
+}
+
+/// Write the printer to this machine's config file.
+///
+/// Always to `printer.conf`, never the legacy extensionless name: whatever
+/// [`config_path`] would have read, the next read finds this first.
+///
+/// **Inert under `cfg(test)`**, the rule every saver in this application
+/// follows since a test replaced the real `filaments.conf` (see
+/// [`crate::palette::Palette::save`]). A test wanting the file goes through
+/// [`config_text`] and a path of its own.
+pub(crate) fn save(printer: &Printer) -> Result<(), String> {
+    if cfg!(test) {
+        return Ok(());
+    }
+    let Some(path) = crate::paths::config_file("printer.conf") else {
+        return Err("no config directory to write to".to_string());
+    };
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|why| format!("could not create {}: {why}", parent.display()))?;
+    }
+    std::fs::write(&path, config_text(printer))
+        .map_err(|why| format!("could not write {}: {why}", path.display()))
+}
+
 #[cfg(test)]
 mod config_tests {
     use super::*;
@@ -599,6 +664,37 @@ mod config_tests {
         let mut file = std::fs::File::create(&path).expect("a temp file");
         file.write_all(body.as_bytes()).expect("write");
         path
+    }
+
+    #[test]
+    fn an_address_is_taken_in_every_shape_it_is_pasted_in() {
+        let at = |host: &str, port: u16| Ok(Printer { host: host.into(), port });
+        assert_eq!(parse_address("192.168.1.50"), at("192.168.1.50", 7125));
+        assert_eq!(parse_address("  u1.local \n"), at("u1.local", 7125));
+        assert_eq!(parse_address("192.168.1.50:7126"), at("192.168.1.50", 7126));
+        assert_eq!(parse_address("http://192.168.1.50/"), at("192.168.1.50", 7125));
+        assert_eq!(parse_address("https://u1.local:7125/#/console"), at("u1.local", 7125));
+    }
+
+    #[test]
+    fn an_address_that_would_not_be_a_host_is_refused() {
+        assert!(parse_address("").is_err());
+        assert!(parse_address("http://").is_err());
+        assert!(parse_address("192.168.1.50:printer").is_err());
+        assert!(parse_address("evil example").is_err());
+        assert!(parse_address("192.168.1.50:99999").is_err());
+    }
+
+    #[test]
+    fn a_saved_printer_reads_back_as_itself() {
+        for printer in [
+            Printer { host: "192.0.2.46".into(), port: 7125 },
+            Printer { host: "u1.local".into(), port: 8080 },
+        ] {
+            let path = write(&config_text(&printer));
+            assert_eq!(configured(Some(&path)), Some(printer));
+            let _ = std::fs::remove_file(path);
+        }
     }
 
     #[test]

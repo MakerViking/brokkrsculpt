@@ -98,19 +98,23 @@ pub struct Uniforms {
     /// application has no filament for is filled with [`UNKNOWN_FILAMENT`], a
     /// colour no filament is, so "painted with a slot this machine does not
     /// have" is visible rather than silently the clay; a slot past the end of
-    /// this array clamps to its last entry, which is that colour unless the
-    /// machine really has fifteen heads. `vec4` and not `vec3` for the 16
-    /// byte array stride uniform address space imposes; the fourth component
-    /// is spare.
+    /// this array clamps to its last entry, which is always that colour.
+    /// `vec4` and not `vec3` for the 16 byte array stride uniform address
+    /// space imposes; the fourth component is spare.
     pub palette: [[f32; 4]; PALETTE_SLOTS],
 }
 
 /// Filament slots the shader can name, counting the unpainted zero.
 ///
-/// Sixteen is what an AMS-class multi-material setup tops out at and four
-/// times what the U1 has. A slot byte can hold 255, and one past this reads as
-/// "unknown filament" rather than wrapping -- see [`Uniforms::palette`].
-pub const PALETTE_SLOTS: usize = 16;
+/// Every slot the 3MF writer can paint, mixes included, plus one: slots 0 to
+/// [`MAX_PAINT_SLOT`] each have an entry, and the last is never a real slot,
+/// so anything past the writer's range clamps onto a colour that says so. Was
+/// sixteen until Full Spectrum numbered eighteen mixes after a U1's four heads.
+/// A slot byte can hold 255, and one past this reads as "unknown filament"
+/// rather than wrapping -- see [`Uniforms::palette`].
+///
+/// [`MAX_PAINT_SLOT`]: brokkr_core::export::threemf::MAX_PAINT_SLOT
+pub const PALETTE_SLOTS: usize = brokkr_core::export::threemf::MAX_PAINT_SLOT as usize + 2;
 
 /// The colour of a slot no filament is loaded in: a magenta no palette here
 /// produces, so it reads as a warning rather than as a choice.

@@ -23,13 +23,13 @@ struct Uniforms {
     // toggle like the tint: zero draws every body as bare clay.
     paint_shown: u32,
     // Linear RGB per filament slot, indexed by the stored slot byte. Slot 0 is
-    // never read. Sixteen entries of 16 bytes, which keeps the struct's size a
-    // multiple of 16 without a padding word; the Rust type asserts the total,
+    // never read. Thirty-four entries of 16 bytes, which keeps the struct's
+    // size a multiple of 16 without a padding word; the Rust type asserts the total,
     // and `renderer::tests::the_shader_palette_is_sized_to_palette_slots`
     // reads this literal and the clamp below out of the source, because a
     // Rust-side change to PALETTE_SLOTS would otherwise pass validation with
     // the shader indexing past what it was given.
-    palette: array<vec4<f32>, 16>,
+    palette: array<vec4<f32>, 34>,
 }
 
 // Luminance of the matcap's BASE clay colour in linear light, which is what a
@@ -103,7 +103,7 @@ fn fragment_main(in: VertexOutput, @builtin(front_facing) front_facing: bool) ->
     // lighting kept. A slot past the palette clamps to the last entry, which
     // the application fills with a colour no filament is.
     if (uniforms.paint_shown != 0u && in.slot != 0u) {
-        let filament = uniforms.palette[min(in.slot, 15u)].rgb;
+        let filament = uniforms.palette[min(in.slot, 33u)].rgb;
         let luma = dot(colour, vec3<f32>(0.2126, 0.7152, 0.0722));
         // Not clamped at 1: the lighting term is allowed to exceed the clay's
         // own, or every painted pixel on the key-lit side collapses to one

@@ -42,10 +42,12 @@
 //! Coordinates are rotated to Z-up on the way out. See [`crate::orientation`].
 //! 3MF carries no vertex normals, so positions are all there is to rotate.
 
+use std::borrow::Cow;
 use std::io::{self, Write};
 
 use super::ExportMesh;
 use crate::orientation::to_print_space;
+use crate::spectrum::{self, Mix};
 
 /// The core specification namespace, which every consumer keys off.
 const CORE_NAMESPACE: &str = "http://schemas.microsoft.com/3dmanufacturing/core/2015/02";
@@ -83,7 +85,7 @@ const CORE_NAMESPACE: &str = "http://schemas.microsoft.com/3dmanufacturing/core/
 const PAINT_CODE: [&str; 16] =
     ["4", "8", "0C", "1C", "2C", "3C", "4C", "5C", "6C", "7C", "8C", "9C", "AC", "BC", "CC", "DC"];
 
-/// How many filament slots a package can name.
+/// How many tool heads a package can name.
 ///
 /// **A ceiling, not a preference.** Above 16 the two lineages disagree about
 /// the escape nibble, so slot 17 would mean one thing to OrcaSlicer and another
@@ -92,10 +94,42 @@ const PAINT_CODE: [&str; 16] =
 /// number this writer can encode, instead of keeping a second copy of it.
 pub const MAX_SLOTS: usize = PAINT_CODE.len();
 
+/// The highest slot a triangle can be painted with, mixes included.
+///
+/// Above [`MAX_SLOTS`] only Snapmaker OrcaSlicer's chunked escape is written,
+/// and only a Full Spectrum mix is ever numbered there -- a mix means nothing
+/// outside that slicer anyway, see [`crate::spectrum`]. 32 holds four heads
+/// and their eighteen mixes with room to spare, and is what the renderer's
+/// palette is sized to.
+pub const MAX_PAINT_SLOT: u8 = 32;
+
 /// The code for a 1-based filament slot, or `None` when the slot is unassigned
 /// or out of range.
-fn paint_code(slot: u8) -> Option<&'static str> {
-    if slot == 0 { None } else { PAINT_CODE.get(slot as usize - 1).copied() }
+///
+/// # Above 16: Snapmaker's chunks
+///
+/// From Snapmaker OrcaSlicer's `TriangleSelector::serialize`: after the `11`
+/// escape, *state - 3* is written in four-bit chunks, and a chunk of `1111`
+/// means "add fifteen and read another". Up to slot 17 that is the single
+/// nibble the table holds; slot 18 is `"0FC"` and 22 is `"4FC"`. Stock
+/// OrcaSlicer 2.4 reads one chunk only, which is the reason this is reached
+/// for a mix and never for a tool head.
+fn paint_code(slot: u8) -> Option<Cow<'static, str>> {
+    match slot {
+        0 => None,
+        1..=16 => Some(Cow::Borrowed(PAINT_CODE[slot as usize - 1])),
+        _ if slot > MAX_PAINT_SLOT => None,
+        _ => {
+            let mut nibbles = vec![0xC_u8];
+            let mut rest = slot - 3;
+            while rest >= 15 {
+                nibbles.push(0xF);
+                rest -= 15;
+            }
+            nibbles.push(rest);
+            Some(Cow::Owned(nibbles.iter().rev().map(|nibble| format!("{nibble:X}")).collect()))
+        }
+    }
 }
 
 /// Where the model sits on the printer's plate.
@@ -154,6 +188,12 @@ pub struct Filaments {
     pub materials: Vec<String>,
     /// The slot an unpainted triangle prints with, 1-based.
     pub base: u8,
+    /// The Full Spectrum mixes the package defines, numbered after the tool
+    /// heads in this order. See [`crate::spectrum`].
+    ///
+    /// **Empty unless a mix is painted.** Defining eighteen mixes nobody used
+    /// would put eighteen rows in the slicer's filament list for every export.
+    pub mixes: Vec<Mix>,
 }
 
 impl Default for Filaments {
@@ -164,6 +204,7 @@ impl Default for Filaments {
             colours: ["#FFFFFF", "#FF0000", "#00B050", "#2850E0"].map(str::to_string).to_vec(),
             materials: vec!["PLA".to_string(); 4],
             base: 1,
+            mixes: Vec::new(),
         }
     }
 }
@@ -419,11 +460,27 @@ fn project_settings_json(filaments: &Filaments) -> String {
     };
     let mut materials = filaments.materials.clone();
     materials.resize(filaments.colours.len(), "PLA".to_string());
+    let mixes = if filaments.mixes.is_empty() {
+        String::new()
+    } else {
+        format!(
+            ",\n  \"mixed_filament_definitions\": \"{}\"",
+            json_escape(&spectrum::definitions(&filaments.mixes))
+        )
+    };
     format!(
-        "{{\n  \"from\": \"project\",\n  \"filament_colour\": [{}],\n  \"filament_type\": [{}]\n}}\n",
+        "{{\n  \"from\": \"project\",\n  \"filament_colour\": [{}],\n  \"filament_type\": [{}]{mixes}\n}}\n",
         list(&filaments.colours),
         list(&materials)
     )
+}
+
+/// Whether `bodies` paint any slot above the tool heads, which is a mix.
+///
+/// What a caller asks before filling [`Filaments::mixes`], so the mixes are
+/// defined exactly when a triangle needs them.
+pub fn paints_a_mix(bodies: &[(&str, &ExportMesh)], tool_heads: usize) -> bool {
+    bodies.iter().any(|(_, mesh)| mesh.slots.iter().any(|&slot| usize::from(slot) > tool_heads))
 }
 
 /// Write `mesh` as a 3MF package, with default filament slots.
@@ -753,19 +810,19 @@ mod tests {
         // `1plate+3color+3MF.3mf`, which between them use slots 1 through 5.
         // Getting these wrong produces a file that opens, slices, and prints in
         // the wrong colours -- there is no error anywhere in that chain.
-        assert_eq!(paint_code(1), Some("4"));
-        assert_eq!(paint_code(2), Some("8"));
-        assert_eq!(paint_code(3), Some("0C"));
-        assert_eq!(paint_code(4), Some("1C"));
-        assert_eq!(paint_code(5), Some("2C"));
-        assert_eq!(paint_code(16), Some("DC"));
+        assert_eq!(paint_code(1).as_deref(), Some("4"));
+        assert_eq!(paint_code(2).as_deref(), Some("8"));
+        assert_eq!(paint_code(3).as_deref(), Some("0C"));
+        assert_eq!(paint_code(4).as_deref(), Some("1C"));
+        assert_eq!(paint_code(5).as_deref(), Some("2C"));
+        assert_eq!(paint_code(16).as_deref(), Some("DC"));
 
         // The escape rule the table encodes, re-derived rather than copied:
         // states of 3 and above are "11" plus four bits of state - 3, which in
         // the reversed-nibble form is the hex digit of (slot - 3) then "C".
         for slot in 3..=16u8 {
             assert_eq!(
-                paint_code(slot),
+                paint_code(slot).as_deref(),
                 Some(format!("{:X}C", slot - 3).as_str()),
                 "slot {slot} does not follow the escape rule"
             );
@@ -775,8 +832,48 @@ mod tests {
     #[test]
     fn slot_zero_and_out_of_range_carry_no_code() {
         assert_eq!(paint_code(0), None, "0 means unassigned, not filament zero");
-        assert_eq!(paint_code(17), None);
+        assert_eq!(paint_code(MAX_PAINT_SLOT + 1), None);
         assert_eq!(paint_code(255), None);
+    }
+
+    #[test]
+    fn mix_slots_use_snapmakers_chunked_escape() {
+        // The values Snapmaker OrcaSlicer's `TriangleSelector::serialize`
+        // writes, read off its source: one nibble up to 17, then a `F`
+        // continuation chunk.
+        assert_eq!(paint_code(17).as_deref(), Some("EC"));
+        assert_eq!(paint_code(18).as_deref(), Some("0FC"));
+        assert_eq!(paint_code(22).as_deref(), Some("4FC"));
+        assert_eq!(paint_code(32).as_deref(), Some("EFC"));
+        // And the chunked rule, run over the old range, IS the old table:
+        // nothing a four-colour export writes has moved.
+        for slot in 3..=16u8 {
+            assert_eq!(paint_code(slot).as_deref(), Some(format!("{:X}C", slot - 3).as_str()));
+        }
+    }
+
+    #[test]
+    fn mixes_are_defined_only_when_given_and_survive_as_json() {
+        let plain = project_settings_json(&Filaments::default());
+        assert!(!plain.contains("mixed_filament_definitions"), "{plain}");
+
+        let mixed = Filaments { mixes: crate::spectrum::full_spectrum(4), ..Filaments::default() };
+        let json = project_settings_json(&mixed);
+        let expected = crate::spectrum::definitions(&mixed.mixes);
+        assert!(
+            json.contains(&format!("\"mixed_filament_definitions\": \"{expected}\"")),
+            "{json}"
+        );
+        assert_eq!(expected.split(';').count(), 18);
+    }
+
+    #[test]
+    fn a_mix_is_noticed_only_above_the_tool_heads() {
+        let heads = with_slots(|index| (index % 4) as u8 + 1);
+        assert!(!paints_a_mix(&solo(&heads), 4));
+        let mixed = with_slots(|index| if index == 0 { 9 } else { 1 });
+        assert!(paints_a_mix(&solo(&mixed), 4));
+        assert!(!paints_a_mix(&solo(&mixed), 9));
     }
 
     #[test]
@@ -883,6 +980,7 @@ mod tests {
             colours: vec!["#FFFFFF".into(), "#000000".into()],
             materials: vec![r#"PLA "Pro""#.into(), "back\\slash\nnewline".into()],
             base: 1,
+            mixes: Vec::new(),
         };
         let json = project_settings_json(&filaments);
 
@@ -916,6 +1014,7 @@ mod tests {
             colours: vec!["#112233".into(), "#445566".into()],
             materials: vec!["PETG".into()],
             base: 2,
+            mixes: Vec::new(),
         };
         let model_settings = model_settings_xml(&solo(&exported()), &filaments);
         assert!(model_settings.contains("key=\"extruder\" value=\"2\""), "{model_settings}");
