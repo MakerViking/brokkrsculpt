@@ -23,6 +23,19 @@ before it, see the
 
 ## Unreleased
 
+### Fixed: models tore apart in the macOS viewport
+
+On a Mac, a model of more than about 65,000 vertices -- which is nearly every
+real one -- drew parts of itself as spikes pointing at its own centre, and
+painting or masking tore more of it the same way. The cause was how the
+viewport asked Metal to draw: each part of the model was handed over as an
+offset into one big buffer, and past the 65,536th vertex Metal read that
+offset's vertices as zero. The model itself was never wrong, so nothing you
+exported was affected; only the picture of it was. The masking display that
+was listed as wrong on macOS was the same fault, and is fixed with it.
+Verified on GitHub's macOS runner, whose GPU is virtual; not yet on a
+physical Mac.
+
 ### The first public build
 
 BrokkrSculpt is now downloadable for **Linux, Windows and macOS**. Nothing is
