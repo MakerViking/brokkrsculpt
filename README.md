@@ -332,18 +332,13 @@ should have to discover for themselves.
 | | Linux | Windows | macOS |
 |---|---|---|---|
 | Sculpting, import, export, printing | yes | yes | yes |
-| Masking **display** | yes | yes | **wrong — see below** |
+| Masking **display** | yes | yes | yes, on the CI runner |
 | Stylus pressure and tilt | yes | untested | untested |
 | SpaceMouse | yes | untested | untested |
 | Update check, download and verify | yes | yes | yes |
 | Replacing itself with the update | yes | untested | untested |
 | Installer the OS trusts | n/a | no | no |
 
-- **macOS masking renders wrong.** The tint spreads past the mask and a seam
-  shows between bricks. The mask itself is correct — what a brush does is
-  unaffected, and so is anything you export — but you cannot trust the blue to
-  tell you where it is. A difference in how the Metal backend reads a vertex
-  attribute; it is being chased, and Linux and Windows are unaffected.
 - **The update SWAP on Windows and macOS has never run on real hardware.** All
   three platforms use the same signed manifest, the same download and the same
   SHA-256 check, and that half has been exercised end to end. What differs is

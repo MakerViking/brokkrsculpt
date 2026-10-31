@@ -1416,6 +1416,65 @@ fn hiding_a_body_removes_exactly_that_body_from_the_picture() {
     assert_eq!(wrong, 0, "{wrong} pixels did not come back when the body was shown again");
 }
 
+/// **A body that lands deep in the pool draws exactly as one at its start.**
+///
+/// Every brick is drawn out of shared buffers, so where its vertices sit is an
+/// accident of upload order. Until the pool made its indices absolute, a
+/// brick's block offset went to the draw as a BASE VERTEX, and on Metal --
+/// where wgpu fetches vertices itself and bounds checks each one -- bricks far
+/// enough into the buffer came out as spikes to the origin: some of their
+/// vertices read as zero. The pool's own readback was byte-identical, so the
+/// data was right and the draw was wrong. Measured on the macOS CI runner,
+/// which is the only place this test can fail; every other backend passes it
+/// either way.
+///
+/// The same sphere twice: once alone in a fresh renderer, once uploaded after
+/// a hidden copy of itself so every one of its bricks sits past it. The two
+/// frames must be identical to the byte.
+#[test]
+fn a_body_far_into_the_pool_draws_exactly_as_one_at_its_start() {
+    const FIRST: NodeId = NodeId(1);
+    const SECOND: NodeId = NodeId(2);
+    let Some(harness) = Harness::new() else {
+        eprintln!("no usable wgpu adapter, skipping the pool offset render test");
+        return;
+    };
+    let distance = MODEL_RADIUS * 3.0;
+    let mut sphere = Volume::new(VOXEL_SIZE);
+    sphere.seed_sphere(Vec3::ZERO, MODEL_RADIUS);
+
+    let mut alone = SculptRenderer::new(&harness.device, &harness.queue, TARGET_FORMAT);
+    alone.resize(&harness.device, WIDTH, HEIGHT);
+    alone.write_uniforms(&harness.queue, &uniforms(distance));
+    upload_body(&mut alone, &harness.device, &harness.queue, &mut sphere, SECOND);
+    let reference = harness.frame(&alone);
+
+    let mut deep = SculptRenderer::new(&harness.device, &harness.queue, TARGET_FORMAT);
+    deep.resize(&harness.device, WIDTH, HEIGHT);
+    deep.write_uniforms(&harness.queue, &uniforms(distance));
+    upload_body(&mut deep, &harness.device, &harness.queue, &mut sphere, FIRST);
+    let ahead = deep.stats().vertices_watermark;
+    upload_body(&mut deep, &harness.device, &harness.queue, &mut sphere, SECOND);
+    deep.set_hidden(&[FIRST]);
+    // Past the 16-bit line by a margin, or the fixture proves less than it says.
+    assert!(ahead > 65_536, "the hidden copy put the second body only {ahead} vertices in");
+    let shifted = harness.frame(&deep);
+    dump("pool-offset", &shifted);
+
+    let differing = reference
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .zip(shifted.as_chunks::<4>().0.iter())
+        .filter(|(one, other)| one != other)
+        .count();
+    assert_eq!(
+        differing, 0,
+        "{differing} pixels differ once the body's vertices sit {ahead} into the pool, so a \
+         brick's place in the buffer reached what is drawn"
+    );
+}
+
 /// How cool a pixel is: blue minus red, in sRGB levels.
 ///
 /// The one number the mask's tint moves and the matcap barely does. Its whole
